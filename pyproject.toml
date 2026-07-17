@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dedupe-media"
+version = "0.1.0"
+description = "Local Gemini-style finder for duplicate images, videos, and GIFs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Seth Saler" }]
+dependencies = [
+    "Pillow>=10.0.0",
+    "pillow-heif>=0.13.0",
+    "ImageHash>=4.3.1",
+    "pybktree>=1.1",
+    "send2trash>=1.8.2",
+    "flask>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+dedupe = "dedupe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dedupe = ["web/static/*", "web/templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

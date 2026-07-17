@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dedupe — Media Duplicate Finder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <rect x="3" y="5" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="9" y="7" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.8" opacity="0.55"/>
+          </svg>
+        </span>
+        <div>
+          <h1>Dedupe</h1>
+          <p class="tagline">Duplicate images, videos &amp; GIFs</p>
+        </div>
+      </div>
+      <div class="top-stats" id="topStats">
+        <span class="stat-chip muted-chip">No scan yet</span>
+      </div>
+    </header>
+
+    <section class="scan-panel" id="scanPanel">
+      <div class="scan-main">
+        <div class="field-row path-row">
+          <label for="paths">Folders to scan</label>
+          <div class="path-input-wrap">
+            <input
+              id="paths"
+              type="text"
+              placeholder="~/Pictures  or drop a path — comma-separate multiple"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button type="button" class="btn ghost path-pick" id="btnPickFolder" title="Choose folder">
+              Choose…
+            </button>
+          </div>
+          <div class="recent-paths" id="recentPaths" hidden></div>
+        </div>
+
+        <div class="scan-meta-row">
+          <button type="button" class="opts-toggle" id="optsToggle" aria-expanded="false">
+            <span class="chev" aria-hidden="true">▸</span>
+            Options
+          </button>
+          <div class="actions-row">
+            <span id="scanStatus" class="status muted">Ready</span>
+            <button id="btnScan" class="btn primary" type="button">
+              <span class="btn-label">Scan</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="options" id="optionsPanel" hidden>
+          <div class="opt-group">
+            <span class="opt-label">Detect</span>
+            <label class="chip-check"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
+            <label class="chip-check"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
+          </div>
+          <div class="opt-group">
+            <span class="opt-label">Types</span>
+            <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
+            <label class="chip-check"><input type="checkbox" id="optGifs" checked /><span>GIFs</span></label>
+            <label class="chip-check"><input type="checkbox" id="optVideos" checked /><span>Videos</span></label>
+          </div>
+          <label class="thresh">
+            <span class="opt-label">Similarity</span>
+            <input type="range" id="threshold" min="0" max="16" value="6" />
+            <span id="threshVal" class="thresh-val">6</span>
+            <span class="thresh-hint">lower = stricter</span>
+          </label>
+          <label class="thresh workers-field">
+            <span class="opt-label">Workers</span>
+            <input type="range" id="workers" min="0" max="16" value="0" />
+            <span id="workersVal" class="thresh-val">Auto</span>
+            <span class="thresh-hint" id="workersHint">parallel hashing</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="progress-wrap" id="progressWrap" hidden>
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-msg" id="progressMsg"></div>
+      </div>
+    </section>
+
+    <section class="empty-state" id="emptyState">
+      <div class="empty-card">
+        <div class="empty-icon" aria-hidden="true">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <rect x="6" y="10" width="24" height="24" rx="4" stroke="currentColor" stroke-width="2"/>
+            <rect x="18" y="14" width="24" height="24" rx="4" stroke="currentColor" stroke-width="2" opacity="0.45"/>
+            <path d="M14 26l5-5 4 4 3-3 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h2>Scan a folder to find duplicates</h2>
+        <p>Point Dedupe at Photos, Downloads, or any media library. Review groups side-by-side, then move extras to Trash or quarantine — never hard-deleted.</p>
+        <ul class="empty-steps">
+          <li><span>1</span> Paste a folder path or click Choose…</li>
+          <li><span>2</span> Hit Scan and wait for groups</li>
+          <li><span>3</span> Review, smart-select, act safely</li>
+        </ul>
+        <p class="empty-hint">
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>Space</kbd> toggle remove · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+        </p>
+      </div>
+    </section>
+
+    <section class="results" id="results" hidden>
+      <aside class="sidebar">
+        <div class="filter-tabs" role="tablist">
+          <button class="tab active" data-kind="all" type="button">All <span class="tab-count" id="countAll">0</span></button>
+          <button class="tab" data-kind="exact" type="button">Exact <span class="tab-count" id="countExact">0</span></button>
+          <button class="tab" data-kind="similar" type="button">Similar <span class="tab-count" id="countSimilar">0</span></button>
+        </div>
+        <div class="group-list" id="groupList" role="listbox" aria-label="Duplicate groups"></div>
+      </aside>
+
+      <main class="detail">
+        <div class="detail-empty" id="detailEmpty">
+          <p>Select a group from the left to compare files.</p>
+          <p class="muted small">Suggested keeps are highlighted in green. Check “Remove” on the rest.</p>
+        </div>
+        <div class="detail-body" id="detailBody" hidden>
+          <div class="detail-header">
+            <div>
+              <h2 id="detailTitle">Group</h2>
+              <p class="muted" id="detailMeta"></p>
+            </div>
+            <div class="detail-tools">
+              <label>
+                Smart Select
+                <select id="smartRule">
+                  <option value="automatic">Automatic</option>
+                  <option value="newest">Keep newest</option>
+                  <option value="oldest">Keep oldest</option>
+                  <option value="largest">Keep largest</option>
+                  <option value="smallest">Keep smallest</option>
+                  <option value="shortest_path">Keep shortest path</option>
+                  <option value="deselect_all">Deselect all</option>
+                </select>
+              </label>
+              <button class="btn" id="btnSmartGroup" type="button">Apply to group</button>
+              <button class="btn ghost" id="btnSmartAll" type="button">Apply to all</button>
+            </div>
+          </div>
+          <div class="members" id="members"></div>
+        </div>
+      </main>
+    </section>
+
+    <footer class="actionbar" id="actionBar" hidden>
+      <div class="action-info">
+        <span class="selection-dot" aria-hidden="true"></span>
+        <span id="selectionSummary">0 files selected</span>
+      </div>
+      <div class="action-controls">
+        <label class="quarantine-field">
+          Quarantine folder
+          <input id="quarantineDir" type="text" placeholder="~/Duplicates" spellcheck="false" />
+        </label>
+        <div class="btn-group">
+          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash">Preview</button>
+          <button class="btn danger" id="btnTrash" type="button">Trash</button>
+        </div>
+        <div class="btn-group">
+          <button class="btn ghost" id="btnDryQuarantine" type="button">Preview</button>
+          <button class="btn warn" id="btnQuarantine" type="button">Quarantine</button>
+        </div>
+        <div class="btn-group">
+          <button class="btn ghost" id="btnDryIsolate" type="button" title="Copy groups into _Dedupe Review inside source">Preview</button>
+          <button class="btn secondary" id="btnIsolate" type="button">Isolate</button>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Lightbox -->
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="lb-close" id="lbClose" type="button" aria-label="Close">✕</button>
+    <button class="lb-nav prev" id="lbPrev" type="button" aria-label="Previous">‹</button>
+    <div class="lb-stage">
+      <img id="lbImage" alt="" />
+      <div class="lb-meta" id="lbMeta"></div>
+    </div>
+    <button class="lb-nav next" id="lbNext" type="button" aria-label="Next">›</button>
+  </div>
+
+  <!-- Confirm modal -->
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <h3 id="modalTitle">Confirm</h3>
+      <p id="modalBody"></p>
+      <div class="modal-actions">
+        <button class="btn ghost" id="modalCancel" type="button">Cancel</button>
+        <button class="btn danger" id="modalConfirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shortcuts help -->
+  <div class="modal-backdrop" id="helpBackdrop" hidden>
+    <div class="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+      <h3 id="helpTitle">Keyboard shortcuts</h3>
+      <dl class="shortcuts">
+        <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group</dd></div>
+        <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group</dd></div>
+        <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card</dd></div>
+        <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Lightbox prev / next</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
+      </dl>
+      <div class="modal-actions">
+        <button class="btn primary" id="helpClose" type="button">Got it</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
