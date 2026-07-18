@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import DuplicateGroup, GroupKind, ScanResult
+from .exact import file_sha256
+from .models import (
+    DuplicateGroup,
+    FileRecord,
+    GroupKind,
+    ScanResult,
+    effective_selected_paths,
+)
 
 
 @dataclass
@@ -30,6 +38,12 @@ class ActionResult:
     log_path: str | None = None
     review_root: str | None = None
     group_dirs: list[str] = field(default_factory=list)
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    completed_at: str | None = None
+    log_error: str | None = None
 
     @property
     def success_count(self) -> int:
@@ -48,29 +62,17 @@ class ActionResult:
             "log_path": self.log_path,
             "review_root": self.review_root,
             "group_dirs": list(self.group_dirs),
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "log_error": self.log_error,
             "items": [asdict(i) for i in self.items],
         }
 
 
 def collect_selected_paths(groups: list[DuplicateGroup]) -> list[str]:
-    """Collect selected paths; enforce keep-at-least-one per group."""
-    selected: list[str] = []
-    for g in groups:
-        members = {m.path for m in g.members}
-        picks = [p for p in g.selected_for_removal if p in members]
-        # Never remove every member
-        if len(picks) >= len(members):
-            keep = g.suggested_keep or next(iter(members))
-            picks = [p for p in picks if p != keep]
-        selected.extend(picks)
-    # unique, preserve order
-    seen: set[str] = set()
-    out: list[str] = []
-    for p in selected:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+    """Collect selected paths; keep one only for duplicate groups."""
+    return effective_selected_paths(groups)
 
 
 def _unique_dest(dest_dir: Path, name: str) -> Path:
@@ -92,14 +94,114 @@ def _write_action_log(
     log_dir: str | Path | None = None,
 ) -> None:
     log_base = Path(log_dir) if log_dir else Path.home() / ".cache" / "dedupe" / "logs"
-    log_base.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = log_base / f"action-{stamp}.json"
     try:
-        log_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        log_base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        log_path = log_base / f"action-{stamp}-{result.session_id[:8]}.json"
         result.log_path = str(log_path)
-    except OSError:
-        pass
+        temp_path = log_path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        temp_path.replace(log_path)
+    except OSError as exc:
+        result.log_path = None
+        result.log_error = str(exc)
+
+
+def _path_in_roots(path: Path, roots: list[str] | None) -> bool:
+    if not roots:
+        return True
+    resolved = path.resolve(strict=True)
+    for raw_root in roots:
+        root = Path(raw_root).expanduser().resolve(strict=False)
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def _validate_record(record: FileRecord, roots: list[str] | None) -> str | None:
+    path = Path(record.path)
+    try:
+        if path.is_symlink():
+            return "refusing to act on a symbolic link"
+        if not path.is_file():
+            return "file no longer exists"
+        if not _path_in_roots(path, roots):
+            return "file is outside the scanned roots"
+        stat = path.stat()
+    except OSError as exc:
+        return str(exc)
+
+    if int(stat.st_size) != int(record.size):
+        return f"file changed since scan (size {record.size} -> {stat.st_size})"
+    if record.device is not None and int(stat.st_dev) != int(record.device):
+        return "file changed since scan (device differs)"
+    if record.inode is not None and int(stat.st_ino) != int(record.inode):
+        return "file changed since scan (inode differs)"
+    if record.mtime_ns is not None:
+        if int(stat.st_mtime_ns) != int(record.mtime_ns):
+            return "file changed since scan (modified time differs)"
+    elif abs(float(stat.st_mtime) - float(record.mtime)) >= 0.001:
+        return "file changed since scan (modified time differs)"
+    return None
+
+
+def _preflight_action(
+    groups: list[DuplicateGroup], paths: list[str], roots: list[str] | None
+) -> dict[str, str]:
+    """Return path -> error for stale, out-of-scope, or no-longer-exact selections."""
+    records = {member.path: member for group in groups for member in group.members}
+    errors: dict[str, str] = {}
+    for path in paths:
+        record = records.get(path)
+        if record is None:
+            errors[path] = "selection is not present in the scan result"
+            continue
+        error = _validate_record(record, roots)
+        if error:
+            errors[path] = error
+
+    current_hashes: dict[str, str] = {}
+    selected = set(paths)
+    for group in groups:
+        if group.kind != GroupKind.EXACT or not selected.intersection(
+            member.path for member in group.members
+        ):
+            continue
+        keep = next(
+            (member for member in group.members if member.path == group.suggested_keep),
+            group.members[0] if group.members else None,
+        )
+        if keep is None:
+            continue
+        keep_error = _validate_record(keep, roots)
+        if keep_error:
+            for member in group.members:
+                if member.path in selected:
+                    errors[member.path] = f"keeper is stale: {keep_error}"
+            continue
+        members_to_verify = [
+            member for member in group.members if member.path in selected
+        ] + [keep]
+        try:
+            for member in members_to_verify:
+                if member.path in errors:
+                    continue
+                current = current_hashes.setdefault(
+                    member.path, file_sha256(member.path)
+                )
+                if member.sha256 and current != member.sha256:
+                    errors[member.path] = "file content no longer matches its scan hash"
+            keep_hash = current_hashes.setdefault(keep.path, file_sha256(keep.path))
+            for member in members_to_verify:
+                if member.path == keep.path or member.path in errors:
+                    continue
+                if current_hashes[member.path] != keep_hash:
+                    errors[member.path] = "file is no longer an exact duplicate of the keeper"
+        except OSError as exc:
+            for member in members_to_verify:
+                if member.path in selected:
+                    errors.setdefault(member.path, str(exc))
+    return errors
 
 
 def apply_actions(
@@ -109,6 +211,7 @@ def apply_actions(
     quarantine_dir: str | Path | None = None,
     dry_run: bool = True,
     log_dir: str | Path | None = None,
+    roots: list[str] | None = None,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
@@ -120,6 +223,7 @@ def apply_actions(
 
     paths = collect_selected_paths(groups)
     result = ActionResult(dry_run=dry_run, action=action)
+    preflight_errors = _preflight_action(groups, paths, roots)
 
     qdir: Path | None = None
     if action == "quarantine":
@@ -129,8 +233,34 @@ def apply_actions(
         if not dry_run:
             qdir.mkdir(parents=True, exist_ok=True)
 
+    if preflight_errors and not dry_run:
+        for path_str in paths:
+            result.items.append(
+                ActionItem(
+                    path=path_str,
+                    ok=False,
+                    action=action,
+                    error=preflight_errors.get(
+                        path_str, "action cancelled because another selected file failed preflight"
+                    ),
+                )
+            )
+        result.completed_at = datetime.now(timezone.utc).isoformat()
+        _write_action_log(result, log_dir)
+        return result
+
     for path_str in paths:
         src = Path(path_str)
+        if path_str in preflight_errors:
+            result.items.append(
+                ActionItem(
+                    path=path_str,
+                    ok=False,
+                    action=action,
+                    error=preflight_errors[path_str],
+                )
+            )
+            continue
         if action == "trash":
             dest_note = "Trash"
             if dry_run:
@@ -186,7 +316,90 @@ def apply_actions(
                     )
                 )
 
+    result.completed_at = datetime.now(timezone.utc).isoformat()
     _write_action_log(result, log_dir)
+    return result
+
+
+def undo_quarantine(
+    action_log: str | Path,
+    *,
+    dry_run: bool = True,
+    log_dir: str | Path | None = None,
+) -> ActionResult:
+    """Restore a completed quarantine action from its receipt.
+
+    Trash restoration remains a Finder operation because send2trash does not expose
+    the final per-volume Trash destination reliably across platforms.
+    """
+    log_path = Path(action_log).expanduser().resolve()
+    data = json.loads(log_path.read_text(encoding="utf-8"))
+    if data.get("action") != "quarantine" or data.get("dry_run"):
+        raise ValueError("only executed quarantine receipts can be undone")
+
+    result = ActionResult(dry_run=dry_run, action="undo:quarantine")
+    planned: list[tuple[Path, Path]] = []
+    for item in reversed(data.get("items") or []):
+        if not item.get("ok") or not item.get("destination"):
+            continue
+        quarantined = Path(item["destination"])
+        original = Path(item["path"])
+        error = None
+        if not quarantined.is_file():
+            error = "quarantined file no longer exists"
+        elif original.exists() or original.is_symlink():
+            error = "original path is already occupied"
+        if error:
+            result.items.append(
+                ActionItem(
+                    path=str(quarantined),
+                    ok=False,
+                    action="undo:quarantine",
+                    destination=str(original),
+                    error=error,
+                )
+            )
+        else:
+            planned.append((quarantined, original))
+
+    if result.fail_count and not dry_run:
+        for quarantined, original in planned:
+            result.items.append(
+                ActionItem(
+                    path=str(quarantined),
+                    ok=False,
+                    action="undo:quarantine",
+                    destination=str(original),
+                    error="undo cancelled because another item failed preflight",
+                )
+            )
+    else:
+        for quarantined, original in planned:
+            try:
+                if not dry_run:
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(quarantined), str(original))
+                result.items.append(
+                    ActionItem(
+                        path=str(quarantined),
+                        ok=True,
+                        action="undo:quarantine",
+                        destination=str(original),
+                    )
+                )
+            except OSError as exc:
+                result.items.append(
+                    ActionItem(
+                        path=str(quarantined),
+                        ok=False,
+                        action="undo:quarantine",
+                        destination=str(original),
+                        error=str(exc),
+                    )
+                )
+
+    result.completed_at = datetime.now(timezone.utc).isoformat()
+    _write_action_log(result, log_dir or log_path.parent)
     return result
 
 
@@ -214,14 +427,10 @@ def _link_or_copy(src: Path, dest: Path, mode: str) -> None:
         shutil.move(str(src), str(dest))
         return
     if mode == "symlink":
-        if dest.exists() or dest.is_symlink():
-            dest.unlink()
         os.symlink(src.resolve(), dest)
         return
     if mode == "hardlink":
         try:
-            if dest.exists():
-                dest.unlink()
             os.link(src, dest)
             return
         except OSError:
@@ -301,25 +510,59 @@ def isolate_groups(
         raise ValueError("mode must be copy, hardlink, symlink, or move")
 
     if review_dir is None:
-        root = default_review_dir(roots, groups)
+        base_root = default_review_dir(roots, groups)
     else:
-        root = Path(review_dir).expanduser().resolve()
+        base_root = Path(review_dir).expanduser().resolve()
+    session_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    session_id = uuid.uuid4().hex
+    root = base_root / f"session-{session_stamp}-{session_id[:8]}"
     result = ActionResult(dry_run=dry_run, action=f"isolate:{mode}", review_root=str(root))
+    result.session_id = session_id
 
     filtered = []
     for g in groups:
         if kinds and g.kind.value not in kinds:
             continue
-        if len(g.members) < 2:
+        if len(g.members) < 2 and g.kind != GroupKind.NO_HUMANS:
             continue
         filtered.append(g)
 
     if not filtered:
+        result.completed_at = datetime.now(timezone.utc).isoformat()
+        _write_action_log(result, log_dir)
+        return result
+
+    validation_errors: dict[str, str] = {}
+    for group in filtered:
+        for member in group.members:
+            error = _validate_record(member, roots)
+            if error:
+                validation_errors[member.path] = error
+    if validation_errors and not dry_run:
+        for group in filtered:
+            for member in group.members:
+                result.items.append(
+                    ActionItem(
+                        path=member.path,
+                        ok=False,
+                        action=f"isolate:{mode}",
+                        group_id=group.id,
+                        error=validation_errors.get(
+                            member.path,
+                            "isolate cancelled because another file failed preflight",
+                        ),
+                    )
+                )
+        result.completed_at = datetime.now(timezone.utc).isoformat()
         _write_action_log(result, log_dir)
         return result
 
     # Separate counters per kind for friendly numbering
-    counters: dict[str, int] = {GroupKind.EXACT.value: 0, GroupKind.SIMILAR.value: 0}
+    counters: dict[str, int] = {
+        GroupKind.EXACT.value: 0,
+        GroupKind.SIMILAR.value: 0,
+        GroupKind.NO_HUMANS.value: 0,
+    }
     index_rows: list[dict] = []
 
     if not dry_run:
@@ -348,13 +591,15 @@ def isolate_groups(
             dest = _unique_dest(group_dir, dest_name) if not dry_run else group_dir / dest_name
 
             if dry_run:
+                error = validation_errors.get(member.path)
                 result.items.append(
                     ActionItem(
                         path=member.path,
-                        ok=True,
+                        ok=error is None,
                         action=f"isolate:{mode}",
                         destination=str(dest),
                         group_id=group.id,
+                        error=error,
                     )
                 )
                 member_rows.append(
@@ -414,7 +659,8 @@ def isolate_groups(
             "note": (
                 "Suggested keep is prefixed KEEP__. "
                 "Originals were left in place (copy/hardlink/symlink) "
-                "unless mode=move."
+                "unless mode=move. Hardlinks share file content with the source; "
+                "editing either name edits the same underlying file."
             ),
         }
         index_rows.append(group_meta)
@@ -449,6 +695,8 @@ def isolate_groups(
             index = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "mode": mode,
+                "session_id": result.session_id,
+                "review_base": str(base_root),
                 "review_root": str(root),
                 "group_count": len(index_rows),
                 "groups": index_rows,
@@ -459,6 +707,7 @@ def isolate_groups(
         except OSError:
             pass
 
+    result.completed_at = datetime.now(timezone.utc).isoformat()
     _write_action_log(result, log_dir)
     return result
 
@@ -482,6 +731,7 @@ def summarize_scan(result: ScanResult) -> str:
         f"Files scanned: {len(result.files)}",
         f"Exact groups: {result.exact_groups}",
         f"Similar groups: {result.similar_groups}",
+        f"Vision candidates: {result.no_human_files}",
         f"Reclaimable: {format_bytes(result.reclaimable_bytes)}",
     ]
     if result.errors:

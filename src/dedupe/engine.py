@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import time
 
 from .cache import HashCache
 from .exact import find_exact_groups
-from .grouping import build_one_group
+from .grouping import build_no_human_groups, build_one_group
+from .human_detection import (
+    DEFAULT_BACKEND as DEFAULT_HUMAN_BACKEND,
+    DEFAULT_PHOTON_MODEL,
+    find_no_human_files,
+)
 from .models import DuplicateGroup, GroupKind, ScanProgress, ScanResult
 from .parallel import resolve_workers
 from .scanner import inventory
@@ -25,6 +31,9 @@ def run_scan(
     *,
     exact: bool = True,
     similar: bool = True,
+    find_no_humans: bool = False,
+    human_backend: str = DEFAULT_HUMAN_BACKEND,
+    photon_model: str = DEFAULT_PHOTON_MODEL,
     include_images: bool = True,
     include_gifs: bool = True,
     include_videos: bool = True,
@@ -34,6 +43,8 @@ def run_scan(
     use_cache: bool = True,
     cache_path: str | Path | None = None,
     workers: int | None = None,
+    exclusions: list[str] | None = None,
+    cancelled: Callable[[], bool] | None = None,
     progress: ProgressCb | None = None,
     on_group: GroupCb | None = None,
 ) -> ScanResult:
@@ -45,10 +56,18 @@ def run_scan(
     """
     n_workers = resolve_workers(workers)
     prog = ScanProgress(phase="starting", message="Starting scan…")
+    started = time.monotonic()
+    phase_started = started
+    previous_phase = prog.phase
     groups: list[DuplicateGroup] = []
     exact_path_sets: list[set[str]] = []
 
     def emit(phase: str, processed: int = 0, total: int = 0, message: str = "") -> None:
+        nonlocal phase_started, previous_phase
+        now = time.monotonic()
+        if phase != previous_phase:
+            phase_started = now
+            previous_phase = phase
         prog.phase = phase
         prog.files_processed = processed
         prog.groups_found = len(groups)
@@ -56,8 +75,19 @@ def run_scan(
             prog.files_found = max(prog.files_found, total)
         if message:
             prog.message = message
+        prog.elapsed_seconds = max(0.0, now - started)
+        phase_elapsed = max(0.0, now - phase_started)
+        if total > 0 and 0 < processed < total and phase_elapsed > 0:
+            rate = processed / phase_elapsed
+            prog.eta_seconds = (total - processed) / rate if rate > 0 else None
+        else:
+            prog.eta_seconds = None
         if progress:
             progress(prog)
+
+    def check_cancelled() -> None:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
 
     def publish(kind: GroupKind, member_lists: list[list]) -> int:
         """Build groups for one phase and stream them via on_group. Returns count added."""
@@ -82,13 +112,25 @@ def run_scan(
         prog.files_found = processed
         emit(phase, processed, total, f"Found {processed} media files…")
 
+    resolved_roots: list[Path] = []
+    root_errors: list[str] = []
+    for root in roots:
+        resolved = Path(root).expanduser().resolve(strict=False)
+        if not resolved.exists():
+            root_errors.append(f"scan root does not exist: {resolved}")
+        else:
+            resolved_roots.append(resolved)
+
+    check_cancelled()
     records = inventory(
-        roots,
+        resolved_roots,
         include_images=include_images,
         include_gifs=include_gifs,
         include_videos=include_videos,
         include_hidden=include_hidden,
+        exclusions=exclusions,
         progress=inv_progress,
+        cancelled=cancelled,
     )
     prog.files_found = len(records)
     prog.bytes_scanned = sum(r.size for r in records)
@@ -105,13 +147,17 @@ def run_scan(
             cache = None
 
     if exact and records:
+        check_cancelled()
         emit("exact", 0, len(records), "Finding exact duplicates…")
 
         def exact_progress(phase: str, processed: int, total: int) -> None:
             emit(phase, processed, total, f"Exact hash {processed}/{total}")
 
         exact_member_lists = find_exact_groups(
-            records, progress=exact_progress, workers=n_workers
+            records,
+            progress=exact_progress,
+            workers=n_workers,
+            cancelled=cancelled,
         )
         n_exact = publish(GroupKind.EXACT, exact_member_lists)
         emit(
@@ -122,6 +168,7 @@ def run_scan(
         )
 
     if similar:
+        check_cancelled()
         emit("similar-image", 0, 0, "Hashing images for similarity…")
 
         def img_progress(phase: str, processed: int, total: int) -> None:
@@ -132,6 +179,7 @@ def run_scan(
             threshold=image_threshold,
             progress=img_progress,
             workers=n_workers,
+            cancelled=cancelled,
         )
         n_img = publish(GroupKind.SIMILAR, img_groups)
         emit(
@@ -151,6 +199,7 @@ def run_scan(
             threshold=video_threshold,
             progress=vid_progress,
             workers=n_workers,
+            cancelled=cancelled,
         )
         n_vid = publish(GroupKind.SIMILAR, vid_groups)
         emit(
@@ -158,6 +207,37 @@ def run_scan(
             0,
             0,
             f"Found {n_vid} similar video group{'s' if n_vid != 1 else ''}",
+        )
+
+    if find_no_humans and records:
+        check_cancelled()
+        emit(
+            "human-detection",
+            0,
+            len(records),
+            f"Looking for media without people ({human_backend})…",
+        )
+
+        def human_progress(phase: str, processed: int, total: int) -> None:
+            emit(phase, processed, total, f"Person detection {processed}/{total}")
+
+        no_human_files = find_no_human_files(
+            records,
+            backend=human_backend,
+            photon_model=photon_model,
+            progress=human_progress,
+            cancelled=cancelled,
+        )
+        for group in build_no_human_groups(no_human_files):
+            groups.append(group)
+            if on_group:
+                on_group(group)
+        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+        emit(
+            "human-detection",
+            len(records),
+            len(records),
+            f"Found {len(no_human_files)} file{'s' if len(no_human_files) != 1 else ''} without detected people",
         )
 
     if cache is not None:
@@ -168,10 +248,10 @@ def run_scan(
             pass
 
     result = ScanResult(
-        roots=[str(Path(r).expanduser().resolve()) for r in roots],
+        roots=[str(root) for root in resolved_roots],
         files=records,
         groups=groups,
-        errors=[r.error for r in records if r.error],
+        errors=[*root_errors, *[r.error for r in records if r.error]],
     )
     result.recompute_stats()
 
@@ -179,9 +259,12 @@ def run_scan(
     prog.phase = "done"
     prog.groups_found = len(groups)
     prog.message = (
-        f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups "
+        f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups, "
+        f"{result.no_human_files} vision candidates "
         f"({len(records)} files)"
     )
+    prog.elapsed_seconds = max(0.0, time.monotonic() - started)
+    prog.eta_seconds = 0.0
     if progress:
         progress(prog)
 

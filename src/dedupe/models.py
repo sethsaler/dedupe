@@ -18,6 +18,12 @@ class MediaType(str, Enum):
 class GroupKind(str, Enum):
     EXACT = "exact"
     SIMILAR = "similar"
+    NO_HUMANS = "no_humans"
+
+
+class ReviewPolicy(str, Enum):
+    KEEP_ONE = "keep_one"
+    INDEPENDENT_CANDIDATES = "independent_candidates"
 
 
 class SmartRule(str, Enum):
@@ -28,6 +34,7 @@ class SmartRule(str, Enum):
     SMALLEST = "smallest"
     SHORTEST_PATH = "shortest_path"
     DESELECT_ALL = "deselect_all"
+    SELECT_CANDIDATES = "select_candidates"
 
 
 IMAGE_EXTS = {
@@ -80,6 +87,9 @@ class FileRecord:
     mtime: float
     media_type: MediaType
     extension: str
+    device: int | None = None
+    inode: int | None = None
+    mtime_ns: int | None = None
     width: int | None = None
     height: int | None = None
     sha256: str | None = None
@@ -88,6 +98,10 @@ class FileRecord:
     dhash: str | None = None
     video_fingerprint: str | None = None
     duration: float | None = None
+    human_detection_status: str | None = None
+    human_detector: str | None = None
+    human_frames_analyzed: int | None = None
+    human_max_confidence: float | None = None
     error: str | None = None
 
     @property
@@ -116,6 +130,9 @@ class FileRecord:
             mtime=float(data["mtime"]),
             media_type=mt,
             extension=data.get("extension", Path(data["path"]).suffix.lower()),
+            device=data.get("device"),
+            inode=data.get("inode"),
+            mtime_ns=data.get("mtime_ns"),
             width=data.get("width"),
             height=data.get("height"),
             sha256=data.get("sha256"),
@@ -124,23 +141,40 @@ class FileRecord:
             dhash=data.get("dhash"),
             video_fingerprint=data.get("video_fingerprint"),
             duration=data.get("duration"),
+            human_detection_status=data.get("human_detection_status"),
+            human_detector=data.get("human_detector"),
+            human_frames_analyzed=data.get("human_frames_analyzed"),
+            human_max_confidence=data.get("human_max_confidence"),
             error=data.get("error"),
         )
 
 
 @dataclass
-class DuplicateGroup:
+class ReviewGroup:
     id: str
     kind: GroupKind
     media_type: MediaType
     members: list[FileRecord]
     selected_for_removal: list[str] = field(default_factory=list)
+    reviewed_paths: list[str] = field(default_factory=list)
     suggested_keep: str | None = None
+
+    @property
+    def policy(self) -> ReviewPolicy:
+        if self.kind == GroupKind.NO_HUMANS:
+            return ReviewPolicy.INDEPENDENT_CANDIDATES
+        return ReviewPolicy.KEEP_ONE
 
     @property
     def reclaimable_bytes(self) -> int:
         if not self.members:
             return 0
+        if self.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
+            selected = set(self.selected_for_removal)
+            reviewed = set(self.reviewed_paths)
+            return sum(
+                m.size for m in self.members if m.path in selected and m.path in reviewed
+            )
         keep = self.suggested_keep
         total = sum(m.size for m in self.members)
         if keep:
@@ -153,24 +187,57 @@ class DuplicateGroup:
         return {
             "id": self.id,
             "kind": self.kind.value,
+            "policy": self.policy.value,
             "media_type": self.media_type.value,
             "members": [m.to_dict() for m in self.members],
             "selected_for_removal": list(self.selected_for_removal),
+            "reviewed_paths": list(self.reviewed_paths),
             "suggested_keep": self.suggested_keep,
             "reclaimable_bytes": self.reclaimable_bytes,
             "member_count": len(self.members),
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> DuplicateGroup:
+    def from_dict(cls, data: dict[str, Any]) -> ReviewGroup:
         return cls(
             id=data["id"],
             kind=GroupKind(data["kind"]),
             media_type=MediaType(data["media_type"]),
             members=[FileRecord.from_dict(m) for m in data.get("members", [])],
             selected_for_removal=list(data.get("selected_for_removal", [])),
+            reviewed_paths=list(data.get("reviewed_paths", [])),
             suggested_keep=data.get("suggested_keep"),
         )
+
+
+# Backward-compatible public name for existing JSON/CLI integrations.
+DuplicateGroup = ReviewGroup
+
+
+def effective_selected_paths(groups: list[DuplicateGroup]) -> list[str]:
+    """Return unique selections while retaining one member of every duplicate group."""
+    ordered: list[str] = []
+    sizes: dict[str, int] = {}
+    for group in groups:
+        members = {member.path: member for member in group.members}
+        for path in group.selected_for_removal:
+            if group.kind == GroupKind.NO_HUMANS and path not in group.reviewed_paths:
+                continue
+            if path in members and path not in sizes:
+                ordered.append(path)
+                sizes[path] = members[path].size
+
+    selected = set(ordered)
+    for group in groups:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES or not group.members:
+            continue
+        member_paths = {member.path for member in group.members}
+        if member_paths <= selected:
+            keep = group.suggested_keep
+            if keep not in member_paths:
+                keep = group.members[0].path
+            selected.discard(keep)
+    return [path for path in ordered if path in selected]
 
 
 @dataclass
@@ -183,6 +250,8 @@ class ScanProgress:
     message: str = ""
     done: bool = False
     error: str | None = None
+    elapsed_seconds: float = 0.0
+    eta_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -195,13 +264,20 @@ class ScanResult:
     groups: list[DuplicateGroup]
     exact_groups: int = 0
     similar_groups: int = 0
+    no_human_files: int = 0
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
 
     def recompute_stats(self) -> None:
         self.exact_groups = sum(1 for g in self.groups if g.kind == GroupKind.EXACT)
         self.similar_groups = sum(1 for g in self.groups if g.kind == GroupKind.SIMILAR)
-        self.reclaimable_bytes = sum(g.reclaimable_bytes for g in self.groups)
+        self.no_human_files = sum(
+            len(g.members) for g in self.groups if g.kind == GroupKind.NO_HUMANS
+        )
+        sizes = {member.path: member.size for group in self.groups for member in group.members}
+        self.reclaimable_bytes = sum(
+            sizes.get(path, 0) for path in effective_selected_paths(self.groups)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         self.recompute_stats()
@@ -211,6 +287,7 @@ class ScanResult:
             "groups": [g.to_dict() for g in self.groups],
             "exact_groups": self.exact_groups,
             "similar_groups": self.similar_groups,
+            "no_human_files": self.no_human_files,
             "reclaimable_bytes": self.reclaimable_bytes,
             "file_count": len(self.files),
             "group_count": len(self.groups),

@@ -45,7 +45,8 @@ def test_isolate_copy_creates_group_folders(tmp_path: Path) -> None:
     assert len(keep_files) == 1
     # originals untouched
     assert Path(a.path).exists() and Path(b.path).exists()
-    assert (review / "_review_index.json").exists()
+    assert Path(result.review_root).parent == review
+    assert (Path(result.review_root) / "_review_index.json").exists()
 
 
 def test_isolate_dry_run_no_writes(tmp_path: Path) -> None:
@@ -93,7 +94,8 @@ def test_isolate_defaults_into_scan_root(tmp_path: Path) -> None:
     # No review_dir → under source
     result = isolate_groups(groups, review_dir=None, mode="copy", dry_run=False, roots=[str(src)])
     assert result.success_count == 2
-    assert result.review_root == str((src / "_Dedupe Review").resolve())
-    assert (src / "_Dedupe Review").is_dir()
+    review_base = (src / "_Dedupe Review").resolve()
+    assert Path(result.review_root).parent == review_base
+    assert Path(result.review_root).is_dir()
     # originals stay in source root
     assert (src / "a.jpg").exists() and (src / "b.jpg").exists()

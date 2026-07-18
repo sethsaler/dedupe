@@ -23,7 +23,7 @@ Build a local app that scans a folder (and subfolders) for **duplicate and near-
   
 3. **Scan** — progress (files found, hashed, groups so far, ETA).
   
-4. **Results** — two buckets: **Exact Duplicates** and **Similars**.
+4. **Results** — **Exact**, **Similar**, and optional **AI review candidates**.
   
 5. **Review** — each group as thumbnails + metadata (path, size, dimensions, modified date).
   
@@ -46,7 +46,7 @@ Safety rails:
 * * *
 ## Detection pipeline
 ### Stage 1 — Inventory
-Walk roots recursively (follow or skip symlinks; skip hidden by default; respect exclusion globs).
+Walk roots recursively, skip symlinks and hidden files by default, enforce scan-root containment, and respect exclusion globs.
 
 Supported media (v1):
 
@@ -143,22 +143,23 @@ dedupe/
 │   ├── grouping.py         # group build, ranking, smart select
 │   ├── actions.py          # trash / move / report (safe)
 │   ├── cache.py            # SQLite hash cache by (path, size, mtime)
-│   ├── models.py           # FileRecord, DuplicateGroup, ScanResult
-│   └── ui/
-│       ├── app.py          # Tk desktop UI (primary)
-│       └── report.py       # HTML review export (optional)
+│   ├── models.py           # FileRecord, ReviewGroup, ScanResult
+│   ├── human_detection.py  # OpenCV / Photon / ensemble person review
+│   ├── human_benchmark.py  # labeled detector comparison harness
+│   └── web/
+│       ├── app.py          # local Flask API + UI server
+│       ├── templates/      # browser review shell
+│       └── static/         # interaction and styling
 ├── tests/
 └── launchers/
     └── Dedupe.command      # macOS double-click
 ```
-### Why Python + Tk for v1
-- Matches your existing `file-organization` skill tooling pattern (Python + Tk tinker UI + `.command` launchers).
+### Why Python + a localhost web UI for v1
+- Python provides Pillow, ImageHash, OpenCV, ffmpeg orchestration, hashing, and safe Trash support.
   
-- Local-only, no server required.
+- A loopback-only Flask UI provides a richer side-by-side review surface while keeping media local.
   
-- Strong ecosystem: Pillow, imagehash, pybktree, hashlib, send2trash.
-  
-- Can later add a web review UI if preferred.
+- Mutating API calls require a per-launch token and current scan generation; the server rejects cross-origin writes.
   
 
 Alternative considered and deferred:
@@ -168,7 +169,7 @@ Alternative considered and deferred:
 - Pure CLI: useful, but Gemini-like review needs previews.
   
 ### Persistence
-- **SQLite cache** under `~/.cache/dedupe/` (or project `.dedupe/`): path → size, mtime, sha256, phash so re-scans are incremental.
+- **SQLite cache** under `~/.cache/dedupe/`: algorithm version + path + device/inode + size + nanosecond mtime → sha256/phash/video fingerprint.
   
 - Invalidate cache entry when size or mtime changes.
   
@@ -179,11 +180,12 @@ Alternative considered and deferred:
 | --- | --- |
 | Language | Python 3.11+ |
 | Images | Pillow, pillow-heif |
+| Optional person review | OpenCV baseline; Photon / Moondream 3.1; conservative ensemble |
 | Perceptual hash | imagehash |
 | Near-neighbor index | pybktree |
 | Video frames | ffmpeg / ffprobe (system dep) |
 | Safe trash | send2trash |
-| UI  | tkinter + optional Pillow thumbnails |
+| UI  | Flask + vanilla browser UI + Pillow thumbnails |
 | Packaging | pyproject.toml, optional `pipx install -e .` |
 | Tests | pytest |
 
@@ -240,7 +242,9 @@ dedupe scan ~/Downloads --action trash --smart automatic --dry-run
   
 4. Dry-run must be first-class.
   
-5. Log every action to a session log (restore path list).
+5. Revalidate identity and scan-root containment immediately before every action.
+
+6. Log every action to a unique atomic receipt; support quarantine restoration from that receipt.
   
 
 * * *
@@ -265,7 +269,7 @@ dedupe scan ~/Downloads --action trash --smart automatic --dry-run
   
 - Cache layer
   
-### Phase 3 — Desktop UI
+### Phase 3 — Local web UI
 - Folder pick, progress, group browser, thumbnails
   
 - Smart Select + Trash actions

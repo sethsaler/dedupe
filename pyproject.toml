@@ -21,6 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+human = ["opencv-python-headless>=4.8.0"]
+photon = ["moondream"]
+vision = ["opencv-python-headless>=4.8.0", "moondream"]
 
 [project.scripts]
 dedupe = "dedupe.cli:main"

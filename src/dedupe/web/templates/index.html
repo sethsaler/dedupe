@@ -3,10 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="dedupe-token" content="{{ csrf_token }}" />
   <title>Dedupe — Media Duplicate Finder</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
@@ -32,17 +30,20 @@
     <section class="scan-panel" id="scanPanel">
       <div class="scan-main">
         <div class="field-row path-row">
-          <label for="paths">Folders to scan</label>
+          <label for="paths">Folders or files to scan</label>
           <div class="path-input-wrap">
             <input
               id="paths"
               type="text"
-              placeholder="~/Pictures  or drop a path — comma-separate multiple"
+              placeholder="~/Pictures or /path/photo.jpg — comma-separate multiple"
               spellcheck="false"
               autocomplete="off"
             />
-            <button type="button" class="btn ghost path-pick" id="btnPickFolder" title="Choose folder">
-              Choose…
+            <button type="button" class="btn ghost path-pick" id="btnPickFolder" title="Choose folders">
+              Folders…
+            </button>
+            <button type="button" class="btn ghost path-pick" id="btnPickFiles" title="Choose files">
+              Files…
             </button>
           </div>
           <div class="recent-paths" id="recentPaths" hidden></div>
@@ -55,6 +56,7 @@
           </button>
           <div class="actions-row">
             <span id="scanStatus" class="status muted">Ready</span>
+            <button id="btnCancelScan" class="btn ghost" type="button" hidden>Cancel</button>
             <button id="btnScan" class="btn primary" type="button">
               <span class="btn-label">Scan</span>
             </button>
@@ -66,7 +68,17 @@
             <span class="opt-label">Detect</span>
             <label class="chip-check"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
+            <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>No person detected (vision)</span></label>
           </div>
+          <label class="detector-field">
+            <span class="opt-label">Vision engine</span>
+            <select id="humanBackend" disabled>
+              <option value="opencv">OpenCV · fast default</option>
+              <option value="photon">Photon · Moondream 3.1</option>
+              <option value="ensemble">Ensemble · safest candidate filter</option>
+            </select>
+            <span class="thresh-hint" id="humanBackendHint">Enable vision review to choose a detector</span>
+          </label>
           <div class="opt-group">
             <span class="opt-label">Types</span>
             <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
@@ -84,6 +96,11 @@
             <input type="range" id="workers" min="0" max="16" value="0" />
             <span id="workersVal" class="thresh-val">Auto</span>
             <span class="thresh-hint" id="workersHint">parallel hashing</span>
+          </label>
+          <label class="exclude-field">
+            <span class="opt-label">Exclude</span>
+            <input id="exclusions" type="text" placeholder="*.tmp, exports/**, cache" spellcheck="false" />
+            <span class="thresh-hint">comma-separated globs</span>
           </label>
         </div>
       </div>
@@ -106,7 +123,7 @@
         <h2>Scan a folder to find duplicates</h2>
         <p>Point Dedupe at Photos, Downloads, or any media library. Review groups side-by-side, then move extras to Trash or quarantine — never hard-deleted.</p>
         <ul class="empty-steps">
-          <li><span>1</span> Paste a folder path or click Choose…</li>
+          <li><span>1</span> Paste paths or choose folders/files</li>
           <li><span>2</span> Hit Scan and wait for groups</li>
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
@@ -122,6 +139,7 @@
           <button class="tab active" data-kind="all" type="button">All <span class="tab-count" id="countAll">0</span></button>
           <button class="tab" data-kind="exact" type="button">Exact <span class="tab-count" id="countExact">0</span></button>
           <button class="tab" data-kind="similar" type="button">Similar <span class="tab-count" id="countSimilar">0</span></button>
+          <button class="tab" data-kind="no_humans" type="button">Vision candidates <span class="tab-count" id="countNoHumans">0</span></button>
         </div>
         <div class="group-list" id="groupList" role="listbox" aria-label="Duplicate groups"></div>
       </aside>
@@ -129,7 +147,7 @@
       <main class="detail">
         <div class="detail-empty" id="detailEmpty">
           <p>Select a group from the left to compare files.</p>
-          <p class="muted small">Suggested keeps are highlighted in green. Check “Remove” on the rest.</p>
+          <p class="muted small">Suggested keeps are highlighted in green. Files are revalidated against the scan before they move.</p>
         </div>
         <div class="detail-body" id="detailBody" hidden>
           <div class="detail-header">
@@ -148,6 +166,7 @@
                   <option value="smallest">Keep smallest</option>
                   <option value="shortest_path">Keep shortest path</option>
                   <option value="deselect_all">Deselect all</option>
+                  <option value="select_candidates">Mark reviewed + select vision candidates</option>
                 </select>
               </label>
               <button class="btn" id="btnSmartGroup" type="button">Apply to group</button>

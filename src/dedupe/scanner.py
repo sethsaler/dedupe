@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from fnmatch import fnmatch
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .models import (
 )
 
 ProgressCb = Callable[[str, int, int], None]
+CancelCb = Callable[[], bool]
 
 
 def media_extensions(
@@ -43,15 +45,16 @@ def inventory(
     follow_symlinks: bool = False,
     exclusions: Iterable[str] | None = None,
     progress: ProgressCb | None = None,
+    cancelled: CancelCb | None = None,
 ) -> list[FileRecord]:
     """Walk roots and return FileRecords for matching media."""
     exts = media_extensions(include_images, include_gifs, include_videos)
     if not exts:
         return []
 
-    exclusion_names = {e.strip().lower() for e in (exclusions or []) if e.strip()}
+    exclusion_patterns = {e.strip().lower() for e in (exclusions or []) if e.strip()}
     # Always skip common junk / system folders + our own review output
-    exclusion_names |= {
+    exclusion_patterns |= {
         ".git",
         ".dedupe",
         "node_modules",
@@ -67,7 +70,17 @@ def inventory(
     seen_inodes: set[tuple[int, int]] = set()
     found = 0
 
+    def excluded(name: str, relative: Path) -> bool:
+        name_lower = name.lower()
+        rel_lower = relative.as_posix().lower()
+        return any(
+            fnmatch(name_lower, pattern) or fnmatch(rel_lower, pattern)
+            for pattern in exclusion_patterns
+        )
+
     for root in roots:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         root_path = Path(root).expanduser().resolve()
         if not root_path.exists():
             continue
@@ -80,26 +93,71 @@ def inventory(
                     progress("inventory", found, found)
             continue
 
+        seen_dir_inodes: set[tuple[int, int]] = set()
+        try:
+            root_stat = root_path.stat()
+            seen_dir_inodes.add((root_stat.st_dev, root_stat.st_ino))
+        except OSError:
+            continue
+
         for dirpath, dirnames, filenames in os.walk(
             root_path, followlinks=follow_symlinks
         ):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             # Prune excluded / hidden dirs in-place
             pruned: list[str] = []
             for d in dirnames:
                 if not include_hidden and d.startswith("."):
                     continue
-                if d.lower() in exclusion_names:
+                candidate = Path(dirpath) / d
+                try:
+                    relative = candidate.relative_to(root_path)
+                except ValueError:
+                    continue
+                if excluded(d, relative):
+                    continue
+                try:
+                    if candidate.is_symlink():
+                        if not follow_symlinks:
+                            continue
+                        resolved = candidate.resolve(strict=True)
+                        if resolved != root_path and root_path not in resolved.parents:
+                            continue
+                        st = resolved.stat()
+                    else:
+                        st = candidate.stat()
+                    inode_key = (st.st_dev, st.st_ino)
+                    if inode_key in seen_dir_inodes:
+                        continue
+                    seen_dir_inodes.add(inode_key)
+                except OSError:
                     continue
                 pruned.append(d)
             dirnames[:] = pruned
 
             for name in filenames:
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
                 if not include_hidden and name.startswith("."):
                     continue
                 path = Path(dirpath) / name
+                try:
+                    relative = path.relative_to(root_path)
+                except ValueError:
+                    continue
+                if excluded(name, relative):
+                    continue
                 if path.suffix.lower() not in exts:
                     continue
                 try:
+                    if path.is_symlink():
+                        if not follow_symlinks:
+                            continue
+                        resolved = path.resolve(strict=True)
+                        if resolved != root_path and root_path not in resolved.parents:
+                            continue
+                        path = resolved
                     st = path.stat()
                     inode_key = (st.st_dev, st.st_ino)
                     if inode_key in seen_inodes:
@@ -140,6 +198,9 @@ def _record_for_file(
             mtime=float(st.st_mtime),
             media_type=media,
             extension=path.suffix.lower(),
+            device=int(st.st_dev),
+            inode=int(st.st_ino),
+            mtime_ns=int(st.st_mtime_ns),
         )
     except OSError:
         return None

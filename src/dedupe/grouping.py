@@ -24,6 +24,45 @@ def rank_keep_candidate(rec: FileRecord) -> tuple:
     )
 
 
+def cluster_around_best(
+    records: list[FileRecord], adjacency: dict[str, set[str]]
+) -> list[list[FileRecord]]:
+    """Build disjoint groups whose members all directly match the best-ranked member.
+
+    Connected-component clustering is unsafe for fuzzy matches: A can match B and B
+    can match C even when A does not match C. By choosing the likely keeper first and
+    only attaching its verified neighbors, every automatically removable member has
+    been compared directly with the file the UI will recommend keeping.
+    """
+    ordered = sorted(
+        records,
+        key=lambda record: (rank_keep_candidate(record), record.path),
+        reverse=True,
+    )
+    by_path = {record.path: record for record in records}
+    remaining = set(by_path)
+    groups: list[list[FileRecord]] = []
+    for keeper in ordered:
+        if keeper.path not in remaining:
+            continue
+        matches = [
+            by_path[path]
+            for path in adjacency.get(keeper.path, set())
+            if path in remaining
+        ]
+        if not matches:
+            remaining.remove(keeper.path)
+            continue
+        matches.sort(
+            key=lambda record: (rank_keep_candidate(record), record.path),
+            reverse=True,
+        )
+        members = [keeper, *matches]
+        groups.append(members)
+        remaining.difference_update(member.path for member in members)
+    return groups
+
+
 def pick_suggested_keep(members: list[FileRecord]) -> str:
     best = max(members, key=rank_keep_candidate)
     return best.path
@@ -100,6 +139,31 @@ def build_groups(
     return groups
 
 
+def build_no_human_groups(
+    members: list[FileRecord], *, chunk_size: int = 50
+) -> list[DuplicateGroup]:
+    """Build review-sized candidate groups, separated by media type."""
+    groups: list[DuplicateGroup] = []
+    for media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO):
+        matching = sorted(
+            (member for member in members if member.media_type == media_type),
+            key=lambda member: member.path,
+        )
+        for offset in range(0, len(matching), chunk_size):
+            chunk = matching[offset : offset + chunk_size]
+            group = DuplicateGroup(
+                id=make_group_id(GroupKind.NO_HUMANS, chunk),
+                kind=GroupKind.NO_HUMANS,
+                media_type=media_type,
+                members=chunk,
+                selected_for_removal=[],
+                reviewed_paths=[],
+                suggested_keep=None,
+            )
+            groups.append(group)
+    return groups
+
+
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     """Mutate selected_for_removal. Always keeps at least one file."""
     members = group.members
@@ -109,6 +173,16 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
 
     if rule == SmartRule.DESELECT_ALL:
         group.selected_for_removal = []
+        return
+
+    if group.kind == GroupKind.NO_HUMANS:
+        group.suggested_keep = None
+        if rule == SmartRule.SELECT_CANDIDATES:
+            group.reviewed_paths = [m.path for m in members]
+            group.selected_for_removal = [m.path for m in members]
+        return
+
+    if rule == SmartRule.SELECT_CANDIDATES:
         return
 
     if rule == SmartRule.AUTOMATIC:

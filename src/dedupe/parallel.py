@@ -58,6 +58,7 @@ def map_parallel(
     backend: Backend = "thread",
     progress: Callable[[int, int], None] | None = None,
     progress_every: int = 1,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[R]:
     """
     Map ``fn`` over ``items``, preserving order.
@@ -78,6 +79,8 @@ def map_parallel(
     if workers <= 1 or n == 1:
         results: list[R] = []
         for i, item in enumerate(items):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             results.append(fn(item))
             done = i + 1
             if progress and (done % every == 0 or done == n):
@@ -102,6 +105,10 @@ def map_parallel(
 
         _submit_more()
         while inflight:
+            if cancelled and cancelled():
+                for future in inflight:
+                    future.cancel()
+                raise InterruptedError("scan cancelled")
             finished, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)
             for fut in finished:
                 idx = inflight.pop(fut)

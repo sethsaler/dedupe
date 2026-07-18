@@ -14,6 +14,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
+from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_IMAGE_WORKERS_CAP, map_parallel, resolve_workers
 
@@ -77,10 +78,13 @@ def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int 
     _register_heif()
 
     import imagehash
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     path = Path(path)
     with Image.open(path) as img:
+        animated = bool(getattr(img, "is_animated", False))
+        if not animated:
+            img = ImageOps.exif_transpose(img)
         # Capture original dimensions before draft (draft can shrink reported size).
         width, height = img.size
 
@@ -92,7 +96,7 @@ def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int 
 
         # For animated GIF: sample first / mid / last frames.
         frames = []
-        if getattr(img, "is_animated", False) and path.suffix.lower() == ".gif":
+        if animated and path.suffix.lower() == ".gif":
             n = getattr(img, "n_frames", 1) or 1
             indices = sorted({0, n // 2, max(0, n - 1)})
             for i in indices:
@@ -162,10 +166,12 @@ def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
     """Cached tile hashes as hex strings for a path."""
     _ensure_image_deps()
     _register_heif()
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         with Image.open(path) as img:
+            if not getattr(img, "is_animated", False):
+                img = ImageOps.exif_transpose(img)
             try:
                 img.draft("RGB", (TILE_NORMALIZE, TILE_NORMALIZE))
             except Exception:
@@ -223,6 +229,7 @@ def find_similar_image_groups(
     skip_paths: set[str] | None = None,
     progress: ProgressCb | None = None,
     workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """
     Cluster near-identical images/GIFs.
@@ -233,7 +240,11 @@ def find_similar_image_groups(
     """
     skip_paths = skip_paths or set()
     n_workers = resolve_workers(workers, cap=DEFAULT_IMAGE_WORKERS_CAP)
-    media = [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
+    media = [
+        r
+        for r in records
+        if r.media_type in (MediaType.IMAGE, MediaType.GIF) and r.path not in skip_paths
+    ]
     total = len(media)
     if total < 2:
         return []
@@ -257,6 +268,7 @@ def find_similar_image_groups(
             backend="thread",
             progress=hash_progress,
             progress_every=5,
+            cancelled=cancelled,
         )
         for path, ph, dh, w, h, err in results:
             rec = by_path[path]
@@ -283,7 +295,13 @@ def find_similar_image_groups(
         import pybktree
     except ImportError:
         return _bruteforce_groups(
-            hashed, threshold, dhash_threshold, tile_max, tile_mean, progress
+            hashed,
+            threshold,
+            dhash_threshold,
+            tile_max,
+            tile_mean,
+            progress,
+            cancelled,
         )
 
     def distance(a: FileRecord, b: FileRecord) -> int:
@@ -293,21 +311,12 @@ def find_similar_image_groups(
 
     tree = pybktree.BKTree(distance, hashed)
 
-    parent: dict[str, str] = {r.path: r.path for r in hashed}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+    adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
     verified = 0
     for i, rec in enumerate(hashed):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         matches = tree.find(rec, threshold)
         for dist, other in matches:
             if other.path == rec.path:
@@ -335,7 +344,8 @@ def find_similar_image_groups(
                 tile_mean=tile_mean,
             ):
                 continue
-            union(rec.path, other.path)
+            adjacency[rec.path].add(other.path)
+            adjacency[other.path].add(rec.path)
             verified += 1
         if progress and (i + 1) % 20 == 0:
             progress("image-cluster", i + 1, len(hashed))
@@ -346,14 +356,7 @@ def find_similar_image_groups(
     # Drop cache entries for this run so memory does not grow unbounded across scans
     _tile_phashes_for_path.cache_clear()
 
-    clusters: dict[str, list[FileRecord]] = {}
-    by_path = {r.path: r for r in hashed}
-    for rec in hashed:
-        root = find(rec.path)
-        clusters.setdefault(root, []).append(by_path[rec.path])
-
-    groups = [members for members in clusters.values() if len(members) >= 2]
-    return groups
+    return cluster_around_best(hashed, adjacency)
 
 
 def _bruteforce_groups(
@@ -363,23 +366,15 @@ def _bruteforce_groups(
     tile_max: int,
     tile_mean: float,
     progress: ProgressCb | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     import imagehash
 
-    parent = {r.path: r.path for r in hashed}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+    adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
     for i, a in enumerate(hashed):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         ha = imagehash.hex_to_hash(a.phash)  # type: ignore[arg-type]
         for b in hashed[i + 1 :]:
             hb = imagehash.hex_to_hash(b.phash)  # type: ignore[arg-type]
@@ -392,15 +387,11 @@ def _bruteforce_groups(
                 a.path, b.path, tile_max=tile_max, tile_mean=tile_mean
             ):
                 continue
-            union(a.path, b.path)
+            adjacency[a.path].add(b.path)
+            adjacency[b.path].add(a.path)
         if progress and (i + 1) % 20 == 0:
             progress("image-cluster", i + 1, len(hashed))
 
     _tile_phashes_for_path.cache_clear()
 
-    clusters: dict[str, list[FileRecord]] = {}
-    by_path = {r.path: r for r in hashed}
-    for rec in hashed:
-        root = find(rec.path)
-        clusters.setdefault(root, []).append(by_path[rec.path])
-    return [m for m in clusters.values() if len(m) >= 2]
+    return cluster_around_best(hashed, adjacency)

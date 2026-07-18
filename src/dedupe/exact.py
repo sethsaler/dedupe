@@ -57,6 +57,7 @@ def find_exact_groups(
     hash_fn: Callable[[str | Path], str] | None = None,
     partial_fn: Callable[[str | Path], str] | None = None,
     workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """
     Return groups of 2+ files that are byte-identical.
@@ -98,6 +99,7 @@ def find_exact_groups(
                 backend="thread",
                 progress=partial_progress,
                 progress_every=20,
+                cancelled=cancelled,
             )
             for path, ph, err in results:
                 rec = by_path[path]
@@ -107,6 +109,8 @@ def find_exact_groups(
                     rec.partial_hash = ph
         else:
             for i, rec in enumerate(partial_targets):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
                 try:
                     rec.partial_hash = partial_fn(rec.path)
                 except OSError as exc:
@@ -149,6 +153,7 @@ def find_exact_groups(
                 backend="thread",
                 progress=full_progress,
                 progress_every=10,
+                cancelled=cancelled,
             )
             for path, sh, err in results:
                 rec = by_path[path]
@@ -158,6 +163,8 @@ def find_exact_groups(
                     rec.sha256 = sh
         else:
             for i, rec in enumerate(full_targets):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
                 try:
                     rec.sha256 = hash_fn(rec.path)
                 except OSError as exc:

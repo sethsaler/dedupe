@@ -169,3 +169,29 @@ def test_real_false_positive_pairs_if_present(tmp_path: Path) -> None:
         if len(imgs) < 2:
             continue
         assert not is_near_identical(str(imgs[0]), str(imgs[1])), root.name
+
+
+def test_similarity_chain_does_not_create_transitive_group(monkeypatch) -> None:
+    """A~B and B~C must not imply A~C in one automatically removable group."""
+    import dedupe.similar_image as module
+
+    def record(path: str, phash: str) -> FileRecord:
+        return FileRecord(
+            path=path,
+            size=1,
+            mtime=1,
+            media_type=MediaType.IMAGE,
+            extension=".jpg",
+            phash=phash,
+            dhash="0000000000000000",
+        )
+
+    a = record("/tmp/a.jpg", "0000000000000000")
+    b = record("/tmp/b.jpg", "000000000000003f")
+    c = record("/tmp/c.jpg", "0000000000000fff")
+    monkeypatch.setattr(module, "is_near_identical", lambda *_args, **_kwargs: True)
+
+    groups = find_similar_image_groups([a, b, c], threshold=6, workers=1)
+
+    assert all(len(group) == 2 for group in groups)
+    assert not any({a.path, c.path} <= {member.path for member in group} for group in groups)

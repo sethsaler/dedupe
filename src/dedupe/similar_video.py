@@ -13,6 +13,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
 
@@ -77,14 +78,22 @@ def probe_dimensions(path: str | Path) -> tuple[int | None, int | None]:
     return w, h
 
 
-def _extract_frames(path: str | Path, out_dir: Path, max_frames: int = MAX_FRAMES) -> list[Path]:
+def _extract_frames(
+    path: str | Path,
+    out_dir: Path,
+    max_frames: int = MAX_FRAMES,
+    *,
+    require_complete: bool = True,
+    duration: float | None = None,
+) -> list[Path]:
     """
     One ffmpeg pass: evenly spaced low-res JPEGs.
 
     Uses a single decode with fps sampling instead of N independent seeks
     (each seek can re-decode from a keyframe).
     """
-    duration, _, _ = probe_video(path)
+    if duration is None:
+        duration, _, _ = probe_video(path)
     pattern = out_dir / "frame_%03d.jpg"
     n = max(3, max_frames)
     if duration and duration > 0:
@@ -98,6 +107,7 @@ def _extract_frames(path: str | Path, out_dir: Path, max_frames: int = MAX_FRAME
 
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
@@ -116,14 +126,16 @@ def _extract_frames(path: str | Path, out_dir: Path, max_frames: int = MAX_FRAME
         "5",
         str(pattern),
     ]
-    subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+    result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+    if require_complete and result.returncode != 0:
+        return []
     return sorted(out_dir.glob("frame_*.jpg"))
 
 
 def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None, int | None, float | None]:
     """
     Return (fingerprint_hex, width, height, duration).
-    Fingerprint is XOR of pHashes of sampled frames (64-bit hex).
+    Fingerprint preserves the ordered pHash sequence of sampled frames.
     """
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg/ffprobe not available")
@@ -135,7 +147,7 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
     duration, width, height = probe_video(path)
 
     with tempfile.TemporaryDirectory(prefix="dedupe-vid-") as tmp:
-        frames = _extract_frames(path, Path(tmp))
+        frames = _extract_frames(path, Path(tmp), duration=duration)
         if not frames:
             return None, width, height, duration
 
@@ -150,16 +162,36 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
         if not hashes:
             return None, width, height, duration
 
-        # XOR all frame hashes → single 64-bit fingerprint
-        combined = hashes[0]
-        for h in hashes[1:]:
-            combined = imagehash.ImageHash(combined.hash ^ h.hash)
+        return "v2:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
 
-        # Mix mid-frame for temporal midpoint sensitivity
-        avg = hashes[len(hashes) // 2]
-        combined = imagehash.ImageHash(combined.hash ^ avg.hash)
 
-        return str(combined), width, height, duration
+def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
+    """Compare ordered frame hashes at normalized positions."""
+    import imagehash
+
+    def parse(value: str) -> list[str]:
+        if value.startswith("v2:"):
+            return [part for part in value[3:].split(",") if part]
+        # Backward-compatible parser; cache versioning prevents normal reuse.
+        return [value] if value else []
+
+    left = parse(a)
+    right = parse(b)
+    if not left or not right:
+        return None
+    count = min(len(left), len(right))
+    if count == 1:
+        left_indexes = right_indexes = [0]
+    else:
+        left_indexes = [round(i * (len(left) - 1) / (count - 1)) for i in range(count)]
+        right_indexes = [round(i * (len(right) - 1) / (count - 1)) for i in range(count)]
+    return [
+        int(
+            imagehash.hex_to_hash(left[left_index])
+            - imagehash.hex_to_hash(right[right_index])
+        )
+        for left_index, right_index in zip(left_indexes, right_indexes, strict=True)
+    ]
 
 
 def _video_fingerprint_job(
@@ -179,6 +211,7 @@ def find_similar_video_groups(
     threshold: int = DEFAULT_THRESHOLD,
     progress: ProgressCb | None = None,
     workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """Cluster near-identical videos by fingerprint Hamming distance."""
     videos = [r for r in records if r.media_type == MediaType.VIDEO]
@@ -211,6 +244,7 @@ def find_similar_video_groups(
             backend="thread",
             progress=hash_progress,
             progress_every=1,
+            cancelled=cancelled,
         )
         for path, fp, w, h, dur, err in results:
             rec = by_path[path]
@@ -232,43 +266,31 @@ def find_similar_video_groups(
     if len(hashed) < 2:
         return []
 
-    import imagehash
-
-    parent = {r.path: r.path for r in hashed}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+    adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
     for i, a in enumerate(hashed):
-        ha = imagehash.hex_to_hash(a.video_fingerprint)  # type: ignore[arg-type]
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         for b in hashed[i + 1 :]:
-            hb = imagehash.hex_to_hash(b.video_fingerprint)  # type: ignore[arg-type]
-            if (ha - hb) > threshold:
+            distances = video_fingerprint_distances(
+                a.video_fingerprint or "", b.video_fingerprint or ""
+            )
+            if not distances:
+                continue
+            mean_distance = sum(distances) / len(distances)
+            if mean_distance > threshold or max(distances) > max(threshold * 2, 4):
                 continue
             # Near-identical: durations should be close when both known
             if a.duration and b.duration and a.duration > 0 and b.duration > 0:
                 ratio = min(a.duration, b.duration) / max(a.duration, b.duration)
                 if ratio < 0.9:
                     continue
-            union(a.path, b.path)
+            adjacency[a.path].add(b.path)
+            adjacency[b.path].add(a.path)
         if progress and (i + 1) % 5 == 0:
             progress("video-cluster", i + 1, len(hashed))
 
     if progress:
         progress("video-cluster", len(hashed), len(hashed))
 
-    clusters: dict[str, list[FileRecord]] = {}
-    by_path = {r.path: r for r in hashed}
-    for rec in hashed:
-        root = find(rec.path)
-        clusters.setdefault(root, []).append(by_path[rec.path])
-
-    return [m for m in clusters.values() if len(m) >= 2]
+    return cluster_around_best(hashed, adjacency)

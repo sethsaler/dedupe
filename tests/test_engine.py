@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
 from dedupe.engine import run_scan
 from dedupe.models import GroupKind
+from dedupe.similar_video import _extract_frames
 
 
 def _save(path: Path, color: tuple[int, int, int], quality: int = 90) -> None:
@@ -78,3 +80,47 @@ def test_run_scan_streams_groups_via_on_group(tmp_path: Path) -> None:
         first_exact = kinds.index(GroupKind.EXACT.value)
         first_similar = kinds.index(GroupKind.SIMILAR.value)
         assert first_exact < first_similar
+
+
+def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> None:
+    _save(tmp_path / "landscape.jpg", (30, 120, 60))
+    captured = {}
+
+    def fake_find(records, *, progress=None, **_kwargs):
+        captured.update(_kwargs)
+        if progress:
+            progress("human-detection", len(records), len(records))
+        return records
+
+    monkeypatch.setattr("dedupe.engine.find_no_human_files", fake_find)
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        human_backend="photon",
+        photon_model="test-model",
+        use_cache=False,
+    )
+
+    assert result.no_human_files == 1
+    assert result.groups[0].kind == GroupKind.NO_HUMANS
+    assert result.groups[0].selected_for_removal == []
+    assert captured["backend"] == "photon"
+    assert captured["photon_model"] == "test-model"
+
+
+def test_human_scan_rejects_frames_from_partial_video_decode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (10.0, 640, 480))
+
+    def failed_ffmpeg(_cmd, **_kwargs):
+        (tmp_path / "frame_001.jpg").write_bytes(b"partial")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", failed_ffmpeg)
+    frames = _extract_frames(
+        tmp_path / "broken.mp4", tmp_path
+    )
+    assert frames == []

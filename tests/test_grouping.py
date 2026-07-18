@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dedupe.actions import collect_selected_paths
-from dedupe.grouping import apply_smart_select, build_groups, pick_suggested_keep
+from dedupe.grouping import (
+    apply_smart_select,
+    build_groups,
+    build_no_human_groups,
+    pick_suggested_keep,
+)
 from dedupe.models import FileRecord, MediaType, SmartRule
 
 
@@ -64,3 +69,32 @@ def test_similar_subset_of_exact_skipped() -> None:
     # Should only produce one group (exact), not a redundant similar
     assert len(groups) == 1
     assert groups[0].kind.value == "exact"
+
+
+def test_no_human_candidate_can_be_selected_for_removal_by_itself() -> None:
+    candidate = _rec("/landscape.jpg", 300, 1)
+    group = build_no_human_groups([candidate])[0]
+
+    assert group.kind.value == "no_humans"
+    assert group.suggested_keep is None
+    assert group.reclaimable_bytes == 0
+    assert collect_selected_paths([group]) == []
+
+    apply_smart_select(group, SmartRule.SELECT_CANDIDATES)
+    assert group.reclaimable_bytes == candidate.size
+    assert collect_selected_paths([group]) == [candidate.path]
+
+    apply_smart_select(group, SmartRule.DESELECT_ALL)
+    assert group.selected_for_removal == []
+
+
+def test_overlapping_no_human_selection_still_retains_a_duplicate() -> None:
+    a = _rec("/landscape.jpg", 300, 1)
+    b = _rec("/landscape-copy.jpg", 300, 2)
+    duplicate = build_groups([[a, b]], [])[0]
+    candidate_group = build_no_human_groups([a, b])[0]
+    apply_smart_select(candidate_group, SmartRule.SELECT_CANDIDATES)
+
+    selected = collect_selected_paths([duplicate, candidate_group])
+    assert len(selected) == 1
+    assert duplicate.suggested_keep not in selected

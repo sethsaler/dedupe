@@ -8,10 +8,11 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
+- **No-person-detected candidates** — optional local computer-vision review surfaces images, GIFs, and sampled videos where the detector found no person
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews
 - **Hash cache** — `~/.cache/dedupe/hashes.sqlite3` for fast re-scans
-- **Local web UI** — thumbnails, lightbox, smart select, keyboard nav, native folder picker, isolate
+- **Local web UI** — thumbnails, lightbox, smart select, keyboard nav, native folder/file picker, isolate
 
 ## Requirements
 
@@ -31,6 +32,12 @@ cd dedupe
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+
+# Optional computer-vision candidate review
+pip install -e ".[human]"
+
+# Optional Photon / Moondream backend (includes OpenCV for ensemble mode)
+pip install -e ".[vision]"
 ```
 
 ## Quick start
@@ -46,7 +53,7 @@ dedupe ui
 That starts the local server, opens your browser, and keeps a Terminal window for logs / Ctrl+C.
 
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
-2. Hit **Scan** — review groups in the sidebar
+2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
 3. Smart Select keep/remove, open thumbnails in the lightbox
 4. **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
 
@@ -64,6 +71,16 @@ dedupe scan ~/Pictures ~/Downloads --json results.json
 # Exact only (faster)
 dedupe scan ~/Movies --no-similar
 
+# Surface media where local vision detected no person for manual review
+dedupe scan ~/Pictures --find-no-person --ui
+
+# Run the same review with Photon, or use OpenCV-first ensemble mode
+dedupe scan ~/Pictures --find-no-person --human-backend photon --ui
+dedupe scan ~/Pictures --find-no-person --human-backend ensemble --ui
+
+# Skip exports and cache folders
+dedupe scan ~/Pictures --exclude 'exports/**' --exclude cache
+
 # Parallel hashing (default: auto = CPU count; 1 = serial)
 dedupe scan ~/Pictures --workers 8
 
@@ -75,7 +92,7 @@ dedupe scan ~/Downloads --action trash --dry-run
 
 # Isolate matches into review folders *inside the scanned source*
 dedupe scan ~/Pictures --action isolate --execute
-# → ~/Pictures/_Dedupe Review/exact/… and …/similar/…
+# → ~/Pictures/_Dedupe Review/session-<timestamp>/exact/… and …/similar/…
 
 # Only exact matches (still under the source by default)
 dedupe scan ~/Pictures --action isolate --isolate-kinds exact --execute
@@ -85,6 +102,10 @@ dedupe isolate results.json --execute
 
 # Override only if you really want a different location
 dedupe isolate results.json --review-dir /some/other/path --execute
+
+# Restore a quarantine action from its receipt (preview first)
+dedupe undo ~/.cache/dedupe/logs/action-<timestamp>-<id>.json
+dedupe undo ~/.cache/dedupe/logs/action-<timestamp>-<id>.json --execute
 
 # Open UI with last scan results
 dedupe scan ~/Pictures --ui
@@ -100,15 +121,16 @@ When exact or similar groups are found, isolate builds a review tree **inside th
   photo1_copy.jpg
   …
   _Dedupe Review/          ← created here, next to the media
-    exact/
-      001_exact_image_n2_photo_abc123/
-        KEEP__photo.jpg      ← suggested keep
-        photo_copy.jpg
-        _group.json          ← sources + metadata
-        README.txt
-    similar/
-      001_similar_image_n2_…
-    _review_index.json
+    session-20260718T…/
+      exact/
+        001_exact_image_n2_photo_abc123/
+          KEEP__photo.jpg      ← suggested keep
+          photo_copy.jpg
+          _group.json          ← sources + metadata
+          README.txt
+      similar/
+        001_similar_image_n2_…
+      _review_index.json
 ```
 
 `_Dedupe Review` is skipped on future scans so review copies are not re-detected.
@@ -116,7 +138,7 @@ When exact or similar groups are found, isolate builds a review tree **inside th
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--isolate-mode copy` | yes | Copy files into review folders (safe) |
-| `--isolate-mode hardlink` | | Same bytes, no extra disk use (same volume) |
+| `--isolate-mode hardlink` | | Same inode and no extra disk use; editing either name edits the same file |
 | `--isolate-mode symlink` | | Symlinks back to originals |
 | `--isolate-mode move` | | **Moves** originals into review (destructive layout) |
 | `--isolate-kinds all\|exact\|similar` | `all` | Filter which groups to isolate |
@@ -130,7 +152,36 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | --- | --- |
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
-| Similar videos | Sample frames with ffmpeg → XOR pHash fingerprint (default Hamming ≤ 8) |
+| Similar videos | Ordered ffmpeg frame pHashes compared at normalized timeline positions (default mean Hamming ≤ 8) |
+| No person detected | Offline OpenCV face + full-body detection on images, representative GIF frames, and up to 8 sampled video frames |
+
+The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 through the local Photon runtime), or `ensemble` (OpenCV positives first, then Photon on uncertain frames). Photon stays opt-in: its first use can download roughly 10 GB of model weights, and detection returns person/face boxes rather than a calibrated confidence score. All processing remains local after the model is available.
+
+“No person detected” is a computer-vision-assisted review filter, not a guarantee. It is opt-in and leaves candidates unselected until you review them manually or apply **Mark reviewed + select vision candidates**. The UI shows how many frames were analyzed. Small, profile, obscured, seated, or unsampled people can still be missed. OpenCV is an optional, CPU-only dependency and does not download a model at runtime.
+
+### Benchmark Photon against your own media
+
+Use a hand-labeled JSON manifest. Relative media paths are resolved from the manifest folder:
+
+```json
+[
+  {"path": "samples/family-photo.jpg", "has_person": true},
+  {"path": "samples/empty-room.jpg", "has_person": false},
+  {"path": "samples/walkthrough.mov", "has_person": true}
+]
+```
+
+```bash
+# OpenCV baseline only; no Photon download
+dedupe benchmark-humans benchmark.json --json benchmark-opencv.json
+
+# Side-by-side comparison; first Photon run may download model weights
+dedupe benchmark-humans benchmark.json \
+  --backends opencv photon ensemble \
+  --json benchmark-all.json
+```
+
+The terminal report includes person recall, no-person precision, accuracy, runtime, and every false-negative path. For this workflow, prioritize **person recall** and inspect every listed missed-person file before deciding whether Photon is safe enough for your library. The JSON output also includes per-file decisions, sampled-frame counts, evidence scores, errors, and latency.
 
 **Near-identical only** — same photo at different quality/export/resolution. Different poses of the same person (or burst frames that actually move) are filtered out by comparing pHash across image quadrants + center crop.
 
@@ -158,7 +209,11 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 
 - Never hard-deletes in the UI
 - Always leaves at least one file per group
-- Actions are logged under `~/.cache/dedupe/logs/`
+- File identity, scan-root containment, and exact hashes are revalidated before execution
+- File and directory symlinks are skipped by default
+- Executed actions receive unique atomic receipts under `~/.cache/dedupe/logs/`
+- Quarantine receipts can restore files with `dedupe undo`; Trash is restored through Finder
+- Mutating localhost API calls require a per-launch session token and current scan generation
 - Use **Preview** next to Trash / Quarantine / Isolate before executing
 
 ## Project layout
@@ -169,6 +224,8 @@ src/dedupe/
   exact.py           # byte-identical groups
   similar_image.py   # perceptual image/GIF groups
   similar_video.py   # video fingerprints
+  human_detection.py # optional local person detection
+  human_benchmark.py # labeled OpenCV / Photon comparison harness
   parallel.py        # thread-pool map for hashing stages
   grouping.py        # ranking + smart select
   actions.py         # trash / quarantine

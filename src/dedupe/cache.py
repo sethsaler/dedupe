@@ -7,6 +7,8 @@ from pathlib import Path
 
 from .models import FileRecord, MediaType
 
+CACHE_ALGORITHM_VERSION = "dedupe-hashes-v2"
+
 
 def default_cache_path() -> Path:
     base = Path.home() / ".cache" / "dedupe"
@@ -20,6 +22,7 @@ class HashCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
+        self._closed = False
         self._init()
 
     def _init(self) -> None:
@@ -29,6 +32,10 @@ class HashCache:
                 path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
                 mtime REAL NOT NULL,
+                mtime_ns INTEGER,
+                device INTEGER,
+                inode INTEGER,
+                algorithm_version TEXT NOT NULL DEFAULT '',
                 media_type TEXT,
                 width INTEGER,
                 height INTEGER,
@@ -41,28 +48,69 @@ class HashCache:
             )
             """
         )
+        existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(hashes)").fetchall()
+        }
+        migrations = {
+            "mtime_ns": "INTEGER",
+            "device": "INTEGER",
+            "inode": "INTEGER",
+            "algorithm_version": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, declaration in migrations.items():
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE hashes ADD COLUMN {column} {declaration}"
+                )
         self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        if not self._closed:
+            self._conn.close()
+            self._closed = True
 
-    def get(self, path: str, size: int, mtime: float) -> dict | None:
+    def __del__(self) -> None:
+        # Cancellation may unwind a scan before the engine reaches its normal close.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def get(self, rec: FileRecord) -> dict | None:
         row = self._conn.execute(
-            "SELECT * FROM hashes WHERE path = ? AND size = ? AND ABS(mtime - ?) < 0.001",
-            (path, size, mtime),
+            "SELECT * FROM hashes WHERE path = ? AND size = ? AND algorithm_version = ?",
+            (rec.path, rec.size, CACHE_ALGORITHM_VERSION),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        cached = dict(row)
+        if rec.mtime_ns is not None and cached.get("mtime_ns") is not None:
+            if int(cached["mtime_ns"]) != int(rec.mtime_ns):
+                return None
+        elif abs(float(cached["mtime"]) - rec.mtime) >= 0.001:
+            return None
+        for key in ("device", "inode"):
+            current = getattr(rec, key)
+            prior = cached.get(key)
+            if current is not None and prior is not None and int(current) != int(prior):
+                return None
+        return cached
 
     def put(self, rec: FileRecord) -> None:
         self._conn.execute(
             """
             INSERT INTO hashes (
-                path, size, mtime, media_type, width, height,
-                sha256, partial_hash, phash, dhash, video_fingerprint, duration
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                path, size, mtime, mtime_ns, device, inode, algorithm_version,
+                media_type, width, height, sha256, partial_hash, phash, dhash,
+                video_fingerprint, duration
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 size=excluded.size,
                 mtime=excluded.mtime,
+                mtime_ns=excluded.mtime_ns,
+                device=excluded.device,
+                inode=excluded.inode,
+                algorithm_version=excluded.algorithm_version,
                 media_type=excluded.media_type,
                 width=excluded.width,
                 height=excluded.height,
@@ -77,6 +125,10 @@ class HashCache:
                 rec.path,
                 rec.size,
                 rec.mtime,
+                rec.mtime_ns,
+                rec.device,
+                rec.inode,
+                CACHE_ALGORITHM_VERSION,
                 rec.media_type.value,
                 rec.width,
                 rec.height,
@@ -96,7 +148,7 @@ class HashCache:
         """Fill records from cache. Returns number of cache hits."""
         hits = 0
         for rec in records:
-            row = self.get(rec.path, rec.size, rec.mtime)
+            row = self.get(rec)
             if not row:
                 continue
             hits += 1

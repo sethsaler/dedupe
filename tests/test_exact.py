@@ -60,3 +60,20 @@ def test_file_sha256_stable(tmp_path: Path) -> None:
     p = tmp_path / "f.bin"
     p.write_bytes(b"abc" * 1000)
     assert file_sha256(p) == file_sha256(p)
+
+
+def test_inventory_skips_file_symlinks_and_honors_globs(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"outside")
+    (root / "linked.jpg").symlink_to(outside)
+    (root / "keep.jpg").write_bytes(b"keep")
+    exports = root / "exports"
+    exports.mkdir()
+    (exports / "skip.jpg").write_bytes(b"skip")
+
+    records = inventory([root], exclusions=["exports/**"])
+
+    assert [Path(record.path).name for record in records] == ["keep.jpg"]
+    assert all(root.resolve() in Path(record.path).parents for record in records)

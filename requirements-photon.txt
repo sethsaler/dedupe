@@ -1,0 +1,2 @@
+-r requirements-human.txt
+moondream

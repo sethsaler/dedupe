@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
 import mimetypes
+import secrets
 import threading
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -19,17 +22,34 @@ from flask import (
 from ..actions import apply_actions, format_bytes, isolate_groups
 from ..engine import run_scan
 from ..grouping import apply_smart_select, apply_smart_select_all
-from ..models import ScanProgress, ScanResult, SmartRule
+from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
+from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_paths
 
-# Shared scan state for background jobs
-_lock = threading.Lock()
-_state: dict = {
-    "result": None,  # ScanResult | None
-    "progress": ScanProgress(),
-    "scanning": False,
-    "last_error": None,
-    "groups_version": 0,  # bumps when groups list changes (for streaming UI)
-}
+
+def _macos_picker_script(kind: str) -> str:
+    chooser = (
+        'choose folder with prompt "Choose folders to scan" '
+        "with multiple selections allowed"
+        if kind == "folder"
+        else 'choose file with prompt "Choose media files to scan" '
+        "with multiple selections allowed"
+    )
+    return (
+        'use framework "AppKit"\n'
+        "use scripting additions\n"
+        "try\n"
+        "  current application's NSApplication's sharedApplication()'s "
+        "activateIgnoringOtherApps:true\n"
+        f"  set selectedItems to {chooser}\n"
+        '  set output to ""\n'
+        "  repeat with selectedItem in selectedItems\n"
+        "    set output to output & POSIX path of selectedItem & linefeed\n"
+        "  end repeat\n"
+        "  return output\n"
+        "on error number -128\n"
+        '  return ""\n'
+        "end try"
+    )
 
 
 def create_app(initial_result: ScanResult | None = None) -> Flask:
@@ -38,12 +58,66 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         template_folder=str(Path(__file__).parent / "templates"),
         static_folder=str(Path(__file__).parent / "static"),
     )
-    app.config["SECRET_KEY"] = "dedupe-local-only"
+    csrf_token = secrets.token_urlsafe(32)
+    app.config["SECRET_KEY"] = secrets.token_hex(32)
+    app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
+    app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
+    lock = threading.RLock()
+    state: dict = {
+        "result": None,
+        "progress": ScanProgress(),
+        "scanning": False,
+        "acting": False,
+        "last_error": None,
+        "groups_version": 0,
+        "scan_id": secrets.token_hex(12),
+        "cancel_event": None,
+        "allowed_reveal_paths": set(),
+    }
+    app.extensions["dedupe_state"] = state
+
+    @app.before_request
+    def protect_mutating_api():
+        mutating = request.path.startswith("/api/") and request.method not in (
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        )
+        reveal_side_effect = (
+            request.path == "/api/reveal" and request.args.get("open") == "1"
+        )
+        if not (mutating or reveal_side_effect):
+            return None
+        if mutating and not request.is_json:
+            return jsonify({"error": "application/json required"}), 415
+        supplied = request.headers.get("X-Dedupe-Token", "")
+        if not hmac.compare_digest(supplied, csrf_token):
+            return jsonify({"error": "invalid local session token"}), 403
+        origin = request.headers.get("Origin")
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                return jsonify({"error": "cross-origin request rejected"}), 403
+        return None
+
+    @app.after_request
+    def local_security_headers(response):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
+            "script-src 'self'; connect-src 'self'; font-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     if initial_result is not None:
-        with _lock:
-            _state["result"] = initial_result
-            _state["progress"] = ScanProgress(
+        with lock:
+            state["result"] = initial_result
+            state["progress"] = ScanProgress(
                 phase="done",
                 done=True,
                 files_found=len(initial_result.files),
@@ -53,7 +127,19 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        return render_template("index.html", csrf_token=csrf_token)
+
+    @app.get("/favicon.ico")
+    def favicon():
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+            '<rect width="64" height="64" rx="16" fill="#5b9dff"/>'
+            '<g fill="none" stroke="#0a2940" stroke-width="5">'
+            '<rect x="12" y="18" width="30" height="28" rx="6"/>'
+            '<rect x="22" y="20" width="30" height="28" rx="6"/>'
+            "</g></svg>"
+        )
+        return Response(svg, mimetype="image/svg+xml")
 
     @app.get("/api/status")
     def api_status():
@@ -61,16 +147,18 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
 
         from ..parallel import DEFAULT_WORKERS_CAP, resolve_workers
 
-        with _lock:
-            prog = _state["progress"]
-            result: ScanResult | None = _state["result"]
+        with lock:
+            prog = state["progress"]
+            result: ScanResult | None = state["result"]
             cpu = os.cpu_count() or 1
             payload = {
-                "scanning": _state["scanning"],
+                "scanning": state["scanning"],
+                "acting": state["acting"],
                 "progress": prog.to_dict(),
                 "has_result": result is not None,
-                "groups_version": _state["groups_version"],
-                "error": _state["last_error"],
+                "groups_version": state["groups_version"],
+                "scan_id": state["scan_id"],
+                "error": state["last_error"],
                 "system": {
                     "cpu_count": cpu,
                     "auto_workers": resolve_workers(None),
@@ -86,27 +174,30 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     "group_count": len(result.groups),
                     "exact_groups": result.exact_groups,
                     "similar_groups": result.similar_groups,
+                    "no_human_files": result.no_human_files,
                     "reclaimable_bytes": result.reclaimable_bytes,
                     "reclaimable_human": format_bytes(result.reclaimable_bytes),
+                    "selected_count": len(effective_selected_paths(result.groups)),
+                    "errors": list(result.errors[:20]),
                 }
             return jsonify(payload)
 
     @app.get("/api/groups")
     def api_groups():
         kind = request.args.get("kind")  # exact | similar | all
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"groups": []})
             groups = result.groups
-            if kind in ("exact", "similar"):
+            if kind in ("exact", "similar", "no_humans"):
                 groups = [g for g in groups if g.kind.value == kind]
             return jsonify({"groups": [g.to_dict() for g in groups]})
 
     @app.get("/api/groups/<group_id>")
     def api_group(group_id: str):
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
             for g in result.groups:
@@ -116,7 +207,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
 
     @app.post("/api/scan")
     def api_scan():
-        data = request.get_json(force=True, silent=True) or {}
+        data = request.get_json(silent=True) or {}
         paths = data.get("paths") or []
         if isinstance(paths, str):
             paths = [paths]
@@ -124,29 +215,43 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         if not paths:
             return jsonify({"error": "paths required"}), 400
 
+        human_backend = str(data.get("human_backend", "opencv")).strip().lower()
+        if human_backend not in HUMAN_BACKENDS:
+            return jsonify({"error": f"unknown human detector: {human_backend}"}), 400
+        photon_model = str(data.get("photon_model", DEFAULT_PHOTON_MODEL)).strip()
+        if not photon_model:
+            photon_model = DEFAULT_PHOTON_MODEL
+
         resolved_roots = [str(Path(p).expanduser().resolve()) for p in paths]
 
-        with _lock:
-            if _state["scanning"]:
+        with lock:
+            if state["scanning"]:
                 return jsonify({"error": "scan already running"}), 409
-            _state["scanning"] = True
-            _state["last_error"] = None
-            _state["progress"] = ScanProgress(phase="starting", message="Starting…")
+            if state["acting"]:
+                return jsonify({"error": "file action already running"}), 409
+            scan_id = secrets.token_hex(12)
+            cancel_event = threading.Event()
+            state["scanning"] = True
+            state["scan_id"] = scan_id
+            state["cancel_event"] = cancel_event
+            state["last_error"] = None
+            state["progress"] = ScanProgress(phase="starting", message="Starting…")
             # Empty result so the UI can stream groups as they appear.
-            _state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
-            _state["groups_version"] = _state.get("groups_version", 0) + 1
+            state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
+            state["groups_version"] = state.get("groups_version", 0) + 1
 
         def worker() -> None:
             try:
 
                 def on_progress(prog: ScanProgress) -> None:
-                    with _lock:
-                        _state["progress"] = prog
+                    with lock:
+                        if state["scan_id"] == scan_id:
+                            state["progress"] = prog
 
                 def on_group(group) -> None:
-                    with _lock:
-                        result: ScanResult | None = _state["result"]
-                        if result is None:
+                    with lock:
+                        result: ScanResult | None = state["result"]
+                        if result is None or state["scan_id"] != scan_id:
                             return
                         # Replace if same id already streamed (shouldn't happen), else append
                         existing = next(
@@ -161,8 +266,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                             key=lambda g: g.reclaimable_bytes, reverse=True
                         )
                         result.recompute_stats()
-                        _state["groups_version"] = _state.get("groups_version", 0) + 1
-                        prog = _state["progress"]
+                        state["groups_version"] = state.get("groups_version", 0) + 1
+                        prog = state["progress"]
                         prog.groups_found = len(result.groups)
 
                 raw_workers = data.get("workers", None)
@@ -176,10 +281,17 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     if workers is not None and workers <= 0:
                         workers = None
 
+                raw_exclusions = data.get("exclusions") or []
+                if isinstance(raw_exclusions, str):
+                    raw_exclusions = raw_exclusions.split(",")
+
                 result = run_scan(
                     paths,
                     exact=bool(data.get("exact", True)),
                     similar=bool(data.get("similar", True)),
+                    find_no_humans=bool(data.get("find_no_humans", False)),
+                    human_backend=human_backend,
+                    photon_model=photon_model,
                     include_images=bool(data.get("include_images", True)),
                     include_gifs=bool(data.get("include_gifs", True)),
                     include_videos=bool(data.get("include_videos", True)),
@@ -188,40 +300,67 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     video_threshold=int(data.get("video_threshold", 8)),
                     use_cache=bool(data.get("use_cache", True)),
                     workers=workers,
+                    exclusions=[
+                        str(pattern).strip()
+                        for pattern in raw_exclusions
+                        if str(pattern).strip()
+                    ],
+                    cancelled=cancel_event.is_set,
                     progress=on_progress,
                     on_group=on_group,
                 )
-                with _lock:
-                    _state["result"] = result
-                    _state["scanning"] = False
-                    _state["groups_version"] = _state.get("groups_version", 0) + 1
-                    _state["progress"] = ScanProgress(
+                with lock:
+                    if state["scan_id"] != scan_id:
+                        return
+                    state["result"] = result
+                    state["scanning"] = False
+                    state["cancel_event"] = None
+                    state["groups_version"] = state.get("groups_version", 0) + 1
+                    state["progress"] = ScanProgress(
                         phase="done",
                         done=True,
                         files_found=len(result.files),
                         groups_found=len(result.groups),
                         message=(
                             f"Done — {result.exact_groups} exact, "
-                            f"{result.similar_groups} similar"
+                            f"{result.similar_groups} similar, "
+                            f"{result.no_human_files} vision candidates"
                         ),
                     )
             except Exception as exc:
-                with _lock:
-                    _state["scanning"] = False
-                    _state["last_error"] = str(exc)
-                    _state["progress"] = ScanProgress(
-                        phase="error",
+                with lock:
+                    if state["scan_id"] != scan_id:
+                        return
+                    was_cancelled = isinstance(exc, InterruptedError)
+                    state["scanning"] = False
+                    state["cancel_event"] = None
+                    state["last_error"] = None if was_cancelled else str(exc)
+                    state["progress"] = ScanProgress(
+                        phase="cancelled" if was_cancelled else "error",
                         done=True,
-                        error=str(exc),
-                        message=str(exc),
+                        error=None if was_cancelled else str(exc),
+                        message="Scan cancelled" if was_cancelled else str(exc),
                     )
 
         threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "scan_id": scan_id})
+
+    @app.post("/api/scan/cancel")
+    def api_scan_cancel():
+        data = request.get_json(silent=True) or {}
+        with lock:
+            event: threading.Event | None = state.get("cancel_event")
+            if not state["scanning"] or event is None:
+                return jsonify({"error": "no scan is running"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session"}), 409
+            event.set()
+            state["progress"].message = "Cancelling after current work item…"
         return jsonify({"ok": True})
 
     @app.post("/api/smart-select")
     def api_smart_select():
-        data = request.get_json(force=True, silent=True) or {}
+        data = request.get_json(silent=True) or {}
         rule_raw = data.get("rule", SmartRule.AUTOMATIC.value)
         group_id = data.get("group_id")
         try:
@@ -229,8 +368,12 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         except ValueError:
             return jsonify({"error": f"invalid rule: {rule_raw}"}), 400
 
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "selections are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
             if group_id:
@@ -246,34 +389,47 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     @app.post("/api/selection")
     def api_selection():
         """Set selected_for_removal for a group (manual checkboxes)."""
-        data = request.get_json(force=True, silent=True) or {}
+        data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         selected = list(data.get("selected") or [])
         if not group_id:
             return jsonify({"error": "group_id required"}), 400
 
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "selections are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
             for g in result.groups:
                 if g.id == group_id:
                     member_paths = {m.path for m in g.members}
                     picks = [p for p in selected if p in member_paths]
-                    # Enforce keep-at-least-one
-                    if len(picks) >= len(member_paths) and member_paths:
+                    # Duplicate groups retain one file; no-human candidate groups may remove all.
+                    if (
+                        g.kind.value != "no_humans"
+                        and len(picks) >= len(member_paths)
+                        and member_paths
+                    ):
                         keep = g.suggested_keep or next(iter(member_paths))
                         if keep in picks:
                             picks = [p for p in picks if p != keep]
                         else:
                             picks = picks[:-1]
                     g.selected_for_removal = picks
+                    if g.kind.value == "no_humans":
+                        reviewed = list(data.get("reviewed") or picks)
+                        g.reviewed_paths = [
+                            path for path in reviewed if path in member_paths
+                        ]
                     return jsonify(g.to_dict())
         return jsonify({"error": "not found"}), 404
 
     @app.post("/api/action")
     def api_action():
-        data = request.get_json(force=True, silent=True) or {}
+        data = request.get_json(silent=True) or {}
         action = (data.get("action") or "trash").lower()
         dry_run = bool(data.get("dry_run", True))
         quarantine_dir = data.get("quarantine_dir")
@@ -283,10 +439,17 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         if action == "quarantine" and not quarantine_dir and not dry_run:
             return jsonify({"error": "quarantine_dir required"}), 400
 
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            if state["scanning"]:
+                return jsonify({"error": "wait for the scan to finish or cancel it"}), 409
+            if state["acting"]:
+                return jsonify({"error": "another file action is already running"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
+            state["acting"] = True
             groups = list(result.groups)
             roots = list(result.roots)
 
@@ -309,72 +472,150 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     action=action,
                     quarantine_dir=quarantine_dir,
                     dry_run=dry_run,
+                    roots=roots,
                 )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400
-
-        # If trash/quarantine executed, drop removed members from in-memory result
-        if not dry_run and action in ("trash", "quarantine"):
-            removed = {i.path for i in action_result.items if i.ok}
-            with _lock:
-                result = _state["result"]
-                if result is not None:
-                    new_groups = []
-                    for g in result.groups:
-                        remaining = [m for m in g.members if m.path not in removed]
-                        if len(remaining) >= 2:
-                            g.members = remaining
-                            g.selected_for_removal = [
-                                p for p in g.selected_for_removal if p not in removed
+        else:
+            # If trash/quarantine executed, drop removed members from in-memory result.
+            if not dry_run and action in ("trash", "quarantine"):
+                removed = {item.path for item in action_result.items if item.ok}
+                with lock:
+                    result = state["result"]
+                    if result is not None:
+                        new_groups = []
+                        for group in result.groups:
+                            remaining = [
+                                member
+                                for member in group.members
+                                if member.path not in removed
                             ]
-                            if g.suggested_keep in removed:
-                                from ..grouping import pick_suggested_keep
+                            minimum = 1 if group.kind.value == "no_humans" else 2
+                            if len(remaining) >= minimum:
+                                group.members = remaining
+                                group.selected_for_removal = [
+                                    path
+                                    for path in group.selected_for_removal
+                                    if path not in removed
+                                ]
+                                group.reviewed_paths = [
+                                    path
+                                    for path in group.reviewed_paths
+                                    if path not in removed
+                                ]
+                                if group.suggested_keep in removed and remaining:
+                                    from ..grouping import pick_suggested_keep
 
-                                g.suggested_keep = pick_suggested_keep(remaining)
-                            new_groups.append(g)
-                        # groups with <2 members dissolve
-                    result.groups = new_groups
-                    result.files = [f for f in result.files if f.path not in removed]
-                    result.recompute_stats()
+                                    group.suggested_keep = pick_suggested_keep(remaining)
+                                new_groups.append(group)
+                            # Groups below their minimum size dissolve.
+                        result.groups = new_groups
+                        result.files = [
+                            file for file in result.files if file.path not in removed
+                        ]
+                        result.recompute_stats()
 
-        return jsonify(action_result.to_dict())
+            with lock:
+                if action_result.review_root:
+                    state["allowed_reveal_paths"].add(
+                        str(Path(action_result.review_root).resolve(strict=False))
+                    )
+
+            return jsonify(action_result.to_dict())
+        finally:
+            with lock:
+                state["acting"] = False
 
     @app.post("/api/pick-folder")
     def api_pick_folder():
-        """Open a native folder picker (macOS/Linux). Returns selected path or cancelled."""
+        """Open a native folder/file picker and return local filesystem paths."""
         import platform
         import subprocess
+
+        data = request.get_json(silent=True) or {}
+        kind = str(data.get("kind") or "folder").lower()
+        if kind not in {"folder", "files"}:
+            return jsonify({"error": "kind must be folder or files"}), 400
+
+        def response_for_process(proc) -> tuple[Response, int] | Response:
+            if proc.returncode != 0:
+                detail = (proc.stderr or "").strip()
+                return (
+                    jsonify({
+                        "error": detail or "The native file picker could not open",
+                        "paths": [],
+                    }),
+                    500,
+                )
+            paths = [
+                str(Path(line.strip()).expanduser().resolve(strict=False))
+                for line in (proc.stdout or "").splitlines()
+                if line.strip()
+            ]
+            if not paths:
+                return jsonify({"cancelled": True, "path": None, "paths": []})
+            return jsonify({
+                "path": paths[0],
+                "paths": paths,
+                "cancelled": False,
+            })
 
         system = platform.system()
         try:
             if system == "Darwin":
-                script = (
-                    'try\n'
-                    '  set theFolder to choose folder with prompt "Choose a folder to scan"\n'
-                    '  return POSIX path of theFolder\n'
-                    'on error number -128\n'
-                    '  return ""\n'
-                    'end try'
-                )
+                script = _macos_picker_script(kind)
                 proc = subprocess.run(
-                    ["osascript", "-e", script],
+                    ["/usr/bin/osascript", "-e", script],
                     capture_output=True,
                     text=True,
                     timeout=300,
                     check=False,
                 )
-                path = (proc.stdout or "").strip()
-                if not path:
-                    return jsonify({"cancelled": True, "path": None})
-                # AppleScript POSIX path ends with /
-                path = path.rstrip("/")
-                return jsonify({"path": path, "cancelled": False})
+                return response_for_process(proc)
 
             if system == "Linux":
-                for cmd in (
-                    ["zenity", "--file-selection", "--directory", "--title=Choose a folder to scan"],
-                    ["kdialog", "--getexistingdirectory", ".", "--title", "Choose a folder to scan"],
-                ):
+                commands = (
+                    (
+                        [
+                            "zenity",
+                            "--file-selection",
+                            "--directory",
+                            "--multiple",
+                            "--separator=\n",
+                            "--title=Choose folders to scan",
+                        ],
+                        [
+                            "kdialog",
+                            "--getexistingdirectory",
+                            ".",
+                            "--multiple",
+                            "--separate-output",
+                            "--title",
+                            "Choose folders to scan",
+                        ],
+                    )
+                    if kind == "folder"
+                    else (
+                        [
+                            "zenity",
+                            "--file-selection",
+                            "--multiple",
+                            "--separator=\n",
+                            "--title=Choose media files to scan",
+                        ],
+                        [
+                            "kdialog",
+                            "--getopenfilename",
+                            ".",
+                            "Media files (*)",
+                            "--multiple",
+                            "--separate-output",
+                            "--title",
+                            "Choose media files to scan",
+                        ],
+                    )
+                )
+                for cmd in commands:
                     try:
                         proc = subprocess.run(
                             cmd,
@@ -384,27 +625,35 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                             check=False,
                         )
                         if proc.returncode == 0:
-                            path = (proc.stdout or "").strip()
-                            if path:
-                                return jsonify({"path": path, "cancelled": False})
-                            return jsonify({"cancelled": True, "path": None})
+                            return response_for_process(proc)
+                        if proc.returncode == 1 and not (proc.stdout or "").strip():
+                            return jsonify({
+                                "cancelled": True,
+                                "path": None,
+                                "paths": [],
+                            })
+                        detail = (proc.stderr or "").strip()
+                        if detail:
+                            return jsonify({"error": detail, "paths": []}), 500
                     except FileNotFoundError:
                         continue
                 return jsonify({
                     "cancelled": False,
                     "path": None,
-                    "message": "No folder dialog available — paste a path instead",
+                    "paths": [],
+                    "message": "No native picker is installed — paste paths instead",
                 })
 
             return jsonify({
                 "cancelled": False,
                 "path": None,
-                "message": "Folder picker not supported on this OS — paste a path instead",
+                "paths": [],
+                "message": "Native picker not supported on this OS — paste paths instead",
             })
         except subprocess.TimeoutExpired:
-            return jsonify({"cancelled": True, "path": None})
+            return jsonify({"error": "The native picker timed out", "paths": []}), 504
         except Exception as exc:
-            return jsonify({"error": str(exc), "path": None}), 500
+            return jsonify({"error": str(exc), "paths": []}), 500
 
     @app.get("/api/thumbnail")
     def api_thumbnail():
@@ -416,8 +665,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             return jsonify({"error": "not found"}), 404
 
         # Only serve files that were part of the last scan (path traversal safety)
-        with _lock:
-            result: ScanResult | None = _state["result"]
+        with lock:
+            result: ScanResult | None = state["result"]
             allowed = {f.path for f in result.files} if result else set()
             if result and result.groups:
                 for g in result.groups:
@@ -487,6 +736,13 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         if not path:
             return jsonify({"error": "path required"}), 400
         p = Path(path)
+        resolved = str(p.expanduser().resolve(strict=False))
+        with lock:
+            result: ScanResult | None = state["result"]
+            allowed = {file.path for file in result.files} if result else set()
+            allowed.update(state["allowed_reveal_paths"])
+        if resolved not in allowed and path not in allowed:
+            return jsonify({"error": "path is not part of this Dedupe session"}), 403
         if open_finder and p.exists():
             import subprocess
 

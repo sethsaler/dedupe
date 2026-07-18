@@ -8,9 +8,16 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .actions import apply_actions, format_bytes, isolate_groups, summarize_scan
+from .actions import (
+    apply_actions,
+    format_bytes,
+    isolate_groups,
+    summarize_scan,
+    undo_quarantine,
+)
 from .engine import run_scan
 from .grouping import apply_smart_select_all
+from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from .models import SmartRule
 
 
@@ -26,10 +33,39 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("paths", nargs="+", help="Folders or files to scan")
     scan.add_argument("--no-exact", action="store_true", help="Skip exact duplicate detection")
     scan.add_argument("--no-similar", action="store_true", help="Skip similar detection")
+    scan.add_argument(
+        "--find-no-person",
+        "--find-no-humans",
+        dest="find_no_humans",
+        action="store_true",
+        help="Surface images/videos where local vision detects no person",
+    )
+    scan.add_argument(
+        "--human-backend",
+        choices=HUMAN_BACKENDS,
+        default="opencv",
+        help="Person detector: opencv (default), photon, or ensemble",
+    )
+    scan.add_argument(
+        "--photon-model",
+        default=DEFAULT_PHOTON_MODEL,
+        metavar="MODEL",
+        help=(
+            f"Local Moondream model for Photon (default: {DEFAULT_PHOTON_MODEL}; "
+            "first use downloads model weights)"
+        ),
+    )
     scan.add_argument("--no-images", action="store_true")
     scan.add_argument("--no-gifs", action="store_true")
     scan.add_argument("--no-videos", action="store_true")
     scan.add_argument("--hidden", action="store_true", help="Include hidden files")
+    scan.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Exclude a file/folder name or root-relative glob (repeatable)",
+    )
     scan.add_argument("--threshold", type=int, default=6, help="Image pHash Hamming threshold")
     scan.add_argument("--video-threshold", type=int, default=8, help="Video fingerprint threshold")
     scan.add_argument(
@@ -72,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument(
         "--isolate-kinds",
-        choices=["all", "exact", "similar"],
+        choices=["all", "exact", "similar", "no_humans"],
         default="all",
         help="Which group kinds to isolate (default: all)",
     )
@@ -99,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Destination root for review folders "
         "(default: <scan root from JSON>/_Dedupe Review)",
     )
+
     isolate.add_argument(
         "--isolate-mode",
         choices=["copy", "hardlink", "symlink", "move"],
@@ -106,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     isolate.add_argument(
         "--isolate-kinds",
-        choices=["all", "exact", "similar"],
+        choices=["all", "exact", "similar", "no_humans"],
         default="all",
     )
     isolate.add_argument("--dry-run", action="store_true")
@@ -114,6 +151,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Actually create folders (default is dry-run unless --execute)",
+    )
+
+    undo = sub.add_parser(
+        "undo",
+        help="Restore an executed quarantine action from its JSON receipt",
+    )
+    undo.add_argument("action_log", help="Quarantine action receipt JSON")
+    undo.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually restore files (default is a dry-run preview)",
+    )
+
+    benchmark = sub.add_parser(
+        "benchmark-humans",
+        help="Compare person detectors against a labeled JSON manifest",
+    )
+    benchmark.add_argument(
+        "manifest",
+        help="JSON list of {path, has_person}; relative paths use the manifest folder",
+    )
+    benchmark.add_argument(
+        "--backends",
+        nargs="+",
+        choices=HUMAN_BACKENDS,
+        default=["opencv"],
+        help=(
+            "Backends to compare (default: opencv). Selecting photon or ensemble "
+            "may download model weights on first use."
+        ),
+    )
+    benchmark.add_argument(
+        "--photon-model",
+        default=DEFAULT_PHOTON_MODEL,
+        metavar="MODEL",
+    )
+    benchmark.add_argument(
+        "--json",
+        dest="json_out",
+        metavar="FILE",
+        help="Write detailed predictions and metrics as JSON",
     )
 
     return p
@@ -132,6 +210,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
         args.paths,
         exact=not args.no_exact,
         similar=not args.no_similar,
+        find_no_humans=args.find_no_humans,
+        human_backend=args.human_backend,
+        photon_model=args.photon_model,
         include_images=not args.no_images,
         include_gifs=not args.no_gifs,
         include_videos=not args.no_videos,
@@ -140,6 +221,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         video_threshold=args.video_threshold,
         use_cache=not args.no_cache,
         workers=args.workers,
+        exclusions=args.exclude,
         progress=on_progress,
     )
 
@@ -162,12 +244,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 action="quarantine",
                 quarantine_dir=args.quarantine_dir,
                 dry_run=dry,
+                roots=result.roots,
             )
         elif args.action == "trash":
             action_result = apply_actions(
                 result.groups,
                 action="trash",
                 dry_run=dry,
+                roots=result.roots,
             )
         elif args.action == "isolate":
             kinds = None if args.isolate_kinds == "all" else {args.isolate_kinds}
@@ -254,6 +338,38 @@ def cmd_isolate(args: argparse.Namespace) -> int:
     return 0 if action_result.fail_count == 0 else 1
 
 
+def cmd_undo(args: argparse.Namespace) -> int:
+    result = undo_quarantine(args.action_log, dry_run=not args.execute)
+    mode = "DRY-RUN" if result.dry_run else "EXECUTED"
+    print(
+        f"{mode} undo: {result.success_count} ok, {result.fail_count} failed"
+    )
+    if result.log_path:
+        print(f"Receipt: {result.log_path}")
+    return 0 if result.fail_count == 0 else 1
+
+
+def cmd_benchmark_humans(args: argparse.Namespace) -> int:
+    from .human_benchmark import format_benchmark_report, run_human_benchmark
+
+    try:
+        report = run_human_benchmark(
+            args.manifest,
+            backends=args.backends,
+            photon_model=args.photon_model,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(format_benchmark_report(report))
+    if args.json_out:
+        out = Path(args.json_out).expanduser()
+        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Wrote {out}")
+    return 1 if any(r.get("error") for r in report["results"].values()) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -263,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ui(args)
     if args.command == "isolate":
         return cmd_isolate(args)
+    if args.command == "undo":
+        return cmd_undo(args)
+    if args.command == "benchmark-humans":
+        return cmd_benchmark_humans(args)
     parser.print_help()
     return 1
 

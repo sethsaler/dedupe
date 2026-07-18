@@ -4,6 +4,9 @@
   const RECENT_KEY = "dedupe.recentPaths";
   const QUAR_KEY = "dedupe.quarantineDir";
   const WORKERS_KEY = "dedupe.workers";
+  const SETTINGS_KEY = "dedupe.scanSettings.v1";
+  const CSRF_TOKEN =
+    document.querySelector('meta[name="dedupe-token"]')?.getAttribute("content") || "";
 
   const state = {
     kind: "all",
@@ -15,9 +18,11 @@
     lightboxPaths: [],
     lightboxIndex: 0,
     scanning: false,
+    acting: false,
     cpuCount: 0,
     autoWorkers: 0,
     groupsVersion: -1, // tracks streaming updates mid-scan
+    scanId: null,
   };
 
   const thresh = $("threshold");
@@ -71,6 +76,23 @@
   }
   updateWorkersUI();
 
+  const humanBackend = $("humanBackend");
+  const humanBackendHint = $("humanBackendHint");
+
+  function updateHumanBackendUI() {
+    const enabled = $("optNoHumans").checked;
+    humanBackend.disabled = !enabled;
+    if (!enabled) {
+      humanBackendHint.textContent = "Enable vision review to choose a detector";
+    } else if (humanBackend.value === "opencv") {
+      humanBackendHint.textContent = "fast CPU-only baseline; no model download";
+    } else if (humanBackend.value === "photon") {
+      humanBackendHint.textContent = "higher-capability local model; first use downloads weights";
+    } else {
+      humanBackendHint.textContent = "OpenCV positives first, then Photon for uncertain frames";
+    }
+  }
+
   // —— Options toggle ——
   $("optsToggle").addEventListener("click", () => {
     const panel = $("optionsPanel");
@@ -109,6 +131,14 @@
     return `${n} B`;
   }
 
+  function formatDuration(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 60) return `${total}s`;
+    const minutes = Math.floor(total / 60);
+    const remainder = total % 60;
+    return `${minutes}m ${remainder}s`;
+  }
+
   function basename(p) {
     return (p || "").split(/[/\\]/).pop() || p;
   }
@@ -123,13 +153,69 @@
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Dedupe-Token": CSRF_TOKEN,
+        ...(opts.headers || {}),
+      },
       ...opts,
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || res.statusText);
     return data;
   }
+
+  const settingIds = [
+    "optExact",
+    "optSimilar",
+    "optNoHumans",
+    "humanBackend",
+    "optImages",
+    "optGifs",
+    "optVideos",
+    "threshold",
+    "exclusions",
+  ];
+
+  function saveScanSettings() {
+    const settings = {};
+    for (const id of settingIds) {
+      const element = $(id);
+      settings[id] = element.type === "checkbox" ? element.checked : element.value;
+    }
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function restoreScanSettings() {
+    try {
+      const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+      for (const id of settingIds) {
+        if (!(id in settings)) continue;
+        const element = $(id);
+        if (element.type === "checkbox") element.checked = !!settings[id];
+        else element.value = settings[id];
+      }
+      if (!["opencv", "photon", "ensemble"].includes(humanBackend.value)) {
+        humanBackend.value = "opencv";
+      }
+      threshVal.textContent = thresh.value;
+      updateHumanBackendUI();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  restoreScanSettings();
+  for (const id of settingIds) {
+    $(id).addEventListener($(id).type === "range" ? "input" : "change", saveScanSettings);
+  }
+  $("optNoHumans").addEventListener("change", updateHumanBackendUI);
+  humanBackend.addEventListener("change", updateHumanBackendUI);
+  updateHumanBackendUI();
 
   // —— Recent paths ——
   function loadRecent() {
@@ -186,22 +272,53 @@
     }
   });
 
-  // —— Folder pick (server native dialog when available) ——
-  $("btnPickFolder").addEventListener("click", async () => {
+  // —— Native folder/file pick (the local server can return absolute paths) ——
+  function appendPickedPaths(paths) {
+    const input = $("paths");
+    const existing = input.value
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    for (const path of paths) {
+      if (path && !existing.includes(path)) existing.push(path);
+    }
+    input.value = existing.join(", ");
+    input.focus();
+  }
+
+  async function pickPaths(kind, button) {
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "Opening…";
     try {
-      const data = await api("/api/pick-folder", { method: "POST", body: "{}" });
-      if (data.path) {
-        const cur = $("paths").value.trim();
-        $("paths").value = cur ? `${cur}, ${data.path}` : data.path;
-        toast("Folder added", "ok");
+      const data = await api("/api/pick-folder", {
+        method: "POST",
+        body: JSON.stringify({ kind }),
+      });
+      const paths = data.paths || (data.path ? [data.path] : []);
+      if (paths.length) {
+        appendPickedPaths(paths);
+        toast(`${paths.length} ${kind === "folder" ? "folder" : "file"}${paths.length === 1 ? "" : "s"} added`, "ok");
       } else if (data.cancelled) {
         /* user cancelled */
       } else {
-        toast(data.message || "Paste a folder path instead");
+        toast(data.message || "Paste a local path instead");
       }
     } catch (e) {
-      toast(e.message || "Could not open folder picker — paste a path instead");
+      toast(e.message || "Could not open the native picker — paste a path instead", "error");
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.textContent = originalLabel;
     }
+  }
+
+  $("btnPickFolder").addEventListener("click", (event) => {
+    pickPaths("folder", event.currentTarget);
+  });
+  $("btnPickFiles").addEventListener("click", (event) => {
+    pickPaths("files", event.currentTarget);
   });
 
   // Drag path text onto input
@@ -269,6 +386,11 @@
     const top = $("topStats");
 
     state.scanning = !!s.scanning;
+    state.acting = !!s.acting;
+    state.scanId = s.scan_id || state.scanId;
+    document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
+      element.disabled = state.scanning || state.acting;
+    });
 
     // Configure workers slider from server CPU info (once)
     if (s.system) {
@@ -288,6 +410,7 @@
       statusEl.textContent = "Scanning…";
       statusEl.classList.remove("error");
       $("btnScan").disabled = true;
+      $("btnCancelScan").hidden = false;
       $("btnScan").querySelector(".btn-label").textContent = "Scanning…";
       const p = s.progress || {};
       const total = p.files_found || 0;
@@ -298,12 +421,14 @@
       if (groupsSoFar > 0) pct = Math.max(pct, Math.min(98, 20 + groupsSoFar * 3));
       fill.style.width = `${p.done ? 100 : Math.max(pct, 5)}%`;
       const baseMsg = p.message || p.phase || "";
+      const eta = p.eta_seconds > 0 ? ` · about ${formatDuration(p.eta_seconds)} left` : "";
       msg.textContent =
         groupsSoFar > 0
-          ? `${baseMsg}${baseMsg ? " · " : ""}${groupsSoFar} group${groupsSoFar === 1 ? "" : "s"} so far`
-          : baseMsg;
+          ? `${baseMsg}${baseMsg ? " · " : ""}${groupsSoFar} group${groupsSoFar === 1 ? "" : "s"} so far${eta}`
+          : `${baseMsg}${eta}`;
     } else {
       $("btnScan").disabled = false;
+      $("btnCancelScan").hidden = true;
       $("btnScan").querySelector(".btn-label").textContent = "Scan";
       if (s.progress?.done) {
         fill.style.width = "100%";
@@ -318,8 +443,9 @@
       const scanningNote = s.scanning ? " · live" : "";
       top.innerHTML = `
         <span class="stat-chip"><span class="dot"></span><strong>${s.summary.group_count}</strong> groups${scanningNote}</span>
-        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar</span>
+        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.no_human_files || 0} vision candidates</span>
         <span class="stat-chip reclaim"><span class="dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
+        ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
       `;
       // Show results as soon as we have a result shell (even 0 groups) while scanning,
       // or whenever summary is present after scan.
@@ -332,6 +458,7 @@
       $("countAll").textContent = s.summary.group_count;
       $("countExact").textContent = s.summary.exact_groups;
       $("countSimilar").textContent = s.summary.similar_groups;
+      $("countNoHumans").textContent = s.summary.no_human_files || 0;
     } else {
       top.innerHTML = s.error
         ? `<span class="stat-chip muted-chip">Error: ${escapeHtml(s.error)}</span>`
@@ -369,9 +496,13 @@
 
     const exact = state.allGroups.filter((g) => g.kind === "exact").length;
     const similar = state.allGroups.filter((g) => g.kind === "similar").length;
+    const noHumans = state.allGroups
+      .filter((g) => g.kind === "no_humans")
+      .reduce((count, g) => count + (g.member_count || 0), 0);
     $("countAll").textContent = state.allGroups.length;
     $("countExact").textContent = exact;
     $("countSimilar").textContent = similar;
+    $("countNoHumans").textContent = noHumans;
 
     if (state.groups.length) {
       $("emptyState").hidden = true;
@@ -415,14 +546,18 @@
       .map((g) => {
         const active = g.id === state.currentId ? "active" : "";
         const sel = groupSelectedCount(g);
+        const badgeLabel = g.kind === "no_humans" ? "vision candidate" : g.kind;
+        const groupSummary = g.kind === "no_humans" && !sel
+          ? `${g.member_count} candidates to review`
+          : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
         return `
           <button class="group-item ${active}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
             <div class="g-top">
               <span>${g.member_count} files · ${escapeHtml(g.media_type)}</span>
-              <span class="badge ${g.kind}">${g.kind}</span>
+              <span class="badge ${g.kind}">${badgeLabel}</span>
             </div>
             <div class="g-sub">
-              <span>${formatBytes(g.reclaimable_bytes)} reclaimable</span>
+              <span>${groupSummary}</span>
               ${sel ? `<span class="sel-mark">${sel} selected</span>` : ""}
             </div>
           </button>
@@ -442,8 +577,22 @@
     const g = await api(`/api/groups/${id}`);
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
-    $("detailTitle").textContent = `${g.kind} · ${g.media_type} · ${g.member_count} files`;
-    $("detailMeta").textContent = `${formatBytes(g.reclaimable_bytes)} reclaimable if extras removed`;
+    const kindLabel = g.kind === "no_humans" ? "No person detected — vision review" : g.kind;
+    $("detailTitle").textContent = `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
+    const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
+    const keeperWhy = keeper
+      ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ranked by resolution, size, date, and path.`
+      : "";
+    $("detailMeta").textContent = g.kind === "no_humans"
+      ? `${formatBytes(g.reclaimable_bytes)} reviewed and selected · detector output is not a guarantee`
+      : `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
+    $("smartRule").querySelectorAll("option").forEach((option) => {
+      const candidateOnly = option.value === "select_candidates";
+      option.disabled = g.kind === "no_humans" ? !candidateOnly && option.value !== "deselect_all" : candidateOnly;
+    });
+    if ($("smartRule").selectedOptions[0]?.disabled) {
+      $("smartRule").value = g.kind === "no_humans" ? "deselect_all" : "automatic";
+    }
     renderMembers(g);
     // keep list item in view
     const active = document.querySelector(`.group-item[data-id="${id}"]`);
@@ -460,6 +609,7 @@
       .map((m, i) => {
         const isKeep = m.path === g.suggested_keep && !selected.has(m.path);
         const isSel = selected.has(m.path);
+        const reviewed = new Set(g.reviewed_paths || []).has(m.path);
         const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
         const focused = i === state.memberFocus ? "focused" : "";
@@ -468,12 +618,16 @@
           : isKeep
             ? `<span class="thumb-badge keep">Keep</span>`
             : "";
+        const evidence = g.kind === "exact"
+          ? "Byte-identical SHA-256 match"
+          : g.kind === "similar"
+            ? "Direct perceptual match to the suggested keeper"
+            : `Vision detector (${m.human_detector || "OpenCV"}) analyzed ${m.human_frames_analyzed || 0} frame(s); no supported person detection exceeded the threshold`;
         return `
           <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
             <div class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${i}" title="Click to enlarge">
               ${badge}
-              <img src="${thumb}" alt="" loading="lazy"
-                onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb-fallback',textContent:'No preview'}))" />
+              <img class="thumb-image" src="${thumb}" alt="" loading="lazy" />
             </div>
             <div class="card-body">
               <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(basename(m.path))}</div>
@@ -482,10 +636,11 @@
                 <span>${formatBytes(m.size)}</span>
                 <span>${dims}</span>
               </div>
+              <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
                 <label>
                   <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
-                  Remove
+                  ${g.kind === "no_humans" ? (reviewed ? "Reviewed + remove" : "Review + remove") : "Remove"}
                 </label>
                 <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>
               </div>
@@ -495,6 +650,15 @@
       })
       .join("");
 
+    box.querySelectorAll(".thumb-image").forEach((image) => {
+      image.addEventListener("error", () => {
+        const fallback = document.createElement("div");
+        fallback.className = "thumb-fallback";
+        fallback.textContent = "No preview";
+        image.replaceWith(fallback);
+      });
+    });
+
     box.querySelectorAll(".sel-cb").forEach((cb) => {
       cb.addEventListener("change", async () => {
         const checks = [...box.querySelectorAll(".sel-cb")];
@@ -502,7 +666,11 @@
         try {
           const updated = await api("/api/selection", {
             method: "POST",
-            body: JSON.stringify({ group_id: g.id, selected: selectedPaths }),
+            body: JSON.stringify({
+              group_id: g.id,
+              selected: selectedPaths,
+              scan_id: state.scanId,
+            }),
           });
           const idx = state.groups.findIndex((x) => x.id === g.id);
           if (idx >= 0) state.groups[idx] = updated;
@@ -547,24 +715,48 @@
     });
   }
 
-  function updateSelectionSummary() {
-    let count = 0;
-    let bytes = 0;
+  function effectiveSelection() {
     const source = state.allGroups.length ? state.allGroups : state.groups;
+    const selected = new Map();
     for (const g of source) {
       const sel = new Set(g.selected_for_removal || []);
+      const reviewed = new Set(g.reviewed_paths || []);
       for (const m of g.members || []) {
-        if (sel.has(m.path)) {
-          count += 1;
-          bytes += m.size || 0;
+        if (sel.has(m.path) && (g.kind !== "no_humans" || reviewed.has(m.path))) {
+          selected.set(m.path, m);
         }
       }
     }
+    for (const g of source) {
+      if (g.kind === "no_humans" || !(g.members || []).length) continue;
+      if (g.members.every((m) => selected.has(m.path))) {
+        selected.delete(g.suggested_keep || g.members[0].path);
+      }
+    }
+    return [...selected.values()];
+  }
+
+  function updateSelectionSummary() {
+    const selected = effectiveSelection();
+    const count = selected.length;
+    const bytes = selected.reduce((total, member) => total + (member.size || 0), 0);
     $("selectionSummary").textContent = `${count} file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
   }
 
   // —— Scan ——
   $("btnScan").addEventListener("click", startScan);
+  $("btnCancelScan").addEventListener("click", async () => {
+    try {
+      await api("/api/scan/cancel", {
+        method: "POST",
+        body: JSON.stringify({ scan_id: state.scanId }),
+      });
+      $("btnCancelScan").disabled = true;
+      toast("Cancelling scan after the current work item…");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  });
   $("paths").addEventListener("keydown", (e) => {
     if (e.key === "Enter") startScan();
   });
@@ -592,25 +784,30 @@
       $("countAll").textContent = "0";
       $("countExact").textContent = "0";
       $("countSimilar").textContent = "0";
+      $("countNoHumans").textContent = "0";
       state.groups = [];
       state.allGroups = [];
       state.currentId = null;
       state.groupsVersion = -1;
       const workersRaw = Number($("workers").value);
-      await api("/api/scan", {
+      const started = await api("/api/scan", {
         method: "POST",
         body: JSON.stringify({
           paths,
           exact: $("optExact").checked,
           similar: $("optSimilar").checked,
+          find_no_humans: $("optNoHumans").checked,
+          human_backend: humanBackend.value,
           include_images: $("optImages").checked,
           include_gifs: $("optGifs").checked,
           include_videos: $("optVideos").checked,
           threshold: Number($("threshold").value),
           // 0 / Auto → null so backend uses resolve_workers auto
           workers: workersRaw > 0 ? workersRaw : null,
+          exclusions: $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean),
         }),
       });
+      state.scanId = started.scan_id || state.scanId;
       if (state.pollTimer) clearInterval(state.pollTimer);
       state.pollTimer = setInterval(async () => {
         try {
@@ -627,6 +824,8 @@
       }, 350);
     } catch (e) {
       toast(e.message, "error");
+    } finally {
+      $("btnCancelScan").disabled = false;
     }
   }
 
@@ -644,7 +843,11 @@
     try {
       const g = await api("/api/smart-select", {
         method: "POST",
-        body: JSON.stringify({ rule: $("smartRule").value, group_id: state.currentId }),
+        body: JSON.stringify({
+          rule: $("smartRule").value,
+          group_id: state.currentId,
+          scan_id: state.scanId,
+        }),
       });
       const idx = state.groups.findIndex((x) => x.id === g.id);
       if (idx >= 0) state.groups[idx] = g;
@@ -663,7 +866,7 @@
     try {
       await api("/api/smart-select", {
         method: "POST",
-        body: JSON.stringify({ rule: $("smartRule").value }),
+        body: JSON.stringify({ rule: $("smartRule").value, scan_id: state.scanId }),
       });
       await loadGroups();
       toast("Smart select applied to all groups", "ok");
@@ -682,9 +885,7 @@
     }
 
     // selection check
-    let count = 0;
-    const source = state.allGroups.length ? state.allGroups : state.groups;
-    for (const g of source) count += groupSelectedCount(g);
+    const count = effectiveSelection().length;
     if (action !== "isolate" && count === 0 && !dryRun) {
       toast("No files selected for removal");
       return;
@@ -697,9 +898,9 @@
         isolate: "Copy all groups into a _Dedupe Review folder inside the scan root?",
       };
       const bodies = {
-        trash: `${count} file(s) will go to Trash (recoverable in Finder on macOS).`,
-        quarantine: `${count} file(s) will move to ${quarantine_dir}.`,
-        isolate: "Originals stay put (copy mode). Opens a review tree for inspection.",
+        trash: `${count} file(s) will be revalidated, then go to Trash (recoverable in Finder on macOS).`,
+        quarantine: `${count} file(s) will be revalidated, then move to ${quarantine_dir}.`,
+        isolate: "Every source will be revalidated, then copied into a new timestamped review session. Originals stay put.",
       };
       const ok = await confirmModal({
         title: labels[action] || "Confirm",
@@ -711,7 +912,12 @@
     }
 
     try {
-      const payload = { action, dry_run: dryRun, quarantine_dir };
+      const payload = {
+        action,
+        dry_run: dryRun,
+        quarantine_dir,
+        scan_id: state.scanId,
+      };
       if (action === "isolate") {
         payload.isolate_mode = "copy";
       }
@@ -722,6 +928,10 @@
       const mode = dryRun ? "Preview" : "Done";
       let msg = `${mode}: ${res.success_count} ok, ${res.fail_count} failed`;
       if (res.review_root) msg += ` · ${res.review_root}`;
+      if (res.log_path) msg += ` · receipt saved`;
+      if (res.fail_count && res.items?.find((item) => item.error)?.error) {
+        msg += ` · ${res.items.find((item) => item.error).error}`;
+      }
       toast(msg, res.fail_count ? "" : "ok");
       if (!dryRun) {
         await loadGroups();
