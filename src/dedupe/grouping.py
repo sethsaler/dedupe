@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from .human_policy import is_current_no_person_decision
 from .models import DuplicateGroup, FileRecord, GroupKind, MediaType, SmartRule
 
 
@@ -142,11 +143,19 @@ def build_groups(
 def build_no_human_groups(
     members: list[FileRecord], *, chunk_size: int = 50
 ) -> list[DuplicateGroup]:
-    """Build review-sized candidate groups, separated by media type."""
+    """Build review groups only from explicit no-person detector decisions."""
     groups: list[DuplicateGroup] = []
     for media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO):
         matching = sorted(
-            (member for member in members if member.media_type == media_type),
+            (
+                member
+                for member in members
+                if member.media_type == media_type
+                and is_current_no_person_decision(
+                    member.human_detection_status,
+                    member.human_detection_signature,
+                )
+            ),
             key=lambda member: member.path,
         )
         for offset in range(0, len(matching), chunk_size):

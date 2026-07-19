@@ -142,13 +142,23 @@
         </div>
         <div class="detail-body" id="detailBody" hidden>
           <div class="detail-header">
-            <div>
+            <div class="detail-heading">
               <h2 id="detailTitle">Group</h2>
               <p class="muted" id="detailMeta"></p>
             </div>
+          </div>
+          <div class="selection-toolbar" aria-label="Group selection controls">
+            <div class="group-selection-summary">
+              <span>Group selection</span>
+              <strong id="groupSelectionSummary">0 of 0 selected</strong>
+            </div>
+            <div class="quick-selection">
+              <button class="btn primary-soft" id="btnSelectSuggested" type="button">Use suggested</button>
+              <button class="btn ghost" id="btnClearGroup" type="button">Deselect all</button>
+            </div>
             <div class="detail-tools">
               <label>
-                Smart Select
+                Selection rule
                 <select id="smartRule">
                   <option value="automatic">Automatic</option>
                   <option value="newest">Keep newest</option>
@@ -160,8 +170,8 @@
                   <option value="select_candidates">Mark reviewed + select non-human</option>
                 </select>
               </label>
-              <button class="btn" id="btnSmartGroup" type="button">Apply to group</button>
-              <button class="btn ghost" id="btnSmartAll" type="button">Apply to all</button>
+              <button class="btn" id="btnSmartGroup" type="button">Apply to this group</button>
+              <button class="btn ghost" id="btnSmartAll" type="button">Apply to every group</button>
             </div>
           </div>
           <div class="members" id="members"></div>
@@ -189,16 +199,16 @@
           <input id="quarantineDir" type="text" placeholder="~/Duplicates" spellcheck="false" />
         </label>
         <div class="btn-group">
-          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash">Preview</button>
-          <button class="btn danger" id="btnTrash" type="button">Trash</button>
+          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash">Preview trash</button>
+          <button class="btn danger" id="btnTrash" type="button">Move to Trash</button>
         </div>
         <div class="btn-group">
-          <button class="btn ghost" id="btnDryQuarantine" type="button">Preview</button>
+          <button class="btn ghost" id="btnDryQuarantine" type="button">Preview quarantine</button>
           <button class="btn warn" id="btnQuarantine" type="button">Quarantine</button>
         </div>
         <div class="btn-group">
-          <button class="btn ghost" id="btnDryIsolate" type="button" title="Copy groups into _Dedupe Review inside source">Preview</button>
-          <button class="btn secondary" id="btnIsolate" type="button">Isolate</button>
+          <button class="btn ghost" id="btnDryIsolate" type="button" title="Copy groups into _Dedupe Review inside source">Preview isolate</button>
+          <button class="btn secondary" id="btnIsolate" type="button">Isolate copies</button>
         </div>
       </div>
     </footer>

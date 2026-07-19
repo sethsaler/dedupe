@@ -11,7 +11,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
-- **Hash cache** — `~/.cache/dedupe/hashes.sqlite3` for fast re-scans
+- **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media
 - **Local web UI** — thumbnails, lightbox, smart select, keyboard nav, native folder/file picker, isolate
 
 ## Requirements
@@ -153,11 +153,13 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
 | Similar videos | Ordered ffmpeg frame pHashes compared at normalized timeline positions (default mean Hamming ≤ 8) |
-| No person detected | Offline OpenCV face + full-body detection on images, representative GIF frames, and up to 8 sampled video frames |
+| No person detected | Offline OpenCV YuNet face + full-body detection on images, representative GIF frames, and up to 16 sampled video frames |
 
 The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 through the local Photon runtime), or `ensemble` (OpenCV positives first, then Photon on uncertain frames). Photon stays opt-in: its first use can download roughly 10 GB of model weights, and detection returns person/face boxes rather than a calibrated confidence score. All processing remains local after the model is available.
 
-“No person detected” is a computer-vision-assisted review filter, not a guarantee. It is opt-in and leaves non-human files unselected until you review them manually or apply **Mark reviewed + select non-human**. The UI shows how many frames were analyzed. Small, profile, obscured, seated, or unsampled people can still be missed. OpenCV is an optional, CPU-only dependency and does not download a model at runtime.
+“No person detected” is a conservative computer-vision-assisted review filter, not a guarantee. It is opt-in and leaves non-human files unselected until you review them manually or apply **Mark reviewed + select non-human**. OpenCV runs the bundled YuNet face model before its full-body detector; if the face model is missing, corrupt, or cannot start, the scan fails closed and surfaces no media as Non-Human. The UI shows how many frames were analyzed. Obscured or unsampled people can still be missed. OpenCV is an optional, CPU-only dependency and does not download a model at runtime.
+
+The bundled YuNet model comes from the official OpenCV Model Zoo. Its MIT license is included at `src/dedupe/assets/LICENSE-YUNET.txt`.
 
 ### Benchmark Photon against your own media
 
@@ -200,8 +202,8 @@ Also:
 
 - Futures stay windowed (~2× workers in flight) so 50k files don’t allocate 50k tasks at once
 - Image decode uses Pillow `draft()` + thumbnail so 12MP HEIC/JPEG never hold full-res RGB
-- Video uses **one-pass** frame sampling (not N independent seeks) at 320px width
-- Hash cache means re-scans skip almost all of the above
+- Video uses **one-pass** frame sampling (not N independent seeks): 320px for duplicate fingerprints and 640px for person detection
+- The scan cache means re-scans skip hashes and person checks for unchanged media; new, replaced, or modified files are analyzed normally
 
 For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2`.
 

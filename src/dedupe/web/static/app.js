@@ -545,6 +545,23 @@
     });
   }
 
+  function updateDetailMeta(g) {
+    if (g.kind === "no_humans") {
+      const reviewed = new Set(g.reviewed_paths || []);
+      const selected = new Set(g.selected_for_removal || []);
+      $("detailMeta").textContent =
+        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · detector output is not a guarantee`;
+      return;
+    }
+
+    const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
+    const keeperWhy = keeper
+      ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ranked by resolution, size, date, and path.`
+      : "";
+    $("detailMeta").textContent =
+      `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
+  }
+
   async function selectGroup(id, { silent = false } = {}) {
     state.currentId = id;
     state.memberFocus = 0;
@@ -554,13 +571,6 @@
     $("detailBody").hidden = false;
     const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
     $("detailTitle").textContent = `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
-    const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
-    const keeperWhy = keeper
-      ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ranked by resolution, size, date, and path.`
-      : "";
-    $("detailMeta").textContent = g.kind === "no_humans"
-      ? `${formatBytes(g.reclaimable_bytes)} reviewed and selected · detector output is not a guarantee`
-      : `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
       option.disabled = g.kind === "no_humans" ? !candidateOnly && option.value !== "deselect_all" : candidateOnly;
@@ -568,6 +578,8 @@
     if ($("smartRule").selectedOptions[0]?.disabled) {
       $("smartRule").value = g.kind === "no_humans" ? "deselect_all" : "automatic";
     }
+    $("btnSelectSuggested").textContent =
+      g.kind === "no_humans" ? "Review + select all" : "Use suggested";
     renderMembers(g);
     // keep list item in view
     const active = document.querySelector(`.group-item[data-id="${id}"]`);
@@ -577,17 +589,24 @@
   function renderMembers(g) {
     const box = $("members");
     const selected = new Set(g.selected_for_removal || []);
+    const reviewedPaths = new Set(g.reviewed_paths || []);
     const members = g.members || [];
     state.lightboxPaths = members.map((m) => m.path);
+    updateDetailMeta(g);
+    const reviewedCount = members.filter((member) => reviewedPaths.has(member.path)).length;
+    $("groupSelectionSummary").textContent = g.kind === "no_humans"
+      ? `${selected.size} selected · ${reviewedCount} of ${members.length} reviewed`
+      : `${selected.size} of ${members.length} selected for removal`;
 
     box.innerHTML = members
       .map((m, i) => {
         const isKeep = m.path === g.suggested_keep && !selected.has(m.path);
         const isSel = selected.has(m.path);
-        const reviewed = new Set(g.reviewed_paths || []).has(m.path);
+        const reviewed = reviewedPaths.has(m.path);
         const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
         const focused = i === state.memberFocus ? "focused" : "";
+        const fileName = basename(m.path);
         const badge = isSel
           ? `<span class="thumb-badge remove">Remove</span>`
           : isKeep
@@ -598,14 +617,20 @@
           : g.kind === "similar"
             ? "Direct perceptual match to the suggested keeper"
             : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
+        const selectionTitle = isSel
+          ? (g.kind === "no_humans" ? "Reviewed · selected" : "Selected for removal")
+          : (g.kind === "no_humans" && reviewed ? "Reviewed · not selected" : "Not selected");
+        const selectionHint = isSel
+          ? "Click to keep this file"
+          : (g.kind === "no_humans" ? "Click to review and remove" : "Click to remove this file");
         return `
           <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
-            <div class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${i}" title="Click to enlarge">
+            <button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${i}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
-              <img class="thumb-image" src="${thumb}" alt="" loading="lazy" />
-            </div>
+              <img class="thumb-image" src="${thumb}" alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />
+            </button>
             <div class="card-body">
-              <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(basename(m.path))}</div>
+              <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
               <div class="path" title="${escapeHtml(m.path)}">${escapeHtml(m.path)}</div>
               <div class="card-meta">
                 <span>${formatBytes(m.size)}</span>
@@ -613,9 +638,12 @@
               </div>
               <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
-                <label>
+                <label class="selection-control">
                   <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
-                  ${g.kind === "no_humans" ? (reviewed ? "Reviewed + remove" : "Review + remove") : "Remove"}
+                  <span class="selection-copy">
+                    <strong>${selectionTitle}</strong>
+                    <small>${selectionHint}</small>
+                  </span>
                 </label>
                 <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>
               </div>
@@ -636,6 +664,7 @@
 
     box.querySelectorAll(".sel-cb").forEach((cb) => {
       cb.addEventListener("change", async () => {
+        const changedPath = cb.dataset.path;
         const checks = [...box.querySelectorAll(".sel-cb")];
         const selectedPaths = checks.filter((c) => c.checked).map((c) => c.dataset.path);
         try {
@@ -652,6 +681,9 @@
           const aidx = state.allGroups.findIndex((x) => x.id === g.id);
           if (aidx >= 0) state.allGroups[aidx] = updated;
           renderMembers(updated);
+          const replacement = [...box.querySelectorAll(".sel-cb")]
+            .find((input) => input.dataset.path === changedPath);
+          if (replacement) replacement.focus();
           renderGroupList();
           updateSelectionSummary();
         } catch (e) {
@@ -830,13 +862,13 @@
     });
   });
 
-  $("btnSmartGroup").addEventListener("click", async () => {
+  async function applyRuleToCurrentGroup(rule, successMessage) {
     if (!state.currentId) return toast("Select a group first");
     try {
       const g = await api("/api/smart-select", {
         method: "POST",
         body: JSON.stringify({
-          rule: $("smartRule").value,
+          rule,
           group_id: state.currentId,
           scan_id: state.scanId,
         }),
@@ -848,10 +880,28 @@
       renderMembers(g);
       renderGroupList();
       updateSelectionSummary();
-      toast("Smart select applied to group", "ok");
+      toast(successMessage, "ok");
     } catch (e) {
       toast(e.message, "error");
     }
+  }
+
+  $("btnSelectSuggested").addEventListener("click", async () => {
+    const current = state.allGroups.find((group) => group.id === state.currentId)
+      || state.groups.find((group) => group.id === state.currentId);
+    const rule = current?.kind === "no_humans" ? "select_candidates" : "automatic";
+    const message = current?.kind === "no_humans"
+      ? "All non-human candidates reviewed and selected"
+      : "Suggested selection applied";
+    await applyRuleToCurrentGroup(rule, message);
+  });
+
+  $("btnClearGroup").addEventListener("click", async () => {
+    await applyRuleToCurrentGroup("deselect_all", "Group selection cleared");
+  });
+
+  $("btnSmartGroup").addEventListener("click", async () => {
+    await applyRuleToCurrentGroup($("smartRule").value, "Selection rule applied to group");
   });
 
   $("btnSmartAll").addEventListener("click", async () => {

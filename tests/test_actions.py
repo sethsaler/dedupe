@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dedupe.actions import apply_actions, undo_quarantine
 from dedupe.grouping import apply_smart_select, build_groups, build_no_human_groups
+from dedupe.human_detection import human_detection_signature
 from dedupe.models import FileRecord, MediaType, SmartRule
 
 
@@ -99,6 +100,8 @@ def test_apply_actions_can_be_scoped_by_kind(tmp_path: Path) -> None:
 
     # A reviewed non-human candidate selected for removal.
     c = _rec(tmp_path / "landscape.jpg", b"scenery-bytes")
+    c.human_detection_status = "no_person_detected"
+    c.human_detection_signature = human_detection_signature()
     no_human_group = build_no_human_groups([c])[0]
     apply_smart_select(no_human_group, SmartRule.SELECT_CANDIDATES)
 

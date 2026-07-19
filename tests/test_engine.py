@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from PIL import Image
 
 from dedupe.engine import run_scan
+from dedupe.human_detection import human_detection_signature
 from dedupe.models import GroupKind
 from dedupe.similar_video import _extract_frames
 
@@ -88,6 +89,12 @@ def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> N
 
     def fake_find(records, *, progress=None, **_kwargs):
         captured.update(_kwargs)
+        for record in records:
+            record.human_detection_status = "no_person_detected"
+            record.human_detection_signature = human_detection_signature(
+                _kwargs.get("backend", "opencv"),
+                photon_model=_kwargs.get("photon_model", "test-model"),
+            )
         if progress:
             progress("human-detection", len(records), len(records))
         return records
@@ -108,6 +115,56 @@ def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> N
     assert result.groups[0].selected_for_removal == []
     assert captured["backend"] == "photon"
     assert captured["photon_model"] == "test-model"
+
+
+def test_repeated_human_scan_only_analyzes_new_files(tmp_path: Path, monkeypatch) -> None:
+    _save(tmp_path / "first.jpg", (30, 120, 60))
+    cache_path = tmp_path / "hashes.sqlite3"
+    calls = 0
+
+    class FakeDetector:
+        backend = "opencv-test"
+
+        def score(self, _frame):
+            nonlocal calls
+            calls += 1
+            return 0.0
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector",
+        lambda *_args, **_kwargs: FakeDetector(),
+    )
+
+    first = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        cache_path=cache_path,
+    )
+    second = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        cache_path=cache_path,
+    )
+    _save(tmp_path / "second.jpg", (80, 30, 120))
+    third = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        cache_path=cache_path,
+    )
+
+    assert calls == 2
+    assert first.no_human_files == 1
+    assert second.no_human_files == 1
+    assert third.no_human_files == 2
 
 
 def test_human_scan_rejects_frames_from_partial_video_decode(

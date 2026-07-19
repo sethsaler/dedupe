@@ -1,4 +1,4 @@
-"""SQLite cache for hashes keyed by path + size + mtime."""
+"""SQLite cache for hashes and person checks keyed by strong file identity."""
 
 from __future__ import annotations
 
@@ -44,7 +44,12 @@ class HashCache:
                 phash TEXT,
                 dhash TEXT,
                 video_fingerprint TEXT,
-                duration REAL
+                duration REAL,
+                human_detection_status TEXT,
+                human_detector TEXT,
+                human_detection_signature TEXT,
+                human_frames_analyzed INTEGER,
+                human_max_confidence REAL
             )
             """
         )
@@ -56,6 +61,11 @@ class HashCache:
             "device": "INTEGER",
             "inode": "INTEGER",
             "algorithm_version": "TEXT NOT NULL DEFAULT ''",
+            "human_detection_status": "TEXT",
+            "human_detector": "TEXT",
+            "human_detection_signature": "TEXT",
+            "human_frames_analyzed": "INTEGER",
+            "human_max_confidence": "REAL",
         }
         for column, declaration in migrations.items():
             if column not in existing:
@@ -102,8 +112,10 @@ class HashCache:
             INSERT INTO hashes (
                 path, size, mtime, mtime_ns, device, inode, algorithm_version,
                 media_type, width, height, sha256, partial_hash, phash, dhash,
-                video_fingerprint, duration
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                video_fingerprint, duration, human_detection_status,
+                human_detector, human_detection_signature, human_frames_analyzed,
+                human_max_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 size=excluded.size,
                 mtime=excluded.mtime,
@@ -119,7 +131,12 @@ class HashCache:
                 phash=excluded.phash,
                 dhash=excluded.dhash,
                 video_fingerprint=excluded.video_fingerprint,
-                duration=excluded.duration
+                duration=excluded.duration,
+                human_detection_status=excluded.human_detection_status,
+                human_detector=excluded.human_detector,
+                human_detection_signature=excluded.human_detection_signature,
+                human_frames_analyzed=excluded.human_frames_analyzed,
+                human_max_confidence=excluded.human_max_confidence
             """,
             (
                 rec.path,
@@ -138,6 +155,11 @@ class HashCache:
                 rec.dhash,
                 rec.video_fingerprint,
                 rec.duration,
+                rec.human_detection_status,
+                rec.human_detector,
+                rec.human_detection_signature,
+                rec.human_frames_analyzed,
+                rec.human_max_confidence,
             ),
         )
 
@@ -160,6 +182,23 @@ class HashCache:
             rec.dhash = row["dhash"] or rec.dhash
             rec.video_fingerprint = row["video_fingerprint"] or rec.video_fingerprint
             rec.duration = row["duration"] if row["duration"] is not None else rec.duration
+            rec.human_detection_status = (
+                row["human_detection_status"] or rec.human_detection_status
+            )
+            rec.human_detector = row["human_detector"] or rec.human_detector
+            rec.human_detection_signature = (
+                row["human_detection_signature"] or rec.human_detection_signature
+            )
+            rec.human_frames_analyzed = (
+                row["human_frames_analyzed"]
+                if row["human_frames_analyzed"] is not None
+                else rec.human_frames_analyzed
+            )
+            rec.human_max_confidence = (
+                row["human_max_confidence"]
+                if row["human_max_confidence"] is not None
+                else rec.human_max_confidence
+            )
             if row["media_type"]:
                 try:
                     rec.media_type = MediaType(row["media_type"])
@@ -169,6 +208,17 @@ class HashCache:
 
     def store_all(self, records: list[FileRecord]) -> None:
         for rec in records:
-            if rec.sha256 or rec.phash or rec.video_fingerprint or rec.partial_hash:
+            has_person_decision = (
+                rec.human_detection_status
+                in {"person_detected", "no_person_detected"}
+                and bool(rec.human_detection_signature)
+            )
+            if (
+                rec.sha256
+                or rec.phash
+                or rec.video_fingerprint
+                or rec.partial_hash
+                or has_person_decision
+            ):
                 self.put(rec)
         self.commit()
