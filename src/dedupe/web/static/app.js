@@ -76,23 +76,6 @@
   }
   updateWorkersUI();
 
-  const humanBackend = $("humanBackend");
-  const humanBackendHint = $("humanBackendHint");
-
-  function updateHumanBackendUI() {
-    const enabled = $("optNoHumans").checked;
-    humanBackend.disabled = !enabled;
-    if (!enabled) {
-      humanBackendHint.textContent = "Enable vision review to choose a detector";
-    } else if (humanBackend.value === "opencv") {
-      humanBackendHint.textContent = "fast CPU-only baseline; no model download";
-    } else if (humanBackend.value === "photon") {
-      humanBackendHint.textContent = "higher-capability local model; first use downloads weights";
-    } else {
-      humanBackendHint.textContent = "OpenCV positives first, then Photon for uncertain frames";
-    }
-  }
-
   // —— Options toggle ——
   $("optsToggle").addEventListener("click", () => {
     const panel = $("optionsPanel");
@@ -169,7 +152,6 @@
     "optExact",
     "optSimilar",
     "optNoHumans",
-    "humanBackend",
     "optImages",
     "optGifs",
     "optVideos",
@@ -199,11 +181,7 @@
         if (element.type === "checkbox") element.checked = !!settings[id];
         else element.value = settings[id];
       }
-      if (!["opencv", "photon", "ensemble"].includes(humanBackend.value)) {
-        humanBackend.value = "opencv";
-      }
       threshVal.textContent = thresh.value;
-      updateHumanBackendUI();
     } catch {
       /* ignore */
     }
@@ -213,9 +191,6 @@
   for (const id of settingIds) {
     $(id).addEventListener($(id).type === "range" ? "input" : "change", saveScanSettings);
   }
-  $("optNoHumans").addEventListener("change", updateHumanBackendUI);
-  humanBackend.addEventListener("change", updateHumanBackendUI);
-  updateHumanBackendUI();
 
   // —— Recent paths ——
   function loadRecent() {
@@ -443,7 +418,7 @@
       const scanningNote = s.scanning ? " · live" : "";
       top.innerHTML = `
         <span class="stat-chip"><span class="dot"></span><strong>${s.summary.group_count}</strong> groups${scanningNote}</span>
-        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.no_human_files || 0} vision candidates</span>
+        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.no_human_files || 0} non-human</span>
         <span class="stat-chip reclaim"><span class="dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
         ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
       `;
@@ -546,9 +521,9 @@
       .map((g) => {
         const active = g.id === state.currentId ? "active" : "";
         const sel = groupSelectedCount(g);
-        const badgeLabel = g.kind === "no_humans" ? "vision candidate" : g.kind;
+        const badgeLabel = g.kind === "no_humans" ? "non-human" : g.kind;
         const groupSummary = g.kind === "no_humans" && !sel
-          ? `${g.member_count} candidates to review`
+          ? `${g.member_count} non-human files to review`
           : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
         return `
           <button class="group-item ${active}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
@@ -577,7 +552,7 @@
     const g = await api(`/api/groups/${id}`);
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
-    const kindLabel = g.kind === "no_humans" ? "No person detected — vision review" : g.kind;
+    const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
     $("detailTitle").textContent = `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
     const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
     const keeperWhy = keeper
@@ -622,7 +597,7 @@
           ? "Byte-identical SHA-256 match"
           : g.kind === "similar"
             ? "Direct perceptual match to the suggested keeper"
-            : `Vision detector (${m.human_detector || "OpenCV"}) analyzed ${m.human_frames_analyzed || 0} frame(s); no supported person detection exceeded the threshold`;
+            : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
         return `
           <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
             <div class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${i}" title="Click to enlarge">
@@ -715,10 +690,24 @@
     });
   }
 
-  function effectiveSelection() {
+  function currentScope() {
+    const el = $("actionScope");
+    return el ? el.value : "all";
+  }
+
+  function scopeLabelFor(scope) {
+    return (
+      { exact: "Exact", similar: "Similar", no_humans: "Non-Human", all: "All" }[scope] ||
+      "All"
+    );
+  }
+
+  function effectiveSelection(scope = currentScope()) {
     const source = state.allGroups.length ? state.allGroups : state.groups;
+    const inScope = (g) => scope === "all" || g.kind === scope;
     const selected = new Map();
     for (const g of source) {
+      if (!inScope(g)) continue;
       const sel = new Set(g.selected_for_removal || []);
       const reviewed = new Set(g.reviewed_paths || []);
       for (const m of g.members || []) {
@@ -728,6 +717,7 @@
       }
     }
     for (const g of source) {
+      if (!inScope(g)) continue;
       if (g.kind === "no_humans" || !(g.members || []).length) continue;
       if (g.members.every((m) => selected.has(m.path))) {
         selected.delete(g.suggested_keep || g.members[0].path);
@@ -737,10 +727,12 @@
   }
 
   function updateSelectionSummary() {
-    const selected = effectiveSelection();
+    const scope = currentScope();
+    const selected = effectiveSelection(scope);
     const count = selected.length;
     const bytes = selected.reduce((total, member) => total + (member.size || 0), 0);
-    $("selectionSummary").textContent = `${count} file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
+    const prefix = scope === "all" ? "" : `${scopeLabelFor(scope)} · `;
+    $("selectionSummary").textContent = `${prefix}${count} file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
   }
 
   // —— Scan ——
@@ -797,7 +789,7 @@
           exact: $("optExact").checked,
           similar: $("optSimilar").checked,
           find_no_humans: $("optNoHumans").checked,
-          human_backend: humanBackend.value,
+          human_backend: "opencv",
           include_images: $("optImages").checked,
           include_gifs: $("optGifs").checked,
           include_videos: $("optVideos").checked,
@@ -884,23 +876,25 @@
       return;
     }
 
-    // selection check
-    const count = effectiveSelection().length;
+    // selection check (scoped to the chosen category)
+    const scope = currentScope();
+    const scopeLabel = scope === "all" ? "" : `${scopeLabelFor(scope)} `;
+    const count = effectiveSelection(scope).length;
     if (action !== "isolate" && count === 0 && !dryRun) {
-      toast("No files selected for removal");
+      toast(`No ${scopeLabel}files selected for removal`);
       return;
     }
 
     if (!dryRun) {
       const labels = {
-        trash: "Move selected files to Trash?",
-        quarantine: "Move selected files to quarantine?",
-        isolate: "Copy all groups into a _Dedupe Review folder inside the scan root?",
+        trash: `Move selected ${scopeLabel}files to Trash?`,
+        quarantine: `Move selected ${scopeLabel}files to quarantine?`,
+        isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `${count} file(s) will be revalidated, then go to Trash (recoverable in Finder on macOS).`,
-        quarantine: `${count} file(s) will be revalidated, then move to ${quarantine_dir}.`,
-        isolate: "Every source will be revalidated, then copied into a new timestamped review session. Originals stay put.",
+        trash: `${count} ${scopeLabel}file(s) will be revalidated, then go to Trash (recoverable in Finder on macOS).`,
+        quarantine: `${count} ${scopeLabel}file(s) will be revalidated, then move to ${quarantine_dir}.`,
+        isolate: `${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated, then copied into a new timestamped review session. Originals stay put.`,
       };
       const ok = await confirmModal({
         title: labels[action] || "Confirm",
@@ -917,9 +911,11 @@
         dry_run: dryRun,
         quarantine_dir,
         scan_id: state.scanId,
+        kinds: scope,
       };
       if (action === "isolate") {
         payload.isolate_mode = "copy";
+        payload.isolate_kinds = scope;
       }
       const res = await api("/api/action", {
         method: "POST",
@@ -961,6 +957,7 @@
   $("btnQuarantine").addEventListener("click", () => runAction("quarantine", false));
   $("btnDryIsolate").addEventListener("click", () => runAction("isolate", true));
   $("btnIsolate").addEventListener("click", () => runAction("isolate", false));
+  $("actionScope").addEventListener("change", updateSelectionSummary);
 
   // —— Lightbox ——
   function openLightbox(index) {

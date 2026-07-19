@@ -68,17 +68,8 @@
             <span class="opt-label">Detect</span>
             <label class="chip-check"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
-            <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>No person detected (vision)</span></label>
+            <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
           </div>
-          <label class="detector-field">
-            <span class="opt-label">Vision engine</span>
-            <select id="humanBackend" disabled>
-              <option value="opencv">OpenCV · fast default</option>
-              <option value="photon">Photon · Moondream 3.1</option>
-              <option value="ensemble">Ensemble · safest candidate filter</option>
-            </select>
-            <span class="thresh-hint" id="humanBackendHint">Enable vision review to choose a detector</span>
-          </label>
           <div class="opt-group">
             <span class="opt-label">Types</span>
             <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
@@ -139,7 +130,7 @@
           <button class="tab active" data-kind="all" type="button">All <span class="tab-count" id="countAll">0</span></button>
           <button class="tab" data-kind="exact" type="button">Exact <span class="tab-count" id="countExact">0</span></button>
           <button class="tab" data-kind="similar" type="button">Similar <span class="tab-count" id="countSimilar">0</span></button>
-          <button class="tab" data-kind="no_humans" type="button">Vision candidates <span class="tab-count" id="countNoHumans">0</span></button>
+          <button class="tab" data-kind="no_humans" type="button">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
         </div>
         <div class="group-list" id="groupList" role="listbox" aria-label="Duplicate groups"></div>
       </aside>
@@ -166,7 +157,7 @@
                   <option value="smallest">Keep smallest</option>
                   <option value="shortest_path">Keep shortest path</option>
                   <option value="deselect_all">Deselect all</option>
-                  <option value="select_candidates">Mark reviewed + select vision candidates</option>
+                  <option value="select_candidates">Mark reviewed + select non-human</option>
                 </select>
               </label>
               <button class="btn" id="btnSmartGroup" type="button">Apply to group</button>
@@ -182,6 +173,15 @@
       <div class="action-info">
         <span class="selection-dot" aria-hidden="true"></span>
         <span id="selectionSummary">0 files selected</span>
+        <label class="scope-field">
+          Act on
+          <select id="actionScope">
+            <option value="all">All categories</option>
+            <option value="exact">Exact</option>
+            <option value="similar">Similar</option>
+            <option value="no_humans">Non-Human</option>
+          </select>
+        </label>
       </div>
       <div class="action-controls">
         <label class="quarantine-field">

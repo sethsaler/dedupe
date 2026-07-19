@@ -8,9 +8,9 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
-- **No-person-detected candidates** — optional local computer-vision review surfaces images, GIFs, and sampled videos where the detector found no person
+- **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
-- **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews
+- **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Hash cache** — `~/.cache/dedupe/hashes.sqlite3` for fast re-scans
 - **Local web UI** — thumbnails, lightbox, smart select, keyboard nav, native folder/file picker, isolate
 
@@ -33,7 +33,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Optional computer-vision candidate review
+# Optional Non-Human detection (OpenCV)
 pip install -e ".[human]"
 
 # Optional Photon / Moondream backend (includes OpenCV for ensemble mode)
@@ -71,7 +71,7 @@ dedupe scan ~/Pictures ~/Downloads --json results.json
 # Exact only (faster)
 dedupe scan ~/Movies --no-similar
 
-# Surface media where local vision detected no person for manual review
+# Surface non-human media where OpenCV detected no person, for manual review
 dedupe scan ~/Pictures --find-no-person --ui
 
 # Run the same review with Photon, or use OpenCV-first ensemble mode
@@ -157,7 +157,7 @@ Requires `--execute` to write folders (otherwise dry-run only).
 
 The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 through the local Photon runtime), or `ensemble` (OpenCV positives first, then Photon on uncertain frames). Photon stays opt-in: its first use can download roughly 10 GB of model weights, and detection returns person/face boxes rather than a calibrated confidence score. All processing remains local after the model is available.
 
-“No person detected” is a computer-vision-assisted review filter, not a guarantee. It is opt-in and leaves candidates unselected until you review them manually or apply **Mark reviewed + select vision candidates**. The UI shows how many frames were analyzed. Small, profile, obscured, seated, or unsampled people can still be missed. OpenCV is an optional, CPU-only dependency and does not download a model at runtime.
+“No person detected” is a computer-vision-assisted review filter, not a guarantee. It is opt-in and leaves non-human files unselected until you review them manually or apply **Mark reviewed + select non-human**. The UI shows how many frames were analyzed. Small, profile, obscured, seated, or unsampled people can still be missed. OpenCV is an optional, CPU-only dependency and does not download a model at runtime.
 
 ### Benchmark Photon against your own media
 

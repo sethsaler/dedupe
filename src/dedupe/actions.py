@@ -212,14 +212,20 @@ def apply_actions(
     dry_run: bool = True,
     log_dir: str | Path | None = None,
     roots: list[str] | None = None,
+    kinds: set[str] | None = None,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
     dry_run: if True, only report what would happen
+    kinds: optional set of group kinds (exact/similar/no_humans) to act on;
+        None acts on every group.
     """
     action = action.lower().strip()
     if action not in ("trash", "quarantine"):
         raise ValueError("action must be 'trash' or 'quarantine'")
+
+    if kinds:
+        groups = [g for g in groups if g.kind.value in kinds]
 
     paths = collect_selected_paths(groups)
     result = ActionResult(dry_run=dry_run, action=action)
@@ -731,7 +737,7 @@ def summarize_scan(result: ScanResult) -> str:
         f"Files scanned: {len(result.files)}",
         f"Exact groups: {result.exact_groups}",
         f"Similar groups: {result.similar_groups}",
-        f"Vision candidates: {result.no_human_files}",
+        f"Non-human files: {result.no_human_files}",
         f"Reclaimable: {format_bytes(result.reclaimable_bytes)}",
     ]
     if result.errors:

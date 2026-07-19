@@ -260,7 +260,7 @@ def run_scan(
     prog.groups_found = len(groups)
     prog.message = (
         f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups, "
-        f"{result.no_human_files} vision candidates "
+        f"{result.no_human_files} non-human "
         f"({len(records)} files)"
     )
     prog.elapsed_seconds = max(0.0, time.monotonic() - started)

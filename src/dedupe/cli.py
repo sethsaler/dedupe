@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--find-no-humans",
         dest="find_no_humans",
         action="store_true",
-        help="Surface images/videos where local vision detects no person",
+        help="Surface non-human media: images/videos where OpenCV detects no person",
     )
     scan.add_argument(
         "--human-backend",

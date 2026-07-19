@@ -1022,6 +1022,23 @@ kbd {
   box-shadow: 0 0 0 3px var(--danger-soft);
 }
 
+.scope-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+  font-size: 0.8rem;
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.scope-field select {
+  padding: 5px 8px;
+  font-size: 0.8rem;
+}
+
 .action-controls {
   display: flex;
   flex-wrap: wrap;

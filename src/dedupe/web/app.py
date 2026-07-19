@@ -324,7 +324,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                         message=(
                             f"Done — {result.exact_groups} exact, "
                             f"{result.similar_groups} similar, "
-                            f"{result.no_human_files} vision candidates"
+                            f"{result.no_human_files} non-human"
                         ),
                     )
             except Exception as exc:
@@ -454,10 +454,10 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             roots = list(result.roots)
 
         try:
+            kinds_raw = data.get("kinds") or data.get("isolate_kinds") or "all"
+            kinds = None if kinds_raw in ("all", "") else {kinds_raw}
             if action == "isolate":
                 mode = (data.get("isolate_mode") or "copy").lower()
-                kinds_raw = data.get("isolate_kinds") or "all"
-                kinds = None if kinds_raw == "all" else {kinds_raw}
                 action_result = isolate_groups(
                     groups,
                     data.get("review_dir"),
@@ -473,6 +473,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     quarantine_dir=quarantine_dir,
                     dry_run=dry_run,
                     roots=roots,
+                    kinds=kinds,
                 )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400

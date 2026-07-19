@@ -69,6 +69,31 @@ def test_mutating_api_rejects_cross_origin_and_plain_text(tmp_path: Path) -> Non
     assert valid.get_json()["success_count"] == 1
 
 
+def test_action_endpoint_scopes_by_kinds(tmp_path: Path) -> None:
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Scoped away from the only (exact) group → nothing to act on.
+    scoped_away = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "scan_id": scan_id, "kinds": "similar"},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert scoped_away.status_code == 200
+    assert scoped_away.get_json()["success_count"] == 0
+
+    # Scoped to exact → the one selected duplicate is reported.
+    scoped_exact = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "scan_id": scan_id, "kinds": "exact"},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert scoped_exact.status_code == 200
+    assert scoped_exact.get_json()["success_count"] == 1
+
+
 def test_mutations_reject_stale_scan_generation(tmp_path: Path) -> None:
     app = create_app(_result(tmp_path))
     client = app.test_client()
