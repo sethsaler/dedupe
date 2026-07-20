@@ -571,6 +571,7 @@
     $("detailBody").hidden = false;
     const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
     $("detailTitle").textContent = `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
+    document.querySelector(".selection-toolbar").hidden = g.kind === "no_humans";
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
       option.disabled = g.kind === "no_humans" ? !candidateOnly && option.value !== "deselect_all" : candidateOnly;
@@ -590,8 +591,11 @@
     const box = $("members");
     const selected = new Set(g.selected_for_removal || []);
     const reviewedPaths = new Set(g.reviewed_paths || []);
+    const deletedPaths = new Set(g.deleted_paths || []);
     const members = g.members || [];
-    state.lightboxPaths = members.map((m) => m.path);
+    state.lightboxPaths = members
+      .filter((member) => !deletedPaths.has(member.path))
+      .map((member) => member.path);
     updateDetailMeta(g);
     const reviewedCount = members.filter((member) => reviewedPaths.has(member.path)).length;
     $("groupSelectionSummary").textContent = g.kind === "no_humans"
@@ -603,9 +607,11 @@
         const isKeep = m.path === g.suggested_keep && !selected.has(m.path);
         const isSel = selected.has(m.path);
         const reviewed = reviewedPaths.has(m.path);
+        const deleted = deletedPaths.has(m.path);
         const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
         const focused = i === state.memberFocus ? "focused" : "";
+        const lightboxIndex = state.lightboxPaths.indexOf(m.path);
         const fileName = basename(m.path);
         const badge = isSel
           ? `<span class="thumb-badge remove">Remove</span>`
@@ -623,12 +629,25 @@
         const selectionHint = isSel
           ? "Click to keep this file"
           : (g.kind === "no_humans" ? "Click to review and remove" : "Click to remove this file");
-        return `
-          <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
-            <button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${i}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
+        const preview = deleted
+          ? `<div class="thumb-wrap deleted-preview"><div class="thumb-fallback">Deleted — undo available</div></div>`
+          : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
               <img class="thumb-image" src="${thumb}" alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />
-            </button>
+            </button>`;
+        const actions = g.kind === "no_humans"
+          ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
+          : `<label class="selection-control">
+                  <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
+                  <span class="selection-copy">
+                    <strong>${selectionTitle}</strong>
+                    <small>${selectionHint}</small>
+                  </span>
+                </label>
+                <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
+        return `
+          <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
+            ${preview}
             <div class="card-body">
               <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
               <div class="path" title="${escapeHtml(m.path)}">${escapeHtml(m.path)}</div>
@@ -638,14 +657,7 @@
               </div>
               <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
-                <label class="selection-control">
-                  <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
-                  <span class="selection-copy">
-                    <strong>${selectionTitle}</strong>
-                    <small>${selectionHint}</small>
-                  </span>
-                </label>
-                <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>
+                ${actions}
               </div>
             </div>
           </article>
@@ -704,7 +716,38 @@
       });
     });
 
-    box.querySelectorAll(".thumb-wrap").forEach((el) => {
+    async function updateDeletedCandidate(path, endpoint) {
+      try {
+        const updated = await api(endpoint, {
+          method: "POST",
+          body: JSON.stringify({ group_id: g.id, path, scan_id: state.scanId }),
+        });
+        const idx = state.groups.findIndex((candidate) => candidate.id === g.id);
+        if (idx >= 0) state.groups[idx] = updated;
+        const allIdx = state.allGroups.findIndex((candidate) => candidate.id === g.id);
+        if (allIdx >= 0) state.allGroups[allIdx] = updated;
+        renderMembers(updated);
+        renderGroupList();
+        updateSelectionSummary();
+        toast(endpoint.endsWith("undo") ? "Image restored" : "Image deleted", "ok");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    }
+
+    box.querySelectorAll(".delete-candidate").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        updateDeletedCandidate(btn.dataset.path, "/api/non-human/delete");
+      });
+    });
+
+    box.querySelectorAll(".undo-delete").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        updateDeletedCandidate(btn.dataset.path, "/api/non-human/undo");
+      });
+    });
+
+    box.querySelectorAll("button.thumb-wrap").forEach((el) => {
       el.addEventListener("click", () => {
         const i = Number(el.dataset.index);
         state.memberFocus = i;

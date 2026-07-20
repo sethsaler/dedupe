@@ -1100,6 +1100,20 @@ kbd {
   background: transparent;
 }
 
+.card-actions > .delete-candidate,
+.card-actions > .undo-delete {
+  width: 100%;
+  min-height: 48px;
+}
+
+.card.deleted {
+  opacity: 0.72;
+}
+
+.deleted-preview {
+  cursor: default;
+}
+
 .linkish {
   background: none;
   border: none;

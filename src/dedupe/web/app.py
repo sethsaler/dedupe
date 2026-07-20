@@ -5,8 +5,10 @@ from __future__ import annotations
 import hmac
 import mimetypes
 import secrets
+import shutil
 import threading
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -61,6 +63,9 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     csrf_token = secrets.token_urlsafe(32)
     app.config["SECRET_KEY"] = secrets.token_hex(32)
     app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
+    app.config["DEDUPE_RECOVERY_DIR"] = str(
+        Path.home() / ".cache" / "dedupe" / "recovery"
+    )
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     lock = threading.RLock()
     state: dict = {
@@ -73,8 +78,17 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         "scan_id": secrets.token_hex(12),
         "cancel_event": None,
         "allowed_reveal_paths": set(),
+        "deleted_files": {},
     }
     app.extensions["dedupe_state"] = state
+
+    def group_payload(group) -> dict:
+        payload = group.to_dict()
+        deleted = state["deleted_files"]
+        payload["deleted_paths"] = [
+            member.path for member in group.members if member.path in deleted
+        ]
+        return payload
 
     @app.before_request
     def protect_mutating_api():
@@ -192,7 +206,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             groups = result.groups
             if kind in ("exact", "similar", "no_humans"):
                 groups = [g for g in groups if g.kind.value == kind]
-            return jsonify({"groups": [g.to_dict() for g in groups]})
+            return jsonify({"groups": [group_payload(g) for g in groups]})
 
     @app.get("/api/groups/<group_id>")
     def api_group(group_id: str):
@@ -202,7 +216,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 return jsonify({"error": "no scan"}), 404
             for g in result.groups:
                 if g.id == group_id:
-                    return jsonify(g.to_dict())
+                    return jsonify(group_payload(g))
         return jsonify({"error": "not found"}), 404
 
     @app.post("/api/scan")
@@ -235,6 +249,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             state["scan_id"] = scan_id
             state["cancel_event"] = cancel_event
             state["last_error"] = None
+            state["deleted_files"] = {}
             state["progress"] = ScanProgress(phase="starting", message="Starting…")
             # Empty result so the UI can stream groups as they appear.
             state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
@@ -380,7 +395,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 for g in result.groups:
                     if g.id == group_id:
                         apply_smart_select(g, rule)
-                        return jsonify(g.to_dict())
+                        return jsonify(group_payload(g))
                 return jsonify({"error": "not found"}), 404
             apply_smart_select_all(result.groups, rule)
             result.recompute_stats()
@@ -424,8 +439,108 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                         g.reviewed_paths = [
                             path for path in reviewed if path in member_paths
                         ]
-                    return jsonify(g.to_dict())
+                    return jsonify(group_payload(g))
         return jsonify({"error": "not found"}), 404
+
+    @app.post("/api/non-human/delete")
+    def api_delete_non_human():
+        """Remove one non-human candidate while retaining a recoverable copy."""
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        path = data.get("path")
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "file actions are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            group = next(
+                (
+                    candidate
+                    for candidate in (result.groups if result else [])
+                    if candidate.id == group_id and candidate.kind.value == "no_humans"
+                ),
+                None,
+            )
+            if group is None or path not in {member.path for member in group.members}:
+                return jsonify({"error": "non-human candidate not found"}), 404
+            if path in state["deleted_files"]:
+                return jsonify(group_payload(group))
+            state["acting"] = True
+            original_selected = list(group.selected_for_removal)
+            original_reviewed = list(group.reviewed_paths)
+            action_group = replace(
+                group,
+                selected_for_removal=[path],
+                reviewed_paths=[path],
+            )
+            roots = list(result.roots)
+
+        try:
+            recovery_dir = Path(app.config["DEDUPE_RECOVERY_DIR"]) / state["scan_id"]
+            action_result = apply_actions(
+                [action_group],
+                action="quarantine",
+                quarantine_dir=recovery_dir,
+                dry_run=False,
+                roots=roots,
+            )
+            item = next((item for item in action_result.items if item.path == path), None)
+            if item is None or not item.ok or not item.destination:
+                error = item.error if item else "delete did not complete"
+                return jsonify({"error": error}), 400
+            with lock:
+                state["deleted_files"][path] = item.destination
+                group.selected_for_removal = [
+                    selected for selected in original_selected if selected != path
+                ]
+                group.reviewed_paths = list(dict.fromkeys([*original_reviewed, path]))
+                return jsonify(group_payload(group))
+        finally:
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/non-human/undo")
+    def api_undo_non_human():
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        path = data.get("path")
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "file actions are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            group = next(
+                (
+                    candidate
+                    for candidate in (result.groups if result else [])
+                    if candidate.id == group_id and candidate.kind.value == "no_humans"
+                ),
+                None,
+            )
+            destination = state["deleted_files"].get(path)
+            if group is None or destination is None:
+                return jsonify({"error": "there is no deleted file to undo"}), 404
+            state["acting"] = True
+
+        try:
+            original = Path(path)
+            recoverable = Path(destination)
+            if original.exists() or original.is_symlink():
+                return jsonify({"error": "the original path is already occupied"}), 409
+            if not recoverable.is_file():
+                return jsonify({"error": "the recoverable file no longer exists"}), 404
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(recoverable), str(original))
+            with lock:
+                state["deleted_files"].pop(path, None)
+                return jsonify(group_payload(group))
+        except OSError as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            with lock:
+                state["acting"] = False
 
     @app.post("/api/action")
     def api_action():

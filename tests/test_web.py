@@ -5,7 +5,8 @@ import platform
 import subprocess
 from pathlib import Path
 
-from dedupe.grouping import build_groups
+from dedupe.grouping import build_groups, build_no_human_groups
+from dedupe.human_detection import human_detection_signature
 from dedupe.models import FileRecord, MediaType, ScanResult
 from dedupe.web.app import create_app
 
@@ -32,6 +33,29 @@ def _result(tmp_path: Path) -> ScanResult:
         roots=[str(tmp_path)],
         files=records,
         groups=build_groups([records], []),
+    )
+
+
+def _non_human_result(tmp_path: Path) -> ScanResult:
+    path = tmp_path / "landscape.jpg"
+    path.write_bytes(b"landscape")
+    stat = path.stat()
+    record = FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        human_detection_status="no_person_detected",
+        human_detection_signature=human_detection_signature(),
+    )
+    return ScanResult(
+        roots=[str(tmp_path)],
+        files=[record],
+        groups=build_no_human_groups([record]),
     )
 
 
@@ -123,6 +147,31 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert "Preview trash" in html
     assert "Preview quarantine" in html
     assert "Preview isolate" in html
+
+
+def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
+    result = _non_human_result(tmp_path)
+    group = result.groups[0]
+    original = Path(group.members[0].path)
+    app = create_app(result)
+    app.config["DEDUPE_RECOVERY_DIR"] = str(tmp_path / "recovery")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
+
+    deleted = client.post("/api/non-human/delete", json=payload, headers=headers)
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted_paths"] == [str(original)]
+    assert not original.exists()
+
+    fetched = client.get(f"/api/groups/{group.id}").get_json()
+    assert fetched["deleted_paths"] == [str(original)]
+
+    undone = client.post("/api/non-human/undo", json=payload, headers=headers)
+    assert undone.status_code == 200
+    assert undone.get_json()["deleted_paths"] == []
+    assert original.read_bytes() == b"landscape"
 
 
 def test_scan_rejects_unknown_human_backend(tmp_path: Path) -> None:
