@@ -250,6 +250,11 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="lbVideo"' in html
     assert 'id="lbSpeed"' in html
 
+    script = app.test_client().get("/static/app.js").get_data(as_text=True)
+    assert 'class="hover-video"' in script
+    assert 'class="thumb-image ${m.media_type === "gif" ? "hover-gif"' in script
+    assert 'video.muted = true' in script
+
 
 def test_media_endpoint_streams_only_scanned_files_with_range_support(tmp_path: Path) -> None:
     result = _result(tmp_path)

@@ -685,12 +685,15 @@
         const selectionHint = isSel
           ? "Click to keep this file"
           : (g.kind === "no_humans" ? "Click to review and remove" : "Click to remove this file");
+        const mediaPreview = m.media_type === "video"
+          ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
+          : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />`;
         const preview = deleted
           ? `<div class="thumb-wrap deleted-preview"><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
           : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
-              <img class="thumb-image" src="${thumb}" alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />
-              ${m.media_type === "video" ? '<span class="video-preview-badge" aria-hidden="true">▶ Play</span>' : ""}
+              ${mediaPreview}
+              ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
             </button>`;
         const actions = g.kind === "no_humans"
           ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
@@ -729,6 +732,31 @@
         fallback.className = "thumb-fallback";
         fallback.textContent = "No preview";
         image.replaceWith(fallback);
+      });
+    });
+
+    box.querySelectorAll(".hover-video").forEach((video) => {
+      const wrap = video.closest(".thumb-wrap");
+      wrap.addEventListener("pointerenter", () => {
+        video.muted = true;
+        if (!video.src) video.src = video.dataset.src;
+        video.play().catch(() => {
+          /* The static poster remains when the browser cannot play this codec. */
+        });
+      });
+      wrap.addEventListener("pointerleave", () => {
+        video.pause();
+        if (video.readyState > 0) video.currentTime = 0;
+      });
+    });
+
+    box.querySelectorAll(".hover-gif").forEach((image) => {
+      const wrap = image.closest(".thumb-wrap");
+      wrap.addEventListener("pointerenter", () => {
+        image.src = image.dataset.src;
+      });
+      wrap.addEventListener("pointerleave", () => {
+        image.src = image.dataset.thumbnail;
       });
     });
 
