@@ -22,15 +22,17 @@ from flask import (
 )
 
 from ..actions import apply_actions, format_bytes, isolate_groups
+from ..cache import HashCache
 from ..engine import run_scan
 from ..grouping import apply_smart_select, apply_smart_select_all
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
+from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
 from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_paths
 
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 1
+WEB_API_VERSION = 3
 
 
 def _macos_picker_script(kind: str) -> str:
@@ -71,6 +73,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     app.config["DEDUPE_RECOVERY_DIR"] = str(
         Path.home() / ".cache" / "dedupe" / "recovery"
     )
+    app.config["DEDUPE_CACHE_PATH"] = None
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     lock = threading.RLock()
     state: dict = {
@@ -320,6 +323,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     image_threshold=int(data.get("threshold", 6)),
                     video_threshold=int(data.get("video_threshold", 8)),
                     use_cache=bool(data.get("use_cache", True)),
+                    cache_path=app.config["DEDUPE_CACHE_PATH"],
                     workers=workers,
                     exclusions=[
                         str(pattern).strip()
@@ -545,6 +549,123 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/non-human/mark-remaining-human")
+    def api_mark_remaining_human():
+        """Persist all undeleted non-human candidates as manually reviewed humans."""
+        data = request.get_json(silent=True) or {}
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "reviews are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            if result is None:
+                return jsonify({"error": "no scan"}), 404
+            deleted = set(state["deleted_files"])
+            records = list(
+                {
+                    member.path: member
+                    for group in result.groups
+                    if group.kind.value == "no_humans"
+                    for member in group.members
+                    if member.path not in deleted
+                }.values()
+            )
+            if not records:
+                return jsonify({"ok": True, "marked_count": 0})
+            state["acting"] = True
+
+        prior = [
+            (
+                record,
+                record.human_detection_status,
+                record.human_detector,
+                record.human_detection_signature,
+            )
+            for record in records
+        ]
+        cache = None
+        try:
+            for record in records:
+                record.human_detection_status = MANUALLY_CONFIRMED_HUMAN_STATUS
+                record.human_detector = "manual_review"
+                # Manual review outranks detector versions. File-identity checks in
+                # HashCache still invalidate the decision when the file changes.
+                record.human_detection_signature = None
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            cache.store_all(records)
+
+            marked_paths = {record.path for record in records}
+            with lock:
+                for group in result.groups:
+                    if group.kind.value != "no_humans":
+                        continue
+                    group.members = [
+                        member for member in group.members if member.path not in marked_paths
+                    ]
+                    group.selected_for_removal = [
+                        path for path in group.selected_for_removal if path not in marked_paths
+                    ]
+                    group.reviewed_paths = [
+                        path for path in group.reviewed_paths if path not in marked_paths
+                    ]
+                result.groups = [group for group in result.groups if group.members]
+                result.recompute_stats()
+                state["groups_version"] = state.get("groups_version", 0) + 1
+            return jsonify({"ok": True, "marked_count": len(records)})
+        except Exception as exc:
+            for record, status, detector, signature in prior:
+                record.human_detection_status = status
+                record.human_detector = detector
+                record.human_detection_signature = signature
+            return jsonify({"error": f"could not save manual reviews: {exc}"}), 500
+        finally:
+            if cache is not None:
+                cache.close()
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/similar/mark-distinct")
+    def api_mark_similar_distinct():
+        """Persist one Similar group as pairwise distinct and remove it from review."""
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "reviews are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            group = next(
+                (
+                    candidate
+                    for candidate in (result.groups if result else [])
+                    if candidate.id == group_id and candidate.kind.value == "similar"
+                ),
+                None,
+            )
+            if group is None:
+                return jsonify({"error": "similar group not found"}), 404
+            records = list(group.members)
+            state["acting"] = True
+
+        cache = None
+        try:
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            pair_count = cache.mark_distinct(records)
+            with lock:
+                result.groups = [candidate for candidate in result.groups if candidate.id != group_id]
+                result.recompute_stats()
+                state["groups_version"] = state.get("groups_version", 0) + 1
+            return jsonify({"ok": True, "pair_count": pair_count})
+        except Exception as exc:
+            return jsonify({"error": f"could not save distinct review: {exc}"}), 500
+        finally:
+            if cache is not None:
+                cache.close()
             with lock:
                 state["acting"] = False
 

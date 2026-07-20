@@ -59,3 +59,17 @@ def test_cache_round_trips_person_decision_without_hashes(tmp_path: Path) -> Non
     assert same.human_frames_analyzed == 1
     assert same.human_max_confidence == 1.0
     cache.close()
+
+
+def test_cache_round_trips_distinct_pair_until_a_file_changes(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    left = _record(tmp_path / "left.jpg", inode=10)
+    right = _record(tmp_path / "right.jpg", inode=11)
+
+    assert cache.mark_distinct([right, left]) == 1
+    assert cache.distinct_pairs([left, right]) == {(left.path, right.path)}
+
+    changed = _record(tmp_path / "right.jpg", inode=11)
+    changed.size += 1
+    assert cache.distinct_pairs([left, changed]) == set()
+    cache.close()

@@ -217,11 +217,13 @@ def find_similar_video_groups(
     records: list[FileRecord],
     *,
     threshold: int = DEFAULT_THRESHOLD,
+    distinct_pairs: set[tuple[str, str]] | None = None,
     progress: ProgressCb | None = None,
     workers: int | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """Cluster near-identical videos by fingerprint Hamming distance."""
+    distinct_pairs = distinct_pairs or set()
     videos = [r for r in records if r.media_type == MediaType.VIDEO]
     if len(videos) < 2:
         return []
@@ -311,6 +313,8 @@ def find_similar_video_groups(
             indexes = range(i + 1, len(hashed))
         for j in indexes:
             b = hashed[j]
+            if tuple(sorted((a.path, b.path))) in distinct_pairs:
+                continue
             left = fingerprints[i]
             right = fingerprints[j]
             # These aligned positions are necessarily under the existing maximum.
@@ -353,4 +357,4 @@ def find_similar_video_groups(
     if progress:
         progress("video-cluster", len(hashed), len(hashed))
 
-    return cluster_around_best(hashed, adjacency)
+    return cluster_around_best(hashed, adjacency, distinct_pairs)

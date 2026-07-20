@@ -249,6 +249,7 @@ def find_similar_image_groups(
     tile_max: int = DEFAULT_TILE_MAX,
     tile_mean: float = DEFAULT_TILE_MEAN,
     skip_paths: set[str] | None = None,
+    distinct_pairs: set[tuple[str, str]] | None = None,
     progress: ProgressCb | None = None,
     workers: int | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -261,6 +262,7 @@ def find_similar_image_groups(
     3. Regional tile pHash (reject pose / composition changes)
     """
     skip_paths = skip_paths or set()
+    distinct_pairs = distinct_pairs or set()
     n_workers = resolve_workers(workers, cap=DEFAULT_IMAGE_WORKERS_CAP)
     media = [
         r
@@ -323,6 +325,7 @@ def find_similar_image_groups(
             tile_mean,
             progress,
             cancelled,
+            distinct_pairs,
         )
 
     # Parse each hash once. The old FileRecord-based distance function converted
@@ -355,6 +358,8 @@ def find_similar_image_groups(
                 if positions[other.path] > i
             )
             for other in candidates:
+                if tuple(sorted((rec.path, other.path))) in distinct_pairs:
+                    continue
                 # Secondary dHash check to reduce false positives
                 if rec.path in dhashes and other.path in dhashes:
                     dhash_distance = (
@@ -393,7 +398,7 @@ def find_similar_image_groups(
         # Records retain hashes for this run and the disk cache; free path cache.
         _tile_phashes_for_path.cache_clear()
 
-    return cluster_around_best(hashed, adjacency)
+    return cluster_around_best(hashed, adjacency, distinct_pairs)
 
 
 def _bruteforce_groups(
@@ -404,9 +409,11 @@ def _bruteforce_groups(
     tile_mean: float,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
+    distinct_pairs: set[tuple[str, str]] | None = None,
 ) -> list[list[FileRecord]]:
     import imagehash
 
+    distinct_pairs = distinct_pairs or set()
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
     for i, a in enumerate(hashed):
@@ -414,6 +421,8 @@ def _bruteforce_groups(
             raise InterruptedError("scan cancelled")
         ha = imagehash.hex_to_hash(a.phash)  # type: ignore[arg-type]
         for b in hashed[i + 1 :]:
+            if tuple(sorted((a.path, b.path))) in distinct_pairs:
+                continue
             hb = imagehash.hex_to_hash(b.phash)  # type: ignore[arg-type]
             if (ha - hb) > threshold:
                 continue
@@ -431,4 +440,4 @@ def _bruteforce_groups(
 
     _tile_phashes_for_path.cache_clear()
 
-    return cluster_around_best(hashed, adjacency)
+    return cluster_around_best(hashed, adjacency, distinct_pairs)

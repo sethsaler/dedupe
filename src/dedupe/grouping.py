@@ -26,7 +26,9 @@ def rank_keep_candidate(rec: FileRecord) -> tuple:
 
 
 def cluster_around_best(
-    records: list[FileRecord], adjacency: dict[str, set[str]]
+    records: list[FileRecord],
+    adjacency: dict[str, set[str]],
+    distinct_pairs: set[tuple[str, str]] | None = None,
 ) -> list[list[FileRecord]]:
     """Build disjoint groups whose members all directly match the best-ranked member.
 
@@ -42,6 +44,11 @@ def cluster_around_best(
     )
     by_path = {record.path: record for record in records}
     remaining = set(by_path)
+    distinct_pairs = distinct_pairs or set()
+
+    def is_distinct(path_a: str, path_b: str) -> bool:
+        return tuple(sorted((path_a, path_b))) in distinct_pairs
+
     groups: list[list[FileRecord]] = []
     for keeper in ordered:
         if keeper.path not in remaining:
@@ -58,7 +65,13 @@ def cluster_around_best(
             key=lambda record: (rank_keep_candidate(record), record.path),
             reverse=True,
         )
-        members = [keeper, *matches]
+        members = [keeper]
+        for match in matches:
+            if not any(is_distinct(match.path, member.path) for member in members):
+                members.append(match)
+        if len(members) < 2:
+            remaining.remove(keeper.path)
+            continue
         groups.append(members)
         remaining.difference_update(member.path for member in members)
     return groups

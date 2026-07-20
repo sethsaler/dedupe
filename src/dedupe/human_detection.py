@@ -8,7 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from .human_policy import CACHEABLE_HUMAN_STATUSES, HUMAN_DETECTION_CACHE_VERSION
+from .human_policy import (
+    CACHEABLE_HUMAN_STATUSES,
+    HUMAN_DETECTION_CACHE_VERSION,
+    MANUALLY_CONFIRMED_HUMAN_STATUS,
+)
 from .models import FileRecord, MediaType
 from .similar_video import _extract_frames, ffmpeg_available
 
@@ -391,8 +395,11 @@ def find_no_human_files(
 
     def has_cached_decision(record: FileRecord) -> bool:
         return (
-            record.human_detection_signature == signature
-            and record.human_detection_status in CACHEABLE_HUMAN_STATUSES
+            record.human_detection_status == MANUALLY_CONFIRMED_HUMAN_STATUS
+            or (
+                record.human_detection_signature == signature
+                and record.human_detection_status in CACHEABLE_HUMAN_STATUSES
+            )
         )
 
     cached = [record for record in candidates if has_cached_decision(record)]

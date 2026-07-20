@@ -27,6 +27,36 @@ brew install ffmpeg
 
 ## Install
 
+### Install or update from GitHub
+
+On macOS or Linux, run this same command for both the first install and future updates:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sethsaler/dedupe/main/install.sh | bash
+```
+
+The installer requires Git and Python 3.11+, checks out the public repository to
+`~/.local/share/dedupe`, creates an isolated virtual environment, and links the
+`dedupe` command into `~/.local/bin`. It includes the OpenCV Non-Human detector;
+the much larger Photon model remains opt-in. The updater only fast-forwards a
+clean installer-managed checkout, so it will not discard local changes.
+
+If `~/.local/bin` is not already on your `PATH`, add it to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then start the app with `dedupe ui`. On macOS, you can also double-click
+`~/.local/share/dedupe/Dedupe.command` in Finder. Install ffmpeg separately for
+video similarity and thumbnails:
+
+```bash
+brew install ffmpeg
+```
+
+### Install from a local checkout
+
 ```bash
 cd dedupe
 python3 -m venv .venv

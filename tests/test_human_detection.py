@@ -148,6 +148,26 @@ def test_detector_signature_change_forces_reanalysis(tmp_path: Path, monkeypatch
     assert record.human_detection_signature == human_detection_signature("opencv")
 
 
+def test_manual_human_confirmation_skips_every_detector_version(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (40, 40), "white").save(path)
+    record = inventory([path])[0]
+    record.human_detection_status = "person_confirmed"
+    record.human_detector = "manual_review"
+    record.human_detection_signature = None
+
+    def fail_if_created(*_args, **_kwargs):
+        raise AssertionError("manually confirmed files must not run the detector")
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector", fail_if_created
+    )
+
+    assert find_no_human_files([record], backend="photon") == []
+
+
 def test_photon_detector_loads_local_model_and_checks_person_then_face(monkeypatch) -> None:
     calls: dict = {"targets": []}
 

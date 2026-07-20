@@ -94,6 +94,24 @@ def test_similar_groups_near_identical_quality(tmp_path: Path) -> None:
     assert str(c.resolve()) not in paths
 
 
+def test_reviewed_distinct_pair_is_not_grouped(tmp_path: Path) -> None:
+    left = tmp_path / "left.jpg"
+    right = tmp_path / "right.jpg"
+    _make_image(left, (40, 80, 120), quality=95)
+    _make_image(right, (40, 80, 120), quality=60)
+    left_record = _rec_for(left)
+    right_record = _rec_for(right)
+    pair = tuple(sorted((left_record.path, right_record.path)))
+
+    groups = find_similar_image_groups(
+        [left_record, right_record],
+        threshold=10,
+        distinct_pairs={pair},
+    )
+
+    assert groups == []
+
+
 def test_dissimilar_not_grouped(tmp_path: Path) -> None:
     a = tmp_path / "a.jpg"
     b = tmp_path / "b.jpg"

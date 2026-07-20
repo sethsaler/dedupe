@@ -169,6 +169,7 @@ def run_scan(
 
     if similar:
         check_cancelled()
+        distinct_pairs = cache.distinct_pairs(records) if cache is not None else set()
         emit("similar-image", 0, 0, "Hashing images for similarity…")
 
         def img_progress(phase: str, processed: int, total: int) -> None:
@@ -177,6 +178,7 @@ def run_scan(
         img_groups = find_similar_image_groups(
             records,
             threshold=image_threshold,
+            distinct_pairs=distinct_pairs,
             progress=img_progress,
             workers=n_workers,
             cancelled=cancelled,
@@ -197,6 +199,7 @@ def run_scan(
         vid_groups = find_similar_video_groups(
             records,
             threshold=video_threshold,
+            distinct_pairs=distinct_pairs,
             progress=vid_progress,
             workers=n_workers,
             cancelled=cancelled,

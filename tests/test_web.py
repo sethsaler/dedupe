@@ -5,6 +5,7 @@ import platform
 import subprocess
 from pathlib import Path
 
+from dedupe.cache import HashCache
 from dedupe.grouping import build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import FileRecord, MediaType, ScanResult
@@ -182,6 +183,100 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     assert undone.status_code == 200
     assert undone.get_json()["deleted_paths"] == []
     assert original.read_bytes() == b"landscape"
+
+
+def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path) -> None:
+    result = _non_human_result(tmp_path)
+    deleted_record = result.files[0]
+    remaining_path = tmp_path / "portrait.jpg"
+    remaining_path.write_bytes(b"portrait")
+    stat = remaining_path.stat()
+    remaining_record = FileRecord(
+        path=str(remaining_path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        human_detection_status="no_person_detected",
+        human_detection_signature=human_detection_signature(),
+    )
+    result.files.append(remaining_record)
+    result.groups = build_no_human_groups(result.files)
+    app = create_app(result)
+    app.config["DEDUPE_RECOVERY_DIR"] = str(tmp_path / "recovery")
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    group_id = result.groups[0].id
+
+    deleted = client.post(
+        "/api/non-human/delete",
+        json={"group_id": group_id, "path": deleted_record.path, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+
+    response = client.post(
+        "/api/non-human/mark-remaining-human",
+        json={"scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["marked_count"] == 1
+    groups = client.get("/api/groups?kind=no_humans").get_json()["groups"]
+    assert len(groups) == 1
+    assert groups[0]["deleted_paths"] == [deleted_record.path]
+    assert [member["path"] for member in groups[0]["members"]] == [deleted_record.path]
+
+    fresh = FileRecord(
+        path=remaining_record.path,
+        size=remaining_record.size,
+        mtime=remaining_record.mtime,
+        media_type=remaining_record.media_type,
+        extension=remaining_record.extension,
+        device=remaining_record.device,
+        inode=remaining_record.inode,
+        mtime_ns=remaining_record.mtime_ns,
+    )
+    cache = HashCache(cache_path)
+    assert cache.hydrate([fresh]) == 1
+    assert fresh.human_detection_status == "person_confirmed"
+    assert fresh.human_detector == "manual_review"
+    assert fresh.human_detection_signature is None
+    assert cache.hydrate([deleted_record]) == 0
+    cache.close()
+
+
+def test_similar_group_can_be_marked_distinct(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    result.groups = build_groups([], [result.files])
+    group = result.groups[0]
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["pair_count"] == 1
+    assert client.get("/api/groups?kind=similar").get_json()["groups"] == []
+    cache = HashCache(cache_path)
+    expected_pair = tuple(sorted(record.path for record in result.files))
+    assert cache.distinct_pairs(result.files) == {expected_pair}
+    cache.close()
 
 
 def test_scan_rejects_unknown_human_backend(tmp_path: Path) -> None:

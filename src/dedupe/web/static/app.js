@@ -605,6 +605,10 @@
     $("detailTitle").textContent = g.kind === "no_humans"
       ? `${kindLabel} · ${g.member_count} files`
       : `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
+    const deletedPaths = new Set(g.deleted_paths || []);
+    $("btnMarkRemainingHuman").hidden =
+      g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
+    $("btnMarkDistinct").hidden = g.kind !== "similar";
     document.querySelector(".selection-toolbar").hidden = g.kind === "no_humans";
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
@@ -1024,6 +1028,48 @@
       });
       await loadGroups();
       toast("Smart select applied to all groups", "ok");
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  });
+
+  $("btnMarkRemainingHuman").addEventListener("click", async () => {
+    const remaining = state.allGroups
+      .filter((group) => group.kind === "no_humans")
+      .reduce((count, group) => {
+        const deleted = new Set(group.deleted_paths || []);
+        return count + (group.members || []).filter((member) => !deleted.has(member.path)).length;
+      }, 0);
+    if (!remaining) return;
+    const noun = remaining === 1 ? "file" : "files";
+    if (!window.confirm(
+      `Mark ${remaining} remaining ${noun} as containing humans? They will not appear in future Non-Human scans unless the files change.`,
+    )) return;
+    try {
+      const result = await api("/api/non-human/mark-remaining-human", {
+        method: "POST",
+        body: JSON.stringify({ scan_id: state.scanId }),
+      });
+      await loadGroups();
+      toast(`${result.marked_count} ${noun} marked as human`, "ok");
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  });
+
+  $("btnMarkDistinct").addEventListener("click", async () => {
+    const current = state.allGroups.find((group) => group.id === state.currentId);
+    if (!current || current.kind !== "similar") return;
+    if (!window.confirm(
+      `Mark these ${current.member_count} files as distinct? This group will stay hidden in future scans unless one of the files changes.`,
+    )) return;
+    try {
+      await api("/api/similar/mark-distinct", {
+        method: "POST",
+        body: JSON.stringify({ group_id: current.id, scan_id: state.scanId }),
+      });
+      await loadGroups();
+      toast("Similar files marked as distinct", "ok");
     } catch (e) {
       toast(e.message, "error");
     }

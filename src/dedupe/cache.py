@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from itertools import combinations
 from pathlib import Path
 
+from .human_policy import CACHEABLE_HUMAN_STATUSES, MANUALLY_CONFIRMED_HUMAN_STATUS
 from .models import FileRecord, MediaType
 
 CACHE_ALGORITHM_VERSION = "dedupe-hashes-v2"
@@ -51,6 +54,17 @@ class HashCache:
                 human_detection_signature TEXT,
                 human_frames_analyzed INTEGER,
                 human_max_confidence REAL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS distinct_similar_pairs (
+                path_a TEXT NOT NULL,
+                identity_a TEXT NOT NULL,
+                path_b TEXT NOT NULL,
+                identity_b TEXT NOT NULL,
+                PRIMARY KEY (path_a, path_b)
             )
             """
         )
@@ -170,6 +184,56 @@ class HashCache:
     def commit(self) -> None:
         self._conn.commit()
 
+    @staticmethod
+    def _identity(rec: FileRecord) -> str:
+        """Stable file identity used to invalidate reviews when either file changes."""
+        return json.dumps(
+            [rec.size, rec.mtime_ns, rec.mtime, rec.device, rec.inode],
+            separators=(",", ":"),
+        )
+
+    def mark_distinct(self, records: list[FileRecord]) -> int:
+        """Persist every pair in a reviewed Similar group as intentionally distinct."""
+        count = 0
+        for left, right in combinations(sorted(records, key=lambda rec: rec.path), 2):
+            self._conn.execute(
+                """
+                INSERT INTO distinct_similar_pairs (
+                    path_a, identity_a, path_b, identity_b
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(path_a, path_b) DO UPDATE SET
+                    identity_a=excluded.identity_a,
+                    identity_b=excluded.identity_b
+                """,
+                (
+                    left.path,
+                    self._identity(left),
+                    right.path,
+                    self._identity(right),
+                ),
+            )
+            count += 1
+        self._conn.commit()
+        return count
+
+    def distinct_pairs(self, records: list[FileRecord]) -> set[tuple[str, str]]:
+        """Return reviewed-distinct pairs whose two file identities still match."""
+        by_path = {record.path: record for record in records}
+        pairs: set[tuple[str, str]] = set()
+        for row in self._conn.execute(
+            "SELECT path_a, identity_a, path_b, identity_b FROM distinct_similar_pairs"
+        ):
+            left = by_path.get(row["path_a"])
+            right = by_path.get(row["path_b"])
+            if left is None or right is None:
+                continue
+            if (
+                self._identity(left) == row["identity_a"]
+                and self._identity(right) == row["identity_b"]
+            ):
+                pairs.add((left.path, right.path))
+        return pairs
+
     def hydrate(self, records: list[FileRecord]) -> int:
         """Fill records from cache. Returns number of cache hits."""
         hits = 0
@@ -214,9 +278,11 @@ class HashCache:
     def store_all(self, records: list[FileRecord]) -> None:
         for rec in records:
             has_person_decision = (
-                rec.human_detection_status
-                in {"person_detected", "no_person_detected"}
-                and bool(rec.human_detection_signature)
+                rec.human_detection_status == MANUALLY_CONFIRMED_HUMAN_STATUS
+                or (
+                    rec.human_detection_status in CACHEABLE_HUMAN_STATUSES
+                    and bool(rec.human_detection_signature)
+                )
             )
             if (
                 rec.sha256

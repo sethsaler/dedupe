@@ -42,3 +42,8 @@ def test_video_clustering_uses_duration_without_changing_matches(monkeypatch) ->
 
     assert len(groups) == 1
     assert {record.path for record in groups[0]} == {"original.mp4", "close.mp4"}
+
+    reviewed_pair = tuple(sorted((original.path, close.path)))
+    assert find_similar_video_groups(
+        [original, close, too_long, different], distinct_pairs={reviewed_pair}
+    ) == []
