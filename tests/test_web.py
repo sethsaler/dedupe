@@ -119,6 +119,95 @@ def test_action_endpoint_scopes_by_kinds(tmp_path: Path) -> None:
     assert scoped_exact.get_json()["success_count"] == 1
 
 
+def test_action_endpoint_combines_exact_and_similar_with_tabulated_counts(
+    tmp_path: Path,
+) -> None:
+    records = []
+    for name, contents in (
+        ("exact-a.jpg", b"same"),
+        ("exact-b.jpg", b"same"),
+        ("similar-a.jpg", b"first"),
+        ("similar-b.jpg", b"second"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(contents)
+        stat = path.stat()
+        records.append(FileRecord(
+            path=str(path),
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=".jpg",
+        ))
+    result = ScanResult(
+        roots=[str(tmp_path)],
+        files=records,
+        groups=build_groups([[records[0], records[1]]], [[records[2], records[3]]]),
+    )
+    app = create_app(result)
+    client = app.test_client()
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/action",
+        json={
+            "action": "trash",
+            "dry_run": True,
+            "scan_id": scan_id,
+            "kinds": "duplicates",
+        },
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success_count"] == 2
+    assert payload["selection_counts"] == {
+        "exact": 1,
+        "similar": 1,
+        "no_humans": 0,
+        "unique_total": 2,
+    }
+
+
+def test_action_count_assigns_exact_similar_overlap_only_once(tmp_path: Path) -> None:
+    records = []
+    for name, contents in (("a.jpg", b"same"), ("b.jpg", b"same"), ("c.jpg", b"other")):
+        path = tmp_path / name
+        path.write_bytes(contents)
+        stat = path.stat()
+        records.append(FileRecord(
+            path=str(path),
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=".jpg",
+        ))
+    groups = build_groups([[records[0], records[1]]], [[records[1], records[2]]])
+    exact = next(group for group in groups if group.kind.value == "exact")
+    similar = next(group for group in groups if group.kind.value == "similar")
+    exact.selected_for_removal = [records[1].path]
+    similar.selected_for_removal = [records[1].path]
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=records, groups=groups))
+    client = app.test_client()
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "scan_id": scan_id, "kinds": "duplicates"},
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+
+    payload = response.get_json()
+    assert payload["success_count"] == 1
+    assert payload["selection_counts"] == {
+        "exact": 1,
+        "similar": 0,
+        "no_humans": 0,
+        "unique_total": 1,
+    }
+
+
 def test_mutations_reject_stale_scan_generation(tmp_path: Path) -> None:
     app = create_app(_result(tmp_path))
     client = app.test_client()

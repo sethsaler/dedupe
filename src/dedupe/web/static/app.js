@@ -600,6 +600,11 @@
     state.memberPage = 0;
     renderGroupList();
     const g = await api(`/api/groups/${id}`);
+    const idx = state.groups.findIndex((group) => group.id === g.id);
+    if (idx >= 0) state.groups[idx] = g;
+    const allIdx = state.allGroups.findIndex((group) => group.id === g.id);
+    if (allIdx >= 0) state.allGroups[allIdx] = g;
+    updateSelectionSummary();
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
     const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
@@ -847,14 +852,23 @@
 
   function scopeLabelFor(scope) {
     return (
-      { exact: "Exact", similar: "Similar", no_humans: "Non-Human", all: "All" }[scope] ||
+      {
+        duplicates: "Exact + Similar",
+        exact: "Exact",
+        similar: "Similar",
+        no_humans: "Non-Human",
+        all: "All",
+      }[scope] ||
       "All"
     );
   }
 
   function effectiveSelection(scope = currentScope()) {
     const source = state.allGroups.length ? state.allGroups : state.groups;
-    const inScope = (g) => scope === "all" || g.kind === scope;
+    const inScope = (g) =>
+      scope === "all" ||
+      g.kind === scope ||
+      (scope === "duplicates" && (g.kind === "exact" || g.kind === "similar"));
     const selected = new Map();
     for (const g of source) {
       if (!inScope(g)) continue;
@@ -876,13 +890,30 @@
     return [...selected.values()];
   }
 
+  function duplicateSelectionCounts() {
+    const combined = new Set(effectiveSelection("duplicates").map((member) => member.path));
+    const exact = new Set(
+      effectiveSelection("exact")
+        .map((member) => member.path)
+        .filter((path) => combined.has(path)),
+    );
+    const similar = effectiveSelection("similar")
+      .filter((member) => combined.has(member.path) && !exact.has(member.path))
+      .length;
+    return { exact: exact.size, similar, uniqueTotal: combined.size };
+  }
+
   function updateSelectionSummary() {
     const scope = currentScope();
     const selected = effectiveSelection(scope);
     const count = selected.length;
     const bytes = selected.reduce((total, member) => total + (member.size || 0), 0);
     const prefix = scope === "all" ? "" : `${scopeLabelFor(scope)} · `;
-    $("selectionSummary").textContent = `${prefix}${count} file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
+    const duplicateCounts = scope === "duplicates" ? duplicateSelectionCounts() : null;
+    const breakdown = duplicateCounts
+      ? ` (${duplicateCounts.exact} Exact + ${duplicateCounts.similar} Similar)`
+      : "";
+    $("selectionSummary").textContent = `${prefix}${count} unique file${count === 1 ? "" : "s"} selected${breakdown} · ${formatBytes(bytes)}`;
   }
 
   // —— Scan ——
@@ -1096,14 +1127,48 @@
     }
 
     if (!dryRun) {
+      let preview;
+      try {
+        preview = await api("/api/action", {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            dry_run: true,
+            quarantine_dir,
+            scan_id: state.scanId,
+            kinds: scope,
+            ...(action === "isolate" ? { isolate_mode: "copy", isolate_kinds: scope } : {}),
+          }),
+        });
+      } catch (error) {
+        toast(`Could not verify selection: ${error.message}`, "error");
+        return;
+      }
+
+      if (action !== "isolate" && preview.fail_count) {
+        const reason = preview.items?.find((item) => item.error)?.error;
+        toast(`Nothing moved: ${preview.fail_count} selected file(s) failed revalidation${reason ? ` · ${reason}` : ""}`, "error");
+        return;
+      }
+      if (action !== "isolate" && preview.success_count === 0) {
+        toast(`No verified ${scopeLabel}files are eligible for this action`);
+        await loadGroups();
+        return;
+      }
+
+      const verifiedCount = action === "isolate" ? count : preview.success_count;
+      const counts = preview.selection_counts || {};
+      const duplicateBreakdown = scope === "duplicates"
+        ? ` (${counts.exact || 0} Exact + ${counts.similar || 0} Similar = ${verifiedCount} unique total)`
+        : "";
       const labels = {
         trash: `Move selected ${scopeLabel}files to Trash?`,
         quarantine: `Move selected ${scopeLabel}files to quarantine?`,
         isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `${count} ${scopeLabel}file(s) will be revalidated, then go to Trash (recoverable in Finder on macOS).`,
-        quarantine: `${count} ${scopeLabel}file(s) will be revalidated, then move to ${quarantine_dir}.`,
+        trash: `${verifiedCount} verified ${scopeLabel}file(s) will go to Trash${duplicateBreakdown} (recoverable in Finder on macOS).`,
+        quarantine: `${verifiedCount} verified ${scopeLabel}file(s) will move to ${quarantine_dir}${duplicateBreakdown}.`,
         isolate: `${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated, then copied into a new timestamped review session. Originals stay put.`,
       };
       const ok = await confirmModal({

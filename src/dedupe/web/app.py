@@ -32,7 +32,7 @@ from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_pat
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 4
+WEB_API_VERSION = 5
 
 
 def _macos_picker_script(kind: str) -> str:
@@ -704,7 +704,32 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
 
         try:
             kinds_raw = data.get("kinds") or data.get("isolate_kinds") or "all"
-            kinds = None if kinds_raw in ("all", "") else {kinds_raw}
+            if kinds_raw == "duplicates":
+                kinds = {"exact", "similar"}
+            else:
+                kinds = None if kinds_raw in ("all", "") else {kinds_raw}
+            scoped_groups = (
+                groups
+                if kinds is None
+                else [group for group in groups if group.kind.value in kinds]
+            )
+            selected_paths = effective_selected_paths(scoped_groups)
+            selected = set(selected_paths)
+            exact_paths = set(effective_selected_paths([
+                group for group in scoped_groups if group.kind.value == "exact"
+            ])) & selected
+            similar_paths = (set(effective_selected_paths([
+                group for group in scoped_groups if group.kind.value == "similar"
+            ])) & selected) - exact_paths
+            no_human_paths = (set(effective_selected_paths([
+                group for group in scoped_groups if group.kind.value == "no_humans"
+            ])) & selected) - exact_paths - similar_paths
+            selection_counts = {
+                "exact": len(exact_paths),
+                "similar": len(similar_paths),
+                "no_humans": len(no_human_paths),
+                "unique_total": len(selected_paths),
+            }
             if action == "isolate":
                 mode = (data.get("isolate_mode") or "copy").lower()
                 action_result = isolate_groups(
@@ -771,7 +796,10 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                         str(Path(action_result.review_root).resolve(strict=False))
                     )
 
-            return jsonify(action_result.to_dict())
+            payload = action_result.to_dict()
+            if action in ("trash", "quarantine"):
+                payload["selection_counts"] = selection_counts
+            return jsonify(payload)
         finally:
             with lock:
                 state["acting"] = False
