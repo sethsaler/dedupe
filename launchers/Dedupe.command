@@ -55,7 +55,7 @@ fi
 # Flask serves static files from disk while its route table is fixed at process start;
 # blindly reusing an old process can therefore show new buttons backed by missing APIs.
 if command -v lsof >/dev/null 2>&1; then
-  PID="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)"
+  PID="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
   if [[ -n "$PID" ]]; then
     EXPECTED_API_VERSION="$("$PYTHON" -c 'from dedupe.web.app import WEB_API_VERSION; print(WEB_API_VERSION)')"
     RUNNING_API_VERSION="$(curl -sf "$URL/api/status" 2>/dev/null \

@@ -153,6 +153,10 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert "Preview trash" in html
     assert "Preview quarantine" in html
     assert "Preview isolate" in html
+    assert 'id="memberPagination"' in html
+    assert 'id="memberPaginationBottom"' in html
+    assert 'class="btn ghost member-prev"' in html
+    assert 'class="btn ghost member-next"' in html
 
 
 def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:

@@ -886,6 +886,30 @@ kbd {
 
 .detail-tools select { min-width: 190px; }
 
+.member-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 0 0 18px;
+}
+
+.member-pagination-bottom {
+  margin: 22px 0 8px;
+  padding-top: 8px;
+}
+
+.member-pagination[hidden] { display: none; }
+
+.member-pagination span,
+.member-page-summary {
+  min-width: 110px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-align: center;
+}
+
 .members {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 320px));

@@ -5,6 +5,7 @@
   const QUAR_KEY = "dedupe.quarantineDir";
   const WORKERS_KEY = "dedupe.workers";
   const SETTINGS_KEY = "dedupe.scanSettings.v1";
+  const MEMBER_PAGE_SIZE = 50;
   const CSRF_TOKEN =
     document.querySelector('meta[name="dedupe-token"]')?.getAttribute("content") || "";
 
@@ -15,6 +16,7 @@
     currentId: null,
     pollTimer: null,
     memberFocus: 0,
+    memberPage: 0,
     lightboxPaths: [],
     lightboxIndex: 0,
     scanning: false,
@@ -112,6 +114,35 @@
       size /= 1024;
     }
     return `${n} B`;
+  }
+
+  function formatMtime(seconds) {
+    if (seconds == null || Number.isNaN(Number(seconds))) return "—";
+    const date = new Date(Number(seconds) * 1000);
+    if (Number.isNaN(date.getTime())) return "—";
+    return date.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  function syncMemberPagination(pageCount, summaryText) {
+    const bars = [
+      $("memberPagination"),
+      $("memberPaginationBottom"),
+    ].filter(Boolean);
+    for (const bar of bars) {
+      bar.hidden = pageCount <= 1;
+      const prev = bar.querySelector(".member-prev");
+      const next = bar.querySelector(".member-next");
+      const summary = bar.querySelector(".member-page-summary");
+      if (prev) prev.disabled = state.memberPage === 0;
+      if (next) next.disabled = state.memberPage >= pageCount - 1;
+      if (summary) summary.textContent = summaryText;
+    }
   }
 
   function formatDuration(seconds) {
@@ -528,7 +559,7 @@
         return `
           <button class="group-item ${active}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
             <div class="g-top">
-              <span>${g.member_count} files · ${escapeHtml(g.media_type)}</span>
+              <span>${g.member_count} files${g.kind === "no_humans" ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
               <span class="badge ${g.kind}">${badgeLabel}</span>
             </div>
             <div class="g-sub">
@@ -565,12 +596,15 @@
   async function selectGroup(id, { silent = false } = {}) {
     state.currentId = id;
     state.memberFocus = 0;
+    state.memberPage = 0;
     renderGroupList();
     const g = await api(`/api/groups/${id}`);
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
     const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
-    $("detailTitle").textContent = `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
+    $("detailTitle").textContent = g.kind === "no_humans"
+      ? `${kindLabel} · ${g.member_count} files`
+      : `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
     document.querySelector(".selection-toolbar").hidden = g.kind === "no_humans";
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
@@ -592,15 +626,27 @@
     const selected = new Set(g.selected_for_removal || []);
     const reviewedPaths = new Set(g.reviewed_paths || []);
     const deletedPaths = new Set(g.deleted_paths || []);
-    const members = g.members || [];
+    const allMembers = g.members || [];
+    const pageCount = g.kind === "no_humans"
+      ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
+      : 1;
+    state.memberPage = Math.max(0, Math.min(pageCount - 1, state.memberPage));
+    const pageStart = state.memberPage * MEMBER_PAGE_SIZE;
+    const members = g.kind === "no_humans"
+      ? allMembers.slice(pageStart, pageStart + MEMBER_PAGE_SIZE)
+      : allMembers;
+    const summaryText = allMembers.length
+      ? `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
+      : "0 results";
+    syncMemberPagination(pageCount, summaryText);
     state.lightboxPaths = members
       .filter((member) => !deletedPaths.has(member.path))
       .map((member) => member.path);
     updateDetailMeta(g);
-    const reviewedCount = members.filter((member) => reviewedPaths.has(member.path)).length;
+    const reviewedCount = allMembers.filter((member) => reviewedPaths.has(member.path)).length;
     $("groupSelectionSummary").textContent = g.kind === "no_humans"
-      ? `${selected.size} selected · ${reviewedCount} of ${members.length} reviewed`
-      : `${selected.size} of ${members.length} selected for removal`;
+      ? `${selected.size} selected · ${reviewedCount} of ${allMembers.length} reviewed`
+      : `${selected.size} of ${allMembers.length} selected for removal`;
 
     box.innerHTML = members
       .map((m, i) => {
@@ -654,6 +700,7 @@
               <div class="card-meta">
                 <span>${formatBytes(m.size)}</span>
                 <span>${dims}</span>
+                <span title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
               </div>
               <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
@@ -764,6 +811,28 @@
       });
     });
   }
+
+  function changeMemberPage(delta) {
+    const current = state.allGroups.find((group) => group.id === state.currentId)
+      || state.groups.find((group) => group.id === state.currentId);
+    if (!current || current.kind !== "no_humans") return;
+    const pageCount = Math.max(1, Math.ceil((current.members || []).length / MEMBER_PAGE_SIZE));
+    const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
+    if (nextPage === state.memberPage) return;
+    state.memberPage = nextPage;
+    state.memberFocus = 0;
+    renderMembers(current);
+    // Jump to the top pager so the next page of results is immediately visible.
+    const topPager = $("memberPagination");
+    if (topPager) topPager.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  document.querySelectorAll(".member-prev").forEach((btn) => {
+    btn.addEventListener("click", () => changeMemberPage(-1));
+  });
+  document.querySelectorAll(".member-next").forEach((btn) => {
+    btn.addEventListener("click", () => changeMemberPage(1));
+  });
 
   function currentScope() {
     const el = $("actionScope");

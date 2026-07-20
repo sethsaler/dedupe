@@ -140,37 +140,40 @@ def build_groups(
     return groups
 
 
-def build_no_human_groups(
-    members: list[FileRecord], *, chunk_size: int = 50
-) -> list[DuplicateGroup]:
-    """Build review groups only from explicit no-person detector decisions."""
-    groups: list[DuplicateGroup] = []
-    for media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO):
-        matching = sorted(
-            (
-                member
-                for member in members
-                if member.media_type == media_type
-                and is_current_no_person_decision(
-                    member.human_detection_status,
-                    member.human_detection_signature,
-                )
-            ),
-            key=lambda member: member.path,
-        )
-        for offset in range(0, len(matching), chunk_size):
-            chunk = matching[offset : offset + chunk_size]
-            group = DuplicateGroup(
-                id=make_group_id(GroupKind.NO_HUMANS, chunk),
-                kind=GroupKind.NO_HUMANS,
-                media_type=media_type,
-                members=chunk,
-                selected_for_removal=[],
-                reviewed_paths=[],
-                suggested_keep=None,
+def build_no_human_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
+    """Build one review collection from explicit no-person detector decisions.
+
+    Members are ordered newest-first by mtime so the Non-Human review pages
+    surface the most recently modified files first.
+    """
+    matching = sorted(
+        (
+            member
+            for member in members
+            if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+            and is_current_no_person_decision(
+                member.human_detection_status,
+                member.human_detection_signature,
             )
-            groups.append(group)
-    return groups
+        ),
+        key=lambda member: (-member.mtime_sort_stamp, member.path),
+    )
+    if not matching:
+        return []
+
+    media_types = {member.media_type for member in matching}
+    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
+    return [
+        DuplicateGroup(
+            id=make_group_id(GroupKind.NO_HUMANS, matching),
+            kind=GroupKind.NO_HUMANS,
+            media_type=media_type,
+            members=matching,
+            selected_for_removal=[],
+            reviewed_paths=[],
+            suggested_keep=None,
+        )
+    ]
 
 
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:

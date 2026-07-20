@@ -14,6 +14,7 @@ class MediaType(str, Enum):
     IMAGE = "image"
     GIF = "gif"
     VIDEO = "video"
+    MIXED = "mixed"
     OTHER = "other"
 
 
@@ -118,6 +119,13 @@ class FileRecord:
             return self.width * self.height
         return 0
 
+    @property
+    def mtime_sort_stamp(self) -> int:
+        """Nanosecond modification stamp for newest-first ordering."""
+        if self.mtime_ns is not None:
+            return int(self.mtime_ns)
+        return int(self.mtime * 1_000_000_000)
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["media_type"] = self.media_type.value
@@ -217,14 +225,18 @@ class ReviewGroup:
         if kind == GroupKind.NO_HUMANS:
             # Loaded or hand-built results may be stale. A positive or missing
             # detector decision must never appear in the Non-Human review flow.
-            members = [
-                member
-                for member in members
-                if is_current_no_person_decision(
-                    member.human_detection_status,
-                    member.human_detection_signature,
-                )
-            ]
+            # Keep newest-first order so Non-Human pages match a fresh scan.
+            members = sorted(
+                (
+                    member
+                    for member in members
+                    if is_current_no_person_decision(
+                        member.human_detection_status,
+                        member.human_detection_signature,
+                    )
+                ),
+                key=lambda member: (-member.mtime_sort_stamp, member.path),
+            )
         member_paths = {member.path for member in members}
         return cls(
             id=data["id"],

@@ -131,6 +131,74 @@ def test_no_human_groups_reject_positive_and_unverified_records() -> None:
     assert groups[0].members == [safe]
 
 
+def test_no_human_candidates_form_one_mixed_media_collection() -> None:
+    candidates = [
+        _mark_no_person(_rec(f"/image-{index:03d}.jpg", 300, index))
+        for index in range(120)
+    ]
+    video = _mark_no_person(_rec("/video.mp4", 500, 121))
+    video.media_type = MediaType.VIDEO
+    candidates.append(video)
+
+    groups = build_no_human_groups(candidates)
+
+    assert len(groups) == 1
+    assert groups[0].media_type == MediaType.MIXED
+    assert len(groups[0].members) == 121
+
+
+def test_no_human_members_ordered_newest_mtime_first() -> None:
+    older = _mark_no_person(_rec("/older.jpg", 300, mtime=10))
+    newer = _mark_no_person(_rec("/newer.jpg", 300, mtime=30))
+    mid = _mark_no_person(_rec("/mid.jpg", 300, mtime=20))
+    # Same mtime: path is the stable tie-breaker.
+    twin_b = _mark_no_person(_rec("/twin-b.jpg", 300, mtime=30))
+    twin_a = _mark_no_person(_rec("/twin-a.jpg", 300, mtime=30))
+    # Nanosecond precision beats coarser float seconds when available.
+    ns_older = _mark_no_person(_rec("/ns-older.jpg", 300, mtime=40))
+    ns_older.mtime_ns = 40_000_000_000
+    ns_newer = _mark_no_person(_rec("/ns-newer.jpg", 300, mtime=40))
+    ns_newer.mtime_ns = 40_000_000_500
+
+    group = build_no_human_groups(
+        [older, newer, mid, twin_b, twin_a, ns_older, ns_newer]
+    )[0]
+
+    assert [m.path for m in group.members] == [
+        "/ns-newer.jpg",
+        "/ns-older.jpg",
+        "/newer.jpg",
+        "/twin-a.jpg",
+        "/twin-b.jpg",
+        "/mid.jpg",
+        "/older.jpg",
+    ]
+
+    loaded = ReviewGroup.from_dict(
+        {
+            "id": "no-human-order",
+            "kind": "no_humans",
+            "media_type": "image",
+            "members": [
+                m.to_dict()
+                for m in [older, mid, twin_b, twin_a, newer, ns_older, ns_newer]
+            ],
+            "selected_for_removal": [],
+            "reviewed_paths": [],
+            "suggested_keep": None,
+        }
+    )
+    assert [m.path for m in loaded.members] == [
+        "/ns-newer.jpg",
+        "/ns-older.jpg",
+        "/newer.jpg",
+        "/twin-a.jpg",
+        "/twin-b.jpg",
+        "/mid.jpg",
+        "/older.jpg",
+    ]
+
+
 def test_loaded_no_human_group_drops_positive_records() -> None:
     safe = _mark_no_person(_rec("/landscape.jpg", 300, 1))
     human = _rec("/portrait.jpg", 400, 2)
