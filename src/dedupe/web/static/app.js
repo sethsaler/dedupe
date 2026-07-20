@@ -5,6 +5,7 @@
   const QUAR_KEY = "dedupe.quarantineDir";
   const WORKERS_KEY = "dedupe.workers";
   const SETTINGS_KEY = "dedupe.scanSettings.v1";
+  const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
   const MEMBER_PAGE_SIZE = 50;
   const CSRF_TOKEN =
     document.querySelector('meta[name="dedupe-token"]')?.getAttribute("content") || "";
@@ -17,7 +18,7 @@
     pollTimer: null,
     memberFocus: 0,
     memberPage: 0,
-    lightboxPaths: [],
+    lightboxItems: [],
     lightboxIndex: 0,
     scanning: false,
     acting: false,
@@ -643,9 +644,9 @@
       ? `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
       : "0 results";
     syncMemberPagination(pageCount, summaryText);
-    state.lightboxPaths = members
+    state.lightboxItems = members
       .filter((member) => !deletedPaths.has(member.path))
-      .map((member) => member.path);
+      .map((member) => ({ path: member.path, mediaType: member.media_type }));
     updateDetailMeta(g);
     const reviewedCount = allMembers.filter((member) => reviewedPaths.has(member.path)).length;
     $("groupSelectionSummary").textContent = g.kind === "no_humans"
@@ -661,7 +662,7 @@
         const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
         const focused = i === state.memberFocus ? "focused" : "";
-        const lightboxIndex = state.lightboxPaths.indexOf(m.path);
+        const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);
         const fileName = basename(m.path);
         const badge = isSel
           ? `<span class="thumb-badge remove">Remove</span>`
@@ -684,6 +685,7 @@
           : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
               <img class="thumb-image" src="${thumb}" alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />
+              ${m.media_type === "video" ? '<span class="video-preview-badge" aria-hidden="true">▶ Play</span>' : ""}
             </button>`;
         const actions = g.kind === "no_humans"
           ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
@@ -1169,24 +1171,62 @@
 
   // —— Lightbox ——
   function openLightbox(index) {
-    if (!state.lightboxPaths.length) return;
-    state.lightboxIndex = Math.max(0, Math.min(index, state.lightboxPaths.length - 1));
+    if (!state.lightboxItems.length) return;
+    state.lightboxIndex = Math.max(0, Math.min(index, state.lightboxItems.length - 1));
     updateLightbox();
     $("lightbox").hidden = false;
   }
 
   function closeLightbox() {
+    $("lbVideo").pause();
+    $("lbVideo").removeAttribute("src");
+    $("lbVideo").load();
     $("lightbox").hidden = true;
   }
 
   function updateLightbox() {
-    const path = state.lightboxPaths[state.lightboxIndex];
-    if (!path) return;
-    $("lbImage").src = `/api/thumbnail?path=${encodeURIComponent(path)}&full=1`;
-    $("lbMeta").textContent = path;
+    const item = state.lightboxItems[state.lightboxIndex];
+    if (!item) return;
+    const image = $("lbImage");
+    const video = $("lbVideo");
+    const isVideo = item.mediaType === "video";
+
+    video.pause();
+    video.hidden = !isVideo;
+    $("lbVideoTools").hidden = !isVideo;
+    image.hidden = isVideo;
+    if (isVideo) {
+      image.removeAttribute("src");
+      video.src = `/api/media?path=${encodeURIComponent(item.path)}`;
+      video.playbackRate = Number($("lbSpeed").value);
+    } else {
+      video.removeAttribute("src");
+      video.load();
+      image.src = `/api/thumbnail?path=${encodeURIComponent(item.path)}&full=1`;
+    }
+    $("lbMeta").textContent = item.path;
     $("lbPrev").disabled = state.lightboxIndex <= 0;
-    $("lbNext").disabled = state.lightboxIndex >= state.lightboxPaths.length - 1;
+    $("lbNext").disabled = state.lightboxIndex >= state.lightboxItems.length - 1;
   }
+
+  try {
+    const savedRate = Number(localStorage.getItem(PLAYBACK_RATE_KEY));
+    if ([0.5, 1, 1.5, 2, 3, 4].includes(savedRate)) $("lbSpeed").value = String(savedRate);
+  } catch {
+    /* ignore */
+  }
+  $("lbSpeed").addEventListener("change", () => {
+    const rate = Number($("lbSpeed").value);
+    $("lbVideo").playbackRate = rate;
+    try {
+      localStorage.setItem(PLAYBACK_RATE_KEY, String(rate));
+    } catch {
+      /* ignore */
+    }
+  });
+  $("lbVideo").addEventListener("loadedmetadata", () => {
+    $("lbVideo").playbackRate = Number($("lbSpeed").value);
+  });
 
   $("lbClose").addEventListener("click", closeLightbox);
   $("lbPrev").addEventListener("click", () => {
@@ -1196,7 +1236,7 @@
     }
   });
   $("lbNext").addEventListener("click", () => {
-    if (state.lightboxIndex < state.lightboxPaths.length - 1) {
+    if (state.lightboxIndex < state.lightboxItems.length - 1) {
       state.lightboxIndex += 1;
       updateLightbox();
     }
@@ -1243,6 +1283,7 @@
     }
 
     if (!$("lightbox").hidden) {
+      if (typing || e.target === $("lbVideo")) return;
       if (e.key === "ArrowLeft") {
         $("lbPrev").click();
         e.preventDefault();

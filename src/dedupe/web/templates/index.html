@@ -236,6 +236,19 @@
     <button class="lb-nav prev" id="lbPrev" type="button" aria-label="Previous">‹</button>
     <div class="lb-stage">
       <img id="lbImage" alt="" />
+      <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
+      <div class="lb-video-tools" id="lbVideoTools" hidden>
+        <label for="lbSpeed">Playback speed</label>
+        <select id="lbSpeed">
+          <option value="0.5">0.5×</option>
+          <option value="1">1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2" selected>2×</option>
+          <option value="3">3×</option>
+          <option value="4">4×</option>
+        </select>
+        <span>Use the video timeline to scrub quickly</span>
+      </div>
       <div class="lb-meta" id="lbMeta"></div>
     </div>
     <button class="lb-nav next" id="lbNext" type="button" aria-label="Next">›</button>

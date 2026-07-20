@@ -32,7 +32,7 @@ from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_pat
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 3
+WEB_API_VERSION = 4
 
 
 def _macos_picker_script(kind: str) -> str:
@@ -94,6 +94,16 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             member.path for member in group.members if member.path in deleted
         ]
         return payload
+
+    def is_scanned_file(path: Path, raw_path: str) -> bool:
+        """Return whether a file belongs to the active local review session."""
+        with lock:
+            result: ScanResult | None = state["result"]
+            allowed = {file.path for file in result.files} if result else set()
+            if result:
+                for group in result.groups:
+                    allowed.update(member.path for member in group.members)
+        return raw_path in allowed or str(path.resolve()) in allowed
 
     @app.before_request
     def protect_mutating_api():
@@ -905,18 +915,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             return jsonify({"error": "not found"}), 404
 
         # Only serve files that were part of the last scan (path traversal safety)
-        with lock:
-            result: ScanResult | None = state["result"]
-            allowed = {f.path for f in result.files} if result else set()
-            if result and result.groups:
-                for g in result.groups:
-                    for m in g.members:
-                        allowed.add(m.path)
-        if str(p.resolve()) not in allowed and path not in allowed:
-            # also allow resolve match
-            resolved = str(p.resolve())
-            if resolved not in allowed:
-                return jsonify({"error": "not in scan"}), 403
+        if not is_scanned_file(p, path):
+            return jsonify({"error": "not in scan"}), 403
 
         ext = p.suffix.lower()
         # Videos: try a cached frame if we can't stream
@@ -967,6 +967,25 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         except Exception:
             mime, _ = mimetypes.guess_type(str(p))
             return send_file(p, mimetype=mime or "application/octet-stream")
+
+    @app.get("/api/media")
+    def api_media():
+        """Stream scanned media with byte ranges for native video seeking."""
+        path = request.args.get("path", "")
+        if not path:
+            return jsonify({"error": "path required"}), 400
+        media_path = Path(path)
+        if not media_path.is_file():
+            return jsonify({"error": "not found"}), 404
+        if not is_scanned_file(media_path, path):
+            return jsonify({"error": "not in scan"}), 403
+
+        mime, _ = mimetypes.guess_type(str(media_path))
+        return send_file(
+            media_path,
+            mimetype=mime or "application/octet-stream",
+            conditional=True,
+        )
 
     @app.get("/api/reveal")
     def api_reveal():

@@ -1014,6 +1014,22 @@ kbd {
   color: #fff0f0;
 }
 
+.video-preview-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 5px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  background: rgba(7, 9, 13, 0.82);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
 .card-body {
   padding: 14px;
   display: flex;
@@ -1293,13 +1309,40 @@ kbd {
   max-height: 100%;
 }
 
-.lb-stage img {
+.lb-stage img,
+.lb-stage video {
   max-width: 100%;
   max-height: calc(100vh - 120px);
   object-fit: contain;
   border-radius: 8px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   animation: zoom-in 0.22s var(--ease-out) both;
+}
+
+.lb-stage video {
+  width: min(1100px, 100%);
+  background: #000;
+}
+
+.lb-video-tools {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.lb-video-tools[hidden] { display: none; }
+
+.lb-video-tools label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.lb-video-tools select {
+  min-height: 32px;
+  padding: 4px 28px 4px 9px;
 }
 
 .lb-meta {

@@ -158,6 +158,28 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="memberPaginationBottom"' in html
     assert 'class="btn ghost member-prev"' in html
     assert 'class="btn ghost member-next"' in html
+    assert 'id="lbVideo"' in html
+    assert 'id="lbSpeed"' in html
+
+
+def test_media_endpoint_streams_only_scanned_files_with_range_support(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    client = create_app(result).test_client()
+    scanned = Path(result.files[0].path)
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"not part of scan")
+
+    response = client.get(
+        "/api/media",
+        query_string={"path": str(scanned)},
+        headers={"Range": "bytes=0-3"},
+    )
+    assert response.status_code == 206
+    assert response.data == b"same"
+    assert response.headers["Accept-Ranges"] == "bytes"
+
+    forbidden = client.get("/api/media", query_string={"path": str(outside)})
+    assert forbidden.status_code == 403
 
 
 def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
