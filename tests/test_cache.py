@@ -23,6 +23,7 @@ def _record(path: Path, *, inode: int) -> FileRecord:
 def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     original = _record(tmp_path / "photo.jpg", inode=10)
+    original.tile_phashes = "0,1,2,3,4"
     cache.store_all([original])
 
     same = _record(tmp_path / "photo.jpg", inode=10)
@@ -32,6 +33,7 @@ def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
 
     assert cache.hydrate([same]) == 1
     assert same.phash == "0" * 16
+    assert same.tile_phashes == "0,1,2,3,4"
     assert cache.hydrate([replaced]) == 0
     cache.close()
 

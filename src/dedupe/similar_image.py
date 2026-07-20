@@ -163,7 +163,7 @@ def _tile_phashes_from_image(img) -> list:
 
 @lru_cache(maxsize=2048)
 def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
-    """Cached tile hashes as hex strings for a path."""
+    """Run-cached tile hashes as hex strings for a path."""
     _ensure_image_deps()
     _register_heif()
     from PIL import Image, ImageOps
@@ -202,12 +202,22 @@ def is_near_identical(
     *,
     tile_max: int = DEFAULT_TILE_MAX,
     tile_mean: float = DEFAULT_TILE_MEAN,
+    tiles_a: tuple[str, ...] | None = None,
+    tiles_b: tuple[str, ...] | None = None,
 ) -> bool:
     """
     True if regional structure matches (same image / scale / quality variants).
     False for same-person different-pose shots that can still pass global pHash.
     """
-    dists = tile_distances(path_a, path_b)
+    if tiles_a is not None and tiles_b is not None and len(tiles_a) == len(tiles_b):
+        import imagehash
+
+        dists = [
+            int(imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b))
+            for a, b in zip(tiles_a, tiles_b, strict=True)
+        ]
+    else:
+        dists = tile_distances(path_a, path_b)
     if dists is None:
         # Fail open only when we cannot verify — safer for rare decode errors
         # is fail closed for "similar"; require tiles when possible.
@@ -217,6 +227,18 @@ def is_near_identical(
     if (sum(dists) / len(dists)) > tile_mean:
         return False
     return True
+
+
+def _record_tile_phashes(record: FileRecord) -> tuple[str, ...] | None:
+    """Load regional hashes once, retaining them on the record for the disk cache."""
+    if record.tile_phashes:
+        values = tuple(part for part in record.tile_phashes.split(",") if part)
+        if values:
+            return values
+    values = _tile_phashes_for_path(record.path)
+    if values:
+        record.tile_phashes = ",".join(values)
+    return values
 
 
 def find_similar_image_groups(
@@ -291,7 +313,6 @@ def find_similar_image_groups(
 
     # BK-tree for fast lookup
     try:
-        import imagehash
         import pybktree
     except ImportError:
         return _bruteforce_groups(
@@ -304,57 +325,73 @@ def find_similar_image_groups(
             cancelled,
         )
 
-    def distance(a: FileRecord, b: FileRecord) -> int:
-        ha = imagehash.hex_to_hash(a.phash)  # type: ignore[arg-type]
-        hb = imagehash.hex_to_hash(b.phash)  # type: ignore[arg-type]
-        return ha - hb
-
-    tree = pybktree.BKTree(distance, hashed)
+    # Parse each hash once. The old FileRecord-based distance function converted
+    # both hexadecimal hashes on every BK-tree comparison, which dominates at
+    # tens of thousands of records. Keep duplicate hashes in a side mapping
+    # because a BK-tree stores each integer key only once.
+    by_phash: dict[int, list[FileRecord]] = {}
+    for record in hashed:
+        by_phash.setdefault(int(record.phash or "0", 16), []).append(record)
+    tree = pybktree.BKTree(lambda a, b: (a ^ b).bit_count(), by_phash)
+    dhashes = {
+        record.path: int(record.dhash, 16)
+        for record in hashed
+        if record.dhash
+    }
+    positions = {record.path: i for i, record in enumerate(hashed)}
 
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
-    verified = 0
-    for i, rec in enumerate(hashed):
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        matches = tree.find(rec, threshold)
-        for dist, other in matches:
-            if other.path == rec.path:
-                continue
-            # Secondary dHash check to reduce false positives
-            if rec.dhash and other.dhash:
-                try:
-                    dh_a = imagehash.hex_to_hash(rec.dhash)
-                    dh_b = imagehash.hex_to_hash(other.dhash)
-                    if (dh_a - dh_b) > dhash_threshold:
+    try:
+        for i, rec in enumerate(hashed):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            matches = tree.find(int(rec.phash or "0", 16), threshold)
+            candidates = (
+                other
+                for _distance, matched_hash in matches
+                for other in by_phash[matched_hash]
+                # Every pair only needs regional verification once.
+                if positions[other.path] > i
+            )
+            for other in candidates:
+                # Secondary dHash check to reduce false positives
+                if rec.path in dhashes and other.path in dhashes:
+                    dhash_distance = (
+                        dhashes[rec.path] ^ dhashes[other.path]
+                    ).bit_count()
+                    if dhash_distance > dhash_threshold:
                         continue
-                except Exception:
-                    pass
-            # Near-identical: also prefer similar aspect ratio
-            if rec.width and rec.height and other.width and other.height:
-                ar_a = rec.width / max(rec.height, 1)
-                ar_b = other.width / max(other.height, 1)
-                if abs(ar_a - ar_b) > 0.15:
+                # Near-identical: also prefer similar aspect ratio
+                if rec.width and rec.height and other.width and other.height:
+                    ar_a = rec.width / max(rec.height, 1)
+                    ar_b = other.width / max(other.height, 1)
+                    if abs(ar_a - ar_b) > 0.15:
+                        continue
+                tiles_a = _record_tile_phashes(rec)
+                tiles_b = _record_tile_phashes(other)
+                if not tiles_a or not tiles_b:
                     continue
-            # Regional structure: reject different pose / composition
-            if not is_near_identical(
-                rec.path,
-                other.path,
-                tile_max=tile_max,
-                tile_mean=tile_mean,
-            ):
-                continue
-            adjacency[rec.path].add(other.path)
-            adjacency[other.path].add(rec.path)
-            verified += 1
-        if progress and (i + 1) % 20 == 0:
-            progress("image-cluster", i + 1, len(hashed))
+                # Regional structure: reject different pose / composition
+                if not is_near_identical(
+                    rec.path,
+                    other.path,
+                    tile_max=tile_max,
+                    tile_mean=tile_mean,
+                    tiles_a=tiles_a,
+                    tiles_b=tiles_b,
+                ):
+                    continue
+                adjacency[rec.path].add(other.path)
+                adjacency[other.path].add(rec.path)
+            if progress and (i + 1) % 20 == 0:
+                progress("image-cluster", i + 1, len(hashed))
 
-    if progress:
-        progress("image-cluster", len(hashed), len(hashed))
-
-    # Drop cache entries for this run so memory does not grow unbounded across scans
-    _tile_phashes_for_path.cache_clear()
+        if progress:
+            progress("image-cluster", len(hashed), len(hashed))
+    finally:
+        # Records retain hashes for this run and the disk cache; free path cache.
+        _tile_phashes_for_path.cache_clear()
 
     return cluster_around_best(hashed, adjacency)
 

@@ -98,6 +98,7 @@ class FileRecord:
     partial_hash: str | None = None
     phash: str | None = None
     dhash: str | None = None
+    tile_phashes: str | None = None
     video_fingerprint: str | None = None
     duration: float | None = None
     human_detection_status: str | None = None
@@ -142,6 +143,7 @@ class FileRecord:
             partial_hash=data.get("partial_hash"),
             phash=data.get("phash"),
             dhash=data.get("dhash"),
+            tile_phashes=data.get("tile_phashes"),
             video_fingerprint=data.get("video_fingerprint"),
             duration=data.get("duration"),
             human_detection_status=data.get("human_detection_status"),

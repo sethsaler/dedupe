@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable
 from pathlib import Path
 
@@ -196,6 +197,11 @@ def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
     ]
 
 
+def _fingerprint_hashes(value: str) -> tuple[int, ...]:
+    raw = value[3:] if value.startswith("v2:") else value
+    return tuple(int(part, 16) for part in raw.split(",") if part)
+
+
 def _video_fingerprint_job(
     path: str,
 ) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
@@ -269,18 +275,70 @@ def find_similar_video_groups(
         return []
 
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
+    fingerprints = [_fingerprint_hashes(record.video_fingerprint or "") for record in hashed]
+
+    # Duration is already part of the match contract. Use its allowed ±10% range
+    # as an exact candidate index instead of comparing every pair. Unlike a broad
+    # Hamming BK-tree search, this remains quick with common black intro frames.
+    known_durations = sorted(
+        (record.duration, index)
+        for index, record in enumerate(hashed)
+        if record.duration is not None and record.duration > 0
+    )
+    duration_values = [duration for duration, _index in known_durations]
+    unknown_duration_indexes = {
+        index
+        for index, record in enumerate(hashed)
+        if record.duration is None or record.duration <= 0
+    }
+    max_frame_distance = max(threshold * 2, 4)
 
     for i, a in enumerate(hashed):
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
-        for b in hashed[i + 1 :]:
-            distances = video_fingerprint_distances(
-                a.video_fingerprint or "", b.video_fingerprint or ""
+        if a.duration is not None and a.duration > 0:
+            start = bisect_left(duration_values, a.duration * 0.9)
+            end = bisect_right(duration_values, a.duration / 0.9)
+            indexes = sorted(
+                {
+                    index
+                    for _duration, index in known_durations[start:end]
+                    if index > i
+                }
+                | {index for index in unknown_duration_indexes if index > i}
             )
+        else:
+            indexes = range(i + 1, len(hashed))
+        for j in indexes:
+            b = hashed[j]
+            left = fingerprints[i]
+            right = fingerprints[j]
+            # These aligned positions are necessarily under the existing maximum.
+            if (
+                (left[0] ^ right[0]).bit_count() > max_frame_distance
+                or (left[-1] ^ right[-1]).bit_count() > max_frame_distance
+            ):
+                continue
+            count = min(len(left), len(right))
+            if count == 1:
+                left_indexes = right_indexes = [0]
+            else:
+                left_indexes = [
+                    round(k * (len(left) - 1) / (count - 1))
+                    for k in range(count)
+                ]
+                right_indexes = [
+                    round(k * (len(right) - 1) / (count - 1))
+                    for k in range(count)
+                ]
+            distances = [
+                (left[li] ^ right[ri]).bit_count()
+                for li, ri in zip(left_indexes, right_indexes, strict=True)
+            ]
             if not distances:
                 continue
             mean_distance = sum(distances) / len(distances)
-            if mean_distance > threshold or max(distances) > max(threshold * 2, 4):
+            if mean_distance > threshold or max(distances) > max_frame_distance:
                 continue
             # Near-identical: durations should be close when both known
             if a.duration and b.duration and a.duration > 0 and b.duration > 0:
