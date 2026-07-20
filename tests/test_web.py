@@ -8,7 +8,7 @@ from pathlib import Path
 from dedupe.grouping import build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import FileRecord, MediaType, ScanResult
-from dedupe.web.app import create_app
+from dedupe.web.app import WEB_API_VERSION, create_app
 
 
 def _result(tmp_path: Path) -> ScanResult:
@@ -135,6 +135,12 @@ def test_app_instances_do_not_share_results(tmp_path: Path) -> None:
 
     assert first.test_client().get("/api/status").get_json()["has_result"] is True
     assert second.test_client().get("/api/status").get_json()["has_result"] is False
+
+
+def test_status_exposes_web_api_version() -> None:
+    status = create_app().test_client().get("/api/status").get_json()
+
+    assert status["web_api_version"] == WEB_API_VERSION
 
 
 def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:

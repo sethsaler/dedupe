@@ -28,6 +28,11 @@ from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_paths
 
 
+# Increment when adding/changing browser-facing API routes. The macOS launcher uses
+# this to avoid pairing static files from the working tree with a stale Flask process.
+WEB_API_VERSION = 1
+
+
 def _macos_picker_script(kind: str) -> str:
     chooser = (
         'choose folder with prompt "Choose folders to scan" '
@@ -170,6 +175,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 "acting": state["acting"],
                 "progress": prog.to_dict(),
                 "has_result": result is not None,
+                "web_api_version": WEB_API_VERSION,
                 "groups_version": state["groups_version"],
                 "scan_id": state["scan_id"],
                 "error": state["last_error"],

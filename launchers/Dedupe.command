@@ -51,17 +51,43 @@ if ! "$PYTHON" -c "import dedupe" 2>/dev/null; then
   fi
 fi
 
-# If the port is already in use, open the existing UI instead of failing
+# Reuse a current Dedupe process, but restart an older process from this checkout.
+# Flask serves static files from disk while its route table is fixed at process start;
+# blindly reusing an old process can therefore show new buttons backed by missing APIs.
 if command -v lsof >/dev/null 2>&1; then
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    banner
-    echo "Dedupe is already running on port $PORT."
-    echo "Opening $URL"
-    open "$URL" 2>/dev/null || true
-    echo ""
-    echo "Press Enter to close this window (server keeps running)…"
-    read -r _
-    exit 0
+  PID="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)"
+  if [[ -n "$PID" ]]; then
+    EXPECTED_API_VERSION="$("$PYTHON" -c 'from dedupe.web.app import WEB_API_VERSION; print(WEB_API_VERSION)')"
+    RUNNING_API_VERSION="$(curl -sf "$URL/api/status" 2>/dev/null \
+      | "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin).get("web_api_version", ""))' \
+      2>/dev/null || true)"
+
+    if [[ "$RUNNING_API_VERSION" == "$EXPECTED_API_VERSION" ]]; then
+      banner
+      echo "Dedupe is already running on port $PORT."
+      echo "Opening $URL"
+      open "$URL" 2>/dev/null || true
+      echo ""
+      echo "Press Enter to close this window (server keeps running)…"
+      read -r _
+      exit 0
+    fi
+
+    PROCESS_CWD="$(lsof -a -p "$PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
+    PROCESS_COMMAND="$(ps -p "$PID" -o command= 2>/dev/null || true)"
+    if [[ "$PROCESS_CWD" == "$ROOT" && "$PROCESS_COMMAND" == *"dedupe.cli ui"* ]]; then
+      echo "Restarting an outdated Dedupe server…"
+      kill "$PID"
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+        sleep 0.2
+      done
+      if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        die "The outdated Dedupe server did not stop. Close it and try again."
+      fi
+    else
+      die "Port $PORT is being used by another application. Close it or set DEDUPE_PORT to another port."
+    fi
   fi
 fi
 
