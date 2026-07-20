@@ -44,6 +44,17 @@ def test_suggested_keep_prefers_resolution() -> None:
     assert pick_suggested_keep([low, high]) == high.path
 
 
+def test_similar_group_selects_lower_resolution_for_removal_by_default() -> None:
+    low = _rec("/a/small.jpg", size=5000, mtime=10, w=100, h=100)
+    high = _rec("/b/big.jpg", size=4000, mtime=5, w=4000, h=3000)
+
+    group = build_groups([], [[low, high]])[0]
+
+    assert group.kind == GroupKind.SIMILAR
+    assert group.suggested_keep == high.path
+    assert group.selected_for_removal == [low.path]
+
+
 def test_smart_select_always_keeps_one() -> None:
     a = _rec("/a.jpg", 100, 1)
     b = _rec("/b.jpg", 200, 2)
