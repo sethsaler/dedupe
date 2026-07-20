@@ -118,6 +118,126 @@ def _path_in_roots(path: Path, roots: list[str] | None) -> bool:
     return False
 
 
+def _volume_root(path: Path) -> Path:
+    """Best-effort mount point of the filesystem holding ``path``."""
+    resolved = path.resolve(strict=False)
+    cur = resolved.parent
+    try:
+        cur_dev = cur.stat().st_dev
+    except OSError:
+        return Path(resolved.anchor)
+    while cur.parent != cur:
+        try:
+            parent_dev = cur.parent.stat().st_dev
+        except OSError:
+            break
+        if parent_dev != cur_dev:
+            break
+        cur = cur.parent
+    return cur
+
+
+def _trash_dirs_for(path: Path) -> list[Path]:
+    """Plausible system Trash directories that may receive ``path`` (best effort).
+
+    send2trash picks the correct Trash internally; this is only used to locate the
+    trashed copy afterwards so an in-app undo can move it back. On macOS that is
+    ``~/.Trash`` plus a per-volume ``.Trashes/<uid>``; on Linux the XDG trash and a
+    per-mount ``.Trash-<uid>``. Unknown platforms return an empty list, in which case
+    the caller reports the file as trashed without a recoverable destination.
+    """
+    import sys
+
+    dirs: list[Path] = []
+    if sys.platform == "darwin":
+        home_trash = Path.home() / ".Trash"
+        if home_trash.exists():
+            dirs.append(home_trash)
+        try:
+            dev = path.stat().st_dev
+            home_dev = home_trash.stat().st_dev if home_trash.exists() else None
+        except OSError:
+            return dirs
+        if dev != home_dev:
+            vol_trash = _volume_root(path) / ".Trashes" / str(os.getuid())
+            if vol_trash.exists():
+                dirs.append(vol_trash)
+    elif sys.platform.startswith("linux"):
+        home_trash = Path.home() / ".local" / "share" / "Trash" / "files"
+        if home_trash.exists():
+            dirs.append(home_trash)
+        try:
+            dev = path.stat().st_dev
+            home_dev = Path.home().stat().st_dev
+        except OSError:
+            return dirs
+        if dev != home_dev:
+            mount_trash = _volume_root(path) / f".Trash-{os.getuid()}"
+            if mount_trash.exists():
+                dirs.append(mount_trash)
+    return dirs
+
+
+def _snapshot_trash(dirs: list[Path]) -> dict[Path, set[str]]:
+    listing: dict[Path, set[str]] = {}
+    for d in dirs:
+        try:
+            listing[d] = {p.name for p in d.iterdir()}
+        except OSError:
+            listing[d] = set()
+    return listing
+
+
+def _send_to_trash(src: Path) -> Path | None:
+    """Move ``src`` to the system Trash and return its resulting Trash path.
+
+    Uses send2trash so the file lands in the OS Trash (Finder Trash on macOS,
+    the XDG/FreeDesktop trash on Linux). Returns ``None`` when the file was trashed
+    successfully but its precise destination could not be determined, so callers can
+    still report success without a recoverable path.
+    """
+    from send2trash import send2trash
+
+    if not src.exists():
+        raise FileNotFoundError(str(src))
+    size = src.stat().st_size
+    name = src.name
+    stem = src.stem
+    dirs = _trash_dirs_for(src)
+    before = _snapshot_trash(dirs)
+    send2trash(str(src))
+    after = _snapshot_trash(dirs)
+
+    # The newly added entry (matched by size to avoid Finder's stray .DS_Store and
+    # concurrent trashes of same-named files) is our file.
+    for d in dirs:
+        for added in after.get(d, set()) - before.get(d, set()):
+            candidate = d / added
+            try:
+                if candidate.stat().st_size == size:
+                    return candidate
+            except OSError:
+                continue
+
+    # Fallback: most recently added matching entry by name, in case the size match
+    # missed it (e.g. send2trash chose a Trash dir we did not enumerate).
+    best: tuple[float, Path] | None = None
+    for d in dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.name == name or p.name.startswith(f"{stem} "):
+                try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    continue
+                if best is None or mtime > best[0]:
+                    best = (mtime, p)
+    return best[1] if best else None
+
+
 def _validate_record(record: FileRecord, roots: list[str] | None) -> str | None:
     path = Path(record.path)
     try:
@@ -268,20 +388,20 @@ def apply_actions(
             )
             continue
         if action == "trash":
-            dest_note = "Trash"
             if dry_run:
                 result.items.append(
-                    ActionItem(path=path_str, ok=True, action="trash", destination=dest_note)
+                    ActionItem(path=path_str, ok=True, action="trash", destination="Trash")
                 )
                 continue
             try:
-                from send2trash import send2trash
-
-                if not src.exists():
-                    raise FileNotFoundError(path_str)
-                send2trash(str(src))
+                destination = _send_to_trash(src)
                 result.items.append(
-                    ActionItem(path=path_str, ok=True, action="trash", destination=dest_note)
+                    ActionItem(
+                        path=path_str,
+                        ok=True,
+                        action="trash",
+                        destination=str(destination) if destination else "Trash",
+                    )
                 )
             except Exception as exc:
                 result.items.append(

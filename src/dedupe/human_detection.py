@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import threading
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
@@ -14,7 +16,14 @@ from .human_policy import (
     MANUALLY_CONFIRMED_HUMAN_STATUS,
 )
 from .models import FileRecord, MediaType
-from .similar_video import _extract_frames, ffmpeg_available
+from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
+from .similar_video import (
+    _extract_frames,
+    _extract_seek_frame_ppm,
+    _sample_timestamps,
+    ffmpeg_available,
+    probe_video,
+)
 
 ProgressCb = Callable[[str, int, int], None]
 
@@ -92,7 +101,9 @@ class _OpenCVPersonDetector:
     def _face_score(self, rgb_frame) -> float:
         """Run two face scales so both small and close-up faces are conservative hits."""
         best = 0.0
-        frame = rgb_frame
+        # Color conversion is linear, so convert once before deriving the two
+        # detection scales rather than converting each resized candidate.
+        frame = self.cv2.cvtColor(rgb_frame, self.cv2.COLOR_RGB2BGR)
         checked_sizes: set[tuple[int, int]] = set()
         for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
             height, width = frame.shape[:2]
@@ -112,9 +123,7 @@ class _OpenCVPersonDetector:
                 continue
             checked_sizes.add(size)
             self.face.setInputSize(size)
-            _result, faces = self.face.detect(
-                self.cv2.cvtColor(candidate, self.cv2.COLOR_RGB2BGR)
-            )
+            _result, faces = self.face.detect(candidate)
             if faces is not None and len(faces):
                 best = max(best, max(float(face[-1]) for face in faces))
                 if best >= YUNET_SCORE_THRESHOLD:
@@ -286,8 +295,16 @@ def _pil_frames(path: Path):
             image.seek(index)
             frame = ImageOps.exif_transpose(image) if frame_count == 1 else image
             rgb = frame.convert("RGB")
-            rgb.thumbnail((1280, 1280))
+            rgb.thumbnail((DETECT_MAX_SIDE, DETECT_MAX_SIDE))
             yield np.asarray(rgb)
+
+
+def _person_sample_timestamps(duration: float) -> list[float]:
+    """Use the normal sample set, but inspect likely/representative frames first."""
+    timestamps = _sample_timestamps(duration, HUMAN_VIDEO_MAX_FRAMES)
+    indexes = [len(timestamps) // 2, 0, len(timestamps) - 1]
+    indexes.extend(index for index in range(len(timestamps)) if index not in indexes)
+    return [timestamps[index] for index in indexes]
 
 
 def _media_person_evidence(
@@ -315,6 +332,36 @@ def _media_person_evidence(
             import numpy as np
             from PIL import Image
 
+            duration = record.duration
+            if duration is None or duration <= 0:
+                duration, width, height = probe_video(record.path)
+                record.duration = duration
+                record.width = width or record.width
+                record.height = height or record.height
+
+            if duration is not None and duration > 0:
+                # Seek and score incrementally. A positive frame stops all later
+                # decodes; a no-person decision still requires every requested
+                # frame to decode successfully.
+                for timestamp in _person_sample_timestamps(duration):
+                    ppm = _extract_seek_frame_ppm(
+                        record.path,
+                        timestamp,
+                        frame_width=HUMAN_VIDEO_FRAME_WIDTH,
+                    )
+                    if ppm is None:
+                        return None, frames_analyzed, max_confidence
+                    with Image.open(BytesIO(ppm)) as image:
+                        frames_analyzed += 1
+                        max_confidence = max(
+                            max_confidence,
+                            detector.score(np.asarray(image.convert("RGB"))),
+                        )
+                    if max_confidence > 0:
+                        return True, frames_analyzed, max_confidence
+                return False, frames_analyzed, max_confidence
+
+            # Rare fallback for containers without a probeable duration.
             with tempfile.TemporaryDirectory(prefix="dedupe-human-video-") as tmp:
                 frames = _extract_frames(
                     record.path,
@@ -375,6 +422,7 @@ def find_no_human_files(
     confidence: float = DEFAULT_CONFIDENCE,
     backend: str = DEFAULT_BACKEND,
     photon_model: str = DEFAULT_PHOTON_MODEL,
+    workers: int | None = None,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[FileRecord]:
@@ -408,7 +456,51 @@ def find_no_human_files(
     if progress and cached:
         progress("human-detection", len(cached), len(candidates))
 
-    if pending:
+    normalized_backend = backend.strip().lower()
+    human_workers = resolve_workers(workers, cap=DEFAULT_HUMAN_WORKERS_CAP)
+
+    if pending and normalized_backend == "opencv" and human_workers > 1 and len(pending) > 1:
+        # OpenCV detector objects mutate their input size and cannot be shared
+        # across threads. Keep one detector per worker thread instead.
+        local = threading.local()
+        detectors: list[PersonDetector] = []
+        detectors_lock = threading.Lock()
+
+        def analyze(record: FileRecord) -> None:
+            detector = getattr(local, "detector", None)
+            if detector is None:
+                detector = create_person_detector(
+                    backend,
+                    confidence=confidence,
+                    photon_model=photon_model,
+                )
+                local.detector = detector
+                with detectors_lock:
+                    detectors.append(detector)
+            analyze_person_presence(
+                record,
+                detector,
+                cache_signature=signature,
+            )
+
+        def parallel_progress(done: int, _total: int) -> None:
+            if progress:
+                progress("human-detection", len(cached) + done, len(candidates))
+
+        try:
+            map_parallel(
+                analyze,
+                pending,
+                workers=human_workers,
+                backend="thread",
+                progress=parallel_progress,
+                progress_every=1,
+                cancelled=cancelled,
+            )
+        finally:
+            for detector in detectors:
+                detector.close()
+    elif pending:
         detector = create_person_detector(
             backend,
             confidence=confidence,

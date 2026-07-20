@@ -1,6 +1,8 @@
 """Optional offline person-candidate detector tests."""
 
 import sys
+import threading
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,10 +13,13 @@ from PIL import Image
 from dedupe.human_detection import (
     _EnsemblePersonDetector,
     _OpenCVPersonDetector,
+    _media_person_evidence,
+    _person_sample_timestamps,
     create_person_detector,
     find_no_human_files,
     human_detection_signature,
 )
+from dedupe.models import FileRecord, MediaType
 from dedupe.scanner import inventory
 
 
@@ -94,6 +99,80 @@ def test_opencv_detector_short_circuits_full_body_pass_after_face_hit() -> None:
     )
 
 
+def test_video_person_detection_seeks_and_stops_after_positive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = FileRecord(
+        path=str(tmp_path / "video.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+    )
+    calls: list[float] = []
+
+    class FakeDetector:
+        backend = "test"
+
+        def score(self, _frame):
+            return 0.8 if len(calls) == 2 else 0.0
+
+        def close(self):
+            return None
+
+    image = Image.new("RGB", (64, 36), "white")
+    encoded = BytesIO()
+    image.save(encoded, format="PPM")
+
+    def fake_seek(_path, timestamp, **_kwargs):
+        calls.append(timestamp)
+        return encoded.getvalue()
+
+    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.human_detection.probe_video", lambda _path: (30.0, 640, 360))
+    monkeypatch.setattr("dedupe.human_detection._extract_seek_frame_ppm", fake_seek)
+
+    assert _media_person_evidence(record, FakeDetector()) == (True, 2, 0.8)
+    assert len(calls) == 2
+    assert (record.duration, record.width, record.height) == (30.0, 640, 360)
+
+
+def test_video_person_samples_prioritize_middle_then_endpoints() -> None:
+    timestamps = _person_sample_timestamps(60.0)
+
+    assert timestamps[:3] == [30.0, 0.0, 56.25]
+    assert sorted(timestamps) == [index * 3.75 for index in range(16)]
+
+
+def test_video_person_detection_fails_closed_on_incomplete_seek(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = FileRecord(
+        path=str(tmp_path / "broken.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=10.0,
+    )
+
+    class FakeDetector:
+        backend = "test"
+
+        def score(self, _frame):
+            raise AssertionError("an incomplete frame must not be scored")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.human_detection._extract_seek_frame_ppm", lambda *_args, **_kwargs: None
+    )
+
+    assert _media_person_evidence(record, FakeDetector()) == (None, 0, 0.0)
+
+
 def test_cached_person_decisions_skip_detector_and_keep_only_non_human(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -146,6 +225,51 @@ def test_detector_signature_change_forces_reanalysis(tmp_path: Path, monkeypatch
     assert calls == 1
     assert record.human_detection_status == "no_person_detected"
     assert record.human_detection_signature == human_detection_signature("opencv")
+
+
+def test_opencv_person_detection_uses_thread_local_workers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    records = []
+    for index in range(4):
+        path = tmp_path / f"image-{index}.jpg"
+        Image.new("RGB", (40, 40), "green").save(path)
+        records.extend(inventory([path]))
+
+    barrier = threading.Barrier(2)
+    created: list[int] = []
+    closed: list[int] = []
+    owner_threads: set[int] = set()
+    lock = threading.Lock()
+
+    class FakeDetector:
+        backend = "opencv-test"
+
+        def __init__(self):
+            with lock:
+                created.append(id(self))
+
+        def score(self, _frame):
+            with lock:
+                owner_threads.add(threading.get_ident())
+            barrier.wait(timeout=2)
+            return 0.0
+
+        def close(self):
+            with lock:
+                closed.append(id(self))
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector",
+        lambda *_args, **_kwargs: FakeDetector(),
+    )
+
+    found = find_no_human_files(records, backend="opencv", workers=2)
+
+    assert found == records
+    assert len(owner_threads) == 2
+    assert len(created) == 2
+    assert set(closed) == set(created)
 
 
 def test_manual_human_confirmation_skips_every_detector_version(

@@ -182,8 +182,8 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | --- | --- |
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
-| Similar videos | Ordered ffmpeg frame pHashes compared at normalized timeline positions (default mean Hamming ≤ 8) |
-| No person detected | Offline OpenCV YuNet face + full-body detection on images, representative GIF frames, and up to 16 sampled video frames |
+| Similar videos | Ordered pHashes from direct ffmpeg timeline seeks, compared at normalized positions (default mean Hamming ≤ 8) |
+| No person detected | Offline OpenCV YuNet face + full-body detection on images, representative GIF frames, and up to 16 direct-seek video frames with positive-evidence early exit |
 
 The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 through the local Photon runtime), or `ensemble` (OpenCV positives first, then Photon on uncertain frames). Photon stays opt-in: its first use can download roughly 10 GB of model weights, and detection returns person/face boxes rather than a calibrated confidence score. All processing remains local after the model is available.
 
@@ -226,14 +226,15 @@ Hashing stages run in a **bounded** thread pool so large libraries don’t pin e
 | `--workers N` | auto (`min(cpu−1, 8)`) | overall budget; `1` = serial |
 | Exact SHA-256 | ≤ budget | max **4** concurrent full-file reads |
 | Image pHash | ≤ budget | max **6**; images downscaled ≤512px before hash |
-| Video fingerprints | ≤ budget | max **2** concurrent ffmpeg (each `-threads 1`) |
+| Video fingerprints | ≤ budget | max **4** concurrent direct-seek ffmpeg jobs (each `-threads 1`) |
+| OpenCV person detection | ≤ budget | max **4** thread-local detectors; Photon/ensemble remain serial |
 
 Also:
 
 - Futures stay windowed (~2× workers in flight) so 50k files don’t allocate 50k tasks at once
 - Image decode uses Pillow `draft()` + thumbnail so 12MP HEIC/JPEG never hold full-res RGB
-- Video uses **one-pass** frame sampling (not N independent seeks): 320px for duplicate fingerprints and 640px for person detection
-- The scan cache means re-scans skip hashes and person checks for unchanged media; new, replaced, or modified files are analyzed normally
+- Video fingerprints fast-seek directly to 32px grayscale samples; person detection uses separate 640px direct seeks and stops decoding after positive evidence
+- The scan cache means re-scans skip hashes and person checks for unchanged media, including files renamed on the same filesystem; new, replaced, or modified files are analyzed normally
 
 For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2`.
 

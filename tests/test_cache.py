@@ -38,6 +38,21 @@ def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_cache_reuses_hashes_after_same_filesystem_move(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    original = _record(tmp_path / "before" / "photo.jpg", inode=10)
+    original.tile_phashes = "0,1,2,3,4"
+    cache.store_all([original])
+
+    moved = _record(tmp_path / "after" / "renamed.jpg", inode=10)
+    moved.phash = None
+
+    assert cache.hydrate([moved]) == 1
+    assert moved.phash == "0" * 16
+    assert moved.tile_phashes == "0,1,2,3,4"
+    cache.close()
+
+
 def test_cache_round_trips_person_decision_without_hashes(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     original = _record(tmp_path / "photo.jpg", inode=10)

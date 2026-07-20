@@ -23,6 +23,7 @@ ProgressCb = Callable[[str, int, int], None]
 DEFAULT_THRESHOLD = 8  # Hamming on combined 64-bit fingerprint
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
 FRAME_WIDTH = 320
+HASH_FRAME_SIZE = 32
 
 
 def ffmpeg_available() -> bool:
@@ -135,6 +136,79 @@ def _extract_frames(
     return sorted(out_dir.glob("frame_*.jpg"))
 
 
+def _sample_timestamps(duration: float, max_frames: int = MAX_FRAMES) -> list[float]:
+    """Return the timeline positions used by the video fingerprint."""
+    count = min(max_frames, max(3, min(max_frames, int(duration) + 1)))
+    return [index * duration / count for index in range(count)]
+
+
+def _extract_hash_frame(path: str | Path, timestamp: float) -> bytes | None:
+    """Fast-seek to one frame and return a 32×32 grayscale image buffer."""
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        # Input-side seeking skips directly to the nearest keyframe instead of
+        # decoding the entire timeline just to retain a handful of frames.
+        "-ss",
+        f"{timestamp:.6f}",
+        "-threads",
+        "1",
+        "-i",
+        str(path),
+        "-an",
+        "-sn",
+        "-vf",
+        f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,format=gray",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    expected = HASH_FRAME_SIZE * HASH_FRAME_SIZE
+    if result.returncode != 0 or len(result.stdout) != expected:
+        return None
+    return result.stdout
+
+
+def _extract_seek_frame_ppm(
+    path: str | Path, timestamp: float, *, frame_width: int
+) -> bytes | None:
+    """Fast-seek to one aspect-preserving frame and return it as PPM bytes."""
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{timestamp:.6f}",
+        "-threads",
+        "1",
+        "-i",
+        str(path),
+        "-an",
+        "-sn",
+        "-vf",
+        f"scale={max(1, int(frame_width))}:-2",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "ppm",
+        "-f",
+        "image2pipe",
+        "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    if result.returncode != 0 or not result.stdout.startswith(b"P6"):
+        return None
+    return result.stdout
+
+
 def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None, int | None, float | None]:
     """
     Return (fingerprint_hex, width, height, duration).
@@ -149,6 +223,18 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
     path = Path(path)
     duration, width, height = probe_video(path)
 
+    if duration is not None and duration > 0:
+        hashes = []
+        for timestamp in _sample_timestamps(duration):
+            raw = _extract_hash_frame(path, timestamp)
+            if raw is None:
+                return None, width, height, duration
+            image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
+            hashes.append(imagehash.phash(image))
+        return "v3:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
+
+    # Rare fallback for containers whose duration cannot be probed. This still
+    # uses the sequential extractor because there are no timestamps to seek to.
     with tempfile.TemporaryDirectory(prefix="dedupe-vid-") as tmp:
         frames = _extract_frames(path, Path(tmp), duration=duration)
         if not frames:
@@ -165,7 +251,7 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
         if not hashes:
             return None, width, height, duration
 
-        return "v2:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
+        return "v3:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
 
 
 def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
@@ -173,7 +259,7 @@ def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
     import imagehash
 
     def parse(value: str) -> list[str]:
-        if value.startswith("v2:"):
+        if value.startswith(("v2:", "v3:")):
             return [part for part in value[3:].split(",") if part]
         # Backward-compatible parser; cache versioning prevents normal reuse.
         return [value] if value else []
@@ -198,7 +284,7 @@ def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
 
 
 def _fingerprint_hashes(value: str) -> tuple[int, ...]:
-    raw = value[3:] if value.startswith("v2:") else value
+    raw = value[3:] if value.startswith(("v2:", "v3:")) else value
     return tuple(int(part, 16) for part in raw.split(",") if part)
 
 
@@ -236,7 +322,13 @@ def find_similar_video_groups(
     video_workers = resolve_workers(workers, cap=DEFAULT_VIDEO_WORKERS_CAP)
 
     total = len(videos)
-    need = [r for r in videos if not r.video_fingerprint]
+    # v3 uses direct timeline seeks and raw grayscale frames. Recompute cached
+    # v2 values once so old and new sampling methods are never compared.
+    need = [
+        r
+        for r in videos
+        if not r.video_fingerprint or not r.video_fingerprint.startswith("v3:")
+    ]
     cached = total - len(need)
 
     if need:

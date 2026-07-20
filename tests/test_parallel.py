@@ -10,6 +10,7 @@ from dedupe.exact import find_exact_groups
 from dedupe.models import FileRecord, MediaType
 from dedupe.parallel import (
     DEFAULT_EXACT_WORKERS_CAP,
+    DEFAULT_HUMAN_WORKERS_CAP,
     DEFAULT_IMAGE_WORKERS_CAP,
     DEFAULT_VIDEO_WORKERS_CAP,
     DEFAULT_WORKERS_CAP,
@@ -63,6 +64,7 @@ def test_resolve_workers() -> None:
     assert resolve_workers(64, cap=DEFAULT_IMAGE_WORKERS_CAP) == DEFAULT_IMAGE_WORKERS_CAP
     assert resolve_workers(64, cap=DEFAULT_EXACT_WORKERS_CAP) == DEFAULT_EXACT_WORKERS_CAP
     assert resolve_workers(64, cap=DEFAULT_VIDEO_WORKERS_CAP) == DEFAULT_VIDEO_WORKERS_CAP
+    assert resolve_workers(64, cap=DEFAULT_HUMAN_WORKERS_CAP) == DEFAULT_HUMAN_WORKERS_CAP
     assert resolve_workers(1, cap=DEFAULT_VIDEO_WORKERS_CAP) == 1
 
 

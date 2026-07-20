@@ -228,6 +228,7 @@ def run_scan(
             records,
             backend=human_backend,
             photon_model=photon_model,
+            workers=n_workers,
             progress=human_progress,
             cancelled=cancelled,
         )

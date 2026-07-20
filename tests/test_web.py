@@ -165,7 +165,6 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     group = result.groups[0]
     original = Path(group.members[0].path)
     app = create_app(result)
-    app.config["DEDUPE_RECOVERY_DIR"] = str(tmp_path / "recovery")
     client = app.test_client()
     headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
     scan_id = client.get("/api/status").get_json()["scan_id"]
@@ -206,7 +205,6 @@ def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path)
     result.files.append(remaining_record)
     result.groups = build_no_human_groups(result.files)
     app = create_app(result)
-    app.config["DEDUPE_RECOVERY_DIR"] = str(tmp_path / "recovery")
     cache_path = tmp_path / "hashes.sqlite3"
     app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
     client = app.test_client()
@@ -251,6 +249,13 @@ def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path)
     assert fresh.human_detection_signature is None
     assert cache.hydrate([deleted_record]) == 0
     cache.close()
+
+    # Restore the trashed file so the test does not leave junk in the real Trash.
+    client.post(
+        "/api/non-human/undo",
+        json={"group_id": group_id, "path": deleted_record.path, "scan_id": scan_id},
+        headers=headers,
+    )
 
 
 def test_similar_group_can_be_marked_distinct(tmp_path: Path) -> None:

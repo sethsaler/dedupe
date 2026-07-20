@@ -115,6 +115,7 @@ def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> N
     assert result.groups[0].selected_for_removal == []
     assert captured["backend"] == "photon"
     assert captured["photon_model"] == "test-model"
+    assert captured["workers"] >= 1
 
 
 def test_repeated_human_scan_only_analyzes_new_files(tmp_path: Path, monkeypatch) -> None:

@@ -70,9 +70,6 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     csrf_token = secrets.token_urlsafe(32)
     app.config["SECRET_KEY"] = secrets.token_hex(32)
     app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
-    app.config["DEDUPE_RECOVERY_DIR"] = str(
-        Path.home() / ".cache" / "dedupe" / "recovery"
-    )
     app.config["DEDUPE_CACHE_PATH"] = None
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     lock = threading.RLock()
@@ -454,7 +451,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
 
     @app.post("/api/non-human/delete")
     def api_delete_non_human():
-        """Remove one non-human candidate while retaining a recoverable copy."""
+        """Move one non-human candidate to the system Trash (Finder Trash on macOS)."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         path = data.get("path")
@@ -487,16 +484,14 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             roots = list(result.roots)
 
         try:
-            recovery_dir = Path(app.config["DEDUPE_RECOVERY_DIR"]) / state["scan_id"]
             action_result = apply_actions(
                 [action_group],
-                action="quarantine",
-                quarantine_dir=recovery_dir,
+                action="trash",
                 dry_run=False,
                 roots=roots,
             )
             item = next((item for item in action_result.items if item.path == path), None)
-            if item is None or not item.ok or not item.destination:
+            if item is None or not item.ok:
                 error = item.error if item else "delete did not complete"
                 return jsonify({"error": error}), 400
             with lock:
@@ -540,7 +535,9 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             if original.exists() or original.is_symlink():
                 return jsonify({"error": "the original path is already occupied"}), 409
             if not recoverable.is_file():
-                return jsonify({"error": "the recoverable file no longer exists"}), 404
+                return jsonify({
+                   "error": "the file is no longer in the Trash; restore it manually from Finder (macOS Trash)"
+               }), 404
             original.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(recoverable), str(original))
             with lock:

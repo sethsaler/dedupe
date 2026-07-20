@@ -680,7 +680,7 @@
           ? "Click to keep this file"
           : (g.kind === "no_humans" ? "Click to review and remove" : "Click to remove this file");
         const preview = deleted
-          ? `<div class="thumb-wrap deleted-preview"><div class="thumb-fallback">Deleted — undo available</div></div>`
+          ? `<div class="thumb-wrap deleted-preview"><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
           : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
               <img class="thumb-image" src="${thumb}" alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />
@@ -780,7 +780,7 @@
         renderMembers(updated);
         renderGroupList();
         updateSelectionSummary();
-        toast(endpoint.endsWith("undo") ? "Image restored" : "Image deleted", "ok");
+        toast(endpoint.endsWith("undo") ? "Image restored" : "Moved to Trash", "ok");
       } catch (err) {
         toast(err.message, "error");
       }

@@ -22,8 +22,12 @@ DEFAULT_WORKERS_CAP = 8
 DEFAULT_EXACT_WORKERS_CAP = 4
 # Concurrent image decodes (Pillow + pHash are CPU + RAM heavy on big JPEGs/HEIC).
 DEFAULT_IMAGE_WORKERS_CAP = 6
-# Concurrent ffmpeg fingerprint jobs (each spawns a real process).
-DEFAULT_VIDEO_WORKERS_CAP = 2
+# Direct-seek fingerprint jobs are short-lived; four keeps modern SSDs/CPUs busy
+# without returning to the contention caused by parallel full-timeline decodes.
+DEFAULT_VIDEO_WORKERS_CAP = 4
+# Concurrent OpenCV detector instances. Photon remains serial because its local
+# model is substantially heavier and does not promise thread-safe inference.
+DEFAULT_HUMAN_WORKERS_CAP = 4
 
 
 def resolve_workers(

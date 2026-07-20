@@ -88,6 +88,14 @@ class HashCache:
                 self._conn.execute(
                     f"ALTER TABLE hashes ADD COLUMN {column} {declaration}"
                 )
+        # Create this after column migrations so caches from early releases can
+        # still open when they predate the identity/version fields.
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS hashes_identity_idx
+            ON hashes (algorithm_version, device, inode, size, media_type)
+            """
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -107,6 +115,26 @@ class HashCache:
             "SELECT * FROM hashes WHERE path = ? AND size = ? AND algorithm_version = ?",
             (rec.path, rec.size, CACHE_ALGORITHM_VERSION),
         ).fetchone()
+        if not row and rec.device is not None and rec.inode is not None:
+            # Paths are not file identity. Reuse work after a rename or move on
+            # the same filesystem, while requiring metadata and media type to
+            # prevent an inode-reuse or extension-change false hit.
+            row = self._conn.execute(
+                """
+                SELECT * FROM hashes
+                WHERE size = ? AND algorithm_version = ? AND device = ?
+                    AND inode = ? AND media_type = ?
+                ORDER BY path
+                LIMIT 1
+                """,
+                (
+                    rec.size,
+                    CACHE_ALGORITHM_VERSION,
+                    rec.device,
+                    rec.inode,
+                    rec.media_type.value,
+                ),
+            ).fetchone()
         if not row:
             return None
         cached = dict(row)

@@ -74,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         metavar="N",
         help=(
-            "Parallel workers for hashing "
-            "(0 = auto, conservative; 1 = serial; stages still cap images/exact/video)"
+            "Parallel workers for hashing and OpenCV person detection "
+            "(0 = auto, conservative; 1 = serial; each stage has a safety cap)"
         ),
     )
     scan.add_argument(
