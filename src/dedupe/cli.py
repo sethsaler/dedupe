@@ -78,7 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
             "(0 = auto, conservative; 1 = serial; stages still cap images/exact/video)"
         ),
     )
-    scan.add_argument("--no-cache", action="store_true")
+    scan.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Recompute hashes and person checks instead of reusing unchanged files",
+    )
     scan.add_argument("--json", dest="json_out", metavar="FILE", help="Write results JSON")
     scan.add_argument(
         "--smart",

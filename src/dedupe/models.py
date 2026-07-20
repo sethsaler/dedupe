@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .human_policy import is_current_no_person_decision
+
 
 class MediaType(str, Enum):
     IMAGE = "image"
@@ -100,6 +102,7 @@ class FileRecord:
     duration: float | None = None
     human_detection_status: str | None = None
     human_detector: str | None = None
+    human_detection_signature: str | None = None
     human_frames_analyzed: int | None = None
     human_max_confidence: float | None = None
     error: str | None = None
@@ -143,6 +146,7 @@ class FileRecord:
             duration=data.get("duration"),
             human_detection_status=data.get("human_detection_status"),
             human_detector=data.get("human_detector"),
+            human_detection_signature=data.get("human_detection_signature"),
             human_frames_analyzed=data.get("human_frames_analyzed"),
             human_max_confidence=data.get("human_max_confidence"),
             error=data.get("error"),
@@ -173,7 +177,14 @@ class ReviewGroup:
             selected = set(self.selected_for_removal)
             reviewed = set(self.reviewed_paths)
             return sum(
-                m.size for m in self.members if m.path in selected and m.path in reviewed
+                m.size
+                for m in self.members
+                if m.path in selected
+                and m.path in reviewed
+                and is_current_no_person_decision(
+                    m.human_detection_status,
+                    m.human_detection_signature,
+                )
             )
         keep = self.suggested_keep
         total = sum(m.size for m in self.members)
@@ -199,13 +210,33 @@ class ReviewGroup:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReviewGroup:
+        kind = GroupKind(data["kind"])
+        members = [FileRecord.from_dict(m) for m in data.get("members", [])]
+        if kind == GroupKind.NO_HUMANS:
+            # Loaded or hand-built results may be stale. A positive or missing
+            # detector decision must never appear in the Non-Human review flow.
+            members = [
+                member
+                for member in members
+                if is_current_no_person_decision(
+                    member.human_detection_status,
+                    member.human_detection_signature,
+                )
+            ]
+        member_paths = {member.path for member in members}
         return cls(
             id=data["id"],
-            kind=GroupKind(data["kind"]),
+            kind=kind,
             media_type=MediaType(data["media_type"]),
-            members=[FileRecord.from_dict(m) for m in data.get("members", [])],
-            selected_for_removal=list(data.get("selected_for_removal", [])),
-            reviewed_paths=list(data.get("reviewed_paths", [])),
+            members=members,
+            selected_for_removal=[
+                path
+                for path in data.get("selected_for_removal", [])
+                if path in member_paths
+            ],
+            reviewed_paths=[
+                path for path in data.get("reviewed_paths", []) if path in member_paths
+            ],
             suggested_keep=data.get("suggested_keep"),
         )
 
@@ -222,6 +253,15 @@ def effective_selected_paths(groups: list[DuplicateGroup]) -> list[str]:
         members = {member.path: member for member in group.members}
         for path in group.selected_for_removal:
             if group.kind == GroupKind.NO_HUMANS and path not in group.reviewed_paths:
+                continue
+            if (
+                group.kind == GroupKind.NO_HUMANS
+                and members.get(path)
+                and not is_current_no_person_decision(
+                    members[path].human_detection_status,
+                    members[path].human_detection_signature,
+                )
+            ):
                 continue
             if path in members and path not in sizes:
                 ordered.append(path)
@@ -296,10 +336,16 @@ class ScanResult:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ScanResult:
+        groups = [DuplicateGroup.from_dict(g) for g in data.get("groups", [])]
+        groups = [
+            group
+            for group in groups
+            if group.kind != GroupKind.NO_HUMANS or group.members
+        ]
         result = cls(
             roots=list(data.get("roots", [])),
             files=[FileRecord.from_dict(f) for f in data.get("files", [])],
-            groups=[DuplicateGroup.from_dict(g) for g in data.get("groups", [])],
+            groups=groups,
             errors=list(data.get("errors", [])),
         )
         result.recompute_stats()

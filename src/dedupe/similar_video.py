@@ -85,6 +85,7 @@ def _extract_frames(
     *,
     require_complete: bool = True,
     duration: float | None = None,
+    frame_width: int = FRAME_WIDTH,
 ) -> list[Path]:
     """
     One ffmpeg pass: evenly spaced low-res JPEGs.
@@ -96,14 +97,15 @@ def _extract_frames(
         duration, _, _ = probe_video(path)
     pattern = out_dir / "frame_%03d.jpg"
     n = max(3, max_frames)
+    output_width = max(1, int(frame_width))
     if duration and duration > 0:
         n = min(max_frames, max(3, min(max_frames, int(duration) + 1)))
         # Spread ~n frames across the whole video.
         fps = n / duration
-        vf = f"fps={fps:.8f},scale={FRAME_WIDTH}:-1"
+        vf = f"fps={fps:.8f},scale={output_width}:-1"
     else:
         n = max_frames
-        vf = f"fps=1,scale={FRAME_WIDTH}:-1"
+        vf = f"fps=1,scale={output_width}:-1"
 
     cmd = [
         "ffmpeg",

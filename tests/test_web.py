@@ -113,6 +113,18 @@ def test_app_instances_do_not_share_results(tmp_path: Path) -> None:
     assert second.test_client().get("/api/status").get_json()["has_result"] is False
 
 
+def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
+    app = create_app(_result(tmp_path))
+    html = app.test_client().get("/").get_data(as_text=True)
+
+    assert 'id="btnSelectSuggested"' in html
+    assert 'id="btnClearGroup"' in html
+    assert "Apply to this group" in html
+    assert "Preview trash" in html
+    assert "Preview quarantine" in html
+    assert "Preview isolate" in html
+
+
 def test_scan_rejects_unknown_human_backend(tmp_path: Path) -> None:
     app = create_app()
     response = app.test_client().post(

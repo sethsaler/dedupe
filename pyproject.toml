@@ -32,7 +32,7 @@ dedupe = "dedupe.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-dedupe = ["web/static/*", "web/templates/*"]
+dedupe = ["assets/*", "web/static/*", "web/templates/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

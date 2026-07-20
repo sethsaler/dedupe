@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
+from .human_policy import CACHEABLE_HUMAN_STATUSES, HUMAN_DETECTION_CACHE_VERSION
 from .models import FileRecord, MediaType
-from .similar_video import MAX_FRAMES, _extract_frames, ffmpeg_available
+from .similar_video import _extract_frames, ffmpeg_available
 
 ProgressCb = Callable[[str, int, int], None]
 
@@ -17,6 +19,16 @@ DEFAULT_BACKEND = "opencv"
 DEFAULT_PHOTON_MODEL = "moondream3.1-9B-A2B"
 HUMAN_BACKENDS = ("opencv", "photon", "ensemble")
 DETECT_MAX_SIDE = 960
+YUNET_SECOND_PASS_MAX_SIDE = 480
+YUNET_SCORE_THRESHOLD = 0.55
+YUNET_NMS_THRESHOLD = 0.3
+YUNET_TOP_K = 5000
+YUNET_MODEL_PATH = (
+    Path(__file__).parent / "assets" / "face_detection_yunet_2023mar.onnx"
+)
+YUNET_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+HUMAN_VIDEO_MAX_FRAMES = 16
+HUMAN_VIDEO_FRAME_WIDTH = 640
 
 
 class PersonDetector(Protocol):
@@ -30,7 +42,7 @@ class PersonDetector(Protocol):
 
 
 class _OpenCVPersonDetector:
-    """CPU-only detector combining a frontal-face cascade with HOG people detection."""
+    """CPU-only detector combining YuNet faces with HOG full-body detection."""
 
     def __init__(self, confidence: float) -> None:
         try:
@@ -43,15 +55,67 @@ class _OpenCVPersonDetector:
 
         self.cv2 = cv2
         self.confidence = max(0.0, float(confidence))
-        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-        self.face = (
-            cv2.CascadeClassifier(str(cascade_path)) if cascade_path.is_file() else None
-        )
-        if self.face is not None and self.face.empty():
-            self.face = None
+        if not YUNET_MODEL_PATH.is_file():
+            raise RuntimeError(
+                "the bundled OpenCV YuNet face model is missing; refusing to "
+                "classify files as non-human with full-body detection alone"
+            )
+        with YUNET_MODEL_PATH.open("rb") as model_file:
+            model_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
+        if model_sha256 != YUNET_MODEL_SHA256:
+            raise RuntimeError(
+                "the bundled OpenCV YuNet face model failed its integrity check; "
+                "refusing to classify files as non-human"
+            )
+        try:
+            self.face = cv2.FaceDetectorYN.create(
+                str(YUNET_MODEL_PATH),
+                "",
+                (320, 320),
+                YUNET_SCORE_THRESHOLD,
+                YUNET_NMS_THRESHOLD,
+                YUNET_TOP_K,
+            )
+        except (AttributeError, cv2.error) as exc:
+            raise RuntimeError(
+                "OpenCV YuNet face detection could not start; install OpenCV 4.5.4 "
+                "or newer. No media was classified as non-human."
+            ) from exc
         self.hog = cv2.HOGDescriptor()
         self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        self.backend = "opencv_face_hog" if self.face is not None else "opencv_hog"
+        self.backend = "opencv_yunet_hog"
+
+    def _face_score(self, rgb_frame) -> float:
+        """Run two face scales so both small and close-up faces are conservative hits."""
+        best = 0.0
+        frame = rgb_frame
+        checked_sizes: set[tuple[int, int]] = set()
+        for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
+            height, width = frame.shape[:2]
+            longest = max(width, height)
+            if longest > max_side:
+                scale = max_side / longest
+                candidate = self.cv2.resize(
+                    frame,
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    interpolation=self.cv2.INTER_AREA,
+                )
+            else:
+                candidate = frame
+            candidate_height, candidate_width = candidate.shape[:2]
+            size = (candidate_width, candidate_height)
+            if size in checked_sizes:
+                continue
+            checked_sizes.add(size)
+            self.face.setInputSize(size)
+            _result, faces = self.face.detect(
+                self.cv2.cvtColor(candidate, self.cv2.COLOR_RGB2BGR)
+            )
+            if faces is not None and len(faces):
+                best = max(best, max(float(face[-1]) for face in faces))
+                if best >= YUNET_SCORE_THRESHOLD:
+                    return best
+        return best
 
     def score(self, rgb_frame) -> float:
         import numpy as np
@@ -67,16 +131,9 @@ class _OpenCVPersonDetector:
                 interpolation=self.cv2.INTER_AREA,
             )
 
-        gray = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2GRAY)
-        if self.face is not None:
-            faces = self.face.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=4,
-                minSize=(20, 20),
-            )
-            if len(faces):
-                return 1.0
+        face_score = self._face_score(frame)
+        if face_score > 0:
+            return face_score
 
         # HOG needs a moderately sized frame and targets upright full-body people.
         if frame.shape[0] < 128 or frame.shape[1] < 64:
@@ -183,6 +240,24 @@ def create_person_detector(
     raise ValueError(f"unknown human detector backend {backend!r}; choose {choices}")
 
 
+def human_detection_signature(
+    backend: str = DEFAULT_BACKEND,
+    *,
+    confidence: float = DEFAULT_CONFIDENCE,
+    photon_model: str = DEFAULT_PHOTON_MODEL,
+) -> str:
+    """Identify detector inputs that must match before a result can be reused."""
+    normalized = backend.strip().lower()
+    parts = [HUMAN_DETECTION_CACHE_VERSION, normalized]
+    if normalized in {"opencv", "ensemble"}:
+        parts.append(f"confidence={max(0.0, float(confidence)):g}")
+        parts.append(f"yunet={YUNET_MODEL_SHA256[:12]}")
+        parts.append(f"face-confidence={YUNET_SCORE_THRESHOLD:g}")
+    if normalized in {"photon", "ensemble"}:
+        parts.append(f"model={photon_model.strip() or DEFAULT_PHOTON_MODEL}")
+    return "|".join(parts)
+
+
 def _create_detector(confidence: float) -> PersonDetector:
     """Backward-compatible factory for the original OpenCV-only path."""
     return create_person_detector("opencv", confidence=confidence)
@@ -240,7 +315,8 @@ def _media_person_evidence(
                 frames = _extract_frames(
                     record.path,
                     Path(tmp),
-                    max_frames=MAX_FRAMES,
+                    max_frames=HUMAN_VIDEO_MAX_FRAMES,
+                    frame_width=HUMAN_VIDEO_FRAME_WIDTH,
                     require_complete=True,
                 )
                 if not frames:
@@ -263,9 +339,15 @@ def _media_person_evidence(
 
 
 def analyze_person_presence(
-    record: FileRecord, detector: PersonDetector
+    record: FileRecord,
+    detector: PersonDetector,
+    *,
+    cache_signature: str | None = None,
 ) -> bool | None:
     """Analyze one record, update its evidence fields, and return the decision."""
+    # A re-analysis must never retain a stale trusted result if decoding fails.
+    record.human_detection_status = None
+    record.human_detection_signature = None
     has_person, frames_analyzed, max_confidence = _media_person_evidence(
         record, detector
     )
@@ -274,8 +356,10 @@ def analyze_person_presence(
     record.human_detector = detector.backend
     if has_person is False:
         record.human_detection_status = "no_person_detected"
+        record.human_detection_signature = cache_signature
     elif has_person is True:
         record.human_detection_status = "person_detected"
+        record.human_detection_signature = cache_signature
     elif record.human_detection_status is None:
         record.human_detection_status = "analysis_failed"
     return has_person
@@ -290,7 +374,7 @@ def find_no_human_files(
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[FileRecord]:
-    """Return files where no person was found; unreadable files are excluded."""
+    """Return files where no person was found, reusing trusted prior checks."""
     candidates = [
         record
         for record in records
@@ -299,21 +383,47 @@ def find_no_human_files(
     if not candidates:
         return []
 
-    detector = create_person_detector(
+    signature = human_detection_signature(
         backend,
         confidence=confidence,
         photon_model=photon_model,
     )
-    no_humans: list[FileRecord] = []
-    try:
-        for index, record in enumerate(candidates, start=1):
-            if cancelled and cancelled():
-                raise InterruptedError("scan cancelled")
-            has_person = analyze_person_presence(record, detector)
-            if has_person is False:
-                no_humans.append(record)
-            if progress:
-                progress("human-detection", index, len(candidates))
-    finally:
-        detector.close()
-    return no_humans
+
+    def has_cached_decision(record: FileRecord) -> bool:
+        return (
+            record.human_detection_signature == signature
+            and record.human_detection_status in CACHEABLE_HUMAN_STATUSES
+        )
+
+    cached = [record for record in candidates if has_cached_decision(record)]
+    pending = [record for record in candidates if not has_cached_decision(record)]
+
+    if progress and cached:
+        progress("human-detection", len(cached), len(candidates))
+
+    if pending:
+        detector = create_person_detector(
+            backend,
+            confidence=confidence,
+            photon_model=photon_model,
+        )
+        try:
+            for index, record in enumerate(pending, start=len(cached) + 1):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                analyze_person_presence(
+                    record,
+                    detector,
+                    cache_signature=signature,
+                )
+                if progress:
+                    progress("human-detection", index, len(candidates))
+        finally:
+            detector.close()
+
+    return [
+        record
+        for record in candidates
+        if record.human_detection_signature == signature
+        and record.human_detection_status == "no_person_detected"
+    ]

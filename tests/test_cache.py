@@ -34,3 +34,26 @@ def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
     assert same.phash == "0" * 16
     assert cache.hydrate([replaced]) == 0
     cache.close()
+
+
+def test_cache_round_trips_person_decision_without_hashes(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    original = _record(tmp_path / "photo.jpg", inode=10)
+    original.phash = None
+    original.human_detection_status = "person_detected"
+    original.human_detector = "opencv_face_hog"
+    original.human_detection_signature = "human-presence-v1|opencv|confidence=0.25"
+    original.human_frames_analyzed = 1
+    original.human_max_confidence = 1.0
+    cache.store_all([original])
+
+    same = _record(tmp_path / "photo.jpg", inode=10)
+    same.phash = None
+
+    assert cache.hydrate([same]) == 1
+    assert same.human_detection_status == "person_detected"
+    assert same.human_detector == "opencv_face_hog"
+    assert same.human_detection_signature == original.human_detection_signature
+    assert same.human_frames_analyzed == 1
+    assert same.human_max_confidence == 1.0
+    cache.close()
