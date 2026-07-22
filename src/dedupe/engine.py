@@ -259,7 +259,12 @@ def run_scan(
             f"Fingerprinting {video_count} videos…",
         )
 
-        def vid_progress(phase: str, processed: int, total: int) -> None:
+        def vid_progress(
+            phase: str, processed: int, total: int, message: str = ""
+        ) -> None:
+            if message:
+                emit(phase, processed, total, message)
+                return
             if "hash" in phase:
                 label = "hashing"
             elif "cluster" in phase:

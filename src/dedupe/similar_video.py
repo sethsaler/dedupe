@@ -19,7 +19,7 @@ from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
 
-ProgressCb = Callable[[str, int, int], None]
+ProgressCb = Callable[[str, int, int, str | None], None]
 
 DEFAULT_THRESHOLD = 8  # Hamming on combined 64-bit fingerprint
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
@@ -330,7 +330,7 @@ def find_similar_video_groups(
 
     if not ffmpeg_available():
         if progress:
-            progress("video-hash", 0, 0)
+            progress("video-hash", 0, 0, "")
         return []
 
     video_workers = resolve_workers(workers, cap=DEFAULT_VIDEO_WORKERS_CAP)
@@ -344,20 +344,21 @@ def find_similar_video_groups(
         if not r.video_fingerprint or not r.video_fingerprint.startswith("v3:")
     ]
     cached = total - len(need)
-    # Per-frame progress so long videos don't leave the bars motionless.
-    total_frames = len(need) * MAX_FRAMES
-    frames_done = 0
-    frame_lock = threading.Lock()
+    videos_done = cached
+    progress_lock = threading.Lock()
 
     if need:
         by_path = {r.path: r for r in need}
 
-        def on_frame(frame: int, _total: int) -> None:
-            nonlocal frames_done
-            with frame_lock:
-                frames_done += 1
+        def on_frame(frame: int, n_frames: int) -> None:
+            with progress_lock:
                 if progress:
-                    progress("video-hash", cached + frames_done, total_frames)
+                    progress(
+                        "video-hash",
+                        videos_done,
+                        total,
+                        f"Video hashing: {videos_done}/{total} · frame {frame}/{n_frames}",
+                    )
 
         def job(path: str) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
             return _video_fingerprint_job(path, on_frame=on_frame)
@@ -375,18 +376,20 @@ def find_similar_video_groups(
             rec = by_path[path]
             if err:
                 rec.error = err
-                continue
-            rec.video_fingerprint = fp
-            if w:
-                rec.width = w
-            if h:
-                rec.height = h
-            if dur is not None:
-                rec.duration = dur
+            else:
+                rec.video_fingerprint = fp
+                if w:
+                    rec.width = w
+                if h:
+                    rec.height = h
+                if dur is not None:
+                    rec.duration = dur
+            videos_done += 1
+            if progress:
+                progress("video-hash", videos_done, total, "")
 
     if progress:
-        completed = cached + frames_done
-        progress("video-hash", completed, completed)
+        progress("video-hash", videos_done, total, "")
 
     hashed = [r for r in videos if r.video_fingerprint]
     if len(hashed) < 2:
@@ -468,9 +471,9 @@ def find_similar_video_groups(
             adjacency[a.path].add(b.path)
             adjacency[b.path].add(a.path)
         if progress and (i + 1) % 5 == 0:
-            progress("video-cluster", i + 1, len(hashed))
+            progress("video-cluster", i + 1, len(hashed), "")
 
     if progress:
-        progress("video-cluster", len(hashed), len(hashed))
+        progress("video-cluster", len(hashed), len(hashed), "")
 
     return cluster_around_best(hashed, adjacency, distinct_pairs)

@@ -9,6 +9,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import replace
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -40,7 +41,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 7
+WEB_API_VERSION = 8
 PREVIEW_TOKEN_TTL_SECONDS = 120
 
 
@@ -1092,6 +1093,17 @@ def create_app(
 
             subprocess.Popen(["open", "-R", str(p)])
         return jsonify({"path": path, "exists": p.exists()})
+
+    @app.post("/api/shutdown")
+    def api_shutdown():
+        """Stop the server process when the browser tab closes."""
+        shutdown = request.environ.get("werkzeug.server.shutdown")
+        if shutdown:
+            shutdown()
+        else:
+            # Fallback for non-Werkzeug runners: kill the process.
+            os.kill(os.getpid(), 9)
+        return jsonify({"ok": True})
 
     return app
 

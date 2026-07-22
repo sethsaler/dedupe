@@ -1643,4 +1643,12 @@
   // —— Init ——
   renderRecent();
   refreshStatus().catch(() => {});
+
+  // Shut down the server when the tab is closed so the Terminal/.command window closes too.
+  window.addEventListener("pagehide", (event) => {
+    if (event.persisted) return;
+    const data = JSON.stringify({});
+    const blob = new Blob([data], { type: "application/json" });
+    navigator.sendBeacon("/api/shutdown", blob);
+  });
 })();
