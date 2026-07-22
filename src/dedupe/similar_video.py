@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable
 from pathlib import Path
@@ -209,10 +210,15 @@ def _extract_seek_frame_ppm(
     return result.stdout
 
 
-def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None, int | None, float | None]:
+def compute_video_fingerprint(
+    path: str | Path,
+    *,
+    on_frame: Callable[[int, int], None] | None = None,
+) -> tuple[str | None, int | None, int | None, float | None]:
     """
     Return (fingerprint_hex, width, height, duration).
     Fingerprint preserves the ordered pHash sequence of sampled frames.
+    ``on_frame(frame_number, total_frames)`` is called after each sampled frame.
     """
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg/ffprobe not available")
@@ -224,13 +230,16 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
     duration, width, height = probe_video(path)
 
     if duration is not None and duration > 0:
+        timestamps = _sample_timestamps(duration)
         hashes = []
-        for timestamp in _sample_timestamps(duration):
+        for i, timestamp in enumerate(timestamps):
             raw = _extract_hash_frame(path, timestamp)
             if raw is None:
                 return None, width, height, duration
             image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
             hashes.append(imagehash.phash(image))
+            if on_frame:
+                on_frame(i + 1, len(timestamps))
         return "v3:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
 
     # Rare fallback for containers whose duration cannot be probed. This still
@@ -241,12 +250,15 @@ def compute_video_fingerprint(path: str | Path) -> tuple[str | None, int | None,
             return None, width, height, duration
 
         hashes = []
-        for fp in frames:
+        for idx, fp in enumerate(frames):
             try:
                 with Image.open(fp) as img:
                     hashes.append(imagehash.phash(img.convert("RGB")))
             except Exception:
                 continue
+            else:
+                if on_frame:
+                    on_frame(idx + 1, len(frames))
 
         if not hashes:
             return None, width, height, duration
@@ -290,10 +302,12 @@ def _fingerprint_hashes(value: str) -> tuple[int, ...]:
 
 def _video_fingerprint_job(
     path: str,
+    *,
+    on_frame: Callable[[int, int], None] | None = None,
 ) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
     """Worker: (path, fingerprint, width, height, duration, error)."""
     try:
-        fp, w, h, dur = compute_video_fingerprint(path)
+        fp, w, h, dur = compute_video_fingerprint(path, on_frame=on_frame)
         return path, fp, w, h, dur, None
     except Exception as exc:
         return path, None, None, None, None, f"video fingerprint failed: {exc}"
@@ -330,22 +344,31 @@ def find_similar_video_groups(
         if not r.video_fingerprint or not r.video_fingerprint.startswith("v3:")
     ]
     cached = total - len(need)
+    # Per-frame progress so long videos don't leave the bars motionless.
+    total_frames = len(need) * MAX_FRAMES
+    frames_done = 0
+    frame_lock = threading.Lock()
 
     if need:
         by_path = {r.path: r for r in need}
 
-        def hash_progress(done: int, _total: int) -> None:
-            if progress:
-                progress("video-hash", cached + done, total)
+        def on_frame(frame: int, _total: int) -> None:
+            nonlocal frames_done
+            with frame_lock:
+                frames_done += 1
+                if progress:
+                    progress("video-hash", cached + frames_done, total_frames)
+
+        def job(path: str) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
+            return _video_fingerprint_job(path, on_frame=on_frame)
 
         results = map_parallel(
-            _video_fingerprint_job,
+            job,
             [r.path for r in need],
             workers=video_workers,
             # ffmpeg spawns real OS processes → threads buy true parallelism.
             backend="thread",
-            progress=hash_progress,
-            progress_every=1,
+            progress=None,
             cancelled=cancelled,
         )
         for path, fp, w, h, dur, err in results:
@@ -362,7 +385,8 @@ def find_similar_video_groups(
                 rec.duration = dur
 
     if progress:
-        progress("video-hash", total, total)
+        completed = cached + frames_done
+        progress("video-hash", completed, completed)
 
     hashed = [r for r in videos if r.video_fingerprint]
     if len(hashed) < 2:

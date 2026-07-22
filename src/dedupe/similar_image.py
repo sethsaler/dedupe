@@ -291,7 +291,7 @@ def find_similar_image_groups(
             # and avoid process-spawn / pickle cost on every file.
             backend="thread",
             progress=hash_progress,
-            progress_every=5,
+            progress_every=1,
             cancelled=cancelled,
         )
         for path, ph, dh, w, h, err in results:

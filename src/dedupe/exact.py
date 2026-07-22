@@ -98,7 +98,7 @@ def find_exact_groups(
                 workers=n_workers,
                 backend="thread",
                 progress=partial_progress,
-                progress_every=20,
+                progress_every=1,
                 cancelled=cancelled,
             )
             for path, ph, err in results:
@@ -152,7 +152,7 @@ def find_exact_groups(
                 workers=n_workers,
                 backend="thread",
                 progress=full_progress,
-                progress_every=10,
+                progress_every=1,
                 cancelled=cancelled,
             )
             for path, sh, err in results:
