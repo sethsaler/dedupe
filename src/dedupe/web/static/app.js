@@ -383,6 +383,42 @@
     });
   }
 
+  // —— Per-folder parallel scan streams ——
+  function renderStreams(streams, scanning) {
+    const panel = $("streamProgress");
+    if (!panel) return;
+    if (!streams.length) {
+      panel.hidden = true;
+      panel.innerHTML = "";
+      return;
+    }
+    panel.hidden = false;
+    panel.innerHTML = streams
+      .map((stream) => {
+        const root = stream.root || "";
+        const name = root.split("/").filter(Boolean).pop() || root;
+        const total = stream.files_found || 0;
+        const done = stream.files_processed || 0;
+        let pct = total ? Math.min(100, Math.round((done / total) * 100)) : (stream.done ? 100 : 8);
+        if (stream.done) pct = 100;
+        const groups = stream.groups_found || 0;
+        const state = stream.done ? "done" : (scanning ? "active" : "idle");
+        const phase = stream.done ? "done" : (stream.phase || "");
+        const detail = [phase, groups ? `${groups} group${groups === 1 ? "" : "s"}` : ""]
+          .filter(Boolean)
+          .join(" · ");
+        return `
+          <div class="stream-row ${state}" title="${escapeHtml(root)}">
+            <div class="stream-head">
+              <span class="stream-name">${escapeHtml(name)}</span>
+              <span class="stream-detail">${escapeHtml(detail)}</span>
+            </div>
+            <div class="stream-bar"><div class="stream-fill" style="width:${Math.max(pct, 4)}%"></div></div>
+          </div>`;
+      })
+      .join("");
+  }
+
   // —— Status / groups ——
   async function refreshStatus() {
     const s = await api("/api/status");
@@ -445,6 +481,8 @@
         else statusEl.classList.remove("error");
       }
     }
+
+    renderStreams(s.streams || [], !!s.scanning);
 
     if (s.summary) {
       const scanningNote = s.scanning ? " · live" : "";
@@ -1003,6 +1041,7 @@
           include_gifs: $("optGifs").checked,
           include_videos: $("optVideos").checked,
           threshold: Number($("threshold").value),
+          parallel_streams: $("optParallel").checked,
           // 0 / Auto → null so backend uses resolve_workers auto
           workers: workersRaw > 0 ? workersRaw : null,
           exclusions: $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean),

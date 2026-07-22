@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from dedupe.engine import run_scan
+from dedupe.engine import run_scan, run_scans_parallel
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import GroupKind
 from dedupe.similar_video import _extract_frames
@@ -81,6 +81,85 @@ def test_run_scan_streams_groups_via_on_group(tmp_path: Path) -> None:
         first_exact = kinds.index(GroupKind.EXACT.value)
         first_similar = kinds.index(GroupKind.SIMILAR.value)
         assert first_exact < first_similar
+
+
+def test_parallel_streams_scan_folders_independently(tmp_path: Path) -> None:
+    """Each folder is its own stream: identical content across folders stays separate."""
+    data = b"identical-binary-payload-for-exact-match!!!"
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    # Same bytes in both folders. A combined scan would merge all four into one
+    # exact group; parallel streams must keep them per-folder.
+    (folder_a / "a1.jpg").write_bytes(data)
+    (folder_a / "a2.jpg").write_bytes(data)
+    (folder_b / "b1.jpg").write_bytes(data)
+    (folder_b / "b2.jpg").write_bytes(data)
+
+    combined = run_scan(
+        [folder_a, folder_b], similar=False, include_videos=False, use_cache=False
+    )
+    assert len([g for g in combined.groups if g.kind == GroupKind.EXACT]) == 1
+
+    result = run_scans_parallel(
+        [folder_a, folder_b], similar=False, include_videos=False, use_cache=False
+    )
+    exact_groups = [g for g in result.groups if g.kind == GroupKind.EXACT]
+    assert len(exact_groups) == 2
+    roots = {g.root for g in exact_groups}
+    assert roots == {str(folder_a.resolve()), str(folder_b.resolve())}
+    # Every group's members live under its tagged root — no cross-folder mixing.
+    for group in exact_groups:
+        assert all(member.path.startswith(group.root) for member in group.members)
+    assert len(result.files) == 4
+
+
+def test_parallel_streams_report_per_stream_and_aggregate_progress(
+    tmp_path: Path,
+) -> None:
+    for i, name in enumerate(("a", "b")):
+        folder = tmp_path / name
+        folder.mkdir()
+        _save(folder / f"{name}.jpg", (30 + i * 40, 60, 90))
+
+    stream_indices: set[int] = set()
+    stream_roots: set[str] = set()
+    aggregate_done = []
+
+    def on_stream_progress(prog) -> None:
+        assert prog.stream_index is not None
+        stream_indices.add(prog.stream_index)
+        stream_roots.add(prog.root)
+
+    def on_progress(prog) -> None:
+        if prog.done:
+            aggregate_done.append(prog)
+
+    run_scans_parallel(
+        [tmp_path / "a", tmp_path / "b"],
+        include_videos=False,
+        use_cache=False,
+        on_stream_progress=on_stream_progress,
+        progress=on_progress,
+    )
+
+    assert stream_indices == {0, 1}
+    assert len(stream_roots) == 2
+    assert aggregate_done and aggregate_done[-1].done
+
+
+def test_parallel_streams_skip_missing_root(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    _save(real / "x.jpg", (10, 20, 30))
+    result = run_scans_parallel(
+        [real, tmp_path / "missing"],
+        include_videos=False,
+        use_cache=False,
+    )
+    assert result.roots == [str(real.resolve())]
+    assert any("does not exist" in err for err in result.errors)
 
 
 def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> None:

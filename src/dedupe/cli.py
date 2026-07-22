@@ -15,7 +15,7 @@ from .actions import (
     summarize_scan,
     undo_quarantine,
 )
-from .engine import run_scan
+from .engine import run_scan, run_scans_parallel
 from .grouping import apply_smart_select_all
 from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from .models import SmartRule
@@ -77,6 +77,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Parallel workers for hashing and OpenCV person detection "
             "(0 = auto, conservative; 1 = serial; each stage has a safety cap)"
         ),
+    )
+    scan.add_argument(
+        "--parallel",
+        action="store_true",
+        help=(
+            "Scan each folder as an independent, concurrent stream "
+            "(no cross-folder dedup; groups only contain files from one folder)"
+        ),
+    )
+    scan.add_argument(
+        "--max-streams",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Max folders to scan at once with --parallel (0 = auto)",
     )
     scan.add_argument(
         "--no-cache",
@@ -210,8 +225,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if prog.done:
             print()
 
-    result = run_scan(
-        args.paths,
+    scan_kwargs = dict(
         exact=not args.no_exact,
         similar=not args.no_similar,
         find_no_humans=args.find_no_humans,
@@ -228,6 +242,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
         exclusions=args.exclude,
         progress=on_progress,
     )
+    if args.parallel:
+        result = run_scans_parallel(
+            args.paths,
+            max_streams=args.max_streams or None,
+            **scan_kwargs,
+        )
+    else:
+        result = run_scan(args.paths, **scan_kwargs)
 
     apply_smart_select_all(result.groups, SmartRule(args.smart))
     print(summarize_scan(result))

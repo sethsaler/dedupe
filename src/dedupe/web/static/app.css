@@ -531,6 +531,76 @@ input[type="text"]:focus, select:focus {
   font-family: var(--mono);
 }
 
+/* —— Per-folder parallel scan streams —— */
+.stream-progress {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px 14px;
+  margin-top: 4px;
+}
+
+.stream-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-2);
+  opacity: 0.72;
+  transition: opacity 0.2s var(--ease-out), border-color 0.2s var(--ease-out);
+}
+
+.stream-row.active {
+  opacity: 1;
+  border-color: var(--accent);
+}
+
+.stream-row.done {
+  opacity: 1;
+}
+
+.stream-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+
+.stream-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stream-detail {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.stream-bar {
+  height: 4px;
+  background: var(--bg);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.stream-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 99px;
+  transition: width 0.28s var(--ease-out);
+}
+
+.stream-row.done .stream-fill {
+  background: var(--ok);
+}
+
 /* —— Empty state —— */
 .empty-state {
   flex: 1;

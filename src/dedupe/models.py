@@ -172,6 +172,8 @@ class ReviewGroup:
     selected_for_removal: list[str] = field(default_factory=list)
     reviewed_paths: list[str] = field(default_factory=list)
     suggested_keep: str | None = None
+    # Source scan root when folders are scanned as independent parallel streams.
+    root: str | None = None
 
     @property
     def policy(self) -> ReviewPolicy:
@@ -216,6 +218,7 @@ class ReviewGroup:
             "suggested_keep": self.suggested_keep,
             "reclaimable_bytes": self.reclaimable_bytes,
             "member_count": len(self.members),
+            "root": self.root,
         }
 
     @classmethod
@@ -252,6 +255,7 @@ class ReviewGroup:
                 path for path in data.get("reviewed_paths", []) if path in member_paths
             ],
             suggested_keep=data.get("suggested_keep"),
+            root=data.get("root"),
         )
 
 
@@ -306,6 +310,9 @@ class ScanProgress:
     error: str | None = None
     elapsed_seconds: float = 0.0
     eta_seconds: float | None = None
+    # Set when this progress belongs to one folder's parallel scan stream.
+    stream_index: int | None = None
+    root: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

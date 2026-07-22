@@ -23,7 +23,7 @@ from flask import (
 
 from ..actions import apply_actions, format_bytes, isolate_groups
 from ..cache import HashCache
-from ..engine import run_scan
+from ..engine import run_scan, run_scans_parallel
 from ..grouping import apply_smart_select, apply_smart_select_all
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
@@ -32,7 +32,7 @@ from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_pat
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 5
+WEB_API_VERSION = 6
 
 
 def _macos_picker_script(kind: str) -> str:
@@ -84,6 +84,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         "cancel_event": None,
         "allowed_reveal_paths": set(),
         "deleted_files": {},
+        "streams": [],
     }
     app.extensions["dedupe_state"] = state
 
@@ -189,6 +190,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 "groups_version": state["groups_version"],
                 "scan_id": state["scan_id"],
                 "error": state["last_error"],
+                "streams": [dict(stream) for stream in state["streams"]],
                 "system": {
                     "cpu_count": cpu,
                     "auto_workers": resolve_workers(None),
@@ -270,6 +272,27 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             # Empty result so the UI can stream groups as they appear.
             state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
             state["groups_version"] = state.get("groups_version", 0) + 1
+            # Default to parallel per-folder streams when more than one folder is
+            # given; each folder becomes its own concurrent scan (no cross-folder dedup).
+            parallel_default = len(resolved_roots) > 1
+            parallel_streams = bool(data.get("parallel_streams", parallel_default))
+            state["streams"] = (
+                [
+                    {
+                        "index": i,
+                        "root": root,
+                        "phase": "starting",
+                        "message": "Queued…",
+                        "files_found": 0,
+                        "files_processed": 0,
+                        "groups_found": 0,
+                        "done": False,
+                    }
+                    for i, root in enumerate(resolved_roots)
+                ]
+                if parallel_streams
+                else []
+            )
 
         def worker() -> None:
             try:
@@ -301,6 +324,25 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                         prog = state["progress"]
                         prog.groups_found = len(result.groups)
 
+                def on_stream_progress(prog: ScanProgress) -> None:
+                    with lock:
+                        if state["scan_id"] != scan_id:
+                            return
+                        streams = state["streams"]
+                        idx = prog.stream_index
+                        if idx is None or idx >= len(streams):
+                            return
+                        streams[idx] = {
+                            "index": idx,
+                            "root": prog.root,
+                            "phase": prog.phase,
+                            "message": prog.message,
+                            "files_found": prog.files_found,
+                            "files_processed": prog.files_processed,
+                            "groups_found": prog.groups_found,
+                            "done": prog.done,
+                        }
+
                 raw_workers = data.get("workers", None)
                 if raw_workers in ("", None):
                     workers = None
@@ -316,8 +358,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 if isinstance(raw_exclusions, str):
                     raw_exclusions = raw_exclusions.split(",")
 
-                result = run_scan(
-                    paths,
+                scan_kwargs = dict(
                     exact=bool(data.get("exact", True)),
                     similar=bool(data.get("similar", True)),
                     find_no_humans=bool(data.get("find_no_humans", False)),
@@ -341,6 +382,14 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     progress=on_progress,
                     on_group=on_group,
                 )
+                if parallel_streams:
+                    result = run_scans_parallel(
+                        paths,
+                        on_stream_progress=on_stream_progress,
+                        **scan_kwargs,
+                    )
+                else:
+                    result = run_scan(paths, **scan_kwargs)
                 with lock:
                     if state["scan_id"] != scan_id:
                         return
