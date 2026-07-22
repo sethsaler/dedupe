@@ -532,11 +532,15 @@
       if (groupsSoFar > 0) pct = Math.max(pct, Math.min(98, 20 + groupsSoFar * 3));
       fill.style.width = `${p.done ? 100 : Math.max(pct, 5)}%`;
       const baseMsg = p.message || p.phase || "";
-      const eta = p.eta_seconds > 0 ? ` · about ${formatDuration(p.eta_seconds)} left` : "";
-      msg.textContent =
-        groupsSoFar > 0
-          ? `${baseMsg}${baseMsg ? " · " : ""}${groupsSoFar} group${groupsSoFar === 1 ? "" : "s"} so far${eta}`
-          : `${baseMsg}${eta}`;
+      const parts = [
+        total > 0 ? `${done}/${total}` : "",
+        baseMsg,
+        groupsSoFar > 1 || groupsSoFar === 1
+          ? `${groupsSoFar} group${groupsSoFar === 1 ? "" : "s"} so far`
+          : "",
+        p.eta_seconds > 0 ? `about ${formatDuration(p.eta_seconds)} left` : "",
+      ];
+      msg.textContent = parts.filter(Boolean).join(" · ");
     } else {
       $("btnScan").disabled = false;
       $("btnCancelScan").hidden = true;

@@ -209,10 +209,24 @@ def run_scan(
     if similar:
         check_cancelled()
         distinct_pairs = cache.distinct_pairs(records) if cache is not None else set()
-        emit("similar-image", 0, 0, "Hashing images for similarity…")
+        image_count = len(
+            [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
+        )
+        emit(
+            "similar-image",
+            0,
+            image_count,
+            f"Hashing {image_count} images for similarity…",
+        )
 
         def img_progress(phase: str, processed: int, total: int) -> None:
-            emit(phase, processed, total, f"Images {phase}: {processed}/{total}")
+            if "hash" in phase:
+                label = "hashing"
+            elif "cluster" in phase:
+                label = "clustering"
+            else:
+                label = phase.replace("-", " ")
+            emit(phase, processed, total, f"Image {label}: {processed}/{total}")
 
         image_started = time.monotonic()
         img_groups = find_similar_image_groups(
@@ -237,10 +251,22 @@ def run_scan(
             if record.error and record.error.startswith("image hash failed")
         ]
 
-        emit("similar-video", 0, 0, "Fingerprinting videos…")
+        video_count = len([r for r in records if r.media_type == MediaType.VIDEO])
+        emit(
+            "similar-video",
+            0,
+            video_count,
+            f"Fingerprinting {video_count} videos…",
+        )
 
         def vid_progress(phase: str, processed: int, total: int) -> None:
-            emit(phase, processed, total, f"Videos {phase}: {processed}/{total}")
+            if "hash" in phase:
+                label = "hashing"
+            elif "cluster" in phase:
+                label = "clustering"
+            else:
+                label = phase.replace("-", " ")
+            emit(phase, processed, total, f"Video {label}: {processed}/{total}")
 
         video_started = time.monotonic()
         vid_groups = find_similar_video_groups(
