@@ -3,6 +3,7 @@
 import json
 import platform
 import subprocess
+import time
 from pathlib import Path
 
 from dedupe.cache import HashCache
@@ -92,6 +93,53 @@ def test_mutating_api_rejects_cross_origin_and_plain_text(tmp_path: Path) -> Non
     )
     assert valid.status_code == 200
     assert valid.get_json()["success_count"] == 1
+
+
+def test_parallel_scan_streams_report_per_folder_and_tag_groups(tmp_path: Path) -> None:
+    data = b"identical-binary-payload-for-exact-match!!!"
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    (folder_a / "a1.jpg").write_bytes(data)
+    (folder_a / "a2.jpg").write_bytes(data)
+    (folder_b / "b1.jpg").write_bytes(data)
+    (folder_b / "b2.jpg").write_bytes(data)
+
+    app = create_app()
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "cache.sqlite3")
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+
+    started = client.post(
+        "/api/scan",
+        json={
+            "paths": [str(folder_a), str(folder_b)],
+            "parallel_streams": True,
+            "similar": False,
+            "include_videos": False,
+            "use_cache": False,
+        },
+        headers={"X-Dedupe-Token": token},
+    )
+    assert started.status_code == 200
+
+    deadline = time.monotonic() + 15
+    status = client.get("/api/status").get_json()
+    while status["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = client.get("/api/status").get_json()
+
+    assert not status["scanning"]
+    # Two independent streams, each reporting its own folder.
+    assert len(status["streams"]) == 2
+    assert all(stream["done"] for stream in status["streams"])
+    assert {Path(stream["root"]).name for stream in status["streams"]} == {"a", "b"}
+
+    groups = client.get("/api/groups?kind=exact").get_json()["groups"]
+    # No cross-folder dedup: one exact group per folder, each tagged with its root.
+    assert len(groups) == 2
+    assert {Path(group["root"]).name for group in groups} == {"a", "b"}
 
 
 def test_action_endpoint_scopes_by_kinds(tmp_path: Path) -> None:

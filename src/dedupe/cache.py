@@ -23,8 +23,15 @@ class HashCache:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path else default_cache_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        self._conn = sqlite3.connect(str(self.path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
+        # WAL + a busy timeout let independent per-folder scan streams share one
+        # cache file concurrently without tripping over "database is locked".
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.DatabaseError:
+            pass
         self._closed = False
         self._init()
 

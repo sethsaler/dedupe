@@ -76,6 +76,11 @@
             <label class="chip-check"><input type="checkbox" id="optGifs" checked /><span>GIFs</span></label>
             <label class="chip-check"><input type="checkbox" id="optVideos" checked /><span>Videos</span></label>
           </div>
+          <div class="opt-group">
+            <span class="opt-label">Folders</span>
+            <label class="chip-check"><input type="checkbox" id="optParallel" checked /><span>Parallel streams</span></label>
+            <span class="thresh-hint">scan each folder concurrently &amp; independently (no cross-folder dedup)</span>
+          </div>
           <label class="thresh">
             <span class="opt-label">Similarity</span>
             <input type="range" id="threshold" min="0" max="16" value="6" />
@@ -99,6 +104,7 @@
       <div class="progress-wrap" id="progressWrap" hidden>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
         <div class="progress-msg" id="progressMsg"></div>
+        <div class="stream-progress" id="streamProgress" hidden></div>
       </div>
     </section>
 
