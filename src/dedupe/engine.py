@@ -16,13 +16,21 @@ from .human_detection import (
     DEFAULT_PHOTON_MODEL,
     find_no_human_files,
 )
-from .models import DuplicateGroup, GroupKind, ScanProgress, ScanResult
+from .models import (
+    DuplicateGroup,
+    GroupKind,
+    MediaType,
+    ScanDiagnostics,
+    ScanProgress,
+    ScanResult,
+    StageDiagnostics,
+)
 from .parallel import resolve_workers
-from .scanner import inventory
+from .scanner import inventory, is_in_photos_library
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import find_similar_image_groups
 from .similar_video import DEFAULT_THRESHOLD as VID_THRESHOLD
-from .similar_video import find_similar_video_groups
+from .similar_video import ffmpeg_available, find_similar_video_groups
 
 ProgressCb = Callable[[ScanProgress], None]
 GroupCb = Callable[[DuplicateGroup], None]
@@ -64,6 +72,14 @@ def run_scan(
     previous_phase = prog.phase
     groups: list[DuplicateGroup] = []
     exact_path_sets: list[set[str]] = []
+    stage_durations: dict[str, float] = {}
+    stage_errors: dict[str, list[str]] = {
+        "exact": [],
+        "similar_image": [],
+        "similar_video": [],
+        "human_detection": [],
+    }
+    cache_hits = 0
 
     def emit(phase: str, processed: int = 0, total: int = 0, message: str = "") -> None:
         nonlocal phase_started, previous_phase
@@ -121,10 +137,16 @@ def run_scan(
         resolved = Path(root).expanduser().resolve(strict=False)
         if not resolved.exists():
             root_errors.append(f"scan root does not exist: {resolved}")
+        elif is_in_photos_library(resolved):
+            root_errors.append(
+                "Photos libraries cannot be scanned directly; export media from "
+                f"Photos.app to a normal folder first: {resolved}"
+            )
         else:
             resolved_roots.append(resolved)
 
     check_cancelled()
+    inventory_started = time.monotonic()
     records = inventory(
         resolved_roots,
         include_images=include_images,
@@ -135,6 +157,7 @@ def run_scan(
         progress=inv_progress,
         cancelled=cancelled,
     )
+    stage_durations["inventory"] = time.monotonic() - inventory_started
     prog.files_found = len(records)
     prog.bytes_scanned = sum(r.size for r in records)
     emit("inventory", len(records), len(records), f"Found {len(records)} media files")
@@ -143,13 +166,19 @@ def run_scan(
     if use_cache:
         try:
             cache = HashCache(cache_path)
-            hits = cache.hydrate(records)
-            emit("cache", hits, len(records), f"Cache hits: {hits}/{len(records)}")
+            cache_hits = cache.hydrate(records)
+            emit(
+                "cache",
+                cache_hits,
+                len(records),
+                f"Cache hits: {cache_hits}/{len(records)}",
+            )
         except Exception as exc:
             emit("cache", 0, 0, f"Cache unavailable: {exc}")
             cache = None
 
     if exact and records:
+        exact_started = time.monotonic()
         check_cancelled()
         emit("exact", 0, len(records), "Finding exact duplicates…")
 
@@ -169,6 +198,13 @@ def run_scan(
             len(records),
             f"Found {n_exact} exact group{'s' if n_exact != 1 else ''}",
         )
+        stage_durations["exact"] = time.monotonic() - exact_started
+        stage_errors["exact"] = [
+            record.error
+            for record in records
+            if record.error
+            and record.error.startswith(("partial hash failed", "sha256 failed"))
+        ]
 
     if similar:
         check_cancelled()
@@ -178,6 +214,7 @@ def run_scan(
         def img_progress(phase: str, processed: int, total: int) -> None:
             emit(phase, processed, total, f"Images {phase}: {processed}/{total}")
 
+        image_started = time.monotonic()
         img_groups = find_similar_image_groups(
             records,
             threshold=image_threshold,
@@ -193,12 +230,19 @@ def run_scan(
             0,
             f"Found {n_img} similar image group{'s' if n_img != 1 else ''}",
         )
+        stage_durations["similar_image"] = time.monotonic() - image_started
+        stage_errors["similar_image"] = [
+            record.error
+            for record in records
+            if record.error and record.error.startswith("image hash failed")
+        ]
 
         emit("similar-video", 0, 0, "Fingerprinting videos…")
 
         def vid_progress(phase: str, processed: int, total: int) -> None:
             emit(phase, processed, total, f"Videos {phase}: {processed}/{total}")
 
+        video_started = time.monotonic()
         vid_groups = find_similar_video_groups(
             records,
             threshold=video_threshold,
@@ -214,8 +258,15 @@ def run_scan(
             0,
             f"Found {n_vid} similar video group{'s' if n_vid != 1 else ''}",
         )
+        stage_durations["similar_video"] = time.monotonic() - video_started
+        stage_errors["similar_video"] = [
+            record.error
+            for record in records
+            if record.error and record.error.startswith("video fingerprint failed")
+        ]
 
     if find_no_humans and records:
+        human_started = time.monotonic()
         check_cancelled()
         emit(
             "human-detection",
@@ -246,6 +297,12 @@ def run_scan(
             len(records),
             f"Found {len(no_human_files)} file{'s' if len(no_human_files) != 1 else ''} without detected people",
         )
+        stage_durations["human_detection"] = time.monotonic() - human_started
+        stage_errors["human_detection"] = [
+            record.error or "person analysis failed"
+            for record in records
+            if record.human_detection_status == "analysis_failed"
+        ]
 
     if cache is not None:
         try:
@@ -254,11 +311,110 @@ def run_scan(
         except Exception:
             pass
 
+    image_records = [
+        record
+        for record in records
+        if record.media_type in (MediaType.IMAGE, MediaType.GIF)
+    ]
+    video_records = [record for record in records if record.media_type == MediaType.VIDEO]
+    size_counts: dict[int, int] = {}
+    for record in records:
+        if record.size > 0:
+            size_counts[record.size] = size_counts.get(record.size, 0) + 1
+    exact_candidates = [
+        record for record in records if record.size > 0 and size_counts[record.size] > 1
+    ]
+
+    exact_failures = stage_errors["exact"]
+    image_failures = stage_errors["similar_image"]
+    video_failures = stage_errors["similar_video"]
+    image_attempted = len(image_records) if similar and len(image_records) >= 2 else 0
+    video_dependency = ffmpeg_available()
+    video_attempted = (
+        len(video_records)
+        if similar and len(video_records) >= 2 and video_dependency
+        else 0
+    )
+    human_failures = stage_errors["human_detection"]
+
+    stages = {
+        "inventory": StageDiagnostics(
+            unit="roots",
+            attempted=len(roots),
+            succeeded=len(resolved_roots),
+            failed=len(root_errors),
+            duration_seconds=stage_durations.get("inventory", 0.0),
+            warnings=root_errors[:10],
+        ),
+        "exact": StageDiagnostics(
+            attempted=len(exact_candidates) if exact else 0,
+            succeeded=(len(exact_candidates) - len(exact_failures)) if exact else 0,
+            failed=len(exact_failures) if exact else 0,
+            skipped=len(records) - (len(exact_candidates) if exact else 0),
+            duration_seconds=stage_durations.get("exact", 0.0),
+            warnings=(
+                [f"{len(exact_failures)} exact-hash candidate(s) failed"]
+                if exact_failures
+                else []
+            ),
+        ),
+        "similar_image": StageDiagnostics(
+            attempted=image_attempted,
+            succeeded=image_attempted - len(image_failures),
+            failed=len(image_failures),
+            skipped=len(records) - image_attempted,
+            duration_seconds=stage_durations.get("similar_image", 0.0),
+            warnings=(
+                [f"{len(image_failures)} image hash(es) failed"]
+                if image_failures
+                else []
+            ),
+        ),
+        "similar_video": StageDiagnostics(
+            attempted=video_attempted,
+            succeeded=video_attempted - len(video_failures),
+            failed=len(video_failures),
+            skipped=len(records) - video_attempted,
+            duration_seconds=stage_durations.get("similar_video", 0.0),
+            warnings=(
+                ["ffmpeg/ffprobe unavailable; eligible videos were not analyzed"]
+                if similar and video_records and not video_dependency
+                else (
+                    [f"{len(video_failures)} video fingerprint(s) failed"]
+                    if video_failures
+                    else []
+                )
+            ),
+        ),
+        "human_detection": StageDiagnostics(
+            attempted=len(records) if find_no_humans else 0,
+            succeeded=(len(records) - len(human_failures)) if find_no_humans else 0,
+            failed=len(human_failures) if find_no_humans else 0,
+            skipped=0 if find_no_humans else len(records),
+            duration_seconds=stage_durations.get("human_detection", 0.0),
+            warnings=(
+                [f"{len(human_failures)} file(s) could not be analyzed for people"]
+                if human_failures
+                else []
+            ),
+        ),
+    }
+    total_duration = max(0.0, time.monotonic() - started)
+    recorded_errors = list(dict.fromkeys(
+        [*root_errors]
+        + [error for errors in stage_errors.values() for error in errors]
+        + [record.error for record in records if record.error]
+    ))
     result = ScanResult(
         roots=[str(root) for root in resolved_roots],
         files=records,
         groups=groups,
-        errors=[*root_errors, *[r.error for r in records if r.error]],
+        errors=recorded_errors,
+        diagnostics=ScanDiagnostics(
+            total_duration_seconds=total_duration,
+            cache_hits=cache_hits,
+            stages=stages,
+        ),
     )
     result.recompute_stats()
 
@@ -270,7 +426,7 @@ def run_scan(
         f"{result.no_human_files} non-human "
         f"({len(records)} files)"
     )
-    prog.elapsed_seconds = max(0.0, time.monotonic() - started)
+    prog.elapsed_seconds = total_duration
     prog.eta_seconds = 0.0
     if progress:
         progress(prog)

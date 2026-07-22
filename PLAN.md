@@ -249,7 +249,7 @@ dedupe scan ~/Downloads --action trash --smart automatic --dry-run
 
 * * *
 ## Implementation phases
-### Phase 1 — Core engine (CLI)
+### Phase 1 — Core engine (CLI) — complete
 - Inventory walk
   
 - Exact duplicate detection
@@ -262,28 +262,39 @@ dedupe scan ~/Downloads --action trash --smart automatic --dry-run
   
 - Tests with fixture media
   
-### Phase 2 — Video + GIF polish
+### Phase 2 — Video + GIF polish — complete
 - ffmpeg video fingerprints
   
 - Animated GIF multi-frame hashing
   
 - Cache layer
   
-### Phase 3 — Local web UI
+### Phase 3 — Local web UI — complete
 - Folder pick, progress, group browser, thumbnails
   
 - Smart Select + Trash actions
   
 - macOS `.command` launcher
   
-### Phase 4 — Polish
-- Incremental re-scan
+### Phase 4 — Polish — substantially complete
+- Cache-backed incremental re-analysis and durable review resume
   
 - Exclusion globs / whitelist folders
   
-- HTML export report
+- Scan-quality report and preview-first action review
   
-- Preference persistence
+- Preference and selection persistence
+
+### Phase 5 — Quality and distribution — in progress
+- Similarity and human-detection benchmark harnesses
+
+- Python/Ruff/package CI and a real Chromium workflow test
+
+- Credential-free macOS app-bundle scaffold plus gated signing/notarization helper
+
+- Remaining: collect representative private benchmark corpora and publish measured targets
+
+- Remaining: produce signed/notarized release artifacts once Apple credentials and release policy are available
   
 
 * * *

@@ -106,6 +106,11 @@ def test_no_human_candidate_can_be_selected_for_removal_by_itself() -> None:
     assert collect_selected_paths([group]) == []
 
     apply_smart_select(group, SmartRule.SELECT_CANDIDATES)
+    assert group.reviewed_paths == []
+    assert group.selected_for_removal == []
+
+    group.reviewed_paths = [candidate.path]
+    apply_smart_select(group, SmartRule.SELECT_CANDIDATES)
     assert group.reclaimable_bytes == candidate.size
     assert collect_selected_paths([group]) == [candidate.path]
 
@@ -120,6 +125,7 @@ def test_overlapping_no_human_selection_still_retains_a_duplicate() -> None:
     _mark_no_person(a)
     _mark_no_person(b)
     candidate_group = build_no_human_groups([a, b])[0]
+    candidate_group.reviewed_paths = [a.path, b.path]
     apply_smart_select(candidate_group, SmartRule.SELECT_CANDIDATES)
 
     selected = collect_selected_paths([duplicate, candidate_group])

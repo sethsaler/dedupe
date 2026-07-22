@@ -12,7 +12,10 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media
-- **Local web UI** — thumbnails, lightbox, smart select, keyboard nav, native folder/file picker, isolate
+- **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
+- **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
+- **Local web UI** — search/sort/filter, similarity presets and explanations, overlay/flicker comparison, keyboard navigation, native picker, and isolate
+- **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts and affected bytes
 
 ## Requirements
 
@@ -84,8 +87,12 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
-3. Smart Select keep/remove, open thumbnails in the lightbox
-4. **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
+3. Search or sort groups, Smart Select keep/remove, and compare Similar images with the lightbox overlay
+4. Review the action preview, then **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
+
+Completed reviews resume automatically after an app restart. Use **Discard saved review**
+to clear the saved session. Changed, missing, or out-of-root files are removed from a
+resumed review before it is shown, and every file is still revalidated immediately before an action.
 
 Keyboard: `j`/`k` groups · `Space` toggle remove · `Enter` lightbox · `?` shortcuts
 
@@ -139,6 +146,10 @@ dedupe undo ~/.cache/dedupe/logs/action-<timestamp>-<id>.json --execute
 
 # Open UI with last scan results
 dedupe scan ~/Pictures --ui
+
+# Check dependencies, optional detectors, and writable app paths
+dedupe doctor
+dedupe doctor --json
 ```
 
 ### Isolate for human review
@@ -193,7 +204,8 @@ The bundled YuNet model comes from the official OpenCV Model Zoo. Its MIT licens
 
 ### Benchmark Photon against your own media
 
-Use a hand-labeled JSON manifest. Relative media paths are resolved from the manifest folder:
+Use a hand-labeled JSON manifest. The sample names below are illustrative; supply your own
+private media. Relative media paths are resolved from the manifest folder:
 
 ```json
 [
@@ -208,12 +220,38 @@ Use a hand-labeled JSON manifest. Relative media paths are resolved from the man
 dedupe benchmark-humans benchmark.json --json benchmark-opencv.json
 
 # Side-by-side comparison; first Photon run may download model weights
+# Requires: pip install -e ".[vision]" and network access for the first ~10 GB download
 dedupe benchmark-humans benchmark.json \
   --backends opencv photon ensemble \
   --json benchmark-all.json
 ```
 
 The terminal report includes person recall, no-person precision, accuracy, runtime, and every false-negative path. For this workflow, prioritize **person recall** and inspect every listed missed-person file before deciding whether Photon is safe enough for your library. The JSON output also includes per-file decisions, sampled-frame counts, evidence scores, errors, and latency.
+
+### Benchmark similarity against labeled pairs
+
+Similarity manifests label pairs rather than individual files. Relative paths resolve from
+the manifest folder:
+
+```json
+{
+  "pairs": [
+    {"path_a": "samples/original.jpg", "path_b": "samples/reexport.jpg", "similar": true},
+    {"path_a": "samples/pose-a.jpg", "path_b": "samples/pose-b.jpg", "similar": false}
+  ]
+}
+```
+
+```bash
+dedupe benchmark-similarity similarity-benchmark.json \
+  --threshold 6 --video-threshold 8 \
+  --json similarity-report.json
+```
+
+The report prioritizes false positives, then false negatives, and includes precision,
+recall, runtime, errors, and per-pair decisions. Use representative private media; the
+repository does not ship personal benchmark photos. For cleanup safety, optimize Similar
+matching for low false-positive rates before increasing recall.
 
 **Near-identical only** — same photo at different quality/export/resolution. Different poses of the same person (or burst frames that actually move) are filtered out by comparing pHash across image quadrants + center crop.
 
@@ -247,7 +285,28 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 - Executed actions receive unique atomic receipts under `~/.cache/dedupe/logs/`
 - Quarantine receipts can restore files with `dedupe undo`; Trash is restored through Finder
 - Mutating localhost API calls require a per-launch session token and current scan generation
-- Use **Preview** next to Trash / Quarantine / Isolate before executing
+- Trash and quarantine execute only after a fresh preview and confirmation in the UI
+- Photos.app `.photoslibrary` packages are never entered or accepted as scan roots; export media from Photos to a normal folder first
+
+### Photos.app libraries
+
+Dedupe deliberately does not manipulate a Photos library package. In Photos.app, select the
+assets to review and use **File → Export** to a normal folder, then scan that export. This
+keeps Photos metadata and library ownership under supported Apple workflows. Direct library
+integration remains out of scope until it can use a supported Apple API end to end.
+
+### Optional macOS application bundle
+
+From the repository root of a local checkout, build a Finder-launchable wrapper around the existing installation:
+
+```bash
+scripts/build-macos-app.sh
+open build/Dedupe.app
+```
+
+The ignored `build/Dedupe.app` is a launcher, not a self-contained Python distribution.
+Developer ID signing and notarization are explicit, credential-gated release steps; see
+[`packaging/README.md`](packaging/README.md).
 
 ## Project layout
 
@@ -259,19 +318,28 @@ src/dedupe/
   similar_video.py   # video fingerprints
   human_detection.py # optional local person detection
   human_benchmark.py # labeled OpenCV / Photon comparison harness
+  similarity_benchmark.py # labeled near-duplicate pair benchmark
+  review_session.py  # atomic resumable review storage
   parallel.py        # thread-pool map for hashing stages
   grouping.py        # ranking + smart select
   actions.py         # trash / quarantine
   cache.py           # SQLite hash cache
   cli.py             # `dedupe` entry point
-  web/               # Flask UI
+  web/               # Flask UI, native picker, and media previews
 ```
 
 ## Tests
 
 ```bash
 pytest
+
+# Browser workflow (requires Playwright Chromium)
+python -m playwright install chromium
+pytest -m e2e
 ```
+
+Normal `pytest` runs exclude the browser test. CI covers Python 3.11–3.14, Ruff,
+wheel installation, and a dedicated Chromium workflow.
 
 ## License
 

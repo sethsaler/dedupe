@@ -4,4 +4,3 @@ ImageHash>=4.3.1
 pybktree>=1.1
 send2trash>=1.8.2
 flask>=3.0.0
-pytest>=8.0.0

@@ -9,7 +9,7 @@ from PIL import Image
 
 from dedupe.engine import run_scan, run_scans_parallel
 from dedupe.human_detection import human_detection_signature
-from dedupe.models import GroupKind
+from dedupe.models import GroupKind, ScanResult
 from dedupe.similar_video import _extract_frames
 
 
@@ -261,3 +261,57 @@ def test_human_scan_rejects_frames_from_partial_video_decode(
         tmp_path / "broken.mp4", tmp_path
     )
     assert frames == []
+
+
+def test_scan_diagnostics_account_for_success_and_round_trip(tmp_path: Path) -> None:
+    data = b"same-sized exact candidate"
+    (tmp_path / "one.jpg").write_bytes(data)
+    (tmp_path / "two.jpg").write_bytes(data)
+
+    result = run_scan([tmp_path], similar=False, use_cache=False)
+
+    assert result.diagnostics.total_duration_seconds > 0
+    assert result.diagnostics.stages["inventory"].succeeded == 1
+    exact = result.diagnostics.stages["exact"]
+    assert (exact.attempted, exact.succeeded, exact.failed) == (2, 2, 0)
+    restored = ScanResult.from_dict(result.to_dict())
+    assert restored.diagnostics.to_dict() == result.diagnostics.to_dict()
+    # Older result JSON remains loadable and receives empty diagnostics.
+    legacy = result.to_dict()
+    legacy.pop("diagnostics")
+    assert ScanResult.from_dict(legacy).diagnostics.stages == {}
+
+
+def test_scan_diagnostics_report_ffmpeg_unavailable(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "one.mp4").write_bytes(b"video one")
+    (tmp_path / "two.mp4").write_bytes(b"video two")
+    monkeypatch.setattr("dedupe.engine.ffmpeg_available", lambda: False)
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: False)
+
+    result = run_scan([tmp_path], exact=False, similar=True, use_cache=False)
+
+    video = result.diagnostics.stages["similar_video"]
+    assert video.attempted == 0
+    assert video.skipped == 2
+    assert any("ffmpeg" in warning for warning in video.warnings)
+
+
+def test_run_scan_rejects_photos_library_root(tmp_path: Path) -> None:
+    library = tmp_path / "Photos Library.photoslibrary"
+    originals = library / "originals"
+    originals.mkdir(parents=True)
+    managed = originals / "managed.jpg"
+    managed.write_bytes(b"managed-by-photos")
+
+    result = run_scan([library], use_cache=False)
+    descendant_result = run_scan([originals], use_cache=False)
+    file_result = run_scan([managed], use_cache=False)
+
+    assert result.files == []
+    assert result.groups == []
+    assert len(result.errors) == 1
+    assert "export media from Photos.app" in result.errors[0]
+    assert descendant_result.files == []
+    assert "export media from Photos.app" in descendant_result.errors[0]
+    assert file_result.files == []
+    assert "export media from Photos.app" in file_result.errors[0]

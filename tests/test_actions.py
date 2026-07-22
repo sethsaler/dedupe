@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import dedupe.actions as actions_module
 from dedupe.actions import apply_actions, undo_quarantine
 from dedupe.grouping import apply_smart_select, build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
-from dedupe.models import FileRecord, MediaType, SmartRule
+from dedupe.models import DuplicateGroup, FileRecord, GroupKind, MediaType, SmartRule
 
 
 def _rec(path: Path, data: bytes) -> FileRecord:
@@ -103,6 +104,7 @@ def test_apply_actions_can_be_scoped_by_kind(tmp_path: Path) -> None:
     c.human_detection_status = "no_person_detected"
     c.human_detection_signature = human_detection_signature()
     no_human_group = build_no_human_groups([c])[0]
+    no_human_group.reviewed_paths = [c.path]
     apply_smart_select(no_human_group, SmartRule.SELECT_CANDIDATES)
 
     groups = [exact_group, no_human_group]
@@ -119,3 +121,90 @@ def test_apply_actions_can_be_scoped_by_kind(tmp_path: Path) -> None:
     )
     assert only_no_humans.success_count == 1
     assert {item.path for item in only_no_humans.items} == {c.path}
+
+
+def test_non_human_scope_still_keeps_member_of_overlapping_exact_group(
+    tmp_path: Path,
+) -> None:
+    a = _rec(tmp_path / "a.jpg", b"same")
+    b = _rec(tmp_path / "b.jpg", b"same")
+    (exact_group,) = build_groups([[a, b]], [])
+    for record in (a, b):
+        record.human_detection_status = "no_person_detected"
+        record.human_detection_signature = human_detection_signature()
+    no_human_group = build_no_human_groups([a, b])[0]
+    no_human_group.reviewed_paths = [a.path, b.path]
+    no_human_group.selected_for_removal = [a.path, b.path]
+
+    result = apply_actions(
+        [exact_group, no_human_group], action="trash", dry_run=True, kinds={"no_humans"}
+    )
+
+    assert result.success_count == 1
+    assert exact_group.suggested_keep not in {item.path for item in result.items}
+
+
+def test_selected_suggested_keeper_uses_and_validates_alternate(tmp_path: Path) -> None:
+    a = _rec(tmp_path / "a.jpg", b"same")
+    b = _rec(tmp_path / "b.jpg", b"same")
+    (group,) = build_groups([[a, b]], [])
+    group.selected_for_removal = [group.suggested_keep or ""]
+    alternate = next(member for member in group.members if member.path != group.suggested_keep)
+    Path(alternate.path).write_bytes(b"changed")
+
+    result = apply_actions(
+        [group], action="quarantine", quarantine_dir=tmp_path / "q", dry_run=False
+    )
+
+    assert result.success_count == 0
+    assert "retained member is stale" in (result.items[0].error or "")
+
+
+def test_similar_group_refuses_stale_only_retained_member(tmp_path: Path) -> None:
+    selected = _rec(tmp_path / "selected.jpg", b"one")
+    retained = _rec(tmp_path / "retained.jpg", b"two")
+    group = DuplicateGroup(
+        id="similar",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[selected, retained],
+        selected_for_removal=[selected.path],
+        suggested_keep=retained.path,
+    )
+    Path(retained.path).write_bytes(b"stale retained file")
+
+    result = apply_actions(
+        [group], action="quarantine", quarantine_dir=tmp_path / "q", dry_run=False
+    )
+
+    assert result.success_count == 0
+    assert "retained member is stale" in (result.items[0].error or "")
+
+
+def test_revalidates_immediately_before_destructive_operation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    a = _rec(tmp_path / "a.jpg", b"same")
+    b = _rec(tmp_path / "b.jpg", b"same")
+    (group,) = build_groups([[a, b]], [])
+    selected_path = group.selected_for_removal[0]
+    original_validate = actions_module.validate_file_record
+    selected_validations = 0
+
+    def mutate_before_second_validation(record, roots=None):
+        nonlocal selected_validations
+        if record.path == selected_path:
+            selected_validations += 1
+            if selected_validations == 2:
+                Path(record.path).write_bytes(b"mutated after batch preflight")
+        return original_validate(record, roots)
+
+    monkeypatch.setattr(actions_module, "validate_file_record", mutate_before_second_validation)
+    result = apply_actions(
+        [group], action="quarantine", quarantine_dir=tmp_path / "q", dry_run=False
+    )
+
+    assert selected_validations == 2
+    assert result.success_count == 0
+    assert Path(selected_path).exists()
+    assert "changed since scan" in (result.items[0].error or "")

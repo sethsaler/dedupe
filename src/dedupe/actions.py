@@ -238,7 +238,8 @@ def _send_to_trash(src: Path) -> Path | None:
     return best[1] if best else None
 
 
-def _validate_record(record: FileRecord, roots: list[str] | None) -> str | None:
+def validate_file_record(record: FileRecord, roots: list[str] | None = None) -> str | None:
+    """Side-effect-free validation of a scanned file's identity and root scope."""
     path = Path(record.path)
     try:
         if path.is_symlink():
@@ -266,41 +267,57 @@ def _validate_record(record: FileRecord, roots: list[str] | None) -> str | None:
 
 
 def _preflight_action(
-    groups: list[DuplicateGroup], paths: list[str], roots: list[str] | None
+    groups: list[DuplicateGroup],
+    paths: list[str],
+    roots: list[str] | None,
+    *,
+    check_paths: set[str] | None = None,
 ) -> dict[str, str]:
     """Return path -> error for stale, out-of-scope, or no-longer-exact selections."""
     records = {member.path: member for group in groups for member in group.members}
     errors: dict[str, str] = {}
-    for path in paths:
+    paths_to_check = paths if check_paths is None else [p for p in paths if p in check_paths]
+    for path in paths_to_check:
         record = records.get(path)
         if record is None:
             errors[path] = "selection is not present in the scan result"
             continue
-        error = _validate_record(record, roots)
+        error = validate_file_record(record, roots)
         if error:
             errors[path] = error
 
-    current_hashes: dict[str, str] = {}
     selected = set(paths)
     for group in groups:
-        if group.kind != GroupKind.EXACT or not selected.intersection(
-            member.path for member in group.members
-        ):
+        member_paths = {member.path for member in group.members}
+        touched = selected.intersection(member_paths)
+        if not touched or (check_paths is not None and not touched.intersection(check_paths)):
             continue
+        if group.kind == GroupKind.NO_HUMANS:
+            continue
+        retained = [member for member in group.members if member.path not in selected]
         keep = next(
-            (member for member in group.members if member.path == group.suggested_keep),
-            group.members[0] if group.members else None,
+            (member for member in retained if member.path == group.suggested_keep),
+            retained[0] if retained else None,
         )
         if keep is None:
+            for path in touched:
+                if check_paths is None or path in check_paths:
+                    errors[path] = "refusing to remove every member of a duplicate group"
             continue
-        keep_error = _validate_record(keep, roots)
+        keep_error = validate_file_record(keep, roots)
         if keep_error:
-            for member in group.members:
-                if member.path in selected:
-                    errors[member.path] = f"keeper is stale: {keep_error}"
+            for path in touched:
+                if check_paths is None or path in check_paths:
+                    errors[path] = f"retained member is stale: {keep_error}"
             continue
+        if group.kind != GroupKind.EXACT:
+            continue
+        current_hashes: dict[str, str] = {}
         members_to_verify = [
-            member for member in group.members if member.path in selected
+            member
+            for member in group.members
+            if member.path in touched
+            and (check_paths is None or member.path in check_paths)
         ] + [keep]
         try:
             for member in members_to_verify:
@@ -333,6 +350,7 @@ def apply_actions(
     log_dir: str | Path | None = None,
     roots: list[str] | None = None,
     kinds: set[str] | None = None,
+    safety_groups: list[DuplicateGroup] | None = None,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
@@ -344,12 +362,25 @@ def apply_actions(
     if action not in ("trash", "quarantine"):
         raise ValueError("action must be 'trash' or 'quarantine'")
 
+    all_safety_groups = safety_groups if safety_groups is not None else groups
+    candidate_groups = groups
     if kinds:
-        groups = [g for g in groups if g.kind.value in kinds]
+        candidate_groups = [g for g in groups if g.kind.value in kinds]
 
-    paths = collect_selected_paths(groups)
+    paths = collect_selected_paths(candidate_groups)
+    # Candidate scope decides what may be acted on; every duplicate group decides
+    # whether doing so would still leave a retained copy (including overlaps).
+    selected = set(paths)
+    for group in all_safety_groups:
+        if group.kind == GroupKind.NO_HUMANS or not group.members:
+            continue
+        member_paths = {member.path for member in group.members}
+        if member_paths <= selected:
+            keep = group.suggested_keep if group.suggested_keep in member_paths else group.members[0].path
+            selected.discard(keep)
+    paths = [path for path in paths if path in selected]
     result = ActionResult(dry_run=dry_run, action=action)
-    preflight_errors = _preflight_action(groups, paths, roots)
+    preflight_errors = _preflight_action(all_safety_groups, paths, roots)
 
     qdir: Path | None = None
     if action == "quarantine":
@@ -394,6 +425,11 @@ def apply_actions(
                 )
                 continue
             try:
+                immediate_errors = _preflight_action(
+                    all_safety_groups, paths, roots, check_paths={path_str}
+                )
+                if path_str in immediate_errors:
+                    raise RuntimeError(immediate_errors[path_str])
                 destination = _send_to_trash(src)
                 result.items.append(
                     ActionItem(
@@ -421,8 +457,11 @@ def apply_actions(
                 )
                 continue
             try:
-                if not src.exists():
-                    raise FileNotFoundError(path_str)
+                immediate_errors = _preflight_action(
+                    all_safety_groups, paths, roots, check_paths={path_str}
+                )
+                if path_str in immediate_errors:
+                    raise RuntimeError(immediate_errors[path_str])
                 shutil.move(str(src), str(dest))
                 result.items.append(
                     ActionItem(
@@ -661,7 +700,7 @@ def isolate_groups(
     validation_errors: dict[str, str] = {}
     for group in filtered:
         for member in group.members:
-            error = _validate_record(member, roots)
+            error = validate_file_record(member, roots)
             if error:
                 validation_errors[member.path] = error
     if validation_errors and not dry_run:

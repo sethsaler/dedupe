@@ -81,12 +81,26 @@
             <label class="chip-check"><input type="checkbox" id="optParallel" checked /><span>Parallel streams</span></label>
             <span class="thresh-hint">scan each folder concurrently &amp; independently (no cross-folder dedup)</span>
           </div>
-          <label class="thresh">
-            <span class="opt-label">Similarity</span>
-            <input type="range" id="threshold" min="0" max="16" value="6" />
-            <span id="threshVal" class="thresh-val">6</span>
-            <span class="thresh-hint">lower = stricter</span>
+          <label class="preset-field">
+            <span class="opt-label">Similarity preset</span>
+            <select id="similarityPreset">
+              <option value="0">Exact visual</option>
+              <option value="3">Very strict</option>
+              <option value="6" selected>Balanced</option>
+              <option value="10">Broader</option>
+            </select>
+            <span class="thresh-hint">Start strict; broader results need closer review.</span>
           </label>
+          </label>
+          <details class="advanced-options">
+            <summary>Advanced similarity threshold</summary>
+            <label class="thresh" for="threshold">
+              <span class="opt-label">Raw distance</span>
+              <input type="range" id="threshold" min="0" max="16" value="6" />
+              <span id="threshVal" class="thresh-val">6</span>
+              <span class="thresh-hint">lower = stricter</span>
+            </label>
+          </details>
           <label class="thresh workers-field">
             <span class="opt-label">Workers</span>
             <input type="range" id="workers" min="0" max="16" value="0" />
@@ -106,6 +120,16 @@
         <div class="progress-msg" id="progressMsg"></div>
         <div class="stream-progress" id="streamProgress" hidden></div>
       </div>
+      <div class="session-status" id="sessionStatus" hidden aria-live="polite">
+        <span id="sessionStatusText"></span>
+        <button class="linkish" id="btnDiscardSession" type="button">Discard saved review</button>
+      </div>
+      <details class="scan-quality" id="scanQuality" hidden>
+        <summary>Scan quality <span id="scanQualitySummary"></span></summary>
+        <div class="quality-warning" id="scanQualityWarning" hidden role="alert"></div>
+        <div class="quality-grid" id="scanQualityGrid"></div>
+        <ul class="quality-warnings" id="scanQualityWarnings"></ul>
+      </details>
     </section>
 
     <section class="empty-state" id="emptyState">
@@ -138,6 +162,29 @@
           <button class="tab" data-kind="similar" type="button">Similar <span class="tab-count" id="countSimilar">0</span></button>
           <button class="tab" data-kind="no_humans" type="button">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
         </div>
+        <div class="result-controls" aria-label="Find and organize results">
+          <label for="resultSearch">Search files</label>
+          <input id="resultSearch" type="search" placeholder="Path or file name" autocomplete="off" />
+          <div class="result-control-row">
+            <label for="resultSort">Sort</label>
+            <select id="resultSort">
+              <option value="reclaimable">Reclaimable bytes</option>
+              <option value="size">Group size</option>
+              <option value="date">Newest date</option>
+              <option value="media">Media type</option>
+            </select>
+          </div>
+          <div class="result-control-row">
+            <label for="selectionFilter">Selection</label>
+            <select id="selectionFilter">
+              <option value="all">Any</option><option value="selected">Selected</option><option value="unselected">Unselected</option>
+            </select>
+          </div>
+          <label class="inline-check"><input id="issuesOnly" type="checkbox" /> Needs attention</label>
+          <label class="inline-check"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
+          <button class="btn primary-soft" id="btnNextReview" type="button">Next unreviewed / needs attention</button>
+          <span class="muted small" id="filteredCount" aria-live="polite"></span>
+        </div>
         <div class="group-list" id="groupList" role="listbox" aria-label="Duplicate groups"></div>
       </aside>
 
@@ -158,6 +205,10 @@
             <button class="btn primary-soft" id="btnMarkDistinct" type="button" hidden>
               Mark as distinct
             </button>
+          </div>
+          <div class="non-human-banner" id="nonHumanBanner" hidden role="note">
+            <strong>Independent Non-Human candidates</strong>
+            <span>These are not duplicates. Review every file independently; person detection can be wrong.</span>
           </div>
           <div class="selection-toolbar" aria-label="Group selection controls">
             <div class="group-selection-summary">
@@ -242,7 +293,15 @@
     <button class="lb-close" id="lbClose" type="button" aria-label="Close">✕</button>
     <button class="lb-nav prev" id="lbPrev" type="button" aria-label="Previous">‹</button>
     <div class="lb-stage">
-      <img id="lbImage" alt="" />
+      <div class="lb-image-stack" id="lbImageStack">
+        <img id="lbImage" alt="Current file preview" />
+        <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+      </div>
+      <div class="lb-compare-tools" id="lbCompareTools" hidden>
+        <label for="lbOpacity">Keeper overlay</label>
+        <input id="lbOpacity" type="range" min="0" max="100" value="50" />
+        <button class="btn ghost" id="lbFlicker" type="button" aria-pressed="false">Hold to flicker keeper</button>
+      </div>
       <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
       <div class="lb-video-tools" id="lbVideoTools" hidden>
         <label for="lbSpeed">Playback speed</label>
@@ -265,7 +324,7 @@
   <div class="modal-backdrop" id="modalBackdrop" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <h3 id="modalTitle">Confirm</h3>
-      <p id="modalBody"></p>
+      <div id="modalBody"></div>
       <div class="modal-actions">
         <button class="btn ghost" id="modalCancel" type="button">Cancel</button>
         <button class="btn danger" id="modalConfirm" type="button">Confirm</button>

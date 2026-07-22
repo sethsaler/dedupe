@@ -26,12 +26,20 @@
     autoWorkers: 0,
     groupsVersion: -1, // tracks streaming updates mid-scan
     scanId: null,
+    reviewSession: null,
   };
 
   const thresh = $("threshold");
   const threshVal = $("threshVal");
   thresh.addEventListener("input", () => {
     threshVal.textContent = thresh.value;
+    const preset = $("similarityPreset");
+    preset.value = [...preset.options].some((option) => option.value === thresh.value) ? thresh.value : "";
+  });
+  $("similarityPreset").addEventListener("change", () => {
+    thresh.value = $("similarityPreset").value;
+    threshVal.textContent = thresh.value;
+    saveScanSettings();
   });
 
   const workersEl = $("workers");
@@ -164,6 +172,27 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function hexDistance(left, right) {
+    if (!left || !right || left.length !== right.length || !/^[0-9a-f]+$/i.test(left + right)) return null;
+    let distance = 0;
+    for (let i = 0; i < left.length; i += 1) {
+      let bits = parseInt(left[i], 16) ^ parseInt(right[i], 16);
+      while (bits) { distance += bits & 1; bits >>>= 1; }
+    }
+    return distance;
+  }
+
+  function similarityExplanation(member, keeper) {
+    const parts = [];
+    const phash = hexDistance(member.phash, keeper.phash);
+    const dhash = hexDistance(member.dhash, keeper.dhash);
+    if (phash !== null) parts.push(`pHash distance ${phash}`);
+    if (dhash !== null) parts.push(`dHash distance ${dhash}`);
+    if (member.tile_phashes && keeper.tile_phashes) parts.push("tile fingerprints compared");
+    if (member.video_fingerprint && keeper.video_fingerprint) parts.push("video fingerprints compared");
+    return parts.join(" · ");
   }
 
   async function api(path, opts = {}) {
@@ -358,7 +387,7 @@
   function confirmModal({ title, body, confirmLabel = "Confirm", danger = true }) {
     return new Promise((resolve) => {
       $("modalTitle").textContent = title;
-      $("modalBody").textContent = body;
+      $("modalBody").innerHTML = body;
       const btn = $("modalConfirm");
       btn.textContent = confirmLabel;
       btn.className = danger ? "btn danger" : "btn primary";
@@ -420,6 +449,44 @@
   }
 
   // —— Status / groups ——
+  function renderDiagnostics(summary) {
+    const diagnostics = summary?.diagnostics;
+    const panel = $("scanQuality");
+    if (!diagnostics || !Object.keys(diagnostics.stages || {}).length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const stages = Object.entries(diagnostics.stages);
+    const failed = stages.reduce((total, [, stage]) => total + (stage.failed || 0), 0);
+    const warnings = [...(summary.errors || [])];
+    for (const [name, stage] of stages) {
+      for (const warning of stage.warnings || []) warnings.push(`${name.replaceAll("_", " ")}: ${warning}`);
+    }
+    $("scanQualitySummary").textContent = `· ${formatDuration(diagnostics.total_duration_seconds)} · ${diagnostics.cache_hits || 0} cache hits`;
+    $("scanQualityGrid").innerHTML = stages.map(([name, stage]) => `
+      <div class="quality-stage">
+        <strong>${escapeHtml(name.replaceAll("_", " "))}</strong><span>${formatDuration(stage.duration_seconds)}</span>
+        <small>${stage.attempted || 0} attempted · ${stage.succeeded || 0} succeeded · ${stage.failed || 0} failed · ${stage.skipped || 0} skipped ${escapeHtml(stage.unit || "files")}</small>
+      </div>`).join("");
+    $("scanQualityWarnings").innerHTML = warnings.slice(0, 20).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+    const incomplete = failed > 0 || warnings.length > 0;
+    $("scanQualityWarning").hidden = !incomplete;
+    $("scanQualityWarning").textContent = incomplete
+      ? `Analysis is incomplete: ${failed ? `${failed} item${failed === 1 ? "" : "s"} failed` : "scan warnings were reported"}. Review warnings before acting.`
+      : "";
+  }
+
+  function renderSession(metadata, resumed = false) {
+    state.reviewSession = metadata || null;
+    const available = !!metadata?.available;
+    $("sessionStatus").hidden = !available;
+    if (!available) return;
+    const when = metadata.saved_at ? new Date(metadata.saved_at).toLocaleString() : "an earlier session";
+    const pruned = metadata.pruned_files ? ` · ${metadata.pruned_files} stale file${metadata.pruned_files === 1 ? "" : "s"} pruned` : "";
+    $("sessionStatusText").textContent = `${resumed ? "Resumed" : "Saved"} review from ${when}${pruned}`;
+  }
+
   async function refreshStatus() {
     const s = await api("/api/status");
     const statusEl = $("scanStatus");
@@ -431,6 +498,7 @@
     state.scanning = !!s.scanning;
     state.acting = !!s.acting;
     state.scanId = s.scan_id || state.scanId;
+    renderSession(s.review_session, s.progress?.message === "Resumed saved review");
     document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
       element.disabled = state.scanning || state.acting;
     });
@@ -485,6 +553,7 @@
     renderStreams(s.streams || [], !!s.scanning);
 
     if (s.summary) {
+      renderDiagnostics(s.summary);
       const scanningNote = s.scanning ? " · live" : "";
       top.innerHTML = `
         <span class="stat-chip"><span class="dot"></span><strong>${s.summary.group_count}</strong> groups${scanningNote}</span>
@@ -505,6 +574,7 @@
       $("countSimilar").textContent = s.summary.similar_groups;
       $("countNoHumans").textContent = s.summary.no_human_files || 0;
     } else {
+      $("scanQuality").hidden = true;
       top.innerHTML = s.error
         ? `<span class="stat-chip muted-chip">Error: ${escapeHtml(s.error)}</span>`
         : `<span class="stat-chip muted-chip">No scan yet</span>`;
@@ -538,6 +608,7 @@
     ]);
     state.groups = filtered.groups || [];
     state.allGroups = all.groups || [];
+    applyResultControls();
 
     const exact = state.allGroups.filter((g) => g.kind === "exact").length;
     const similar = state.allGroups.filter((g) => g.kind === "similar").length;
@@ -581,7 +652,41 @@
     return (g.selected_for_removal || []).length;
   }
 
+  function groupComplete(g) {
+    if (g.kind === "no_humans") return (g.reviewed_paths || []).length >= (g.member_count || 0);
+    return (g.selected_for_removal || []).length >= Math.max(0, (g.member_count || 0) - 1);
+  }
+
+  function groupNeedsAttention(g) {
+    return (g.members || []).some((member) => member.error) || (g.deleted_paths || []).length > 0 || !groupComplete(g);
+  }
+
+  function applyResultControls() {
+    const query = ($("resultSearch").value || "").trim().toLowerCase();
+    const selection = $("selectionFilter").value;
+    let groups = state.allGroups.filter((g) => state.kind === "all" || g.kind === state.kind);
+    groups = groups.filter((g) => {
+      const selected = groupSelectedCount(g) > 0;
+      if (query && !(g.members || []).some((member) => member.path.toLowerCase().includes(query))) return false;
+      if (selection === "selected" && !selected) return false;
+      if (selection === "unselected" && selected) return false;
+      if ($("issuesOnly").checked && !groupNeedsAttention(g)) return false;
+      if ($("hideCompleted").checked && groupComplete(g)) return false;
+      return true;
+    });
+    const sort = $("resultSort").value;
+    groups.sort((a, b) => {
+      if (sort === "size") return (b.member_count || 0) - (a.member_count || 0);
+      if (sort === "date") return Math.max(...(b.members || []).map((m) => m.mtime || 0), 0) - Math.max(...(a.members || []).map((m) => m.mtime || 0), 0);
+      if (sort === "media") return String(a.media_type).localeCompare(String(b.media_type));
+      return (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
+    });
+    state.groups = groups;
+    $("filteredCount").textContent = `${groups.length} of ${state.allGroups.length} groups shown`;
+  }
+
   function renderGroupList() {
+    applyResultControls();
     const list = $("groupList");
     if (!state.groups.length) {
       list.innerHTML = `<div class="group-empty">No groups in this filter.</div>`;
@@ -653,6 +758,7 @@
     $("btnMarkRemainingHuman").hidden =
       g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
     $("btnMarkDistinct").hidden = g.kind !== "similar";
+    $("nonHumanBanner").hidden = g.kind !== "no_humans";
     document.querySelector(".selection-toolbar").hidden = g.kind === "no_humans";
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
@@ -662,7 +768,7 @@
       $("smartRule").value = g.kind === "no_humans" ? "deselect_all" : "automatic";
     }
     $("btnSelectSuggested").textContent =
-      g.kind === "no_humans" ? "Review + select all" : "Use suggested";
+      g.kind === "no_humans" ? "Select reviewed candidates" : "Use suggested";
     renderMembers(g);
     // keep list item in view
     const active = document.querySelector(`.group-item[data-id="${id}"]`);
@@ -689,7 +795,7 @@
     syncMemberPagination(pageCount, summaryText);
     state.lightboxItems = members
       .filter((member) => !deletedPaths.has(member.path))
-      .map((member) => ({ path: member.path, mediaType: member.media_type }));
+      .map((member) => ({ path: member.path, mediaType: member.media_type, keeper: g.suggested_keep, kind: g.kind }));
     updateDetailMeta(g);
     const reviewedCount = allMembers.filter((member) => reviewedPaths.has(member.path)).length;
     $("groupSelectionSummary").textContent = g.kind === "no_humans"
@@ -712,10 +818,12 @@
           : isKeep
             ? `<span class="thumb-badge keep">Keep</span>`
             : "";
+        const keeper = allMembers.find((candidate) => candidate.path === g.suggested_keep);
+        const distanceParts = g.kind === "similar" && keeper ? similarityExplanation(m, keeper) : "";
         const evidence = g.kind === "exact"
           ? "Byte-identical SHA-256 match"
           : g.kind === "similar"
-            ? "Direct perceptual match to the suggested keeper"
+            ? `Perceptual match to suggested keeper${distanceParts ? ` · ${distanceParts}` : ""} (explanation only, not a probability)`
             : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
         const selectionTitle = isSel
           ? (g.kind === "no_humans" ? "Reviewed · selected" : "Selected for removal")
@@ -840,11 +948,13 @@
       });
     });
 
-    async function updateDeletedCandidate(path, endpoint) {
+    async function updateDeletedCandidate(path, endpoint, previewToken = null) {
       try {
         const updated = await api(endpoint, {
           method: "POST",
-          body: JSON.stringify({ group_id: g.id, path, scan_id: state.scanId }),
+          body: JSON.stringify({ group_id: g.id, path, scan_id: state.scanId,
+            dry_run: endpoint.endsWith("delete") ? !previewToken : undefined,
+            preview_token: previewToken }),
         });
         const idx = state.groups.findIndex((candidate) => candidate.id === g.id);
         if (idx >= 0) state.groups[idx] = updated;
@@ -860,8 +970,17 @@
     }
 
     box.querySelectorAll(".delete-candidate").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        updateDeletedCandidate(btn.dataset.path, "/api/non-human/delete");
+      btn.addEventListener("click", async () => {
+        const member = allMembers.find((item) => item.path === btn.dataset.path);
+        try {
+          const preview = await api("/api/non-human/delete", { method: "POST", body: JSON.stringify({
+            group_id: g.id, path: btn.dataset.path, scan_id: state.scanId, dry_run: true,
+          }) });
+          if (!preview.success_count) return toast("This file is not safely eligible for deletion", "error");
+          const ok = await confirmModal({ title: "Move this file to Trash?", danger: true,
+            confirmLabel: "Move to Trash", body: `<div class="review-sheet"><p><strong>${escapeHtml(basename(member.path))} · ${formatBytes(member.size)}</strong></p><p class="heuristic-warning"><strong>Review carefully:</strong> Non-Human detection is heuristic and may miss people.</p></div>` });
+          if (ok) await updateDeletedCandidate(btn.dataset.path, "/api/non-human/delete", preview.preview_token);
+        } catch (err) { toast(err.message, "error"); }
       });
     });
 
@@ -1078,6 +1197,31 @@
     });
   });
 
+  ["resultSearch", "resultSort", "selectionFilter", "issuesOnly", "hideCompleted"].forEach((id) => {
+    $(id).addEventListener(id === "resultSearch" ? "input" : "change", () => renderGroupList());
+  });
+  $("btnNextReview").addEventListener("click", () => {
+    const candidates = state.groups.filter(groupNeedsAttention);
+    if (!candidates.length) return toast("No unreviewed results need attention", "ok");
+    const current = candidates.findIndex((group) => group.id === state.currentId);
+    selectGroup(candidates[(current + 1) % candidates.length].id);
+  });
+
+  $("btnDiscardSession").addEventListener("click", async () => {
+    const ok = await confirmModal({
+      title: "Discard saved review?",
+      body: "<p>This removes the durable review state and its selections. Your media files are not changed.</p>",
+      confirmLabel: "Discard saved review",
+    });
+    if (!ok) return;
+    try {
+      await api("/api/review-session", { method: "DELETE" });
+      state.groups = []; state.allGroups = []; state.currentId = null;
+      renderSession(null); renderGroupList(); await refreshStatus();
+      toast("Saved review discarded", "ok");
+    } catch (error) { toast(error.message, "error"); }
+  });
+
   async function applyRuleToCurrentGroup(rule, successMessage) {
     if (!state.currentId) return toast("Select a group first");
     try {
@@ -1107,7 +1251,7 @@
       || state.groups.find((group) => group.id === state.currentId);
     const rule = current?.kind === "no_humans" ? "select_candidates" : "automatic";
     const message = current?.kind === "no_humans"
-      ? "All non-human candidates reviewed and selected"
+      ? "Reviewed non-human candidates selected"
       : "Suggested selection applied";
     await applyRuleToCurrentGroup(rule, message);
   });
@@ -1177,6 +1321,7 @@
 
   // —— Actions ——
   async function runAction(action, dryRun) {
+    let previewToken = null;
     const quarantine_dir = $("quarantineDir").value.trim() || null;
     if (action === "quarantine" && !dryRun && !quarantine_dir) {
       toast("Set a quarantine folder first");
@@ -1207,6 +1352,7 @@
             ...(action === "isolate" ? { isolate_mode: "copy", isolate_kinds: scope } : {}),
           }),
         });
+        previewToken = preview.preview_token;
       } catch (error) {
         toast(`Could not verify selection: ${error.message}`, "error");
         return;
@@ -1225,18 +1371,18 @@
 
       const verifiedCount = action === "isolate" ? count : preview.success_count;
       const counts = preview.selection_counts || {};
-      const duplicateBreakdown = scope === "duplicates"
-        ? ` (${counts.exact || 0} Exact + ${counts.similar || 0} Similar = ${verifiedCount} unique total)`
-        : "";
+      const selectedMembers = effectiveSelection(scope);
+      const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
+      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.no_humans || 0} Non-Human`;
       const labels = {
         trash: `Move selected ${scopeLabel}files to Trash?`,
         quarantine: `Move selected ${scopeLabel}files to quarantine?`,
         isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `${verifiedCount} verified ${scopeLabel}file(s) will go to Trash${duplicateBreakdown} (recoverable in Finder on macOS).`,
-        quarantine: `${verifiedCount} verified ${scopeLabel}file(s) will move to ${quarantine_dir}${duplicateBreakdown}.`,
-        isolate: `${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated, then copied into a new timestamped review session. Originals stay put.`,
+        trash: `<div class="review-sheet"><p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p><p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        quarantine: `<div class="review-sheet"><p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p><p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        isolate: `<div class="review-sheet"><p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
       };
       const ok = await confirmModal({
         title: labels[action] || "Confirm",
@@ -1254,6 +1400,7 @@
         quarantine_dir,
         scan_id: state.scanId,
         kinds: scope,
+        preview_token: previewToken,
       };
       if (action === "isolate") {
         payload.isolate_mode = "copy";
@@ -1322,10 +1469,13 @@
     const image = $("lbImage");
     const video = $("lbVideo");
     const isVideo = item.mediaType === "video";
+    const canCompare = !isVideo && item.kind === "similar" && item.keeper && item.keeper !== item.path;
 
     video.pause();
     video.hidden = !isVideo;
     $("lbVideoTools").hidden = !isVideo;
+    $("lbCompareTools").hidden = !canCompare;
+    $("lbImageStack").hidden = isVideo;
     image.hidden = isVideo;
     if (isVideo) {
       image.removeAttribute("src");
@@ -1335,6 +1485,12 @@
       video.removeAttribute("src");
       video.load();
       image.src = `/api/thumbnail?path=${encodeURIComponent(item.path)}&full=1`;
+      const keeperImage = $("lbKeeperImage");
+      keeperImage.hidden = !canCompare;
+      if (canCompare) {
+        keeperImage.src = `/api/thumbnail?path=${encodeURIComponent(item.keeper)}&full=1`;
+        keeperImage.style.opacity = String(Number($("lbOpacity").value) / 100);
+      } else keeperImage.removeAttribute("src");
     }
     $("lbMeta").textContent = item.path;
     $("lbPrev").disabled = state.lightboxIndex <= 0;
@@ -1359,6 +1515,18 @@
   $("lbVideo").addEventListener("loadedmetadata", () => {
     $("lbVideo").playbackRate = Number($("lbSpeed").value);
   });
+  $("lbOpacity").addEventListener("input", () => {
+    $("lbKeeperImage").style.opacity = String(Number($("lbOpacity").value) / 100);
+  });
+  const showKeeper = (show) => {
+    $("lbKeeperImage").style.opacity = show ? "1" : "0";
+    $("lbFlicker").setAttribute("aria-pressed", show ? "true" : "false");
+  };
+  ["pointerdown", "keydown"].forEach((eventName) => $("lbFlicker").addEventListener(eventName, (event) => {
+    if (eventName === "keydown" && ![" ", "Enter"].includes(event.key)) return;
+    showKeeper(true);
+  }));
+  ["pointerup", "pointerleave", "keyup", "blur"].forEach((eventName) => $("lbFlicker").addEventListener(eventName, () => showKeeper(false)));
 
   $("lbClose").addEventListener("click", closeLightbox);
   $("lbPrev").addEventListener("click", () => {

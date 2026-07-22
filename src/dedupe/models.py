@@ -319,6 +319,61 @@ class ScanProgress:
 
 
 @dataclass
+class StageDiagnostics:
+    """Bounded accounting for one scan stage (units are named explicitly)."""
+
+    unit: str = "files"
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    duration_seconds: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StageDiagnostics:
+        return cls(
+            unit=str(data.get("unit", "files")),
+            attempted=int(data.get("attempted", 0)),
+            succeeded=int(data.get("succeeded", 0)),
+            failed=int(data.get("failed", 0)),
+            skipped=int(data.get("skipped", 0)),
+            duration_seconds=float(data.get("duration_seconds", 0.0)),
+            warnings=[str(value) for value in data.get("warnings", [])[:10]],
+        )
+
+
+@dataclass
+class ScanDiagnostics:
+    total_duration_seconds: float = 0.0
+    cache_hits: int = 0
+    stages: dict[str, StageDiagnostics] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_duration_seconds": self.total_duration_seconds,
+            "cache_hits": self.cache_hits,
+            "stages": {name: stage.to_dict() for name, stage in self.stages.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ScanDiagnostics:
+        raw_stages = data.get("stages", {})
+        return cls(
+            total_duration_seconds=float(data.get("total_duration_seconds", 0.0)),
+            cache_hits=int(data.get("cache_hits", 0)),
+            stages={
+                str(name): StageDiagnostics.from_dict(value)
+                for name, value in raw_stages.items()
+                if isinstance(value, dict)
+            },
+        )
+
+
+@dataclass
 class ScanResult:
     roots: list[str]
     files: list[FileRecord]
@@ -328,6 +383,7 @@ class ScanResult:
     no_human_files: int = 0
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
 
     def recompute_stats(self) -> None:
         self.exact_groups = sum(1 for g in self.groups if g.kind == GroupKind.EXACT)
@@ -353,6 +409,7 @@ class ScanResult:
             "file_count": len(self.files),
             "group_count": len(self.groups),
             "errors": list(self.errors),
+            "diagnostics": self.diagnostics.to_dict(),
         }
 
     @classmethod
@@ -368,6 +425,7 @@ class ScanResult:
             files=[FileRecord.from_dict(f) for f in data.get("files", [])],
             groups=groups,
             errors=list(data.get("errors", [])),
+            diagnostics=ScanDiagnostics.from_dict(data.get("diagnostics", {})),
         )
         result.recompute_stats()
         return result

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.metadata
 import json
+import os
+import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from . import __version__
 from .actions import (
     apply_actions,
-    format_bytes,
     isolate_groups,
     summarize_scan,
     undo_quarantine,
@@ -21,12 +26,20 @@ from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from .models import SmartRule
 
 
+def application_version() -> str:
+    """Return the installed distribution version, including in source checkouts."""
+    try:
+        return importlib.metadata.version("dedupe-media")
+    except importlib.metadata.PackageNotFoundError:
+        return __version__
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="dedupe",
         description="Find duplicate images, videos, and GIFs (Gemini-style).",
     )
-    p.add_argument("--version", action="version", version=f"dedupe {__version__}")
+    p.add_argument("--version", action="version", version=f"dedupe {application_version()}")
     sub = p.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Scan folders for duplicates")
@@ -213,6 +226,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write detailed predictions and metrics as JSON",
     )
 
+    doctor = sub.add_parser("doctor", help="Check dependencies and writable application paths")
+    doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    similarity = sub.add_parser(
+        "benchmark-similarity",
+        help="Evaluate similarity detection against a labeled pair manifest",
+    )
+    similarity.add_argument("manifest", help="JSON list of labeled media pairs")
+    similarity.add_argument("--json", dest="json_out", required=True, metavar="OUTPUT")
+    similarity.add_argument("--threshold", type=int, default=6, help="Image threshold")
+    similarity.add_argument("--video-threshold", type=int, default=8, help="Video threshold")
+    similarity.add_argument("--workers", type=int, default=None, metavar="N")
+
     return p
 
 
@@ -253,6 +279,27 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     apply_smart_select_all(result.groups, SmartRule(args.smart))
     print(summarize_scan(result))
+    diagnostics = result.diagnostics
+    failed = sum(stage.failed for stage in diagnostics.stages.values())
+    warnings = [
+        warning
+        for stage in diagnostics.stages.values()
+        for warning in stage.warnings
+    ]
+    print(
+        f"Diagnostics: {failed} failed across scan stages, "
+        f"{diagnostics.cache_hits} cache hits, {diagnostics.total_duration_seconds:.2f}s"
+    )
+    for name, stage in diagnostics.stages.items():
+        if stage.failed or stage.warnings:
+            print(
+                f"  {name}: {stage.failed} failed, {stage.skipped} skipped "
+                f"({stage.unit})"
+            )
+    for warning in warnings[:10]:
+        print(f"  warning: {warning}")
+    if len(warnings) > 10:
+        print(f"  … +{len(warnings) - 10} more warnings")
 
     if args.json_out:
         out = Path(args.json_out)
@@ -396,6 +443,159 @@ def cmd_benchmark_humans(args: argparse.Namespace) -> int:
     return 1 if any(r.get("error") for r in report["results"].values()) else 0
 
 
+def _executable_status(name: str) -> dict[str, object]:
+    path = shutil.which(name)
+    version = None
+    if path:
+        try:
+            completed = subprocess.run(
+                [path, "-version"], capture_output=True, text=True, timeout=5, check=False
+            )
+            first_line = (completed.stdout or completed.stderr).splitlines()
+            version = first_line[0] if first_line else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return {"available": path is not None, "path": path, "version": version}
+
+
+def _path_status(path: Path) -> dict[str, object]:
+    """Check whether an application file can be created without touching that file."""
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        writable = os.access(parent, os.W_OK)
+    except OSError:
+        writable = False
+    return {"path": str(path), "writable": writable}
+
+
+def collect_doctor_report() -> dict[str, object]:
+    """Collect local diagnostics without scanning media or loading Photon."""
+    required_modules = {
+        "PIL": "Pillow",
+        "imagehash": "ImageHash",
+        "pybktree": "pybktree",
+        "send2trash": "Send2Trash",
+        "flask": "Flask",
+    }
+    imports: dict[str, dict[str, object]] = {}
+    for module, distribution in required_modules.items():
+        try:
+            importlib.import_module(module)
+            try:
+                version = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                version = None
+            imports[module] = {
+                "ok": True,
+                "version": version,
+            }
+        except Exception as exc:
+            imports[module] = {"ok": False, "error": str(exc)}
+
+    from .cache import default_cache_path
+    from .human_detection import YUNET_MODEL_PATH
+    from .review_session import default_review_session_path
+
+    try:
+        cv2 = importlib.import_module("cv2")
+        opencv = {
+            "available": True,
+            "version": getattr(cv2, "__version__", None),
+            "yunet_model": str(YUNET_MODEL_PATH),
+            "yunet_ready": YUNET_MODEL_PATH.is_file(),
+        }
+    except Exception as exc:
+        opencv = {"available": False, "error": str(exc), "yunet_ready": False}
+
+    paths = {
+        "cache": _path_status(default_cache_path()),
+        "state": _path_status(default_review_session_path()),
+    }
+    blockers = [f"cannot import {name}" for name, status in imports.items() if not status["ok"]]
+    blockers.extend(
+        f"{name} path is not writable" for name, status in paths.items() if not status["writable"]
+    )
+    return {
+        "application": {"name": "dedupe", "version": application_version()},
+        "python": {"version": platform.python_version(), "executable": sys.executable},
+        "platform": {"system": platform.system(), "release": platform.release()},
+        "imports": imports,
+        "ffmpeg": _executable_status("ffmpeg"),
+        "ffprobe": _executable_status("ffprobe"),
+        "opencv": opencv,
+        "paths": paths,
+        "core_ready": not blockers,
+        "blockers": blockers,
+    }
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    report = collect_doctor_report()
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        app = report["application"]
+        python = report["python"]
+        system = report["platform"]
+        print(f"dedupe {app['version']}")
+        print(f"Python {python['version']} ({python['executable']})")
+        print(f"Platform: {system['system']} {system['release']}")
+        for name, status in report["imports"].items():
+            print(f"Import {name}: {'ok' if status['ok'] else 'MISSING'}")
+        for name in ("ffmpeg", "ffprobe"):
+            status = report[name]
+            detail = status.get("version") or "not found"
+            print(f"{name}: {detail}")
+        cv = report["opencv"]
+        print(
+            f"OpenCV/YuNet (optional): "
+            f"{'ready' if cv.get('available') and cv.get('yunet_ready') else 'not ready'}"
+        )
+        for name, status in report["paths"].items():
+            print(f"{name.title()} path: {status['path']} ({'writable' if status['writable'] else 'NOT writable'})")
+        print(f"Core operation: {'ready' if report['core_ready'] else 'BLOCKED'}")
+    return 0 if report["core_ready"] else 1
+
+
+def _format_similarity_report(report: dict[str, object]) -> str:
+    def pct(value: object) -> str:
+        return "n/a" if value is None else f"{float(value) * 100:.1f}%"
+
+    lines = [f"Similarity benchmark: {report['evaluated']}/{report['total']} pairs evaluated"]
+    lines.append(f"False positives: {report['false_positives']}")
+    lines.extend(f"  {a} <> {b}" for a, b in report["false_positive_pairs"])
+    lines.append(f"False negatives: {report['false_negatives']}")
+    lines.extend(f"  {a} <> {b}" for a, b in report["false_negative_pairs"])
+    lines.append(
+        f"Precision: {pct(report['precision'])}  Recall: {pct(report['recall'])}  "
+        f"Runtime: {report['elapsed_seconds']:.2f}s"
+    )
+    if report["errors"]:
+        lines.append(f"Errors: {report['errors']}")
+    return "\n".join(lines)
+
+
+def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
+    from .similarity_benchmark import run_similarity_benchmark
+
+    try:
+        report = run_similarity_benchmark(
+            args.manifest,
+            image_threshold=args.threshold,
+            video_threshold=args.video_threshold,
+            workers=args.workers,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_similarity_report(report))
+    out = Path(args.json_out).expanduser()
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"Wrote {out}")
+    return 1 if report["errors"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -409,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_undo(args)
     if args.command == "benchmark-humans":
         return cmd_benchmark_humans(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
+    if args.command == "benchmark-similarity":
+        return cmd_benchmark_similarity(args)
     parser.print_help()
     return 1
 

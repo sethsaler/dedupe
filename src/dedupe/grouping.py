@@ -203,8 +203,8 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     if group.kind == GroupKind.NO_HUMANS:
         group.suggested_keep = None
         if rule == SmartRule.SELECT_CANDIDATES:
-            group.reviewed_paths = [m.path for m in members]
-            group.selected_for_removal = [m.path for m in members]
+            reviewed = set(group.reviewed_paths)
+            group.selected_for_removal = [m.path for m in members if m.path in reviewed]
         return
 
     if rule == SmartRule.SELECT_CANDIDATES:

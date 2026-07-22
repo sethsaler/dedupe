@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hmac
-import mimetypes
 import secrets
 import shutil
 import threading
+import time
 import webbrowser
 from dataclasses import replace
 from pathlib import Path
@@ -28,40 +28,26 @@ from ..grouping import apply_smart_select, apply_smart_select_all
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
 from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_paths
+from ..review_session import (
+    ReviewSessionLoad,
+    discard_review_session,
+    load_review_session,
+    save_review_session,
+)
+from .media import image_thumbnail_bytes, is_video, media_mimetype, video_thumbnail_bytes
+from .native_picker import pick_native_paths
 
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 6
+WEB_API_VERSION = 7
+PREVIEW_TOKEN_TTL_SECONDS = 120
 
 
-def _macos_picker_script(kind: str) -> str:
-    chooser = (
-        'choose folder with prompt "Choose folders to scan" '
-        "with multiple selections allowed"
-        if kind == "folder"
-        else 'choose file with prompt "Choose media files to scan" '
-        "with multiple selections allowed"
-    )
-    return (
-        'use framework "AppKit"\n'
-        "use scripting additions\n"
-        "try\n"
-        "  current application's NSApplication's sharedApplication()'s "
-        "activateIgnoringOtherApps:true\n"
-        f"  set selectedItems to {chooser}\n"
-        '  set output to ""\n'
-        "  repeat with selectedItem in selectedItems\n"
-        "    set output to output & POSIX path of selectedItem & linefeed\n"
-        "  end repeat\n"
-        "  return output\n"
-        "on error number -128\n"
-        '  return ""\n'
-        "end try"
-    )
-
-
-def create_app(initial_result: ScanResult | None = None) -> Flask:
+def create_app(
+    initial_result: ScanResult | None = None,
+    review_session_path: str | Path | None = None,
+) -> Flask:
     app = Flask(
         __name__,
         template_folder=str(Path(__file__).parent / "templates"),
@@ -73,6 +59,9 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     app.config["DEDUPE_CACHE_PATH"] = None
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     lock = threading.RLock()
+    loaded = ReviewSessionLoad(path=Path(review_session_path) if review_session_path else None)
+    if initial_result is None:
+        loaded = load_review_session(review_session_path)
     state: dict = {
         "result": None,
         "progress": ScanProgress(),
@@ -85,8 +74,54 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         "allowed_reveal_paths": set(),
         "deleted_files": {},
         "streams": [],
+        "review_session": loaded,
+        "preview_tokens": {},
     }
     app.extensions["dedupe_state"] = state
+
+    def persist_result() -> bool:
+        """Persist the active completed result, recording errors for status APIs."""
+        with lock:
+            result = state["result"]
+            if result is None:
+                return False
+            try:
+                metadata = save_review_session(result, review_session_path)
+                state["review_session"] = ReviewSessionLoad(
+                    result=result,
+                    path=Path(metadata["path"]),
+                    saved_at=metadata["saved_at"],
+                )
+                return True
+            except (OSError, TypeError, ValueError) as exc:
+                report = state["review_session"]
+                report.error = str(exc)
+                state["last_error"] = f"Could not save review: {exc}"
+                return False
+
+    def normalized_destination(action: str, destination) -> str | None:
+        if action != "quarantine" or not destination:
+            return None
+        return str(Path(destination).expanduser().resolve(strict=False))
+
+    def preview_manifest(action: str, scope, destination, action_result) -> tuple:
+        eligible = tuple(sorted(item.path for item in action_result.items if item.ok))
+        return (state["scan_id"], action, scope or "all", destination, eligible)
+
+    def issue_preview_token(manifest: tuple) -> str:
+        now = time.monotonic()
+        state["preview_tokens"] = {
+            token: value
+            for token, value in state["preview_tokens"].items()
+            if value[1] > now
+        }
+        token = secrets.token_urlsafe(24)
+        state["preview_tokens"][token] = (manifest, now + PREVIEW_TOKEN_TTL_SECONDS)
+        return token
+
+    def consume_preview_token(token: str | None, manifest: tuple) -> bool:
+        stored = state["preview_tokens"].pop(token, None) if token else None
+        return bool(stored and stored[1] > time.monotonic() and stored[0] == manifest)
 
     def group_payload(group) -> dict:
         payload = group.to_dict()
@@ -153,6 +188,20 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 files_found=len(initial_result.files),
                 groups_found=len(initial_result.groups),
                 message="Loaded previous scan",
+                elapsed_seconds=initial_result.diagnostics.total_duration_seconds,
+            )
+        persist_result()
+    elif loaded.result is not None:
+        with lock:
+            state["result"] = loaded.result
+            state["scan_id"] = secrets.token_hex(12)
+            state["progress"] = ScanProgress(
+                phase="done",
+                done=True,
+                files_found=len(loaded.result.files),
+                groups_found=len(loaded.result.groups),
+                message="Resumed saved review",
+                elapsed_seconds=loaded.result.diagnostics.total_duration_seconds,
             )
 
     @app.get("/")
@@ -191,6 +240,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 "scan_id": state["scan_id"],
                 "error": state["last_error"],
                 "streams": [dict(stream) for stream in state["streams"]],
+                "review_session": state["review_session"].metadata(),
                 "system": {
                     "cpu_count": cpu,
                     "auto_workers": resolve_workers(None),
@@ -211,8 +261,56 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     "reclaimable_human": format_bytes(result.reclaimable_bytes),
                     "selected_count": len(effective_selected_paths(result.groups)),
                     "errors": list(result.errors[:20]),
+                    "diagnostics": result.diagnostics.to_dict(),
                 }
             return jsonify(payload)
+
+    @app.get("/api/review-session")
+    def api_review_session():
+        with lock:
+            return jsonify(state["review_session"].metadata())
+
+    @app.post("/api/review-session/resume")
+    def api_review_session_resume():
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "review is locked during active work"}), 409
+            report = load_review_session(review_session_path)
+            state["review_session"] = report
+            if report.result is None:
+                return jsonify(report.metadata()), 404
+            state["result"] = report.result
+            state["scan_id"] = secrets.token_hex(12)
+            state["deleted_files"] = {}
+            state["groups_version"] += 1
+            state["progress"] = ScanProgress(
+                phase="done",
+                done=True,
+                files_found=len(report.result.files),
+                groups_found=len(report.result.groups),
+                message="Resumed saved review",
+            )
+            payload = report.metadata()
+            payload["scan_id"] = state["scan_id"]
+            return jsonify(payload)
+
+    @app.delete("/api/review-session")
+    def api_review_session_discard():
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "review is locked during active work"}), 409
+            try:
+                removed = discard_review_session(review_session_path)
+            except OSError as exc:
+                return jsonify({"error": str(exc)}), 500
+            old_path = state["review_session"].path
+            state["review_session"] = ReviewSessionLoad(path=old_path)
+            state["result"] = None
+            state["deleted_files"] = {}
+            state["scan_id"] = secrets.token_hex(12)
+            state["groups_version"] += 1
+            state["progress"] = ScanProgress()
+        return jsonify({"ok": True, "discarded": removed})
 
     @app.get("/api/groups")
     def api_groups():
@@ -262,6 +360,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             if state["acting"]:
                 return jsonify({"error": "file action already running"}), 409
             scan_id = secrets.token_hex(12)
+            previous_result = state["result"]
+            previous_deleted = dict(state["deleted_files"])
             cancel_event = threading.Event()
             state["scanning"] = True
             state["scan_id"] = scan_id
@@ -271,6 +371,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             state["progress"] = ScanProgress(phase="starting", message="Starting…")
             # Empty result so the UI can stream groups as they appear.
             state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
+            state["preview_tokens"] = {}
             state["groups_version"] = state.get("groups_version", 0) + 1
             # Default to parallel per-folder streams when more than one folder is
             # given; each folder becomes its own concurrent scan (no cross-folder dedup).
@@ -393,11 +494,12 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 with lock:
                     if state["scan_id"] != scan_id:
                         return
+                    if not result.roots and result.errors:
+                        raise RuntimeError("; ".join(result.errors))
                     state["result"] = result
-                    state["scanning"] = False
-                    state["cancel_event"] = None
                     state["groups_version"] = state.get("groups_version", 0) + 1
-                    state["progress"] = ScanProgress(
+                    state["progress"] = replace(
+                        state["progress"],
                         phase="done",
                         done=True,
                         files_found=len(result.files),
@@ -407,12 +509,22 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                             f"{result.similar_groups} similar, "
                             f"{result.no_human_files} non-human"
                         ),
+                        elapsed_seconds=result.diagnostics.total_duration_seconds,
+                        eta_seconds=0.0,
                     )
+                    persist_result()
+                    state["scanning"] = False
+                    state["cancel_event"] = None
             except Exception as exc:
                 with lock:
                     if state["scan_id"] != scan_id:
                         return
                     was_cancelled = isinstance(exc, InterruptedError)
+                    state["result"] = previous_result
+                    state["deleted_files"] = previous_deleted
+                    state["scan_id"] = secrets.token_hex(12)
+                    state["groups_version"] += 1
+                    state["preview_tokens"] = {}
                     state["scanning"] = False
                     state["cancel_event"] = None
                     state["last_error"] = None if was_cancelled else str(exc)
@@ -461,10 +573,13 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 for g in result.groups:
                     if g.id == group_id:
                         apply_smart_select(g, rule)
-                        return jsonify(group_payload(g))
+                        payload = group_payload(g)
+                        persist_result()
+                        return jsonify(payload)
                 return jsonify({"error": "not found"}), 404
             apply_smart_select_all(result.groups, rule)
             result.recompute_stats()
+            persist_result()
             return jsonify({"ok": True, "group_count": len(result.groups)})
 
     @app.post("/api/selection")
@@ -501,11 +616,15 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                             picks = picks[:-1]
                     g.selected_for_removal = picks
                     if g.kind.value == "no_humans":
-                        reviewed = list(data.get("reviewed") or picks)
+                        if "reviewed" not in data:
+                            return jsonify({"error": "reviewed paths required for Non-Human updates"}), 400
+                        reviewed = list(data.get("reviewed") or [])
                         g.reviewed_paths = [
                             path for path in reviewed if path in member_paths
                         ]
-                    return jsonify(group_payload(g))
+                    payload = group_payload(g)
+                    persist_result()
+                    return jsonify(payload)
         return jsonify({"error": "not found"}), 404
 
     @app.post("/api/non-human/delete")
@@ -514,6 +633,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         path = data.get("path")
+        dry_run = bool(data.get("dry_run", True))
         with lock:
             if state["scanning"] or state["acting"]:
                 return jsonify({"error": "file actions are locked during active work"}), 409
@@ -541,13 +661,30 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 reviewed_paths=[path],
             )
             roots = list(result.roots)
+            safety_groups = list(result.groups)
 
         try:
-            action_result = apply_actions(
+            preview = apply_actions(
                 [action_group],
                 action="trash",
-                dry_run=False,
+                dry_run=True,
                 roots=roots,
+                safety_groups=safety_groups,
+            )
+            manifest = (state["scan_id"], "trash", "non-human", None, tuple(sorted(
+                item.path for item in preview.items if item.ok
+            )))
+            if dry_run:
+                payload = preview.to_dict()
+                with lock:
+                    payload["preview_token"] = issue_preview_token(manifest)
+                return jsonify(payload)
+            with lock:
+                if not consume_preview_token(data.get("preview_token"), manifest):
+                    return jsonify({"error": "preview expired or selection changed; preview again"}), 409
+            action_result = apply_actions(
+                [action_group], action="trash", dry_run=False, roots=roots,
+                safety_groups=safety_groups,
             )
             item = next((item for item in action_result.items if item.path == path), None)
             if item is None or not item.ok:
@@ -559,7 +696,9 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     selected for selected in original_selected if selected != path
                 ]
                 group.reviewed_paths = list(dict.fromkeys([*original_reviewed, path]))
-                return jsonify(group_payload(group))
+                payload = group_payload(group)
+                persist_result()
+                return jsonify(payload)
         finally:
             with lock:
                 state["acting"] = False
@@ -671,6 +810,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 result.groups = [group for group in result.groups if group.members]
                 result.recompute_stats()
                 state["groups_version"] = state.get("groups_version", 0) + 1
+            persist_result()
             return jsonify({"ok": True, "marked_count": len(records)})
         except Exception as exc:
             for record, status, detector, signature in prior:
@@ -716,6 +856,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                 result.groups = [candidate for candidate in result.groups if candidate.id != group_id]
                 result.recompute_stats()
                 state["groups_version"] = state.get("groups_version", 0) + 1
+            persist_result()
             return jsonify({"ok": True, "pair_count": pair_count})
         except Exception as exc:
             return jsonify({"error": f"could not save distinct review: {exc}"}), 500
@@ -731,6 +872,7 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         action = (data.get("action") or "trash").lower()
         dry_run = bool(data.get("dry_run", True))
         quarantine_dir = data.get("quarantine_dir")
+        destination = normalized_destination(action, quarantine_dir)
 
         if action not in ("trash", "quarantine", "isolate"):
             return jsonify({"error": "action must be trash, quarantine, or isolate"}), 400
@@ -790,14 +932,28 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                     roots=roots,
                 )
             else:
-                action_result = apply_actions(
+                preview_result = apply_actions(
                     groups,
                     action=action,
-                    quarantine_dir=quarantine_dir,
-                    dry_run=dry_run,
+                    quarantine_dir=destination,
+                    dry_run=True,
                     roots=roots,
                     kinds=kinds,
+                    safety_groups=groups,
                 )
+                manifest = preview_manifest(action, kinds_raw, destination, preview_result)
+                if dry_run:
+                    action_result = preview_result
+                    with lock:
+                        preview_token = issue_preview_token(manifest)
+                else:
+                    with lock:
+                        if not consume_preview_token(data.get("preview_token"), manifest):
+                            return jsonify({"error": "preview expired or selection changed; preview again"}), 409
+                    action_result = apply_actions(
+                        groups, action=action, quarantine_dir=destination,
+                        dry_run=False, roots=roots, kinds=kinds, safety_groups=groups,
+                    )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400
         else:
@@ -838,6 +994,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
                             file for file in result.files if file.path not in removed
                         ]
                         result.recompute_stats()
+                if removed:
+                    persist_result()
 
             with lock:
                 if action_result.review_root:
@@ -848,6 +1006,8 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
             payload = action_result.to_dict()
             if action in ("trash", "quarantine"):
                 payload["selection_counts"] = selection_counts
+                if dry_run:
+                    payload["preview_token"] = preview_token
             return jsonify(payload)
         finally:
             with lock:
@@ -856,131 +1016,12 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
     @app.post("/api/pick-folder")
     def api_pick_folder():
         """Open a native folder/file picker and return local filesystem paths."""
-        import platform
-        import subprocess
-
         data = request.get_json(silent=True) or {}
         kind = str(data.get("kind") or "folder").lower()
         if kind not in {"folder", "files"}:
             return jsonify({"error": "kind must be folder or files"}), 400
-
-        def response_for_process(proc) -> tuple[Response, int] | Response:
-            if proc.returncode != 0:
-                detail = (proc.stderr or "").strip()
-                return (
-                    jsonify({
-                        "error": detail or "The native file picker could not open",
-                        "paths": [],
-                    }),
-                    500,
-                )
-            paths = [
-                str(Path(line.strip()).expanduser().resolve(strict=False))
-                for line in (proc.stdout or "").splitlines()
-                if line.strip()
-            ]
-            if not paths:
-                return jsonify({"cancelled": True, "path": None, "paths": []})
-            return jsonify({
-                "path": paths[0],
-                "paths": paths,
-                "cancelled": False,
-            })
-
-        system = platform.system()
-        try:
-            if system == "Darwin":
-                script = _macos_picker_script(kind)
-                proc = subprocess.run(
-                    ["/usr/bin/osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    check=False,
-                )
-                return response_for_process(proc)
-
-            if system == "Linux":
-                commands = (
-                    (
-                        [
-                            "zenity",
-                            "--file-selection",
-                            "--directory",
-                            "--multiple",
-                            "--separator=\n",
-                            "--title=Choose folders to scan",
-                        ],
-                        [
-                            "kdialog",
-                            "--getexistingdirectory",
-                            ".",
-                            "--multiple",
-                            "--separate-output",
-                            "--title",
-                            "Choose folders to scan",
-                        ],
-                    )
-                    if kind == "folder"
-                    else (
-                        [
-                            "zenity",
-                            "--file-selection",
-                            "--multiple",
-                            "--separator=\n",
-                            "--title=Choose media files to scan",
-                        ],
-                        [
-                            "kdialog",
-                            "--getopenfilename",
-                            ".",
-                            "Media files (*)",
-                            "--multiple",
-                            "--separate-output",
-                            "--title",
-                            "Choose media files to scan",
-                        ],
-                    )
-                )
-                for cmd in commands:
-                    try:
-                        proc = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=300,
-                            check=False,
-                        )
-                        if proc.returncode == 0:
-                            return response_for_process(proc)
-                        if proc.returncode == 1 and not (proc.stdout or "").strip():
-                            return jsonify({
-                                "cancelled": True,
-                                "path": None,
-                                "paths": [],
-                            })
-                        detail = (proc.stderr or "").strip()
-                        if detail:
-                            return jsonify({"error": detail, "paths": []}), 500
-                    except FileNotFoundError:
-                        continue
-                return jsonify({
-                    "cancelled": False,
-                    "path": None,
-                    "paths": [],
-                    "message": "No native picker is installed — paste paths instead",
-                })
-
-            return jsonify({
-                "cancelled": False,
-                "path": None,
-                "paths": [],
-                "message": "Native picker not supported on this OS — paste paths instead",
-            })
-        except subprocess.TimeoutExpired:
-            return jsonify({"error": "The native picker timed out", "paths": []}), 504
-        except Exception as exc:
-            return jsonify({"error": str(exc), "paths": []}), 500
+        payload, status = pick_native_paths(kind)
+        return jsonify(payload), status
 
     @app.get("/api/thumbnail")
     def api_thumbnail():
@@ -995,23 +1036,10 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         if not is_scanned_file(p, path):
             return jsonify({"error": "not in scan"}), 403
 
-        ext = p.suffix.lower()
         # Videos: try a cached frame if we can't stream
-        if ext in {
-            ".mp4",
-            ".mov",
-            ".m4v",
-            ".avi",
-            ".mkv",
-            ".webm",
-            ".mts",
-            ".m2ts",
-            ".wmv",
-            ".flv",
-            ".3gp",
-        }:
+        if is_video(p):
             try:
-                thumb = _video_thumb_bytes(p)
+                thumb = video_thumbnail_bytes(p)
                 if thumb:
                     return Response(thumb, mimetype="image/jpeg")
             except Exception:
@@ -1021,29 +1049,10 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         # Images / GIFs via Pillow resize
         # ?full=1 → larger lightbox preview
         full = request.args.get("full") == "1"
-        max_edge = 1600 if full else 320
-        quality = 88 if full else 80
         try:
-            from io import BytesIO
-
-            from PIL import Image
-
-            try:
-                from pillow_heif import register_heif_opener
-
-                register_heif_opener()
-            except Exception:
-                pass
-
-            with Image.open(p) as img:
-                img = img.convert("RGB")
-                img.thumbnail((max_edge, max_edge))
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=quality)
-                return Response(buf.getvalue(), mimetype="image/jpeg")
+            return Response(image_thumbnail_bytes(p, full=full), mimetype="image/jpeg")
         except Exception:
-            mime, _ = mimetypes.guess_type(str(p))
-            return send_file(p, mimetype=mime or "application/octet-stream")
+            return send_file(p, mimetype=media_mimetype(p))
 
     @app.get("/api/media")
     def api_media():
@@ -1057,10 +1066,9 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         if not is_scanned_file(media_path, path):
             return jsonify({"error": "not in scan"}), 403
 
-        mime, _ = mimetypes.guess_type(str(media_path))
         return send_file(
             media_path,
-            mimetype=mime or "application/octet-stream",
+            mimetype=media_mimetype(media_path),
             conditional=True,
         )
 
@@ -1086,53 +1094,6 @@ def create_app(initial_result: ScanResult | None = None) -> Flask:
         return jsonify({"path": path, "exists": p.exists()})
 
     return app
-
-
-def _video_thumb_bytes(path: Path) -> bytes | None:
-    import subprocess
-    import tempfile
-
-    if not shutil_which("ffmpeg"):
-        return None
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        out = tmp.name
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                "1",
-                "-i",
-                str(path),
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=320:-1",
-                "-y",
-                out,
-            ],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        data = Path(out).read_bytes()
-        return data if data else None
-    except Exception:
-        return None
-    finally:
-        try:
-            Path(out).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def shutil_which(cmd: str) -> str | None:
-    import shutil
-
-    return shutil.which(cmd)
 
 
 def run_app(

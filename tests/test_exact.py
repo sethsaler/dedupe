@@ -77,3 +77,25 @@ def test_inventory_skips_file_symlinks_and_honors_globs(tmp_path: Path) -> None:
 
     assert [Path(record.path).name for record in records] == ["keep.jpg"]
     assert all(root.resolve() in Path(record.path).parents for record in records)
+
+
+def test_inventory_never_enters_photos_library_packages(tmp_path: Path) -> None:
+    library = tmp_path / "Photos Library.photoslibrary"
+    originals = library / "originals"
+    originals.mkdir(parents=True)
+    (originals / "managed.jpg").write_bytes(b"photos-managed")
+    (tmp_path / "exported.jpg").write_bytes(b"safe-export")
+
+    records = inventory([tmp_path])
+
+    assert [Path(record.path).name for record in records] == ["exported.jpg"]
+
+
+def test_inventory_rejects_direct_photos_library_descendants(tmp_path: Path) -> None:
+    originals = tmp_path / "Photos Library.photoslibrary" / "originals"
+    originals.mkdir(parents=True)
+    managed = originals / "managed.jpg"
+    managed.write_bytes(b"photos-managed")
+
+    assert inventory([originals]) == []
+    assert inventory([managed]) == []

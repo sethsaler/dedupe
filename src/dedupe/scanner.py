@@ -20,6 +20,12 @@ ProgressCb = Callable[[str, int, int], None]
 CancelCb = Callable[[], bool]
 
 
+def is_in_photos_library(path: str | Path) -> bool:
+    """Return whether a path is a Photos-managed package or one of its descendants."""
+    resolved = Path(path).expanduser().resolve(strict=False)
+    return any(part.lower().endswith(".photoslibrary") for part in resolved.parts)
+
+
 def media_extensions(
     include_images: bool = True,
     include_gifs: bool = True,
@@ -57,6 +63,7 @@ def inventory(
     exclusion_patterns |= {
         ".git",
         ".dedupe",
+        "*.photoslibrary",
         "node_modules",
         ".trash",
         ".ds_store",
@@ -83,6 +90,8 @@ def inventory(
             raise InterruptedError("scan cancelled")
         root_path = Path(root).expanduser().resolve()
         if not root_path.exists():
+            continue
+        if is_in_photos_library(root_path):
             continue
         if root_path.is_file():
             rec = _record_for_file(root_path, exts)
