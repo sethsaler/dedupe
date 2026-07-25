@@ -7,12 +7,15 @@ single decoder thread, with one-pass frame extraction and small frame size.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
 from .grouping import cluster_around_best
@@ -25,10 +28,45 @@ DEFAULT_THRESHOLD = 8  # Hamming on combined 64-bit fingerprint
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
 FRAME_WIDTH = 320
 HASH_FRAME_SIZE = 32
+HASH_FRAME_FILTER = f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,format=gray"
 
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+# The hwaccel capability probe must bypass any test-patched subprocess.run so
+# fake runners never see (or answer) the one-time "-hwaccels" query.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+@lru_cache(maxsize=1)
+def _hwaccel_args() -> tuple[str, ...]:
+    """Input-side ffmpeg args enabling hardware decode, or () when unsupported.
+
+    On macOS, VideoToolbox offloads H.264/HEVC decoding to dedicated silicon —
+    much faster on high-resolution sources and it frees CPU for the image
+    hashing that now runs concurrently. H.264/HEVC decoder output is spec-exact,
+    so fingerprints match software-decoded values. Every caller retries without
+    these args on failure, and DEDUPE_DISABLE_HWACCEL=1 forces software decode.
+    """
+    if os.environ.get("DEDUPE_DISABLE_HWACCEL"):
+        return ()
+    if sys.platform != "darwin" or not shutil.which("ffmpeg"):
+        return ()
+    try:
+        result = _REAL_SUBPROCESS_RUN(
+            ["ffmpeg", "-hide_banner", "-hwaccels"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and "videotoolbox" in (result.stdout or ""):
+            return ("-hwaccel", "videotoolbox")
+    except Exception:
+        pass
+    return ()
 
 
 def probe_video(path: str | Path) -> tuple[float | None, int | None, int | None]:
@@ -144,13 +182,27 @@ def _sample_timestamps(duration: float, max_frames: int = MAX_FRAMES) -> list[fl
 
 
 def _extract_hash_frame(path: str | Path, timestamp: float) -> bytes | None:
-    """Fast-seek to one frame and return a 32×32 grayscale image buffer."""
+    """Fast-seek to one frame and return a 32×32 grayscale image buffer.
+
+    Tries hardware decode when available, falling back to software decode.
+    """
+    hwaccel = _hwaccel_args()
+    raw = _extract_hash_frame_once(path, timestamp, hwaccel)
+    if raw is None and hwaccel:
+        raw = _extract_hash_frame_once(path, timestamp, ())
+    return raw
+
+
+def _extract_hash_frame_once(
+    path: str | Path, timestamp: float, hwaccel: tuple[str, ...]
+) -> bytes | None:
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
+        *hwaccel,
         # Input-side seeking skips directly to the nearest keyframe instead of
         # decoding the entire timeline just to retain a handful of frames.
         "-ss",
@@ -162,7 +214,7 @@ def _extract_hash_frame(path: str | Path, timestamp: float) -> bytes | None:
         "-an",
         "-sn",
         "-vf",
-        f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,format=gray",
+        HASH_FRAME_FILTER,
         "-frames:v",
         "1",
         "-f",
@@ -176,16 +228,92 @@ def _extract_hash_frame(path: str | Path, timestamp: float) -> bytes | None:
     return result.stdout
 
 
+def _extract_hash_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+    """Fast-seek every sampled timestamp in a single ffmpeg process.
+
+    The same file is opened once per timestamp so each output keeps the exact
+    input-side seek of the per-frame extractor, which makes the buffers
+    byte-identical to :func:`_extract_hash_frame` while spawning one process
+    instead of one per frame. Tries hardware decode when available, falling
+    back to software decode. Returns ``[]`` when the pass is incomplete so the
+    caller can fall back.
+    """
+    if not timestamps:
+        return []
+    hwaccel = _hwaccel_args()
+    frames = _extract_hash_frames_once(path, timestamps, hwaccel)
+    if not frames and hwaccel:
+        frames = _extract_hash_frames_once(path, timestamps, ())
+    return frames
+
+
+def _extract_hash_frames_once(
+    path: str | Path, timestamps: list[float], hwaccel: tuple[str, ...]
+) -> list[bytes]:
+    expected = HASH_FRAME_SIZE * HASH_FRAME_SIZE
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    for timestamp in timestamps:
+        cmd += [*hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
+    with tempfile.TemporaryDirectory(prefix="dedupe-vidhash-") as tmp:
+        targets = [Path(tmp) / f"frame_{index:03d}.raw" for index in range(len(timestamps))]
+        for index, target in enumerate(targets):
+            cmd += [
+                "-map",
+                f"{index}:v",
+                "-an",
+                "-sn",
+                "-vf",
+                HASH_FRAME_FILTER,
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-y",
+                str(target),
+            ]
+        result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        if result.returncode != 0:
+            return []
+        frames: list[bytes] = []
+        for target in targets:
+            try:
+                raw = target.read_bytes()
+            except OSError:
+                return []
+            if len(raw) != expected:
+                return []
+            frames.append(raw)
+        return frames
+
+
 def _extract_seek_frame_ppm(
     path: str | Path, timestamp: float, *, frame_width: int
 ) -> bytes | None:
-    """Fast-seek to one aspect-preserving frame and return it as PPM bytes."""
+    """Fast-seek to one aspect-preserving frame and return it as PPM bytes.
+
+    Tries hardware decode when available, falling back to software decode.
+    """
+    hwaccel = _hwaccel_args()
+    raw = _extract_seek_frame_ppm_once(path, timestamp, hwaccel, frame_width=frame_width)
+    if raw is None and hwaccel:
+        raw = _extract_seek_frame_ppm_once(path, timestamp, (), frame_width=frame_width)
+    return raw
+
+
+def _extract_seek_frame_ppm_once(
+    path: str | Path,
+    timestamp: float,
+    hwaccel: tuple[str, ...],
+    *,
+    frame_width: int,
+) -> bytes | None:
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
+        *hwaccel,
         "-ss",
         f"{timestamp:.6f}",
         "-threads",
@@ -231,11 +359,17 @@ def compute_video_fingerprint(
 
     if duration is not None and duration > 0:
         timestamps = _sample_timestamps(duration)
+        raw_frames = _extract_hash_frames(path, timestamps)
+        if len(raw_frames) != len(timestamps):
+            # Per-frame fallback for inputs the batched pass cannot satisfy.
+            raw_frames = []
+            for timestamp in timestamps:
+                raw = _extract_hash_frame(path, timestamp)
+                if raw is None:
+                    return None, width, height, duration
+                raw_frames.append(raw)
         hashes = []
-        for i, timestamp in enumerate(timestamps):
-            raw = _extract_hash_frame(path, timestamp)
-            if raw is None:
-                return None, width, height, duration
+        for i, raw in enumerate(raw_frames):
             image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
             hashes.append(imagehash.phash(image))
             if on_frame:
@@ -430,11 +564,12 @@ def find_similar_video_groups(
             )
         else:
             indexes = range(i + 1, len(hashed))
+        left = fingerprints[i]
         for j in indexes:
             b = hashed[j]
-            if tuple(sorted((a.path, b.path))) in distinct_pairs:
+            # Only pay for the ordered key when reviews exist to look up.
+            if distinct_pairs and tuple(sorted((a.path, b.path))) in distinct_pairs:
                 continue
-            left = fingerprints[i]
             right = fingerprints[j]
             # These aligned positions are necessarily under the existing maximum.
             if (

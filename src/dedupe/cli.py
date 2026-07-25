@@ -16,6 +16,7 @@ from pathlib import Path
 from . import __version__
 from .actions import (
     apply_actions,
+    format_bytes,
     isolate_groups,
     summarize_scan,
     undo_quarantine,
@@ -144,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Which group kinds to isolate (default: all)",
     )
+    scan.add_argument(
+        "--allow-cross-device",
+        action="store_true",
+        help="Allow quarantine/isolate-move onto another volume "
+        "(copies, verifies, then deletes the original instead of failing preflight)",
+    )
     scan.add_argument("--dry-run", action="store_true", default=True)
     scan.add_argument("--execute", action="store_true", help="Actually perform --action")
     scan.add_argument("--ui", action="store_true", help="Open web UI after scan")
@@ -178,6 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["all", "exact", "similar", "no_humans"],
         default="all",
     )
+    isolate.add_argument(
+        "--allow-cross-device",
+        action="store_true",
+        help="Allow --isolate-mode move onto another volume (copy, verify, delete original)",
+    )
     isolate.add_argument("--dry-run", action="store_true")
     isolate.add_argument(
         "--execute",
@@ -189,12 +201,67 @@ def build_parser() -> argparse.ArgumentParser:
         "undo",
         help="Restore an executed quarantine action from its JSON receipt",
     )
-    undo.add_argument("action_log", help="Quarantine action receipt JSON")
+    undo.add_argument(
+        "action_log",
+        metavar="RECEIPT",
+        help="Receipt id (see `dedupe receipts list`) or path to a receipt JSON",
+    )
     undo.add_argument(
         "--execute",
         action="store_true",
         help="Actually restore files (default is a dry-run preview)",
     )
+    undo.add_argument(
+        "--log-dir",
+        default=None,
+        metavar="DIR",
+        help="Receipt directory to resolve ids against (default: ~/.cache/dedupe/logs)",
+    )
+
+    receipts = sub.add_parser("receipts", help="List, inspect, and prune action receipts")
+    receipts_sub = receipts.add_subparsers(dest="receipts_command", required=True)
+
+    def _add_log_dir(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--log-dir",
+            default=None,
+            metavar="DIR",
+            help="Receipt directory (default: ~/.cache/dedupe/logs)",
+        )
+        parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    receipts_list = receipts_sub.add_parser("list", help="List receipts, newest first")
+    receipts_list.add_argument("--limit", type=int, default=20, metavar="N")
+    receipts_list.add_argument(
+        "--no-previews", action="store_true", help="Hide dry-run preview receipts"
+    )
+    receipts_list.add_argument(
+        "--undoable", action="store_true", help="Only receipts that can be undone"
+    )
+    _add_log_dir(receipts_list)
+
+    receipts_show = receipts_sub.add_parser("show", help="Show one receipt")
+    receipts_show.add_argument("receipt", metavar="ID", help="Receipt id, filename, or path")
+    receipts_show.add_argument(
+        "--items", type=int, default=20, metavar="N", help="Max items to print (0 = all)"
+    )
+    _add_log_dir(receipts_show)
+
+    receipts_prune = receipts_sub.add_parser("prune", help="Delete old receipts")
+    receipts_prune.add_argument(
+        "--older-than", dest="older_than", type=float, metavar="DAYS",
+        help="Delete receipts older than DAYS",
+    )
+    receipts_prune.add_argument(
+        "--keep", type=int, metavar="N", help="Keep only the N newest receipts"
+    )
+    receipts_prune.add_argument(
+        "--drop-previews", action="store_true", help="Delete every dry-run preview receipt"
+    )
+    receipts_prune.add_argument(
+        "--execute", action="store_true", help="Actually delete (default is a preview)"
+    )
+    _add_log_dir(receipts_prune)
 
     benchmark = sub.add_parser(
         "benchmark-humans",
@@ -318,6 +385,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 quarantine_dir=args.quarantine_dir,
                 dry_run=dry,
                 roots=result.roots,
+                allow_cross_device=args.allow_cross_device,
             )
         elif args.action == "trash":
             action_result = apply_actions(
@@ -335,6 +403,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 kinds=kinds,
                 dry_run=dry,
                 roots=result.roots,
+                allow_cross_device=args.allow_cross_device,
             )
         else:
             print(f"error: unknown action {args.action}", file=sys.stderr)
@@ -394,6 +463,7 @@ def cmd_isolate(args: argparse.Namespace) -> int:
         kinds=kinds,
         dry_run=dry,
         roots=result.roots,
+        allow_cross_device=args.allow_cross_device,
     )
     mode = "DRY-RUN" if dry else "EXECUTED"
     print(
@@ -412,14 +482,121 @@ def cmd_isolate(args: argparse.Namespace) -> int:
 
 
 def cmd_undo(args: argparse.Namespace) -> int:
-    result = undo_quarantine(args.action_log, dry_run=not args.execute)
+    from .receipts import ReceiptError
+
+    try:
+        result = undo_quarantine(
+            args.action_log,
+            dry_run=not args.execute,
+            receipt_dir=getattr(args, "log_dir", None),
+        )
+    except ReceiptError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     mode = "DRY-RUN" if result.dry_run else "EXECUTED"
     print(
         f"{mode} undo: {result.success_count} ok, {result.fail_count} failed"
     )
+    for item in result.items:
+        if not item.ok:
+            print(f"  failed: {item.path} -> {item.destination}: {item.error}")
     if result.log_path:
         print(f"Receipt: {result.log_path}")
     return 0 if result.fail_count == 0 else 1
+
+
+def _receipt_line(summary) -> str:
+    when = (summary.started_at or "")[:19].replace("T", " ")
+    tag = "preview" if summary.dry_run else "executed"
+    flags = " undoable" if summary.undoable else ""
+    return (
+        f"{summary.id}  {when}  {summary.action:<16} {tag:<8} "
+        f"{summary.success_count} ok / {summary.fail_count} failed  "
+        f"{format_bytes(summary.bytes)}{flags}"
+    )
+
+
+def cmd_receipts(args: argparse.Namespace) -> int:
+    from .receipts import ReceiptError, list_receipts, load_receipt, prune_receipts
+
+    if args.receipts_command == "list":
+        summaries = list_receipts(
+            args.log_dir,
+            limit=args.limit or None,
+            include_previews=not args.no_previews,
+            undoable_only=args.undoable,
+        )
+        if args.json:
+            print(json.dumps([s.to_dict() for s in summaries], indent=2))
+            return 0
+        if not summaries:
+            print("No action receipts found.")
+            return 0
+        for summary in summaries:
+            print(_receipt_line(summary))
+        return 0
+
+    if args.receipts_command == "show":
+        try:
+            data = load_receipt(args.receipt, args.log_dir)
+        except (ReceiptError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(data, indent=2))
+            return 0
+        print(f"Receipt: {data['id']}")
+        print(f"Path: {data.get('log_path')}")
+        print(f"Action: {data.get('action')} ({'dry-run' if data.get('dry_run') else 'executed'})")
+        print(f"Started: {data.get('started_at')}  Completed: {data.get('completed_at')}")
+        print(f"Result: {data.get('success_count')} ok, {data.get('fail_count')} failed")
+        if data.get("review_root"):
+            print(f"Review root: {data['review_root']}")
+        items = data.get("items") or []
+        shown = items if args.items in (0, None) else items[: args.items]
+        for item in shown:
+            status = "ok  " if item.get("ok") else "FAIL"
+            detail = item.get("destination") if item.get("ok") else item.get("error")
+            print(f"  [{status}] {item.get('path')} -> {detail}")
+        if len(shown) < len(items):
+            print(f"  … +{len(items) - len(shown)} more items")
+        return 0
+
+    if args.receipts_command == "prune":
+        if args.older_than is None and args.keep is None and not args.drop_previews:
+            print(
+                "error: choose at least one of --older-than, --keep, --drop-previews",
+                file=sys.stderr,
+            )
+            return 2
+        pruned = prune_receipts(
+            args.log_dir,
+            older_than_days=args.older_than,
+            keep=args.keep,
+            drop_previews=args.drop_previews,
+            dry_run=not args.execute,
+        )
+        if args.json:
+            print(json.dumps(pruned.to_dict(), indent=2))
+            return 0 if not pruned.errors else 1
+        mode = "DRY-RUN" if pruned.dry_run else "EXECUTED"
+        print(
+            f"{mode} prune: {pruned.removed_count} receipts "
+            f"({format_bytes(pruned.freed_bytes)}), {pruned.kept_count} kept"
+        )
+        for removed in pruned.removed[:20]:
+            print(f"  {removed.id}  ({removed.reason})")
+        if pruned.removed_count > 20:
+            print(f"  … +{pruned.removed_count - 20} more")
+        for error in pruned.errors:
+            print(f"  error: {error}", file=sys.stderr)
+        return 0 if not pruned.errors else 1
+
+    print(f"error: unknown receipts command {args.receipts_command}", file=sys.stderr)
+    return 2
 
 
 def cmd_benchmark_humans(args: argparse.Namespace) -> int:
@@ -607,6 +784,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_isolate(args)
     if args.command == "undo":
         return cmd_undo(args)
+    if args.command == "receipts":
+        return cmd_receipts(args)
     if args.command == "benchmark-humans":
         return cmd_benchmark_humans(args)
     if args.command == "doctor":

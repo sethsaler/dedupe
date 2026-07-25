@@ -1,8 +1,10 @@
 """Local web API security and state-isolation tests."""
 
 import json
+import os
 import platform
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -15,9 +17,12 @@ from dedupe.models import (
     FileRecord,
     MediaType,
     ScanDiagnostics,
+    ScanProgress,
     ScanResult,
     StageDiagnostics,
 )
+from dedupe.web import app as web_app
+from dedupe.web import media as web_media
 from dedupe.web.app import WEB_API_VERSION, create_app
 
 
@@ -25,6 +30,7 @@ from dedupe.web.app import WEB_API_VERSION, create_app
 def isolate_review_session(tmp_path: Path, monkeypatch) -> None:
     """Never let a web test read or overwrite the user's saved review."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEDUPE_THUMBNAIL_CACHE_DIR", str(tmp_path / "thumbs"))
 
 
 def _result(tmp_path: Path) -> ScanResult:
@@ -704,3 +710,696 @@ def test_macos_picker_surfaces_native_error(monkeypatch) -> None:
 
     assert response.status_code == 500
     assert "Not authorized" in response.get_json()["error"]
+
+
+def _two_group_result(tmp_path: Path) -> ScanResult:
+    records = []
+    for name, contents in (
+        ("a.jpg", b"same1"),
+        ("b.jpg", b"same1"),
+        ("c.jpg", b"same2"),
+        ("d.jpg", b"same2"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(contents)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".jpg",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    groups = build_groups([records[:2], records[2:]], [])
+    groups[0].suggested_keep = records[0].path
+    groups[0].selected_for_removal = [records[1].path]
+    groups[1].suggested_keep = records[2].path
+    groups[1].selected_for_removal = [records[3].path]
+    return ScanResult(roots=[str(tmp_path)], files=records, groups=groups)
+
+
+def test_action_rejects_stale_preview_token_with_auto_retry_message(tmp_path: Path) -> None:
+    """A non-dry-run /api/action call with a stale/bogus preview token returns 409."""
+    result = _result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/action",
+        json={
+            "action": "trash",
+            "dry_run": False,
+            "scan_id": scan_id,
+            "preview_token": "stale-or-bogus-token",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    data = response.get_json()
+    assert data["preview_stale"] is True
+    assert data["preview_stale_reason"] == "missing"
+    assert "preview again" in data["error"]
+    assert all(Path(record.path).exists() for record in result.files)
+
+
+def test_expired_preview_token_reports_expiry_and_refuses_to_execute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An expired token never executes; the client is told to confirm a fresh preview."""
+    result = _result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    quarantine = tmp_path / "quarantine"
+    base = {
+        "action": "quarantine",
+        "dry_run": False,
+        "scan_id": scan_id,
+        "quarantine_dir": str(quarantine),
+        "kinds": "exact",
+    }
+
+    fresh = client.post("/api/action", json={**base, "dry_run": True}, headers=headers)
+    assert fresh.get_json()["preview_expires_in"] == web_app.PREVIEW_TOKEN_TTL_SECONDS
+
+    # Issue a token that is already past its lifetime instead of waiting ten minutes.
+    monkeypatch.setattr(web_app, "PREVIEW_TOKEN_TTL_SECONDS", -1)
+    payload = client.post(
+        "/api/action", json={**base, "dry_run": True}, headers=headers
+    ).get_json()
+    expired = client.post(
+        "/api/action", json={**base, "preview_token": payload["preview_token"]}, headers=headers
+    )
+
+    assert expired.status_code == 409
+    body = expired.get_json()
+    assert body["preview_stale_reason"] == "expired"
+    assert "expired" in body["error"]
+    assert not quarantine.exists()
+
+    # Re-previewing issues a usable token, so the user only re-confirms the numbers.
+    monkeypatch.undo()
+    refreshed = client.post(
+        "/api/action", json={**base, "dry_run": True}, headers=headers
+    ).get_json()
+    assert refreshed["preview_token"] != payload["preview_token"]
+    executed = client.post(
+        "/api/action", json={**base, "preview_token": refreshed["preview_token"]}, headers=headers
+    )
+    assert executed.status_code == 200
+    assert executed.get_json()["success_count"] == 1
+    assert len(list(quarantine.iterdir())) == 1
+
+
+def test_bulk_selection_keeps_one_member_of_every_duplicate_group(tmp_path: Path) -> None:
+    result = _two_group_result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/selection/bulk",
+        json={"operation": "select_all", "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["group_count"] == 2
+    assert body["selected_count"] == 2
+    for group in result.groups:
+        assert group.suggested_keep not in group.selected_for_removal
+        assert len(group.selected_for_removal) == len(group.members) - 1
+
+    cleared = client.post(
+        "/api/selection/bulk",
+        json={"operation": "select_none", "scan_id": scan_id},
+        headers=headers,
+    ).get_json()
+    assert cleared["selected_count"] == 0
+    assert all(not group.selected_for_removal for group in result.groups)
+
+    inverted = client.post(
+        "/api/selection/bulk",
+        json={"operation": "invert", "scan_id": scan_id},
+        headers=headers,
+    ).get_json()
+    assert inverted["selected_count"] == 2
+    assert all(
+        group.suggested_keep not in group.selected_for_removal for group in result.groups
+    )
+
+
+def test_bulk_selection_scopes_to_requested_groups_and_criteria(tmp_path: Path) -> None:
+    result = _two_group_result(tmp_path)
+    first, second = result.groups
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    client.post(
+        "/api/selection/bulk",
+        json={"operation": "select_none", "scan_id": scan_id},
+        headers=headers,
+    )
+    scoped = client.post(
+        "/api/selection/bulk",
+        json={
+            "operation": "select_all",
+            "group_ids": [first.id],
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+
+    assert scoped.status_code == 200
+    assert scoped.get_json()["group_count"] == 1
+    assert first.selected_for_removal
+    assert second.selected_for_removal == []
+
+    # Every member is the same size here, so "smaller than the keeper" selects nothing.
+    criteria = client.post(
+        "/api/selection/bulk",
+        json={
+            "operation": "criteria",
+            "scan_id": scan_id,
+            "criteria": {"smaller_than_keeper": True},
+        },
+        headers=headers,
+    )
+    assert criteria.status_code == 200
+    assert criteria.get_json()["selected_count"] == 0
+
+    by_size = client.post(
+        "/api/selection/bulk",
+        json={"operation": "criteria", "scan_id": scan_id, "criteria": {"min_size": 1}},
+        headers=headers,
+    ).get_json()
+    assert by_size["selected_count"] == 2
+
+    rejected = client.post(
+        "/api/selection/bulk",
+        json={"operation": "delete_everything", "scan_id": scan_id},
+        headers=headers,
+    )
+    assert rejected.status_code == 400
+    bad_criteria = client.post(
+        "/api/selection/bulk",
+        json={"operation": "criteria", "scan_id": scan_id, "criteria": {"min_size": "huge"}},
+        headers=headers,
+    )
+    assert bad_criteria.status_code == 400
+
+
+def test_bulk_selection_marks_non_human_picks_reviewed(tmp_path: Path) -> None:
+    result = _non_human_result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/selection/bulk",
+        json={"operation": "select_all", "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    group = result.groups[0]
+    # Independent candidates are not duplicates, so all of them may be selected.
+    assert group.selected_for_removal == [member.path for member in group.members]
+    assert group.reviewed_paths == group.selected_for_removal
+
+
+def test_smart_select_can_target_a_subset_of_groups(tmp_path: Path) -> None:
+    result = _two_group_result(tmp_path)
+    first, second = result.groups
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/smart-select",
+        json={"rule": "deselect_all", "group_ids": [second.id], "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["group_count"] == 1
+    assert first.selected_for_removal
+    assert second.selected_for_removal == []
+
+
+def test_action_partial_success_response_includes_selection_counts_and_items(
+    tmp_path: Path,
+) -> None:
+    """Dry-run and executed /api/action responses include selection_counts and a mixed items array."""
+    result = _two_group_result(tmp_path)
+    Path(result.groups[0].suggested_keep).unlink()
+
+    app = create_app(result)
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    quarantine = tmp_path / "quarantine"
+    base_payload = {
+        "action": "quarantine",
+        "scan_id": scan_id,
+        "quarantine_dir": str(quarantine),
+    }
+
+    preview = client.post(
+        "/api/action",
+        json={**base_payload, "dry_run": True},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert preview.status_code == 200
+    preview_payload = preview.get_json()
+    assert "selection_counts" in preview_payload
+    assert preview_payload["selection_counts"]["exact"] == 2
+    preview_items = preview_payload["items"]
+    assert len(preview_items) == 2
+    assert {item["ok"] for item in preview_items} == {True, False}
+
+    executed = client.post(
+        "/api/action",
+        json={**base_payload, "dry_run": False, "preview_token": preview_payload["preview_token"]},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert executed.status_code == 200
+    executed_payload = executed.get_json()
+    assert "selection_counts" in executed_payload
+    executed_items = executed_payload["items"]
+    assert len(executed_items) == 2
+    assert {item["ok"] for item in executed_items} == {True, False}
+    assert len(list(quarantine.iterdir())) == 1
+
+
+def test_thumbnail_is_generated_once_and_served_from_disk(tmp_path: Path, monkeypatch) -> None:
+    result = _result(tmp_path)
+    client = create_app(result).test_client()
+    scanned = Path(result.files[0].path)
+    calls = []
+
+    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
+        calls.append((str(path), full))
+        return b"jpeg-bytes"
+
+    monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
+
+    first = client.get("/api/thumbnail", query_string={"path": str(scanned)})
+    second = client.get("/api/thumbnail", query_string={"path": str(scanned)})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.data == second.data == b"jpeg-bytes"
+    assert len(calls) == 1
+    assert "immutable" in second.headers["Cache-Control"]
+    assert second.headers["ETag"]
+    assert second.headers["Last-Modified"]
+
+    cached = list((tmp_path / "thumbs").rglob("*.jpg"))
+    assert len(cached) == 1
+
+
+def test_thumbnail_cache_key_changes_when_source_file_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = _result(tmp_path)
+    client = create_app(result).test_client()
+    scanned = Path(result.files[0].path)
+    calls = []
+
+    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
+        calls.append(str(path))
+        return b"jpeg-%d" % len(calls)
+
+    monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
+
+    original = client.get("/api/thumbnail", query_string={"path": str(scanned)})
+    scanned.write_bytes(b"same duplicate but edited")
+    stat = scanned.stat()
+    os.utime(scanned, ns=(stat.st_mtime_ns + 1_000_000_000, stat.st_mtime_ns + 1_000_000_000))
+    refreshed = client.get("/api/thumbnail", query_string={"path": str(scanned)})
+    full_variant = client.get("/api/thumbnail", query_string={"path": str(scanned), "full": "1"})
+
+    assert len(calls) == 3
+    assert original.headers["ETag"] != refreshed.headers["ETag"]
+    assert refreshed.headers["ETag"] != full_variant.headers["ETag"]
+
+
+def test_thumbnail_rejects_paths_outside_the_scan(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    client = create_app(result).test_client()
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"not part of scan")
+
+    forbidden = client.get("/api/thumbnail", query_string={"path": str(outside)})
+    traversal = client.get(
+        "/api/thumbnail",
+        query_string={"path": f"{result.files[0].path}/../outside.jpg"},
+    )
+
+    assert forbidden.status_code == 403
+    assert traversal.status_code in (403, 404)
+    assert not list((tmp_path / "thumbs").rglob("*.jpg"))
+
+
+def test_thumbnail_cache_prunes_least_recently_used_entries(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "thumbs"
+    for index in range(4):
+        target = cache_dir / f"{index:02d}" / "entry.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x" * 100)
+        os.utime(target, (1_600_000_000 + index, 1_600_000_000 + index))
+
+    removed = web_media.prune_thumbnail_cache(cache_dir=cache_dir, budget=250)
+
+    remaining = sorted(path.parent.name for path in cache_dir.rglob("*.jpg"))
+    assert removed == 2
+    assert remaining == ["02", "03"]
+
+
+def test_groups_endpoint_paginates_without_changing_default_behaviour(tmp_path: Path) -> None:
+    result = _two_group_result(tmp_path)
+    client = create_app(result).test_client()
+
+    everything = client.get("/api/groups").get_json()
+    first = client.get("/api/groups", query_string={"limit": 1}).get_json()
+    second = client.get("/api/groups", query_string={"limit": 1, "offset": 1}).get_json()
+    past_end = client.get("/api/groups", query_string={"limit": 1, "offset": 99}).get_json()
+
+    assert len(everything["groups"]) == 2
+    assert everything["total"] == 2
+    assert [g["id"] for g in first["groups"] + second["groups"]] == [
+        g["id"] for g in everything["groups"]
+    ]
+    assert first["total"] == second["total"] == 2
+    assert past_end["groups"] == []
+    assert everything["groups_version"] == first["groups_version"]
+
+
+def _wait_idle(client, timeout: float = 5.0) -> dict:
+    """Return the first status snapshot with no scan in flight."""
+    deadline = time.monotonic() + timeout
+    status = client.get("/api/status").get_json()
+    while status["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.005)
+        status = client.get("/api/status").get_json()
+    assert status["scanning"] is False
+    return status
+
+
+def _quarantine_action(tmp_path: Path, scan_id: str) -> dict:
+    return {
+        "action": "quarantine",
+        "dry_run": False,
+        "scan_id": scan_id,
+        "quarantine_dir": str(tmp_path / "quarantine"),
+        "kinds": "exact",
+    }
+
+
+def test_second_execute_is_refused_while_one_is_in_flight(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(_result(tmp_path))
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = app.test_client().get("/api/status").get_json()["scan_id"]
+    base = _quarantine_action(tmp_path, scan_id)
+    real_apply = web_app.apply_actions
+    inside = threading.Event()
+    release = threading.Event()
+    executes = []
+
+    def blocking_apply(groups, **kwargs):
+        if kwargs.get("dry_run", True):
+            return real_apply(groups, **kwargs)
+        executes.append(kwargs)
+        inside.set()
+        assert release.wait(5)
+        return real_apply(groups, **kwargs)
+
+    monkeypatch.setattr(web_app, "apply_actions", blocking_apply)
+    token = app.test_client().post(
+        "/api/action", json={**base, "dry_run": True}, headers=headers
+    ).get_json()["preview_token"]
+    first: dict = {}
+
+    def execute() -> None:
+        response = app.test_client().post(
+            "/api/action", json={**base, "preview_token": token}, headers=headers
+        )
+        first["status"] = response.status_code
+        first["payload"] = response.get_json()
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    assert inside.wait(5)
+    refused = app.test_client().post(
+        "/api/action", json={**base, "preview_token": token}, headers=headers
+    )
+    release.set()
+    worker.join(5)
+
+    assert refused.status_code == 409
+    assert "already running" in refused.get_json()["error"]
+    assert first["status"] == 200
+    assert first["payload"]["success_count"] == 1
+    assert len(executes) == 1
+    assert len(list((tmp_path / "quarantine").iterdir())) == 1
+    assert app.test_client().get("/api/status").get_json()["acting"] is False
+
+
+def test_action_is_refused_while_a_scan_is_running(tmp_path: Path, monkeypatch) -> None:
+    scanning = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan(paths, **kwargs):
+        scanning.set()
+        assert release.wait(5)
+        return ScanResult(roots=[str(tmp_path)], files=[], groups=[])
+
+    monkeypatch.setattr(web_app, "run_scan", blocking_scan)
+    app = create_app(_result(tmp_path), review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    started = client.post(
+        "/api/scan", json={"paths": [str(tmp_path)]}, headers=headers
+    ).get_json()
+    assert scanning.wait(5)
+    refused = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "scan_id": started["scan_id"]},
+        headers=headers,
+    )
+    release.set()
+    status = _wait_idle(client)
+
+    assert refused.status_code == 409
+    assert "scan" in refused.get_json()["error"]
+    assert status["acting"] is False
+
+
+def test_scan_is_refused_while_an_action_is_running(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(_result(tmp_path), review_session_path=tmp_path / "review.json")
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = app.test_client().get("/api/status").get_json()["scan_id"]
+    real_apply = web_app.apply_actions
+    inside = threading.Event()
+    release = threading.Event()
+    scans = []
+
+    def blocking_apply(groups, **kwargs):
+        inside.set()
+        assert release.wait(5)
+        return real_apply(groups, **kwargs)
+
+    monkeypatch.setattr(web_app, "apply_actions", blocking_apply)
+    monkeypatch.setattr(web_app, "run_scan", lambda paths, **kwargs: scans.append(paths))
+    preview: dict = {}
+
+    def act() -> None:
+        response = app.test_client().post(
+            "/api/action",
+            json={"action": "trash", "dry_run": True, "scan_id": scan_id},
+            headers=headers,
+        )
+        preview["status"] = response.status_code
+
+    worker = threading.Thread(target=act)
+    worker.start()
+    assert inside.wait(5)
+    refused = app.test_client().post(
+        "/api/scan", json={"paths": [str(tmp_path)]}, headers=headers
+    )
+    release.set()
+    worker.join(5)
+
+    assert refused.status_code == 409
+    assert "file action already running" in refused.get_json()["error"]
+    assert preview["status"] == 200
+    assert scans == []
+    status = app.test_client().get("/api/status").get_json()
+    assert status["acting"] is False and status["scanning"] is False
+
+
+def test_simultaneous_executes_sharing_one_preview_token_act_once(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    app = create_app(result)
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = app.test_client().get("/api/status").get_json()["scan_id"]
+    base = _quarantine_action(tmp_path, scan_id)
+    token = app.test_client().post(
+        "/api/action", json={**base, "dry_run": True}, headers=headers
+    ).get_json()["preview_token"]
+
+    barrier = threading.Barrier(2)
+    guard = threading.Lock()
+    outcomes: list[tuple[int, dict]] = []
+
+    def execute() -> None:
+        client = app.test_client()
+        barrier.wait(5)
+        response = client.post(
+            "/api/action", json={**base, "preview_token": token}, headers=headers
+        )
+        with guard:
+            outcomes.append((response.status_code, response.get_json()))
+
+    threads = [threading.Thread(target=execute) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert sorted(status for status, _ in outcomes) == [200, 409]
+    assert sum(payload.get("success_count", 0) for _, payload in outcomes) == 1
+    assert len(list((tmp_path / "quarantine").iterdir())) == 1
+    assert len([record for record in result.files if Path(record.path).exists()]) == 1
+    assert app.test_client().get("/api/status").get_json()["acting"] is False
+
+
+def test_scan_cancel_racing_completion_leaves_state_coherent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    completed = _result(root)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan(paths, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return completed
+
+    monkeypatch.setattr(web_app, "run_scan", blocking_scan)
+    app = create_app(review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    started = client.post(
+        "/api/scan", json={"paths": [str(root)]}, headers=headers
+    ).get_json()
+    assert entered.wait(5)
+
+    barrier = threading.Barrier(2)
+    cancelled: dict = {}
+
+    def cancel() -> None:
+        barrier.wait(5)
+        response = app.test_client().post(
+            "/api/scan/cancel", json={"scan_id": started["scan_id"]}, headers=headers
+        )
+        cancelled["status"] = response.status_code
+
+    canceller = threading.Thread(target=cancel)
+    canceller.start()
+    barrier.wait(5)
+    release.set()
+    canceller.join(5)
+    status = _wait_idle(client)
+
+    assert cancelled["status"] in (200, 409)
+    assert status["scan_id"] == started["scan_id"]
+    assert status["error"] is None
+    assert status["progress"]["done"] is True
+    assert status["progress"]["message"].startswith("Done")
+    assert status["summary"]["group_count"] == len(completed.groups)
+    stale_cancel = client.post(
+        "/api/scan/cancel", json={"scan_id": status["scan_id"]}, headers=headers
+    )
+    assert stale_cancel.status_code == 409
+
+
+def test_stale_scan_worker_never_overwrites_a_newer_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    stale = _result(first_root)
+    fresh = _result(second_root)
+    captured: dict = {}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan(paths, **kwargs):
+        if paths[0] == str(first_root):
+            captured["progress"] = kwargs["progress"]
+            captured["on_group"] = kwargs["on_group"]
+            entered.set()
+            assert release.wait(5)
+            raise InterruptedError("scan cancelled")
+        return fresh
+
+    monkeypatch.setattr(web_app, "run_scan", blocking_scan)
+    app = create_app(review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    first = client.post(
+        "/api/scan", json={"paths": [str(first_root)]}, headers=headers
+    ).get_json()
+    assert entered.wait(5)
+    assert client.post(
+        "/api/scan/cancel", json={"scan_id": first["scan_id"]}, headers=headers
+    ).status_code == 200
+    release.set()
+    _wait_idle(client)
+
+    second = client.post(
+        "/api/scan", json={"paths": [str(second_root)]}, headers=headers
+    ).get_json()
+    before = _wait_idle(client)
+    assert before["scan_id"] == second["scan_id"]
+
+    # The abandoned worker's callbacks fire after a newer scan already owns the state.
+    late = threading.Thread(
+        target=lambda: (
+            captured["progress"](ScanProgress(phase="hashing", message="stale progress")),
+            captured["on_group"](stale.groups[0]),
+        )
+    )
+    late.start()
+    late.join(5)
+
+    after = client.get("/api/status").get_json()
+    group_ids = [group["id"] for group in client.get("/api/groups").get_json()["groups"]]
+    assert after["scan_id"] == second["scan_id"]
+    assert after["progress"] == before["progress"]
+    assert after["groups_version"] == before["groups_version"]
+    assert group_ids == [group.id for group in fresh.groups]
+    assert stale.groups[0].id not in group_ids

@@ -61,9 +61,11 @@ def run_scan(
 ) -> ScanResult:
     """Run a full scan.
 
-    ``on_group`` is called as soon as each duplicate group is finalized (exact
-    first, then similar-image, then similar-video) so UIs can stream results
-    instead of waiting for the whole scan.
+    Exact hashing, image/GIF similarity, and video similarity all run
+    concurrently. ``on_group`` is called as soon as each duplicate group is
+    finalized so UIs can stream results instead of waiting for the whole scan;
+    exact groups are always published before similar groups because similar
+    grouping consults the exact-group membership.
     """
     n_workers = resolve_workers(workers)
     prog = ScanProgress(phase="starting", message="Starting scan…")
@@ -108,21 +110,30 @@ def run_scan(
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
 
+    publish_lock = threading.Lock()
+
     def publish(kind: GroupKind, member_lists: list[list]) -> int:
-        """Build groups for one phase and stream them via on_group. Returns count added."""
+        """Build groups for one phase and stream them via on_group. Returns count added.
+
+        Thread-safe: the concurrent similar-image and similar-video stages both
+        publish their groups from worker threads.
+        """
         added = 0
-        for members in member_lists:
-            g = build_one_group(kind, members, exact_path_sets=exact_path_sets or None)
-            if g is None:
-                continue
-            groups.append(g)
-            if kind == GroupKind.EXACT:
-                exact_path_sets.append({m.path for m in g.members})
-            added += 1
-            if on_group:
-                on_group(g)
-        # Keep most-reclaimable first for partial UI views
-        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+        with publish_lock:
+            for members in member_lists:
+                g = build_one_group(
+                    kind, members, exact_path_sets=exact_path_sets or None
+                )
+                if g is None:
+                    continue
+                groups.append(g)
+                if kind == GroupKind.EXACT:
+                    exact_path_sets.append({m.path for m in g.members})
+                added += 1
+                if on_group:
+                    on_group(g)
+            # Keep most-reclaimable first for partial UI views
+            groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
         return added
 
     emit("inventory", message=f"Walking folders… ({n_workers} workers)")
@@ -177,47 +188,73 @@ def run_scan(
             emit("cache", 0, 0, f"Cache unavailable: {exc}")
             cache = None
 
-    if exact and records:
-        exact_started = time.monotonic()
+    run_exact = exact and bool(records)
+    run_similar = similar
+
+    if run_exact or run_similar:
         check_cancelled()
-        emit("exact", 0, len(records), "Finding exact duplicates…")
-
-        def exact_progress(phase: str, processed: int, total: int) -> None:
-            emit(phase, processed, total, f"Exact hash {processed}/{total}")
-
-        exact_member_lists = find_exact_groups(
-            records,
-            progress=exact_progress,
-            workers=n_workers,
-            cancelled=cancelled,
+        distinct_pairs = (
+            cache.distinct_pairs(records)
+            if (run_similar and cache is not None)
+            else set()
         )
-        n_exact = publish(GroupKind.EXACT, exact_member_lists)
-        emit(
-            "exact",
-            len(records),
-            len(records),
-            f"Found {n_exact} exact group{'s' if n_exact != 1 else ''}",
-        )
-        stage_durations["exact"] = time.monotonic() - exact_started
-        stage_errors["exact"] = [
-            record.error
-            for record in records
-            if record.error
-            and record.error.startswith(("partial hash failed", "sha256 failed"))
-        ]
-
-    if similar:
-        check_cancelled()
-        distinct_pairs = cache.distinct_pairs(records) if cache is not None else set()
         image_count = len(
             [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
         )
-        emit(
-            "similar-image",
-            0,
-            image_count,
-            f"Hashing {image_count} images for similarity…",
-        )
+        video_count = len([r for r in records if r.media_type == MediaType.VIDEO])
+
+        # Exact hashing (disk-bound), image/GIF hashing (CPU-bound), and video
+        # fingerprinting (ffmpeg subprocess-bound) all run concurrently. Images
+        # /GIFs and videos are disjoint file sets that can never share a
+        # duplicate group, and exact hashing touches different record fields
+        # than the similarity stages (a same-record ``error`` write can race,
+        # which is a benign last-writer-wins, same as sequential overwrites).
+        # Similar groups are only *published* after exact groups exist because
+        # build_one_group consults exact_path_sets; the expensive hashing work
+        # itself never waits. Progress from all stages is merged into one
+        # "processing" phase so combined counts/ETA stay meaningful.
+        stage_lock = threading.Lock()
+        stage_text: dict[str, str] = {}
+        stage_counts: dict[str, tuple[int, int]] = {}
+        exact_done = threading.Event()
+
+        def _emit_stages_locked() -> None:
+            processed = sum(done for done, _total in stage_counts.values())
+            total = sum(total for _done, total in stage_counts.values())
+            message = " · ".join(
+                text
+                for text in (
+                    stage_text.get("exact"),
+                    stage_text.get("image"),
+                    stage_text.get("video"),
+                )
+                if text
+            )
+            emit("processing", processed, total, message)
+
+        def _stage_progress(stage: str, text: str, processed: int, total: int) -> None:
+            with stage_lock:
+                stage_text[stage] = text
+                if total:
+                    stage_counts[stage] = (processed, total)
+                _emit_stages_locked()
+
+        with stage_lock:
+            if run_exact:
+                stage_text["exact"] = "Finding exact duplicates…"
+                stage_counts["exact"] = (0, len(records))
+            if run_similar and image_count:
+                stage_text["image"] = f"Hashing {image_count} images…"
+                stage_counts["image"] = (0, image_count)
+            if run_similar and video_count:
+                stage_text["video"] = f"Fingerprinting {video_count} videos…"
+                stage_counts["video"] = (0, video_count)
+            _emit_stages_locked()
+
+        def exact_progress(phase: str, processed: int, total: int) -> None:
+            _stage_progress(
+                "exact", f"Exact hash {processed}/{total}", processed, total
+            )
 
         def img_progress(phase: str, processed: int, total: int) -> None:
             if "hash" in phase:
@@ -226,75 +263,123 @@ def run_scan(
                 label = "clustering"
             else:
                 label = phase.replace("-", " ")
-            emit(phase, processed, total, f"Image {label}: {processed}/{total}")
-
-        image_started = time.monotonic()
-        img_groups = find_similar_image_groups(
-            records,
-            threshold=image_threshold,
-            distinct_pairs=distinct_pairs,
-            progress=img_progress,
-            workers=n_workers,
-            cancelled=cancelled,
-        )
-        n_img = publish(GroupKind.SIMILAR, img_groups)
-        emit(
-            "similar-image",
-            0,
-            0,
-            f"Found {n_img} similar image group{'s' if n_img != 1 else ''}",
-        )
-        stage_durations["similar_image"] = time.monotonic() - image_started
-        stage_errors["similar_image"] = [
-            record.error
-            for record in records
-            if record.error and record.error.startswith("image hash failed")
-        ]
-
-        video_count = len([r for r in records if r.media_type == MediaType.VIDEO])
-        emit(
-            "similar-video",
-            0,
-            video_count,
-            f"Fingerprinting {video_count} videos…",
-        )
+            _stage_progress(
+                "image", f"Images {label}: {processed}/{total}", processed, total
+            )
 
         def vid_progress(
             phase: str, processed: int, total: int, message: str = ""
         ) -> None:
-            if message:
-                emit(phase, processed, total, message)
-                return
             if "hash" in phase:
                 label = "hashing"
             elif "cluster" in phase:
                 label = "clustering"
             else:
                 label = phase.replace("-", " ")
-            emit(phase, processed, total, f"Video {label}: {processed}/{total}")
+            text = message or f"Videos {label}: {processed}/{total}"
+            _stage_progress("video", text, processed, total)
 
-        video_started = time.monotonic()
-        vid_groups = find_similar_video_groups(
-            records,
-            threshold=video_threshold,
-            distinct_pairs=distinct_pairs,
-            progress=vid_progress,
-            workers=n_workers,
-            cancelled=cancelled,
-        )
-        n_vid = publish(GroupKind.SIMILAR, vid_groups)
-        emit(
-            "similar-video",
-            0,
-            0,
-            f"Found {n_vid} similar video group{'s' if n_vid != 1 else ''}",
-        )
-        stage_durations["similar_video"] = time.monotonic() - video_started
-        stage_errors["similar_video"] = [
-            record.error
-            for record in records
-            if record.error and record.error.startswith("video fingerprint failed")
-        ]
+        def _exact_stage() -> tuple[int, float]:
+            started_at = time.monotonic()
+            try:
+                exact_member_lists = find_exact_groups(
+                    records,
+                    progress=exact_progress,
+                    workers=n_workers,
+                    cancelled=cancelled,
+                )
+                count = publish(GroupKind.EXACT, exact_member_lists)
+                _stage_progress(
+                    "exact",
+                    f"Found {count} exact group{'s' if count != 1 else ''}",
+                    0,
+                    0,
+                )
+                return count, time.monotonic() - started_at
+            finally:
+                # Always unblock similar publishing, even on cancel/error.
+                exact_done.set()
+
+        def _image_stage() -> tuple[int, float]:
+            started_at = time.monotonic()
+            img_groups = find_similar_image_groups(
+                records,
+                threshold=image_threshold,
+                distinct_pairs=distinct_pairs,
+                progress=img_progress,
+                workers=n_workers,
+                cancelled=cancelled,
+            )
+            exact_done.wait()
+            count = publish(GroupKind.SIMILAR, img_groups)
+            _stage_progress(
+                "image",
+                f"Found {count} similar image group{'s' if count != 1 else ''}",
+                0,
+                0,
+            )
+            return count, time.monotonic() - started_at
+
+        def _video_stage() -> tuple[int, float]:
+            started_at = time.monotonic()
+            vid_groups = find_similar_video_groups(
+                records,
+                threshold=video_threshold,
+                distinct_pairs=distinct_pairs,
+                progress=vid_progress,
+                workers=n_workers,
+                cancelled=cancelled,
+            )
+            exact_done.wait()
+            count = publish(GroupKind.SIMILAR, vid_groups)
+            _stage_progress(
+                "video",
+                f"Found {count} similar video group{'s' if count != 1 else ''}",
+                0,
+                0,
+            )
+            return count, time.monotonic() - started_at
+
+        stage_jobs: dict[str, Callable[[], tuple[int, float]]] = {}
+        if run_exact:
+            stage_jobs["exact"] = _exact_stage
+        else:
+            exact_done.set()
+        if run_similar:
+            stage_jobs["image"] = _image_stage
+            stage_jobs["video"] = _video_stage
+
+        stage_results: dict[str, tuple[int, float]] = {}
+        with ThreadPoolExecutor(
+            max_workers=len(stage_jobs), thread_name_prefix="scan-stage"
+        ) as stage_pool:
+            futures = {
+                name: stage_pool.submit(fn) for name, fn in stage_jobs.items()
+            }
+            for name, future in futures.items():
+                stage_results[name] = future.result()
+
+        if run_exact:
+            stage_durations["exact"] = stage_results["exact"][1]
+            stage_errors["exact"] = [
+                record.error
+                for record in records
+                if record.error
+                and record.error.startswith(("partial hash failed", "sha256 failed"))
+            ]
+        if run_similar:
+            stage_durations["similar_image"] = stage_results["image"][1]
+            stage_durations["similar_video"] = stage_results["video"][1]
+            stage_errors["similar_image"] = [
+                record.error
+                for record in records
+                if record.error and record.error.startswith("image hash failed")
+            ]
+            stage_errors["similar_video"] = [
+                record.error
+                for record in records
+                if record.error and record.error.startswith("video fingerprint failed")
+            ]
 
     if find_no_humans and records:
         human_started = time.monotonic()
@@ -335,12 +420,16 @@ def run_scan(
             if record.human_detection_status == "analysis_failed"
         ]
 
+    cache_errors: list[str] = []
     if cache is not None:
         try:
             cache.store_all(records)
+        except Exception as exc:
+            cache_errors.append(f"cache store failed: {exc}")
+        try:
             cache.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            cache_errors.append(f"cache close failed: {exc}")
 
     image_records = [
         record
@@ -430,10 +519,21 @@ def run_scan(
             ),
         ),
     }
+    if cache_errors:
+        # A cache write failure means the next scan silently redoes the work;
+        # surface it instead of dropping it.
+        stages["cache"] = StageDiagnostics(
+            unit="cache",
+            attempted=1,
+            succeeded=0,
+            failed=len(cache_errors),
+            warnings=cache_errors[:10],
+        )
     total_duration = max(0.0, time.monotonic() - started)
     recorded_errors = list(dict.fromkeys(
         [*root_errors]
         + [error for errors in stage_errors.values() for error in errors]
+        + cache_errors
         + [record.error for record in records if record.error]
     ))
     result = ScanResult(

@@ -7,6 +7,8 @@
   const SETTINGS_KEY = "dedupe.scanSettings.v1";
   const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
   const MEMBER_PAGE_SIZE = 50;
+  const GROUP_FETCH_PAGE = 250;
+  const GROUP_RENDER_CHUNK = 60;
   const CSRF_TOKEN =
     document.querySelector('meta[name="dedupe-token"]')?.getAttribute("content") || "";
 
@@ -27,7 +29,38 @@
     groupsVersion: -1, // tracks streaming updates mid-scan
     scanId: null,
     reviewSession: null,
+    groupListLimit: GROUP_RENDER_CHUNK, // how many sidebar rows are in the DOM
+    groupsLoadToken: 0,
+    groupsTotal: 0,
   };
+
+  // —— Batched rendering ——
+  const pendingRender = { groupList: false, selection: false, members: null };
+  let renderHandle = null;
+
+  function flushRenders() {
+    renderHandle = null;
+    const members = pendingRender.members;
+    const list = pendingRender.groupList;
+    const selection = pendingRender.selection;
+    pendingRender.members = null;
+    pendingRender.groupList = false;
+    pendingRender.selection = false;
+    if (members) renderMembers(members);
+    if (list) renderGroupList();
+    if (selection) updateSelectionSummary();
+  }
+
+  function scheduleRender({ groupList = false, selection = false, members = null } = {}) {
+    if (groupList) pendingRender.groupList = true;
+    if (selection) pendingRender.selection = true;
+    if (members) pendingRender.members = members;
+    if (renderHandle !== null) return;
+    renderHandle =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame(flushRenders)
+        : setTimeout(flushRenders, 0);
+  }
 
   const thresh = $("threshold");
   const threshVal = $("threshVal");
@@ -205,7 +238,12 @@
       ...opts,
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || res.statusText);
+    if (!res.ok) {
+      const error = new Error(data.error || res.statusText);
+      error.status = res.status;
+      error.data = data;
+      throw error;
+    }
     return data;
   }
 
@@ -384,16 +422,36 @@
   });
 
   // —— Confirm modal ——
-  function confirmModal({ title, body, confirmLabel = "Confirm", danger = true }) {
+  function formatCountdown(seconds) {
+    const total = Math.max(0, Math.round(seconds));
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+  }
+
+  /**
+   * Resolves true (confirmed), false (cancelled), or "expired" when a preview
+   * token ran out while the sheet was open. Callers must re-preview on "expired";
+   * an execute is never attempted on a lapsed token.
+   */
+  function confirmModal({
+    title,
+    body,
+    confirmLabel = "Confirm",
+    danger = true,
+    validitySeconds = null,
+  }) {
     return new Promise((resolve) => {
       $("modalTitle").textContent = title;
       $("modalBody").innerHTML = body;
       const btn = $("modalConfirm");
       btn.textContent = confirmLabel;
       btn.className = danger ? "btn danger" : "btn primary";
+      const validity = $("modalValidity");
+      let ticker = null;
       $("modalBackdrop").hidden = false;
 
       const cleanup = (ok) => {
+        if (ticker !== null) clearInterval(ticker);
+        ticker = null;
         $("modalBackdrop").hidden = true;
         btn.removeEventListener("click", onOk);
         $("modalCancel").removeEventListener("click", onCancel);
@@ -409,6 +467,26 @@
       btn.addEventListener("click", onOk);
       $("modalCancel").addEventListener("click", onCancel);
       document.addEventListener("keydown", onKey);
+
+      if (validitySeconds > 0) {
+        const expiresAt = Date.now() + validitySeconds * 1000;
+        const tick = () => {
+          const left = (expiresAt - Date.now()) / 1000;
+          if (left <= 0) {
+            cleanup("expired");
+            return;
+          }
+          validity.textContent = `Verified against the current selection · preview valid for ${formatCountdown(left)}`;
+          validity.classList.toggle("expiring", left <= 60);
+        };
+        validity.hidden = false;
+        tick();
+        ticker = setInterval(tick, 1000);
+      } else {
+        validity.hidden = true;
+        validity.textContent = "";
+        validity.classList.remove("expiring");
+      }
     });
   }
 
@@ -442,10 +520,14 @@
               <span class="stream-name">${escapeHtml(name)}</span>
               <span class="stream-detail">${escapeHtml(detail)}</span>
             </div>
-            <div class="stream-bar"><div class="stream-fill" style="width:${Math.max(pct, 4)}%"></div></div>
+            <div class="stream-bar"><div class="stream-fill" data-pct="${Math.max(pct, 4)}"></div></div>
           </div>`;
       })
       .join("");
+    // The local CSP forbids style attributes, so widths are applied through CSSOM.
+    panel.querySelectorAll(".stream-fill").forEach((fill) => {
+      fill.style.width = `${fill.dataset.pct}%`;
+    });
   }
 
   // —— Status / groups ——
@@ -477,14 +559,62 @@
       : "";
   }
 
+  function prunedReasonSummary(metadata) {
+    const reasons = metadata.pruned_reasons || {};
+    const labels = metadata.pruned_reason_labels || {};
+    return Object.entries(reasons)
+      .map(([reason, count]) => `${count} ${labels[reason] || reason}`)
+      .join(" · ");
+  }
+
+  function renderPrunedDetail(metadata) {
+    const panel = $("sessionPruned");
+    const samples = metadata?.pruned_samples || [];
+    const total = Number(metadata?.pruned_files) || 0;
+    panel.hidden = !total;
+    if (!total) {
+      $("sessionPrunedList").innerHTML = "";
+      $("sessionPrunedMore").hidden = true;
+      return;
+    }
+    const summary = prunedReasonSummary(metadata);
+    $("sessionPrunedSummary").textContent = summary
+      ? `What was dropped? (${summary})`
+      : "What was dropped?";
+    $("sessionPrunedList").innerHTML = samples
+      .map(
+        (sample) =>
+          `<li><span class="pruned-path" title="${escapeHtml(sample.path)}">${escapeHtml(basename(sample.path))}</span><span class="muted small">${escapeHtml(sample.detail || sample.reason)}</span></li>`,
+      )
+      .join("");
+    const hidden = total - samples.length;
+    $("sessionPrunedMore").hidden = hidden <= 0;
+    $("sessionPrunedMore").textContent = hidden > 0
+      ? `…and ${hidden} more file${hidden === 1 ? "" : "s"} not listed.`
+      : "";
+  }
+
   function renderSession(metadata, resumed = false) {
     state.reviewSession = metadata || null;
     const available = !!metadata?.available;
-    $("sessionStatus").hidden = !available;
-    if (!available) return;
+    const corrupt = !!metadata?.corrupt;
+    $("sessionStatus").hidden = !available && !corrupt;
+    $("sessionStatus").classList.toggle("warn", corrupt);
+    if (!available && !corrupt) return;
+    if (corrupt) {
+      $("sessionFlag").textContent = "!";
+      $("sessionStatusText").textContent =
+        `The saved review could not be read (${metadata.error || "unreadable file"}). Scan again, or discard it to start clean.`;
+      $("btnDiscardSession").textContent = "Discard unreadable review";
+      renderPrunedDetail(null);
+      return;
+    }
+    $("sessionFlag").textContent = "✔";
+    $("btnDiscardSession").textContent = "Discard saved review";
     const when = metadata.saved_at ? new Date(metadata.saved_at).toLocaleString() : "an earlier session";
     const pruned = metadata.pruned_files ? ` · ${metadata.pruned_files} stale file${metadata.pruned_files === 1 ? "" : "s"} pruned` : "";
     $("sessionStatusText").textContent = `${resumed ? "Resumed" : "Saved"} review from ${when}${pruned}`;
+    renderPrunedDetail(metadata);
   }
 
   async function refreshStatus() {
@@ -605,13 +735,50 @@
     return s;
   }
 
+  async function fetchAllGroups(token) {
+    // Pages are only consistent within one groups_version; mid-scan the server
+    // re-sorts as groups stream in, so restart when the version moves under us.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const collected = [];
+      let offset = 0;
+      let total = 0;
+      let version = null;
+      let stale = false;
+      for (;;) {
+        const page = await api(`/api/groups?kind=all&offset=${offset}&limit=${GROUP_FETCH_PAGE}`);
+        if (token !== state.groupsLoadToken) return null;
+        if (version === null) version = page.groups_version;
+        else if (page.groups_version !== version) {
+          stale = true;
+          break;
+        }
+        const batch = page.groups || [];
+        collected.push(...batch);
+        total = Number.isFinite(Number(page.total)) ? Number(page.total) : collected.length;
+        offset += batch.length;
+        if (collected.length === batch.length && collected.length < total) {
+          // Paint the first page immediately so streamed groups appear without delay.
+          state.allGroups = collected;
+          renderGroupList();
+        }
+        if (!batch.length || collected.length >= total) break;
+      }
+      if (!stale) {
+        state.groupsTotal = total;
+        return collected;
+      }
+    }
+    const fallback = await api(`/api/groups?kind=all`);
+    if (token !== state.groupsLoadToken) return null;
+    state.groupsTotal = Number(fallback.total) || (fallback.groups || []).length;
+    return fallback.groups || [];
+  }
+
   async function loadGroups({ preserveSelection = false } = {}) {
-    const [filtered, all] = await Promise.all([
-      api(`/api/groups?kind=${encodeURIComponent(state.kind)}`),
-      api(`/api/groups?kind=all`),
-    ]);
-    state.groups = filtered.groups || [];
-    state.allGroups = all.groups || [];
+    const token = ++state.groupsLoadToken;
+    const all = await fetchAllGroups(token);
+    if (all === null) return;
+    state.allGroups = all;
     applyResultControls();
 
     const exact = state.allGroups.filter((g) => g.kind === "exact").length;
@@ -629,8 +796,7 @@
       $("results").hidden = false;
     }
 
-    renderGroupList();
-    updateSelectionSummary();
+    scheduleRender({ groupList: true, selection: true });
     if (state.currentId) {
       const still = state.groups.find((g) => g.id === state.currentId);
       if (still) {
@@ -665,9 +831,66 @@
     return (g.members || []).some((member) => member.error) || (g.deleted_paths || []).length > 0 || !groupComplete(g);
   }
 
+  function numericFilter(id) {
+    const raw = ($(id).value || "").trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function pathMatcher() {
+    const raw = ($("filterPathPattern").value || "").trim();
+    if (!raw) return null;
+    if (!/[*?]/.test(raw)) {
+      const needle = raw.toLowerCase();
+      return (path) => path.toLowerCase().includes(needle);
+    }
+    const expression = raw
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".");
+    let pattern;
+    try {
+      pattern = new RegExp(expression, "i");
+    } catch {
+      return null;
+    }
+    return (path) => pattern.test(path);
+  }
+
+  function advancedFilters() {
+    const minMb = numericFilter("filterMinMb");
+    const maxMb = numericFilter("filterMaxMb");
+    const filters = {
+      minSize: minMb == null ? null : minMb * 1024 * 1024,
+      maxSize: maxMb == null ? null : maxMb * 1024 * 1024,
+      minWidth: numericFilter("filterMinWidth"),
+      minHeight: numericFilter("filterMinHeight"),
+      matchPath: pathMatcher(),
+    };
+    filters.active =
+      filters.minSize != null ||
+      filters.maxSize != null ||
+      filters.minWidth != null ||
+      filters.minHeight != null ||
+      !!filters.matchPath;
+    return filters;
+  }
+
+  function memberMatchesFilters(member, filters) {
+    if (filters.minSize != null && (member.size || 0) < filters.minSize) return false;
+    if (filters.maxSize != null && (member.size || 0) > filters.maxSize) return false;
+    if (filters.minWidth != null && (member.width || 0) < filters.minWidth) return false;
+    if (filters.minHeight != null && (member.height || 0) < filters.minHeight) return false;
+    if (filters.matchPath && !filters.matchPath(member.path)) return false;
+    return true;
+  }
+
   function applyResultControls() {
     const query = ($("resultSearch").value || "").trim().toLowerCase();
     const selection = $("selectionFilter").value;
+    const filters = advancedFilters();
+    $("advancedFilterFlag").hidden = !filters.active;
     let groups = state.allGroups.filter((g) => state.kind === "all" || g.kind === state.kind);
     groups = groups.filter((g) => {
       const selected = groupSelectedCount(g) > 0;
@@ -676,6 +899,10 @@
       if (selection === "unselected" && selected) return false;
       if ($("issuesOnly").checked && !groupNeedsAttention(g)) return false;
       if ($("hideCompleted").checked && groupComplete(g)) return false;
+      // Advanced filters keep a group when any one of its files qualifies.
+      if (filters.active && !(g.members || []).some((member) => memberMatchesFilters(member, filters))) {
+        return false;
+      }
       return true;
     });
     const sort = $("resultSort").value;
@@ -689,39 +916,138 @@
     $("filteredCount").textContent = `${groups.length} of ${state.allGroups.length} groups shown`;
   }
 
-  function renderGroupList() {
-    applyResultControls();
-    const list = $("groupList");
-    if (!state.groups.length) {
-      list.innerHTML = `<div class="group-empty">No groups in this filter.</div>`;
-      return;
-    }
-    list.innerHTML = state.groups
-      .map((g) => {
-        const active = g.id === state.currentId ? "active" : "";
-        const sel = groupSelectedCount(g);
-        const badgeLabel = g.kind === "no_humans" ? "non-human" : g.kind;
-        const groupSummary = g.kind === "no_humans" && !sel
-          ? `${g.member_count} non-human files to review`
-          : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
-        return `
-          <button class="group-item ${active}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
+  function groupItemHtml(g) {
+    const active = g.id === state.currentId ? "active" : "";
+    const sel = groupSelectedCount(g);
+    const badgeLabel = g.kind === "no_humans" ? "non-human" : g.kind;
+    const groupSummary = g.kind === "no_humans" && !sel
+      ? `${g.member_count} non-human files to review`
+      : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
+    // Status is never colour-only: the glyph and its label carry the same meaning.
+    const attention = groupNeedsAttention(g);
+    const stateLabel = attention ? "Needs review" : "Reviewed";
+    const stateGlyph = attention ? "●" : "✔";
+    return `
+          <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
             <div class="g-top">
               <span>${g.member_count} files${g.kind === "no_humans" ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
               <span class="badge ${g.kind}">${badgeLabel}</span>
             </div>
+            <div class="g-state"><span class="g-state-glyph" aria-hidden="true">${stateGlyph}</span>${stateLabel}</div>
             <div class="g-sub">
               <span>${groupSummary}</span>
               ${sel ? `<span class="sel-mark">${sel} selected</span>` : ""}
             </div>
           </button>
         `;
-      })
-      .join("");
+  }
 
-    list.querySelectorAll(".group-item[data-id]").forEach((btn) => {
-      btn.addEventListener("click", () => selectGroup(btn.dataset.id));
+  function groupMoreHtml() {
+    const remaining = Math.max(0, state.groups.length - state.groupListLimit);
+    if (!remaining) return "";
+    return `
+          <div class="group-more-wrap">
+            <button class="btn ghost group-more" type="button">Show ${Math.min(remaining, GROUP_RENDER_CHUNK)} more (${remaining} hidden)</button>
+          </div>`;
+  }
+
+  function wireGroupList() {
+    const list = $("groupList");
+    if (list.dataset.wired === "1") return list;
+    list.dataset.wired = "1";
+    list.addEventListener("click", (event) => {
+      if (event.target.closest(".group-more")) {
+        growGroupList();
+        return;
+      }
+      const btn = event.target.closest(".group-item[data-id]");
+      if (btn) selectGroup(btn.dataset.id);
     });
+    list.addEventListener("scroll", () => {
+      if (list.scrollTop + list.clientHeight >= list.scrollHeight - 240) growGroupList();
+    });
+    return list;
+  }
+
+  function resetGroupListWindow() {
+    state.groupListLimit = GROUP_RENDER_CHUNK;
+  }
+
+  function growGroupList() {
+    if (state.groupListLimit >= state.groups.length) return;
+    const list = wireGroupList();
+    const from = state.groupListLimit;
+    const to = Math.min(state.groups.length, from + GROUP_RENDER_CHUNK);
+    state.groupListLimit = to;
+    const html = state.groups.slice(from, to).map(groupItemHtml).join("");
+    const more = list.querySelector(".group-more-wrap");
+    if (more) more.insertAdjacentHTML("beforebegin", html);
+    else list.insertAdjacentHTML("beforeend", html);
+    if (more) more.outerHTML = groupMoreHtml();
+  }
+
+  function renderGroupList() {
+    applyResultControls();
+    const list = wireGroupList();
+    if (!state.groups.length) {
+      list.innerHTML = `<div class="group-empty">No groups in this filter.</div>`;
+      return;
+    }
+    // Only the visited window lives in the DOM; the rest streams in on scroll.
+    state.groupListLimit = Math.max(
+      GROUP_RENDER_CHUNK,
+      Math.min(state.groupListLimit, state.groups.length),
+    );
+    const scrollTop = list.scrollTop;
+    list.innerHTML =
+      state.groups.slice(0, state.groupListLimit).map(groupItemHtml).join("") + groupMoreHtml();
+    list.scrollTop = Math.min(scrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
+  }
+
+  function updateGroupListItem(g) {
+    const node = $("groupList").querySelector(`.group-item[data-id="${g.id}"]`);
+    if (!node) return false;
+    const holder = document.createElement("div");
+    holder.innerHTML = groupItemHtml(g).trim();
+    const fresh = holder.firstElementChild;
+    if (!fresh) return false;
+    node.className = fresh.className;
+    node.setAttribute("aria-selected", fresh.getAttribute("aria-selected"));
+    node.innerHTML = fresh.innerHTML;
+    return true;
+  }
+
+  function selectionFiltersActive() {
+    return (
+      $("selectionFilter").value !== "all" ||
+      $("issuesOnly").checked ||
+      $("hideCompleted").checked
+    );
+  }
+
+  function markGroupListActive(id) {
+    const list = $("groupList");
+    list.querySelectorAll(".group-item.active").forEach((node) => {
+      node.classList.remove("active");
+      node.setAttribute("aria-selected", "false");
+    });
+    const node = list.querySelector(`.group-item[data-id="${id}"]`);
+    if (node) {
+      node.classList.add("active");
+      node.setAttribute("aria-selected", "true");
+    }
+    return node;
+  }
+
+  function ensureGroupVisible(id) {
+    const index = state.groups.findIndex((g) => g.id === id);
+    if (index < 0) return;
+    if (index < state.groupListLimit) return;
+    state.groupListLimit = Math.min(
+      state.groups.length,
+      Math.ceil((index + 1) / GROUP_RENDER_CHUNK) * GROUP_RENDER_CHUNK,
+    );
+    renderGroupList();
   }
 
   function updateDetailMeta(g) {
@@ -745,13 +1071,16 @@
     state.currentId = id;
     state.memberFocus = 0;
     state.memberPage = 0;
-    renderGroupList();
+    ensureGroupVisible(id);
+    markGroupListActive(id);
     const g = await api(`/api/groups/${id}`);
     const idx = state.groups.findIndex((group) => group.id === g.id);
     if (idx >= 0) state.groups[idx] = g;
     const allIdx = state.allGroups.findIndex((group) => group.id === g.id);
     if (allIdx >= 0) state.allGroups[allIdx] = g;
-    updateSelectionSummary();
+    updateGroupListItem(g);
+    markGroupListActive(id);
+    scheduleRender({ selection: true });
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
     const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
@@ -932,8 +1261,13 @@
           const replacement = [...box.querySelectorAll(".sel-cb")]
             .find((input) => input.dataset.path === changedPath);
           if (replacement) replacement.focus();
-          renderGroupList();
-          updateSelectionSummary();
+          // Patch the single sidebar row unless a filter depends on selection.
+          if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+            scheduleRender({ groupList: true });
+          } else {
+            applyResultControls();
+          }
+          scheduleRender({ selection: true });
         } catch (e) {
           toast(e.message, "error");
           cb.checked = !cb.checked;
@@ -965,8 +1299,7 @@
         const allIdx = state.allGroups.findIndex((candidate) => candidate.id === g.id);
         if (allIdx >= 0) state.allGroups[allIdx] = updated;
         renderMembers(updated);
-        renderGroupList();
-        updateSelectionSummary();
+        scheduleRender({ groupList: true, selection: true });
         toast(endpoint.endsWith("undo") ? "Image restored" : "Moved to Trash", "ok");
       } catch (err) {
         toast(err.message, "error");
@@ -1151,6 +1484,8 @@
       state.allGroups = [];
       state.currentId = null;
       state.groupsVersion = -1;
+      state.groupsTotal = 0;
+      resetGroupListWindow();
       const workersRaw = Number($("workers").value);
       const started = await api("/api/scan", {
         method: "POST",
@@ -1197,12 +1532,30 @@
       document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
       state.kind = tab.dataset.kind;
+      resetGroupListWindow();
       await loadGroups();
     });
   });
 
-  ["resultSearch", "resultSort", "selectionFilter", "issuesOnly", "hideCompleted"].forEach((id) => {
-    $(id).addEventListener(id === "resultSearch" ? "input" : "change", () => renderGroupList());
+  const LIVE_FILTER_IDS = [
+    "resultSearch",
+    "filterMinMb",
+    "filterMaxMb",
+    "filterMinWidth",
+    "filterMinHeight",
+    "filterPathPattern",
+  ];
+  // Filters render synchronously so the list matches the inputs on the next tick.
+  [...LIVE_FILTER_IDS, "resultSort", "selectionFilter", "issuesOnly", "hideCompleted"].forEach((id) => {
+    $(id).addEventListener(LIVE_FILTER_IDS.includes(id) ? "input" : "change", () => {
+      resetGroupListWindow();
+      renderGroupList();
+    });
+  });
+  $("btnClearFilters").addEventListener("click", () => {
+    for (const id of LIVE_FILTER_IDS.filter((value) => value !== "resultSearch")) $(id).value = "";
+    resetGroupListWindow();
+    renderGroupList();
   });
   $("btnNextReview").addEventListener("click", () => {
     const candidates = state.groups.filter(groupNeedsAttention);
@@ -1242,8 +1595,12 @@
       const aidx = state.allGroups.findIndex((x) => x.id === g.id);
       if (aidx >= 0) state.allGroups[aidx] = g;
       renderMembers(g);
-      renderGroupList();
-      updateSelectionSummary();
+      if (selectionFiltersActive() || !updateGroupListItem(g)) {
+        scheduleRender({ groupList: true });
+      } else {
+        applyResultControls();
+      }
+      scheduleRender({ selection: true });
       toast(successMessage, "ok");
     } catch (e) {
       toast(e.message, "error");
@@ -1279,6 +1636,73 @@
     } catch (e) {
       toast(e.message, "error");
     }
+  });
+
+  // —— Bulk selection over the filtered view ——
+  async function runBulkSelection(operation, criteria = null, label = "") {
+    const groupIds = state.groups.map((group) => group.id);
+    if (!groupIds.length) return toast("No groups are shown in this filter");
+    const nonHuman = state.groups.filter((group) => group.kind === "no_humans").length;
+    if (nonHuman && operation !== "select_none") {
+      const ok = await confirmModal({
+        title: "Include Non-Human candidates?",
+        confirmLabel: "Apply to all shown groups",
+        danger: false,
+        body: `<div class="review-sheet"><p><strong>${nonHuman} Non-Human group${nonHuman === 1 ? "" : "s"}</strong> ${nonHuman === 1 ? "is" : "are"} in this view.</p><p>Those files are independent candidates, so a bulk selection also marks them reviewed and every candidate can be selected. Detection is heuristic — nothing is deleted until you run an action.</p></div>`,
+      });
+      if (ok !== true) return;
+    }
+    try {
+      const result = await api("/api/selection/bulk", {
+        method: "POST",
+        body: JSON.stringify({
+          operation,
+          group_ids: groupIds,
+          criteria: criteria || {},
+          scan_id: state.scanId,
+        }),
+      });
+      await loadGroups({ preserveSelection: true });
+      if (state.currentId) await selectGroup(state.currentId, { silent: true });
+      scheduleRender({ groupList: true, selection: true });
+      const noun = result.changed_count === 1 ? "group" : "groups";
+      toast(
+        `${label || operation}: ${result.changed_count} ${noun} updated · ${result.selected_count} files selected`,
+        "ok",
+      );
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  }
+
+  $("btnBulkAll").addEventListener("click", () => runBulkSelection("select_all", null, "Select all"));
+  $("btnBulkNone").addEventListener("click", () => runBulkSelection("select_none", null, "Select none"));
+  $("btnBulkInvert").addEventListener("click", () => runBulkSelection("invert", null, "Invert"));
+
+  function syncBulkValueRow() {
+    const rule = $("bulkCriteria").value;
+    const needsValue = rule !== "smaller_than_keeper";
+    $("bulkValueRow").hidden = !needsValue;
+    $("bulkValue").placeholder = rule === "path_contains" ? "text or /folder/" : "MB";
+  }
+  $("bulkCriteria").addEventListener("change", syncBulkValueRow);
+  syncBulkValueRow();
+
+  $("btnBulkCriteria").addEventListener("click", () => {
+    const rule = $("bulkCriteria").value;
+    const raw = ($("bulkValue").value || "").trim();
+    const criteria = {};
+    if (rule === "smaller_than_keeper") {
+      criteria.smaller_than_keeper = true;
+    } else if (rule === "path_contains") {
+      if (!raw) return toast("Enter the text a path must contain");
+      criteria.path_contains = raw;
+    } else {
+      const megabytes = Number(raw);
+      if (!Number.isFinite(megabytes) || megabytes < 0) return toast("Enter a size in MB");
+      criteria[rule] = Math.round(megabytes * 1024 * 1024);
+    }
+    runBulkSelection("criteria", criteria, "Rule applied");
   });
 
   $("btnMarkRemainingHuman").addEventListener("click", async () => {
@@ -1324,8 +1748,16 @@
   });
 
   // —— Actions ——
-  async function runAction(action, dryRun) {
+  const MAX_PREVIEW_REFRESHES = 2;
+
+  function previewNoticeHtml(notice) {
+    return notice ? `<p class="preview-notice">${escapeHtml(notice)}</p>` : "";
+  }
+
+  async function runAction(action, dryRun, options = {}) {
+    const { attempt = 0, notice = "" } = options;
     let previewToken = null;
+    let previewValidity = null;
     const quarantine_dir = $("quarantineDir").value.trim() || null;
     if (action === "quarantine" && !dryRun && !quarantine_dir) {
       toast("Set a quarantine folder first");
@@ -1357,43 +1789,56 @@
           }),
         });
         previewToken = preview.preview_token;
+        previewValidity = Number(preview.preview_expires_in) || null;
       } catch (error) {
         toast(`Could not verify selection: ${error.message}`, "error");
         return;
       }
 
-      if (action !== "isolate" && preview.fail_count) {
-        const reason = preview.items?.find((item) => item.error)?.error;
-        toast(`Nothing moved: ${preview.fail_count} selected file(s) failed revalidation${reason ? ` · ${reason}` : ""}`, "error");
-        return;
-      }
       if (action !== "isolate" && preview.success_count === 0) {
         toast(`No verified ${scopeLabel}files are eligible for this action`);
         await loadGroups();
         return;
       }
 
-      const verifiedCount = action === "isolate" ? count : preview.success_count;
+      const eligibleCount = preview.success_count;
+      const verifiedCount = action === "isolate" ? count : eligibleCount;
       const counts = preview.selection_counts || {};
       const selectedMembers = effectiveSelection(scope);
       const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
       const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.no_humans || 0} Non-Human`;
+      const skippedWarning = (action !== "isolate" && preview.fail_count)
+        ? `<p><strong>${eligibleCount} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
+        : "";
       const labels = {
         trash: `Move selected ${scopeLabel}files to Trash?`,
         quarantine: `Move selected ${scopeLabel}files to quarantine?`,
         isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `<div class="review-sheet"><p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p><p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
-        quarantine: `<div class="review-sheet"><p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p><p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
-        isolate: `<div class="review-sheet"><p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
+        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        quarantine: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        isolate: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
       };
       const ok = await confirmModal({
         title: labels[action] || "Confirm",
         body: bodies[action] || "",
         confirmLabel: action === "trash" ? "Move to Trash" : action === "quarantine" ? "Quarantine" : "Isolate",
         danger: action === "trash",
+        validitySeconds: previewToken ? previewValidity : null,
       });
+      if (ok === "expired") {
+        // The token lapsed while the sheet was open: re-verify, then re-confirm.
+        if (attempt >= MAX_PREVIEW_REFRESHES) {
+          toast("Preview keeps expiring — try again when you are ready to confirm", "error");
+          return;
+        }
+        toast("Preview expired — re-checking the current selection…");
+        return runAction(action, dryRun, {
+          attempt: attempt + 1,
+          notice: "The previous preview expired. These numbers were just re-verified — confirm them again.",
+        });
+      }
       if (!ok) return;
     }
 
@@ -1415,11 +1860,16 @@
         body: JSON.stringify(payload),
       });
       const mode = dryRun ? "Preview" : "Done";
-      let msg = `${mode}: ${res.success_count} ok, ${res.fail_count} failed`;
+      let msg = (!dryRun && res.fail_count > 0)
+        ? `Done: ${res.success_count} ok, ${res.fail_count} skipped`
+        : `${mode}: ${res.success_count} ok, ${res.fail_count} failed`;
       if (res.review_root) msg += ` · ${res.review_root}`;
       if (res.log_path) msg += ` · receipt saved`;
-      if (res.fail_count && res.items?.find((item) => item.error)?.error) {
-        msg += ` · ${res.items.find((item) => item.error).error}`;
+      if (res.fail_count) {
+        const failed = res.items?.find((item) => item.error);
+        if (failed) {
+          msg += ` · ${basename(failed.path)}: ${failed.error}`;
+        }
       }
       toast(msg, res.fail_count ? "" : "ok");
       if (!dryRun) {
@@ -1440,6 +1890,16 @@
         if (sample) toast(`${msg} — e.g. ${sample}`);
       }
     } catch (e) {
+      const stale = e.data?.preview_stale
+        || /preview expired|selection changed|fresh preview/i.test(e.message);
+      if (stale && attempt < MAX_PREVIEW_REFRESHES) {
+        // Never execute on a stale token: re-run the dry run and re-confirm.
+        toast(`${e.message} — re-checking now…`);
+        return runAction(action, dryRun, {
+          attempt: attempt + 1,
+          notice: `${e.message.charAt(0).toUpperCase()}${e.message.slice(1)}. These numbers were just re-verified — confirm them again.`,
+        });
+      }
       toast(e.message, "error");
     }
   }
@@ -1600,11 +2060,29 @@
 
     if (typing || $("results").hidden) return;
 
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
     if (e.key === "j" || e.key === "ArrowDown") {
       navGroup(1);
       e.preventDefault();
     } else if (e.key === "k" || e.key === "ArrowUp") {
       navGroup(-1);
+      e.preventDefault();
+    } else if (e.key === "]") {
+      navAttention(1);
+      e.preventDefault();
+    } else if (e.key === "[") {
+      navAttention(-1);
+      e.preventDefault();
+    } else if (e.key === "u" && state.currentId) {
+      $("btnSelectSuggested").click();
+      e.preventDefault();
+    } else if (e.key === "s" && state.currentId) {
+      $("btnSmartGroup").click();
+      e.preventDefault();
+    } else if (e.key === "a") {
+      if ($("actionBar").hidden) return;
+      $("btnTrash").click();
       e.preventDefault();
     } else if (e.key === "Enter" && state.currentId) {
       openLightbox(state.memberFocus || 0);
@@ -1638,6 +2116,16 @@
     if (idx < 0) idx = delta > 0 ? -1 : 0;
     idx = Math.max(0, Math.min(state.groups.length - 1, idx + delta));
     selectGroup(state.groups[idx].id);
+  }
+
+  function navAttention(delta) {
+    const candidates = state.groups.filter(groupNeedsAttention);
+    if (!candidates.length) return toast("No shown groups need attention", "ok");
+    const current = candidates.findIndex((group) => group.id === state.currentId);
+    const next = current < 0
+      ? (delta > 0 ? 0 : candidates.length - 1)
+      : (current + delta + candidates.length) % candidates.length;
+    selectGroup(candidates[next].id);
   }
 
   // —— Init ——

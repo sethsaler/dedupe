@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 from dedupe.models import FileRecord, MediaType
 from dedupe.similar_image import (
     compute_image_hashes,
+    compute_image_hashes_with_tiles,
     find_similar_image_groups,
     is_near_identical,
     tile_distances,
@@ -72,6 +73,98 @@ def test_compute_image_hashes(tmp_path: Path) -> None:
     ph, dh, w, h = compute_image_hashes(p)
     assert ph and dh
     assert w == 64 and h == 64
+
+
+def test_hashing_pass_also_returns_tile_hashes(tmp_path: Path) -> None:
+    p = tmp_path / "a.jpg"
+    _make_image(p, (40, 80, 120))
+    ph, dh, w, h, tiles = compute_image_hashes_with_tiles(p)
+    assert ph and dh and w == 64 and h == 64
+    assert tiles is not None and len(tiles) == 5
+
+
+def test_grouping_reuses_tile_hashes_without_reopening_files(tmp_path: Path, monkeypatch) -> None:
+    """Tiles come from the hashing decode; no second decode per candidate."""
+    import dedupe.similar_image as module
+
+    a = tmp_path / "orig.jpg"
+    b = tmp_path / "reexport.jpg"
+    _make_image(a, (40, 80, 120), quality=95)
+    _make_image(b, (40, 80, 120), quality=60)
+
+    module._tile_phashes_for_path.cache_clear()
+    lazy_calls: list[str] = []
+    original = module._tile_phashes_for_path.__wrapped__
+
+    def counted(path: str):
+        lazy_calls.append(path)
+        return original(path)
+
+    counted.cache_clear = lambda: None
+    monkeypatch.setattr(module, "_tile_phashes_for_path", counted)
+
+    records = [_rec_for(a), _rec_for(b)]
+    groups = find_similar_image_groups(records, threshold=10)
+
+    assert len(groups) == 1
+    assert lazy_calls == []
+    assert all(
+        len(module.decode_tile_phashes(record.tile_phashes) or ()) == 5
+        for record in records
+    )
+
+
+def test_lazy_tiles_match_tiles_from_hashing_pass(tmp_path: Path) -> None:
+    """Both tile paths must agree or mixed records would score as different."""
+    import dedupe.similar_image as module
+
+    p = tmp_path / "photo.jpg"
+    _soft_photo(p, size=(900, 700))
+    module._tile_phashes_for_path.cache_clear()
+
+    lazy = module._tile_phashes_for_path(str(p))
+    _ph, _dh, _w, _h, eager = compute_image_hashes_with_tiles(p)
+
+    assert lazy == eager
+
+
+def test_legacy_tile_hashes_are_recomputed(tmp_path: Path) -> None:
+    """Tiles written by the older pipeline are ignored, not compared."""
+    import dedupe.similar_image as module
+
+    p = tmp_path / "photo.jpg"
+    _soft_photo(p)
+    record = _rec_for(p)
+    record.tile_phashes = ",".join(["0000000000000000"] * 5)
+
+    values = module._record_tile_phashes(record)
+
+    assert values is not None
+    assert record.tile_phashes.startswith(f"{module.TILE_HASH_VERSION}:")
+    assert module.decode_tile_phashes(record.tile_phashes) == values
+
+
+def test_records_without_stored_tiles_still_group(tmp_path: Path) -> None:
+    """Hydrated-from-old-cache records fall back to lazy tile hashing."""
+    a = tmp_path / "orig.jpg"
+    b = tmp_path / "reexport.jpg"
+    _make_image(a, (40, 80, 120), quality=95)
+    _make_image(b, (40, 80, 120), quality=60)
+
+    records = []
+    for path in (a, b):
+        record = _rec_for(path)
+        phash, dhash, width, height = compute_image_hashes(path)
+        record.phash = phash
+        record.dhash = dhash
+        record.width = width
+        record.height = height
+        records.append(record)
+
+    assert all(record.tile_phashes is None for record in records)
+    groups = find_similar_image_groups(records, threshold=10)
+    assert len(groups) == 1
+    assert all(record.tile_phashes for record in records)
 
 
 def test_similar_groups_near_identical_quality(tmp_path: Path) -> None:
@@ -213,3 +306,56 @@ def test_similarity_chain_does_not_create_transitive_group(monkeypatch) -> None:
 
     assert all(len(group) == 2 for group in groups)
     assert not any({a.path, c.path} <= {member.path for member in group} for group in groups)
+
+
+def _spy_map_parallel(monkeypatch, captured: dict):
+    """Record the backend passed to map_parallel while running the real thing."""
+    import dedupe.similar_image as module
+
+    real_map = module.map_parallel
+
+    def spy(fn, items, **kwargs):
+        captured["backend"] = kwargs.get("backend")
+        return real_map(fn, items, **kwargs)
+
+    monkeypatch.setattr(module, "map_parallel", spy)
+
+
+def test_small_batches_hash_with_threads(tmp_path: Path, monkeypatch) -> None:
+    _soft_photo(tmp_path / "a.jpg")
+    _soft_photo(tmp_path / "b.jpg")
+    records = [_rec_for(tmp_path / "a.jpg"), _rec_for(tmp_path / "b.jpg")]
+
+    captured: dict = {}
+    _spy_map_parallel(monkeypatch, captured)
+
+    find_similar_image_groups(records, workers=2)
+
+    # Two images are far below PROCESS_POOL_MIN_IMAGES.
+    assert captured["backend"] == "thread"
+
+
+def test_large_batches_hash_with_process_pool(tmp_path: Path, monkeypatch) -> None:
+    """Real process pool: backend flips to processes and results still group."""
+    import dedupe.similar_image as module
+
+    _soft_photo(tmp_path / "a.jpg")
+    _soft_photo(tmp_path / "b.jpg")
+    _make_image(tmp_path / "unique.jpg", (200, 10, 200))
+    records = [
+        _rec_for(tmp_path / "a.jpg"),
+        _rec_for(tmp_path / "b.jpg"),
+        _rec_for(tmp_path / "unique.jpg"),
+    ]
+
+    captured: dict = {}
+    _spy_map_parallel(monkeypatch, captured)
+    monkeypatch.setattr(module, "PROCESS_POOL_MIN_IMAGES", 1)
+
+    groups = find_similar_image_groups(records, workers=2)
+
+    assert captured["backend"] == "process"
+    assert len(groups) == 1
+    assert {Path(record.path).name for record in groups[0]} == {"a.jpg", "b.jpg"}
+    # Hashes computed in worker processes must land back on the parent records.
+    assert all(record.phash for record in records)

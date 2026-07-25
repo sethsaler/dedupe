@@ -35,6 +35,17 @@ DEFAULT_TILE_MEAN = 5.0
 HASH_MAX_SIDE = 512
 # Normalize to this size before tiling so different resolutions compare fairly.
 TILE_NORMALIZE = 256
+# Only records without stored tile hashes reach the path cache; keep it large
+# enough that a big scan never re-decodes the same file twice.
+TILE_CACHE_SIZE = 65536
+# Tile hashes now come from the hashing pass decode. Tag stored values so tiles
+# written by the previous tiling pipeline are recomputed instead of compared.
+TILE_HASH_VERSION = "t2"
+# A process pool sidesteps GIL contention in the pHash/dHash/tile math (small
+# numpy/scipy ops hold the GIL even though Pillow's decoder releases it), but
+# costs an interpreter spawn plus Pillow/imagehash imports per worker. Only
+# batches at least this large amortize that startup; smaller ones use threads.
+PROCESS_POOL_MIN_IMAGES = 512
 
 
 def _ensure_image_deps() -> None:
@@ -73,6 +84,20 @@ def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int 
 
     Width/height are the *original* dimensions. Hashing works on a downscaled
     copy so large photos stay cheap in RAM/CPU.
+    """
+    phash, dhash, width, height, _tiles = compute_image_hashes_with_tiles(
+        path, with_tiles=False
+    )
+    return phash, dhash, width, height
+
+
+def compute_image_hashes_with_tiles(
+    path: str | Path, *, with_tiles: bool = True
+) -> tuple[str | None, str | None, int | None, int | None, tuple[str, ...] | None]:
+    """Return (phash_hex, dhash_hex, width, height, tile_phashes).
+
+    Regional tile hashes are derived from the frame decoded for pHash/dHash so
+    verification never has to open the file a second time.
     """
     _ensure_image_deps()
     _register_heif()
@@ -123,18 +148,27 @@ def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int 
             phash = str(combined_p)
             dhash = str(combined_d)
 
-        return phash, dhash, width, height
+        tiles: tuple[str, ...] | None = None
+        if with_tiles:
+            try:
+                tiles = tuple(str(t) for t in _tile_phashes_from_image(frames[0]))
+            except Exception:
+                tiles = None
+
+        return phash, dhash, width, height, tiles
 
 
 def _image_hash_job(
     path: str,
-) -> tuple[str, str | None, str | None, int | None, int | None, str | None]:
-    """Worker: (path, phash, dhash, width, height, error)."""
+) -> tuple[
+    str, str | None, str | None, int | None, int | None, tuple[str, ...] | None, str | None
+]:
+    """Worker: (path, phash, dhash, width, height, tile_phashes, error)."""
     try:
-        ph, dh, w, h = compute_image_hashes(path)
-        return path, ph, dh, w, h, None
+        ph, dh, w, h, tiles = compute_image_hashes_with_tiles(path)
+        return path, ph, dh, w, h, tiles, None
     except Exception as exc:
-        return path, None, None, None, None, f"image hash failed: {exc}"
+        return path, None, None, None, None, None, f"image hash failed: {exc}"
 
 
 def _tile_phashes_from_image(img) -> list:
@@ -161,9 +195,9 @@ def _tile_phashes_from_image(img) -> list:
     return [imagehash.phash(canvas.crop(box)) for box in regions]
 
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=TILE_CACHE_SIZE)
 def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
-    """Run-cached tile hashes as hex strings for a path."""
+    """Run-cached tile hashes for records that carry no stored tile hashes."""
     _ensure_image_deps()
     _register_heif()
     from PIL import Image, ImageOps
@@ -172,11 +206,13 @@ def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
         with Image.open(path) as img:
             if not getattr(img, "is_animated", False):
                 img = ImageOps.exif_transpose(img)
+            # Same decode ladder as the hashing pass so lazily computed tiles
+            # are identical to the ones stored during hashing.
             try:
-                img.draft("RGB", (TILE_NORMALIZE, TILE_NORMALIZE))
+                img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
             except Exception:
                 pass
-            tiles = _tile_phashes_from_image(img)
+            tiles = _tile_phashes_from_image(_downscale_for_hash(img))
             return tuple(str(t) for t in tiles)
     except Exception:
         return None
@@ -229,15 +265,27 @@ def is_near_identical(
     return True
 
 
+def encode_tile_phashes(values: tuple[str, ...]) -> str:
+    """Serialize tile hashes with the version that produced them."""
+    return f"{TILE_HASH_VERSION}:" + ",".join(values)
+
+
+def decode_tile_phashes(stored: str | None) -> tuple[str, ...] | None:
+    """Parse stored tile hashes, ignoring values from an older tiling pipeline."""
+    if not stored or not stored.startswith(f"{TILE_HASH_VERSION}:"):
+        return None
+    values = tuple(part for part in stored[len(TILE_HASH_VERSION) + 1 :].split(",") if part)
+    return values or None
+
+
 def _record_tile_phashes(record: FileRecord) -> tuple[str, ...] | None:
     """Load regional hashes once, retaining them on the record for the disk cache."""
-    if record.tile_phashes:
-        values = tuple(part for part in record.tile_phashes.split(",") if part)
-        if values:
-            return values
+    values = decode_tile_phashes(record.tile_phashes)
+    if values:
+        return values
     values = _tile_phashes_for_path(record.path)
     if values:
-        record.tile_phashes = ",".join(values)
+        record.tile_phashes = encode_tile_phashes(values)
     return values
 
 
@@ -283,24 +331,32 @@ def find_similar_image_groups(
             if progress:
                 progress("image-hash", cached + done, total)
 
+        # Threads for small batches (I/O + Pillow C decode release the GIL
+        # often enough, and there is no process-spawn cost); a process pool
+        # once the uncached batch is large enough to amortize worker startup.
+        backend = (
+            "process"
+            if n_workers > 1 and len(need) >= PROCESS_POOL_MIN_IMAGES
+            else "thread"
+        )
         results = map_parallel(
             _image_hash_job,
             [r.path for r in need],
             workers=n_workers,
-            # Threads: I/O + Pillow C decode release the GIL often enough,
-            # and avoid process-spawn / pickle cost on every file.
-            backend="thread",
+            backend=backend,
             progress=hash_progress,
             progress_every=1,
             cancelled=cancelled,
         )
-        for path, ph, dh, w, h, err in results:
+        for path, ph, dh, w, h, tiles, err in results:
             rec = by_path[path]
             if err:
                 rec.error = err
                 continue
             rec.phash = ph
             rec.dhash = dh
+            if tiles:
+                rec.tile_phashes = encode_tile_phashes(tiles)
             if w:
                 rec.width = w
             if h:

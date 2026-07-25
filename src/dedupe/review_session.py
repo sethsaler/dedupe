@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +14,29 @@ from .models import GroupKind, ScanResult
 
 REVIEW_SESSION_VERSION = 1
 MAX_REVIEW_SESSION_BYTES = 64 * 1024 * 1024
+MAX_PRUNE_SAMPLES = 20
+
+PRUNE_REASON_LABELS = {
+    "missing": "no longer on disk",
+    "changed": "changed since the scan",
+    "outside_roots": "outside the scanned folders",
+    "symlink": "became a symbolic link",
+    "unreadable": "could not be read",
+}
+
+
+def prune_reason(error: str) -> str:
+    """Bucket a validation error into a stable, user-facing pruning reason."""
+    lowered = error.lower()
+    if "symbolic link" in lowered:
+        return "symlink"
+    if "no longer exists" in lowered or "no such file" in lowered:
+        return "missing"
+    if "outside the scanned roots" in lowered:
+        return "outside_roots"
+    if "changed since scan" in lowered:
+        return "changed"
+    return "unreadable"
 
 
 def default_review_session_path() -> Path:
@@ -28,7 +51,10 @@ class ReviewSessionLoad:
     path: Path | None = None
     saved_at: str | None = None
     pruned_files: int = 0
+    pruned_reasons: dict[str, int] = field(default_factory=dict)
+    pruned_samples: list[dict] = field(default_factory=list)
     error: str | None = None
+    corrupt: bool = False
 
     @property
     def available(self) -> bool:
@@ -40,6 +66,13 @@ class ReviewSessionLoad:
             "available": self.available,
             "saved_at": self.saved_at,
             "pruned_files": self.pruned_files,
+            "pruned_reasons": dict(self.pruned_reasons),
+            "pruned_reason_labels": {
+                reason: PRUNE_REASON_LABELS[reason] for reason in self.pruned_reasons
+            },
+            "pruned_samples": [dict(sample) for sample in self.pruned_samples],
+            "pruned_sample_limit": MAX_PRUNE_SAMPLES,
+            "corrupt": self.corrupt,
             "error": self.error,
         }
 
@@ -92,23 +125,23 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
         return report
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         report.error = str(exc)
+        report.corrupt = True
         return report
 
-    valid_paths = {
-        record.path
-        for record in result.files
-        if validate_file_record(record, result.roots) is None
-    }
+    valid_paths: set[str] = set()
+    invalid: dict[str, str] = {}
     # Group members can exist outside result.files in older exports; validate them too.
-    for group in result.groups:
-        valid_paths.update(
-            member.path
-            for member in group.members
-            if validate_file_record(member, result.roots) is None
-        )
-    before = len({f.path for f in result.files} | {
-        m.path for group in result.groups for m in group.members
-    })
+    records = list(result.files) + [
+        member for group in result.groups for member in group.members
+    ]
+    for record in records:
+        error = validate_file_record(record, result.roots)
+        if error is None:
+            valid_paths.add(record.path)
+        else:
+            invalid.setdefault(record.path, error)
+    for path in valid_paths:
+        invalid.pop(path, None)
     result.files = [record for record in result.files if record.path in valid_paths]
     groups = []
     for group in result.groups:
@@ -125,7 +158,16 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
     result.recompute_stats()
     report.result = result
     report.saved_at = envelope.get("saved_at")
-    report.pruned_files = before - len(valid_paths)
+    report.pruned_files = len(invalid)
+    reasons: dict[str, int] = {}
+    for error in invalid.values():
+        reason = prune_reason(error)
+        reasons[reason] = reasons.get(reason, 0) + 1
+    report.pruned_reasons = reasons
+    report.pruned_samples = [
+        {"path": path, "reason": prune_reason(error), "detail": error}
+        for path, error in sorted(invalid.items())[:MAX_PRUNE_SAMPLES]
+    ]
     if report.pruned_files:
         try:
             saved = save_review_session(result, target)

@@ -75,3 +75,102 @@ def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     assert text.index("False positives") < text.index("False negatives") < text.index("Precision")
     assert json.loads(output.read_text(encoding="utf-8")) == report
     assert calls == [("pairs.json", {"image_threshold": 7, "video_threshold": 8, "workers": None})]
+
+
+def _quarantine_receipts(tmp_path: Path):
+    from dedupe.actions import apply_actions
+    from dedupe.grouping import build_groups
+    from dedupe.models import FileRecord, MediaType
+
+    def _rec(path: Path, data: bytes) -> FileRecord:
+        path.write_bytes(data)
+        st = path.stat()
+        return FileRecord(
+            path=str(path.resolve()),
+            size=st.st_size,
+            mtime=st.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=path.suffix.lower(),
+        )
+
+    logs = tmp_path / "logs"
+    groups = build_groups([[_rec(tmp_path / "a.jpg", b"dup"), _rec(tmp_path / "b.jpg", b"dup")]], [])
+    apply_actions(
+        groups, action="quarantine", quarantine_dir=tmp_path / "q",
+        dry_run=True, log_dir=logs,
+    )
+    executed = apply_actions(
+        groups, action="quarantine", quarantine_dir=tmp_path / "q",
+        dry_run=False, log_dir=logs, roots=[str(tmp_path)],
+    )
+    return logs, executed
+
+
+def test_receipts_list_json_is_newest_first(tmp_path: Path, capsys) -> None:
+    logs, executed = _quarantine_receipts(tmp_path)
+
+    assert cli.main(["receipts", "list", "--log-dir", str(logs), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [entry["log_path"] for entry in payload][0] == executed.log_path
+    assert payload[0]["undoable"] is True
+    assert any(entry["dry_run"] for entry in payload)
+
+    assert cli.main(["receipts", "list", "--log-dir", str(logs), "--no-previews", "--json"]) == 0
+    executed_only = json.loads(capsys.readouterr().out)
+    assert len(executed_only) == 1
+
+
+def test_receipts_show_accepts_an_id_and_reports_unknown_ids(tmp_path: Path, capsys) -> None:
+    logs, executed = _quarantine_receipts(tmp_path)
+    receipt_id = Path(executed.log_path).stem
+
+    assert cli.main(["receipts", "show", receipt_id, "--log-dir", str(logs)]) == 0
+    text = capsys.readouterr().out
+    assert receipt_id in text
+    assert "quarantine (executed)" in text
+
+    assert cli.main(["receipts", "show", "does-not-exist", "--log-dir", str(logs)]) == 2
+    assert "no receipt matching" in capsys.readouterr().err
+
+
+def test_receipts_prune_requires_a_criterion_and_previews_by_default(
+    tmp_path: Path, capsys
+) -> None:
+    logs, _ = _quarantine_receipts(tmp_path)
+
+    assert cli.main(["receipts", "prune", "--log-dir", str(logs)]) == 2
+    assert "at least one of" in capsys.readouterr().err
+
+    assert cli.main(["receipts", "prune", "--log-dir", str(logs), "--drop-previews"]) == 0
+    assert "DRY-RUN prune: 1 receipts" in capsys.readouterr().out
+    assert len(list(logs.iterdir())) == 2
+
+    assert cli.main(
+        ["receipts", "prune", "--log-dir", str(logs), "--drop-previews", "--execute", "--json"]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed_count"] == 1 and payload["kept_count"] == 1
+    assert len(list(logs.iterdir())) == 1
+
+
+def test_undo_resolves_a_receipt_id(tmp_path: Path, capsys) -> None:
+    logs, executed = _quarantine_receipts(tmp_path)
+    quarantined = Path(executed.items[0].destination)
+    original = Path(executed.items[0].path)
+    assert quarantined.exists() and not original.exists()
+
+    assert cli.main(["undo", Path(executed.log_path).stem, "--log-dir", str(logs)]) == 0
+    assert "DRY-RUN undo: 1 ok" in capsys.readouterr().out
+    assert not original.exists()
+
+    assert cli.main(
+        ["undo", Path(executed.log_path).stem, "--log-dir", str(logs), "--execute"]
+    ) == 0
+    assert "EXECUTED undo: 1 ok" in capsys.readouterr().out
+    assert original.exists() and not quarantined.exists()
+
+
+def test_undo_reports_unknown_receipt(tmp_path: Path, capsys) -> None:
+    assert cli.main(["undo", "missing-receipt", "--log-dir", str(tmp_path / "logs")]) == 2
+    assert "no receipt matching" in capsys.readouterr().err

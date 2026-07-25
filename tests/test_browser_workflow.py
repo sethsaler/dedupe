@@ -96,3 +96,52 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     ]
     assert page_errors == []
     assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_bulk_selection_and_advanced_filters(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+
+    # A path glob narrows the sidebar and clearing it restores the full list.
+    page.locator("#advancedFilters summary").click()
+    page.locator("#filterPathPattern").fill("*/no-such-folder/*")
+    assert page.locator(".group-item").count() == 0
+    page.locator("#filterPathPattern").fill("*keeper*")
+    assert page.locator(".group-item").count() == 1
+    page.locator("#btnClearFilters").click()
+    assert page.locator(".group-item").count() == 1
+
+    # Bulk operations always leave one member of a duplicate group behind.
+    page.locator("#bulkPanel summary").click()
+    page.locator("#btnBulkNone").click()
+    page.locator("#toast").filter(has_text="Select none").wait_for()
+    page.locator("#members .sel-cb").first.wait_for(state="visible")
+    assert page.locator("#members .sel-cb:checked").count() == 0
+    page.locator("#btnBulkAll").click()
+    page.locator("#toast").filter(has_text="Select all").wait_for()
+    page.wait_for_function(
+        "document.querySelectorAll('#members .sel-cb:checked').length === 1"
+    )
+    assert page.locator("#members .card.keep").count() == 1
+
+    # The review sheet states how long its server-issued preview stays valid.
+    page.locator("#btnTrash").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    assert "preview valid for" in page.locator("#modalValidity").inner_text()
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+    assert page_errors == []

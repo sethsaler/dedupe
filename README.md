@@ -12,10 +12,12 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media
+- **Thumbnail cache** — previews are kept on disk under `~/.cache/dedupe/thumbnails/` and pruned least-recently-used against a size budget
 - **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
-- **Local web UI** — search/sort/filter, similarity presets and explanations, overlay/flicker comparison, keyboard navigation, native picker, and isolate
-- **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts and affected bytes
+- **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, overlay/flicker comparison, keyboard navigation, native picker, and isolate
+- **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
+- **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
 
 ## Requirements
 
@@ -88,13 +90,39 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
 3. Search or sort groups, Smart Select keep/remove, and compare Similar images with the lightbox overlay
-4. Review the action preview, then **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
+4. Narrow the list with **Advanced filters** (size range in MB, minimum pixel width/height, path substring or glob); a group matches when any of its files match
+5. Use **Bulk selection** to select all / none / invert, or apply one rule (smaller than keeper, larger than … MB, smaller than … MB, path contains …) to every group currently shown
+6. Review the action preview, then **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
+
+Bulk selection is re-derived on the server, so duplicate groups always keep their suggested
+keeper no matter what the browser asks for.
+
+The confirmation sheet counts down how long its preview stays valid. If the preview lapses
+while the sheet is open, the execute is never attempted with a stale token: the selection is
+re-verified automatically and you confirm the refreshed numbers.
 
 Completed reviews resume automatically after an app restart. Use **Discard saved review**
 to clear the saved session. Changed, missing, or out-of-root files are removed from a
-resumed review before it is shown, and every file is still revalidated immediately before an action.
+resumed review before it is shown, and every file is still revalidated immediately before an
+action. The resumed-session banner reports how many files were pruned and why (no longer on
+disk, changed since the scan, outside the scanned folders, became a symbolic link, could not
+be read), with a "What was dropped?" list of up to 20 example files.
 
-Keyboard: `j`/`k` groups · `Space` toggle remove · `Enter` lightbox · `?` shortcuts
+Keyboard:
+
+| Key | Action |
+| --- | --- |
+| `j` / `↓` | Next group |
+| `k` / `↑` | Previous group |
+| `[` / `]` | Previous / next group needing attention |
+| `u` | Use the suggested selection for this group |
+| `s` | Apply the selection rule to this group |
+| `a` | Open the action review sheet (preview trash) |
+| `Space` | Toggle remove on the focused card |
+| `Enter` | Open the lightbox |
+| `←` / `→` | Focus previous / next card · lightbox previous / next |
+| `Esc` | Close the lightbox, help, or overlay |
+| `?` | Shortcut help |
 
 ### CLI
 
@@ -140,8 +168,28 @@ dedupe isolate results.json --execute
 # Override only if you really want a different location
 dedupe isolate results.json --review-dir /some/other/path --execute
 
-# Restore a quarantine action from its receipt (preview first)
-dedupe undo ~/.cache/dedupe/logs/action-<timestamp>-<id>.json
+# Quarantine onto another volume (copy, verify, then delete the original)
+dedupe scan ~/Pictures --action quarantine --quarantine-dir /Volumes/Backup/dupes \
+  --allow-cross-device --execute
+
+# Same flag for `--isolate-mode move` across volumes
+dedupe isolate results.json --isolate-mode move --allow-cross-device --execute
+
+# Browse action receipts (newest first)
+dedupe receipts list
+dedupe receipts list --limit 50 --no-previews --undoable
+dedupe receipts list --json
+
+# Inspect one receipt by id, filename, path, or unique id substring
+dedupe receipts show action-20260718T101500.482913Z-1a2b3c4d
+dedupe receipts show 1a2b3c4d --items 0
+
+# Delete old receipts (dry-run preview unless --execute)
+dedupe receipts prune --older-than 30
+dedupe receipts prune --keep 50 --drop-previews --execute
+
+# Restore a quarantine action from its receipt id or path (preview first)
+dedupe undo action-20260718T101500.482913Z-1a2b3c4d
 dedupe undo ~/.cache/dedupe/logs/action-<timestamp>-<id>.json --execute
 
 # Open UI with last scan results
@@ -276,14 +324,28 @@ Also:
 
 For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2`.
 
+## Files and caches
+
+| Path | Contents |
+| --- | --- |
+| `~/.cache/dedupe/hashes.sqlite3` | Scan cache: hashes, video fingerprints, and completed person checks |
+| `~/.cache/dedupe/thumbnails/` | Disk-backed grid and lightbox thumbnails, pruned least-recently-used against a 512 MB budget |
+| `~/.cache/dedupe/logs/` | Action receipts: `action-*.json` for executed actions, `preview-*.json` for dry-run previews |
+| `~/.local/state/dedupe/review-session.json` | The resumable review (result + selections); honours `XDG_STATE_HOME` |
+
+`DEDUPE_THUMBNAIL_CACHE_DIR` relocates the thumbnail cache and
+`DEDUPE_THUMBNAIL_CACHE_BUDGET` sets its budget in bytes. Receipts are pruned with
+`dedupe receipts prune`; the other caches can be deleted safely and are rebuilt on demand.
+
 ## Safety
 
 - Never hard-deletes in the UI
 - Always leaves at least one file per group
 - File identity, scan-root containment, and exact hashes are revalidated before execution
 - File and directory symlinks are skipped by default
-- Executed actions receive unique atomic receipts under `~/.cache/dedupe/logs/`
-- Quarantine receipts can restore files with `dedupe undo`; Trash is restored through Finder
+- Executed actions receive unique atomic receipts under `~/.cache/dedupe/logs/`, named `action-<stamp>-<session>.json`; dry-run previews are written alongside them as `preview-<stamp>-<session>.json`
+- Quarantine receipts can restore files with `dedupe undo <receipt-id|path>`; Trash is restored through Finder
+- `dedupe receipts list / show / prune` browses and trims that history without touching the files themselves
 - Mutating localhost API calls require a per-launch session token and current scan generation
 - Trash and quarantine execute only after a fresh preview and confirmation in the UI
 - Photos.app `.photoslibrary` packages are never entered or accepted as scan roots; export media from Photos to a normal folder first
@@ -323,6 +385,7 @@ src/dedupe/
   parallel.py        # thread-pool map for hashing stages
   grouping.py        # ranking + smart select
   actions.py         # trash / quarantine
+  receipts.py        # receipt discovery, inspection, and pruning
   cache.py           # SQLite hash cache
   cli.py             # `dedupe` entry point
   web/               # Flask UI, native picker, and media previews

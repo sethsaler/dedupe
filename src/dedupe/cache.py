@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from itertools import combinations
 from pathlib import Path
@@ -11,6 +10,67 @@ from .human_policy import CACHEABLE_HUMAN_STATUSES, MANUALLY_CONFIRMED_HUMAN_STA
 from .models import FileRecord, MediaType
 
 CACHE_ALGORITHM_VERSION = "dedupe-hashes-v2"
+# Rows per executemany batch when persisting a scan.
+STORE_BATCH_SIZE = 1000
+
+_UPSERT_SQL = """
+    INSERT INTO hashes (
+        path, size, mtime, mtime_ns, device, inode, algorithm_version,
+        media_type, width, height, sha256, partial_hash, phash, dhash,
+        tile_phashes, video_fingerprint, duration, human_detection_status,
+        human_detector, human_detection_signature, human_frames_analyzed,
+        human_max_confidence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+        size=excluded.size,
+        mtime=excluded.mtime,
+        mtime_ns=excluded.mtime_ns,
+        device=excluded.device,
+        inode=excluded.inode,
+        algorithm_version=excluded.algorithm_version,
+        media_type=excluded.media_type,
+        width=excluded.width,
+        height=excluded.height,
+        sha256=excluded.sha256,
+        partial_hash=excluded.partial_hash,
+        phash=excluded.phash,
+        dhash=excluded.dhash,
+        tile_phashes=excluded.tile_phashes,
+        video_fingerprint=excluded.video_fingerprint,
+        duration=excluded.duration,
+        human_detection_status=excluded.human_detection_status,
+        human_detector=excluded.human_detector,
+        human_detection_signature=excluded.human_detection_signature,
+        human_frames_analyzed=excluded.human_frames_analyzed,
+        human_max_confidence=excluded.human_max_confidence
+"""
+
+
+def _upsert_row(rec: FileRecord) -> tuple:
+    return (
+        rec.path,
+        rec.size,
+        rec.mtime,
+        rec.mtime_ns,
+        rec.device,
+        rec.inode,
+        CACHE_ALGORITHM_VERSION,
+        rec.media_type.value,
+        rec.width,
+        rec.height,
+        rec.sha256,
+        rec.partial_hash,
+        rec.phash,
+        rec.dhash,
+        rec.tile_phashes,
+        rec.video_fingerprint,
+        rec.duration,
+        rec.human_detection_status,
+        rec.human_detector,
+        rec.human_detection_signature,
+        rec.human_frames_analyzed,
+        rec.human_max_confidence,
+    )
 
 
 def default_cache_path() -> Path:
@@ -158,63 +218,7 @@ class HashCache:
         return cached
 
     def put(self, rec: FileRecord) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO hashes (
-                path, size, mtime, mtime_ns, device, inode, algorithm_version,
-                media_type, width, height, sha256, partial_hash, phash, dhash,
-                tile_phashes, video_fingerprint, duration, human_detection_status,
-                human_detector, human_detection_signature, human_frames_analyzed,
-                human_max_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                size=excluded.size,
-                mtime=excluded.mtime,
-                mtime_ns=excluded.mtime_ns,
-                device=excluded.device,
-                inode=excluded.inode,
-                algorithm_version=excluded.algorithm_version,
-                media_type=excluded.media_type,
-                width=excluded.width,
-                height=excluded.height,
-                sha256=excluded.sha256,
-                partial_hash=excluded.partial_hash,
-                phash=excluded.phash,
-                dhash=excluded.dhash,
-                tile_phashes=excluded.tile_phashes,
-                video_fingerprint=excluded.video_fingerprint,
-                duration=excluded.duration,
-                human_detection_status=excluded.human_detection_status,
-                human_detector=excluded.human_detector,
-                human_detection_signature=excluded.human_detection_signature,
-                human_frames_analyzed=excluded.human_frames_analyzed,
-                human_max_confidence=excluded.human_max_confidence
-            """,
-            (
-                rec.path,
-                rec.size,
-                rec.mtime,
-                rec.mtime_ns,
-                rec.device,
-                rec.inode,
-                CACHE_ALGORITHM_VERSION,
-                rec.media_type.value,
-                rec.width,
-                rec.height,
-                rec.sha256,
-                rec.partial_hash,
-                rec.phash,
-                rec.dhash,
-                rec.tile_phashes,
-                rec.video_fingerprint,
-                rec.duration,
-                rec.human_detection_status,
-                rec.human_detector,
-                rec.human_detection_signature,
-                rec.human_frames_analyzed,
-                rec.human_max_confidence,
-            ),
-        )
+        self._conn.execute(_UPSERT_SQL, _upsert_row(rec))
 
     def commit(self) -> None:
         self._conn.commit()
@@ -222,9 +226,13 @@ class HashCache:
     @staticmethod
     def _identity(rec: FileRecord) -> str:
         """Stable file identity used to invalidate reviews when either file changes."""
-        return json.dumps(
-            [rec.size, rec.mtime_ns, rec.mtime, rec.device, rec.inode],
-            separators=(",", ":"),
+        # Byte-for-byte the old json.dumps(..., separators=(",", ":")) output so
+        # identities recorded by earlier versions still compare equal.
+        return "[{},{},{},{},{}]".format(
+            *(
+                "null" if value is None else repr(value)
+                for value in (rec.size, rec.mtime_ns, rec.mtime, rec.device, rec.inode)
+            )
         )
 
     def mark_distinct(self, records: list[FileRecord]) -> int:
@@ -311,6 +319,7 @@ class HashCache:
         return hits
 
     def store_all(self, records: list[FileRecord]) -> None:
+        rows: list[tuple] = []
         for rec in records:
             has_person_decision = (
                 rec.human_detection_status == MANUALLY_CONFIRMED_HUMAN_STATUS
@@ -326,5 +335,8 @@ class HashCache:
                 or rec.partial_hash
                 or has_person_decision
             ):
-                self.put(rec)
+                rows.append(_upsert_row(rec))
+        # One statement per batch instead of one round trip per record.
+        for start in range(0, len(rows), STORE_BATCH_SIZE):
+            self._conn.executemany(_UPSERT_SQL, rows[start : start + STORE_BATCH_SIZE])
         self.commit()

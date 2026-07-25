@@ -83,6 +83,109 @@ def test_run_scan_streams_groups_via_on_group(tmp_path: Path) -> None:
         assert first_exact < first_similar
 
 
+def test_similar_image_and_video_stages_run_concurrently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Image/GIF and video similarity are disjoint, so they run at the same time."""
+    import threading
+
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "a.jpg", (30, 60, 90))
+    (tmp_path / "b.mp4").write_bytes(b"not-a-real-video")
+
+    image_started = threading.Event()
+    video_started = threading.Event()
+
+    def fake_images(records, **_kwargs):
+        image_started.set()
+        assert video_started.wait(timeout=10), "video stage did not run concurrently"
+        return []
+
+    def fake_videos(records, **_kwargs):
+        video_started.set()
+        assert image_started.wait(timeout=10), "image stage did not run concurrently"
+        return []
+
+    monkeypatch.setattr(engine_mod, "find_similar_image_groups", fake_images)
+    monkeypatch.setattr(engine_mod, "find_similar_video_groups", fake_videos)
+
+    run_scan([tmp_path], exact=False, similar=True, use_cache=False)
+
+    assert image_started.is_set()
+    assert video_started.is_set()
+
+
+def test_exact_stage_overlaps_similarity_hashing(tmp_path: Path, monkeypatch) -> None:
+    """Exact hashing runs concurrently with similarity hashing."""
+    import threading
+
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "a.jpg", (30, 60, 90))
+
+    exact_started = threading.Event()
+    image_started = threading.Event()
+
+    def fake_exact(records, **_kwargs):
+        exact_started.set()
+        assert image_started.wait(timeout=10), "image stage did not overlap exact"
+        return []
+
+    def fake_images(records, **_kwargs):
+        image_started.set()
+        assert exact_started.wait(timeout=10), "exact stage did not overlap image"
+        return []
+
+    monkeypatch.setattr(engine_mod, "find_exact_groups", fake_exact)
+    monkeypatch.setattr(engine_mod, "find_similar_image_groups", fake_images)
+    monkeypatch.setattr(
+        engine_mod, "find_similar_video_groups", lambda records, **_kwargs: []
+    )
+
+    run_scan([tmp_path], exact=True, similar=True, use_cache=False)
+
+    assert exact_started.is_set()
+    assert image_started.is_set()
+
+
+def test_similar_groups_publish_after_slow_exact(tmp_path: Path, monkeypatch) -> None:
+    """Even when exact is slow, similar groups are published after exact groups."""
+    import time as time_mod
+
+    import dedupe.engine as engine_mod
+
+    data = b"identical-binary-payload-for-exact-match!!!"
+    (tmp_path / "exact1.jpg").write_bytes(data)
+    (tmp_path / "exact2.jpg").write_bytes(data)
+    _save(tmp_path / "sim1.jpg", (30, 60, 90), quality=95)
+    _save(tmp_path / "sim2.jpg", (30, 60, 90), quality=50)
+
+    real_exact = engine_mod.find_exact_groups
+
+    def slow_exact(records, **kwargs):
+        time_mod.sleep(0.3)
+        return real_exact(records, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "find_exact_groups", slow_exact)
+
+    kinds: list[str] = []
+    result = run_scan(
+        [tmp_path],
+        exact=True,
+        similar=True,
+        include_videos=False,
+        use_cache=False,
+        image_threshold=12,
+        on_group=lambda g: kinds.append(g.kind.value),
+    )
+
+    assert GroupKind.EXACT.value in kinds
+    assert GroupKind.SIMILAR.value in kinds
+    assert kinds.index(GroupKind.EXACT.value) < kinds.index(GroupKind.SIMILAR.value)
+    assert result.exact_groups >= 1
+
+
 def test_parallel_streams_scan_folders_independently(tmp_path: Path) -> None:
     """Each folder is its own stream: identical content across folders stays separate."""
     data = b"identical-binary-payload-for-exact-match!!!"
@@ -294,6 +397,28 @@ def test_scan_diagnostics_report_ffmpeg_unavailable(tmp_path: Path, monkeypatch)
     assert video.attempted == 0
     assert video.skipped == 2
     assert any("ffmpeg" in warning for warning in video.warnings)
+
+
+def test_cache_store_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
+    """A failed cache write must surface, not be swallowed."""
+    _save(tmp_path / "one.jpg", (30, 60, 90))
+
+    def boom(self, _records):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("dedupe.cache.HashCache.store_all", boom)
+
+    result = run_scan(
+        [tmp_path],
+        similar=False,
+        include_videos=False,
+        cache_path=tmp_path / "hashes.sqlite3",
+    )
+
+    assert any("cache store failed: disk full" in error for error in result.errors)
+    cache_stage = result.diagnostics.stages["cache"]
+    assert cache_stage.failed == 1
+    assert any("disk full" in warning for warning in cache_stage.warnings)
 
 
 def test_run_scan_rejects_photos_library_root(tmp_path: Path) -> None:

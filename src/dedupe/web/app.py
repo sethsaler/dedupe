@@ -35,14 +35,103 @@ from ..review_session import (
     load_review_session,
     save_review_session,
 )
-from .media import image_thumbnail_bytes, is_video, media_mimetype, video_thumbnail_bytes
+from .media import cached_thumbnail, is_video, media_mimetype
 from .native_picker import pick_native_paths
 
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 8
-PREVIEW_TOKEN_TTL_SECONDS = 120
+WEB_API_VERSION = 11
+PREVIEW_TOKEN_TTL_SECONDS = 600
+
+# Why an execute was refused, phrased so the UI can tell the user what happens next.
+PREVIEW_STALE_MESSAGES = {
+    "missing": (
+        "this action needs a fresh preview; preview again and confirm the new numbers"
+    ),
+    "expired": (
+        f"preview expired after {PREVIEW_TOKEN_TTL_SECONDS // 60} minutes; "
+        "preview again and confirm the refreshed numbers"
+    ),
+    "changed": (
+        "selection changed since the preview; preview again and confirm the new numbers"
+    ),
+}
+
+
+def stale_preview_payload(reason: str) -> dict:
+    return {
+        "error": PREVIEW_STALE_MESSAGES[reason],
+        "preview_stale": True,
+        "preview_stale_reason": reason,
+        "preview_ttl_seconds": PREVIEW_TOKEN_TTL_SECONDS,
+    }
+
+
+BULK_SELECT_OPERATIONS = {"select_all", "select_none", "invert", "criteria"}
+
+
+def parse_bulk_criteria(raw: dict) -> dict:
+    """Validate bulk-selection criteria; unknown keys are ignored, bad values reject."""
+    criteria: dict = {}
+    for key in ("min_size", "max_size"):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        size = int(value)
+        if size < 0:
+            raise ValueError(f"{key} must not be negative")
+        criteria[key] = size
+    contains = raw.get("path_contains")
+    if contains not in (None, ""):
+        criteria["path_contains"] = str(contains).lower()
+    if raw.get("smaller_than_keeper"):
+        criteria["smaller_than_keeper"] = True
+    return criteria
+
+
+def bulk_member_matches(member, group, criteria: dict) -> bool:
+    if "min_size" in criteria and member.size < criteria["min_size"]:
+        return False
+    if "max_size" in criteria and member.size > criteria["max_size"]:
+        return False
+    if "path_contains" in criteria and criteria["path_contains"] not in member.path.lower():
+        return False
+    if criteria.get("smaller_than_keeper"):
+        keeper = next((m for m in group.members if m.path == group.suggested_keep), None)
+        if keeper is None or member.size >= keeper.size:
+            return False
+    return True
+
+
+def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
+    """Return the selection a bulk operation produces, with keep-one enforced.
+
+    Duplicate groups never have their suggested keeper selected, so at least one
+    member always survives. Non-human candidate groups are independent files and
+    may have every candidate selected.
+    """
+    keep_one = group.kind.value != "no_humans"
+    keeper = None
+    if keep_one and group.members:
+        member_paths = [member.path for member in group.members]
+        keeper = group.suggested_keep if group.suggested_keep in member_paths else member_paths[0]
+    if operation == "select_none":
+        return []
+    already = set(group.selected_for_removal)
+    picks = []
+    for member in group.members:
+        if member.path == keeper:
+            continue
+        if operation == "select_all":
+            chosen = True
+        elif operation == "invert":
+            chosen = member.path not in already
+        else:
+            chosen = bulk_member_matches(member, group, criteria)
+        if chosen:
+            picks.append(member.path)
+    return picks
 
 
 def create_app(
@@ -120,9 +209,16 @@ def create_app(
         state["preview_tokens"][token] = (manifest, now + PREVIEW_TOKEN_TTL_SECONDS)
         return token
 
-    def consume_preview_token(token: str | None, manifest: tuple) -> bool:
+    def consume_preview_token(token: str | None, manifest: tuple) -> str:
+        """Spend a one-use token and say why it was refused: the client re-previews."""
         stored = state["preview_tokens"].pop(token, None) if token else None
-        return bool(stored and stored[1] > time.monotonic() and stored[0] == manifest)
+        if stored is None:
+            return "missing"
+        if stored[1] <= time.monotonic():
+            return "expired"
+        if stored[0] != manifest:
+            return "changed"
+        return "valid"
 
     def group_payload(group) -> dict:
         payload = group.to_dict()
@@ -176,7 +272,8 @@ def create_app(
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        if request.path.startswith("/api/"):
+        immutable = "immutable" in response.headers.get("Cache-Control", "")
+        if request.path.startswith("/api/") and not immutable:
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -313,17 +410,50 @@ def create_app(
             state["progress"] = ScanProgress()
         return jsonify({"ok": True, "discarded": removed})
 
+    def int_arg(name: str, default: int | None = None) -> int | None:
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
     @app.get("/api/groups")
     def api_groups():
         kind = request.args.get("kind")  # exact | similar | all
+        # No limit → full list, so older clients and callers behave as before.
+        limit = int_arg("limit")
+        offset = max(0, int_arg("offset", 0) or 0)
         with lock:
             result: ScanResult | None = state["result"]
             if result is None:
-                return jsonify({"groups": []})
+                return jsonify(
+                    {
+                        "groups": [],
+                        "total": 0,
+                        "offset": offset,
+                        "limit": limit,
+                        "groups_version": state["groups_version"],
+                    }
+                )
             groups = result.groups
             if kind in ("exact", "similar", "no_humans"):
                 groups = [g for g in groups if g.kind.value == kind]
-            return jsonify({"groups": [group_payload(g) for g in groups]})
+            total = len(groups)
+            if limit is not None:
+                groups = groups[offset : offset + max(0, limit)]
+            elif offset:
+                groups = groups[offset:]
+            return jsonify(
+                {
+                    "groups": [group_payload(g) for g in groups],
+                    "total": total,
+                    "offset": offset,
+                    "limit": limit,
+                    "groups_version": state["groups_version"],
+                }
+            )
 
     @app.get("/api/groups/<group_id>")
     def api_group(group_id: str):
@@ -557,6 +687,9 @@ def create_app(
         data = request.get_json(silent=True) or {}
         rule_raw = data.get("rule", SmartRule.AUTOMATIC.value)
         group_id = data.get("group_id")
+        group_ids = data.get("group_ids")
+        if group_ids is not None and not isinstance(group_ids, list):
+            return jsonify({"error": "group_ids must be a list"}), 400
         try:
             rule = SmartRule(rule_raw)
         except ValueError:
@@ -578,10 +711,15 @@ def create_app(
                         persist_result()
                         return jsonify(payload)
                 return jsonify({"error": "not found"}), 404
-            apply_smart_select_all(result.groups, rule)
+            if group_ids is None:
+                scoped = result.groups
+            else:
+                wanted = {str(value) for value in group_ids}
+                scoped = [g for g in result.groups if g.id in wanted]
+            apply_smart_select_all(scoped, rule)
             result.recompute_stats()
             persist_result()
-            return jsonify({"ok": True, "group_count": len(result.groups)})
+            return jsonify({"ok": True, "group_count": len(scoped)})
 
     @app.post("/api/selection")
     def api_selection():
@@ -627,6 +765,64 @@ def create_app(
                     persist_result()
                     return jsonify(payload)
         return jsonify({"error": "not found"}), 404
+
+    @app.post("/api/selection/bulk")
+    def api_selection_bulk():
+        """Apply one selection operation across many groups, server-side invariants only.
+
+        The client sends the group ids it currently shows; every safety rule
+        (keep one member of every duplicate group, never select a keeper, only
+        real members) is re-derived here from server state.
+        """
+        data = request.get_json(silent=True) or {}
+        operation = str(data.get("operation") or "").lower()
+        if operation not in BULK_SELECT_OPERATIONS:
+            return jsonify({"error": f"unknown bulk operation: {operation}"}), 400
+        group_ids = data.get("group_ids")
+        if group_ids is not None and not isinstance(group_ids, list):
+            return jsonify({"error": "group_ids must be a list"}), 400
+        raw_criteria = data.get("criteria") or {}
+        if not isinstance(raw_criteria, dict):
+            return jsonify({"error": "criteria must be an object"}), 400
+        try:
+            criteria = parse_bulk_criteria(raw_criteria)
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": f"invalid criteria: {exc}"}), 400
+
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "selections are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            if result is None:
+                return jsonify({"error": "no scan"}), 404
+            if group_ids is None:
+                scoped = list(result.groups)
+            else:
+                wanted = {str(value) for value in group_ids}
+                scoped = [g for g in result.groups if g.id in wanted]
+            changed = 0
+            for group in scoped:
+                picks = bulk_selection_picks(group, operation, criteria)
+                if picks == list(group.selected_for_removal):
+                    continue
+                group.selected_for_removal = picks
+                if group.kind.value == "no_humans":
+                    # Selecting a candidate is also a review decision for it.
+                    group.reviewed_paths = list(
+                        dict.fromkeys([*group.reviewed_paths, *picks])
+                    )
+                changed += 1
+            result.recompute_stats()
+            persist_result()
+            return jsonify({
+                "ok": True,
+                "operation": operation,
+                "group_count": len(scoped),
+                "changed_count": changed,
+                "selected_count": len(effective_selected_paths(result.groups)),
+            })
 
     @app.post("/api/non-human/delete")
     def api_delete_non_human():
@@ -679,10 +875,12 @@ def create_app(
                 payload = preview.to_dict()
                 with lock:
                     payload["preview_token"] = issue_preview_token(manifest)
+                payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
                 return jsonify(payload)
             with lock:
-                if not consume_preview_token(data.get("preview_token"), manifest):
-                    return jsonify({"error": "preview expired or selection changed; preview again"}), 409
+                verdict = consume_preview_token(data.get("preview_token"), manifest)
+                if verdict != "valid":
+                    return jsonify(stale_preview_payload(verdict)), 409
             action_result = apply_actions(
                 [action_group], action="trash", dry_run=False, roots=roots,
                 safety_groups=safety_groups,
@@ -949,8 +1147,9 @@ def create_app(
                         preview_token = issue_preview_token(manifest)
                 else:
                     with lock:
-                        if not consume_preview_token(data.get("preview_token"), manifest):
-                            return jsonify({"error": "preview expired or selection changed; preview again"}), 409
+                        verdict = consume_preview_token(data.get("preview_token"), manifest)
+                        if verdict != "valid":
+                            return jsonify(stale_preview_payload(verdict)), 409
                     action_result = apply_actions(
                         groups, action=action, quarantine_dir=destination,
                         dry_run=False, roots=roots, kinds=kinds, safety_groups=groups,
@@ -1009,6 +1208,7 @@ def create_app(
                 payload["selection_counts"] = selection_counts
                 if dry_run:
                     payload["preview_token"] = preview_token
+                    payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
             return jsonify(payload)
         finally:
             with lock:
@@ -1037,23 +1237,26 @@ def create_app(
         if not is_scanned_file(p, path):
             return jsonify({"error": "not in scan"}), 403
 
-        # Videos: try a cached frame if we can't stream
-        if is_video(p):
-            try:
-                thumb = video_thumbnail_bytes(p)
-                if thumb:
-                    return Response(thumb, mimetype="image/jpeg")
-            except Exception:
-                pass
-            return jsonify({"error": "no preview"}), 404
-
-        # Images / GIFs via Pillow resize
         # ?full=1 → larger lightbox preview
-        full = request.args.get("full") == "1"
-        try:
-            return Response(image_thumbnail_bytes(p, full=full), mimetype="image/jpeg")
-        except Exception:
+        variant = "full" if request.args.get("full") == "1" else "thumb"
+        cached = cached_thumbnail(p, variant=variant)
+        if cached is None:
+            # Videos have no still to fall back to; images can serve the original.
+            if is_video(p):
+                return jsonify({"error": "no preview"}), 404
             return send_file(p, mimetype=media_mimetype(p))
+
+        thumb_path, key = cached
+        response = send_file(
+            thumb_path,
+            mimetype="image/jpeg",
+            conditional=True,
+            etag=key,
+            last_modified=p.stat().st_mtime,
+        )
+        # The key already includes source mtime/size, so the body can never change.
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        return response
 
     @app.get("/api/media")
     def api_media():

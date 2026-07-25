@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
+  <a class="skip-link" href="#scanPanel">Skip to main content</a>
   <div class="app">
     <header class="topbar">
       <div class="brand">
@@ -27,7 +28,7 @@
       </div>
     </header>
 
-    <section class="scan-panel" id="scanPanel">
+    <section class="scan-panel" id="scanPanel" tabindex="-1">
       <div class="scan-main">
         <div class="field-row path-row">
           <label for="paths">Folders or files to scan</label>
@@ -121,7 +122,15 @@
         <div class="stream-progress" id="streamProgress" hidden></div>
       </div>
       <div class="session-status" id="sessionStatus" hidden aria-live="polite">
-        <span id="sessionStatusText"></span>
+        <div class="session-status-main">
+          <span class="session-flag" id="sessionFlag" aria-hidden="true">✔</span>
+          <span id="sessionStatusText"></span>
+        </div>
+        <details class="session-pruned" id="sessionPruned" hidden>
+          <summary id="sessionPrunedSummary">What was dropped?</summary>
+          <ul class="pruned-list" id="sessionPrunedList"></ul>
+          <p class="muted small" id="sessionPrunedMore" hidden></p>
+        </details>
         <button class="linkish" id="btnDiscardSession" type="button">Discard saved review</button>
       </div>
       <details class="scan-quality" id="scanQuality" hidden>
@@ -149,7 +158,7 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>Space</kbd> toggle remove · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>[</kbd>/<kbd>]</kbd> needs attention · <kbd>Space</kbd> toggle remove · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
@@ -182,6 +191,53 @@
           </div>
           <label class="inline-check"><input id="issuesOnly" type="checkbox" /> Needs attention</label>
           <label class="inline-check"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
+          <details class="sidebar-panel" id="advancedFilters">
+            <summary>Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></summary>
+            <div class="result-control-row">
+              <label for="filterMinMb">Size MB</label>
+              <div class="range-pair">
+                <input id="filterMinMb" type="number" min="0" step="0.1" placeholder="min" aria-label="Minimum file size in megabytes" />
+                <input id="filterMaxMb" type="number" min="0" step="0.1" placeholder="max" aria-label="Maximum file size in megabytes" />
+              </div>
+            </div>
+            <div class="result-control-row">
+              <label for="filterMinWidth">Min px</label>
+              <div class="range-pair">
+                <input id="filterMinWidth" type="number" min="0" step="1" placeholder="width" aria-label="Minimum pixel width" />
+                <input id="filterMinHeight" type="number" min="0" step="1" placeholder="height" aria-label="Minimum pixel height" />
+              </div>
+            </div>
+            <div class="result-control-row">
+              <label for="filterPathPattern">Path</label>
+              <input id="filterPathPattern" type="text" spellcheck="false" placeholder="*/Screenshots/* or .heic" />
+            </div>
+            <span class="thresh-hint">A group matches when any of its files match. Path accepts a substring or a glob.</span>
+            <button class="btn ghost" id="btnClearFilters" type="button">Clear advanced filters</button>
+          </details>
+          <details class="sidebar-panel" id="bulkPanel">
+            <summary>Bulk selection</summary>
+            <p class="muted small" id="bulkScope">Applies to the groups currently shown.</p>
+            <div class="bulk-row">
+              <button class="btn ghost" id="btnBulkAll" type="button">Select all</button>
+              <button class="btn ghost" id="btnBulkNone" type="button">Select none</button>
+              <button class="btn ghost" id="btnBulkInvert" type="button">Invert</button>
+            </div>
+            <div class="result-control-row">
+              <label for="bulkCriteria">Rule</label>
+              <select id="bulkCriteria">
+                <option value="smaller_than_keeper">Smaller than keeper</option>
+                <option value="min_size">Larger than … MB</option>
+                <option value="max_size">Smaller than … MB</option>
+                <option value="path_contains">Path contains …</option>
+              </select>
+            </div>
+            <div class="result-control-row" id="bulkValueRow" hidden>
+              <label for="bulkValue">Value</label>
+              <input id="bulkValue" type="text" spellcheck="false" placeholder="MB" />
+            </div>
+            <button class="btn primary-soft" id="btnBulkCriteria" type="button">Apply rule to shown groups</button>
+            <span class="thresh-hint">Duplicate groups always keep their suggested keeper; the server re-checks that.</span>
+          </details>
           <button class="btn primary-soft" id="btnNextReview" type="button">Next unreviewed / needs attention</button>
           <span class="muted small" id="filteredCount" aria-live="polite"></span>
         </div>
@@ -325,6 +381,7 @@
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <h3 id="modalTitle">Confirm</h3>
       <div id="modalBody"></div>
+      <p class="modal-validity" id="modalValidity" hidden aria-live="polite"></p>
       <div class="modal-actions">
         <button class="btn ghost" id="modalCancel" type="button">Cancel</button>
         <button class="btn danger" id="modalConfirm" type="button">Confirm</button>
@@ -339,9 +396,13 @@
       <dl class="shortcuts">
         <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group</dd></div>
         <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group</dd></div>
+        <div><dt><kbd>[</kbd> / <kbd>]</kbd></dt><dd>Previous / next group needing attention</dd></div>
         <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card</dd></div>
         <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
-        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Lightbox prev / next</dd></div>
+        <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
+        <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
+        <div><dt><kbd>a</kbd></dt><dd>Open the action review sheet (preview trash)</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Focus previous / next card · lightbox prev / next</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>

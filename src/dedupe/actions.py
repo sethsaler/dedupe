@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISLNK, S_ISREG
 
 from .exact import file_sha256
 from .models import (
@@ -18,6 +21,23 @@ from .models import (
     ScanResult,
     effective_selected_paths,
 )
+from .parallel import map_parallel, resolve_workers
+from .receipts import receipt_filename, resolve_log_dir, resolve_receipt_path
+from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD, compute_image_hashes
+from .similar_video import (
+    DEFAULT_THRESHOLD as VID_THRESHOLD,
+    compute_video_fingerprint,
+    video_fingerprint_distances,
+)
+
+
+# Destructive file work is I/O bound; a small pool hides move/copy latency
+# without saturating the disk or the system Trash service.
+DEFAULT_ACTION_WORKERS_CAP = 4
+
+
+class CrossDeviceError(OSError):
+    """Raised when an action would cross filesystems without explicit consent."""
 
 
 @dataclass
@@ -28,6 +48,7 @@ class ActionItem:
     destination: str | None = None
     error: str | None = None
     group_id: str | None = None
+    size: int | None = None
 
 
 @dataclass
@@ -75,16 +96,18 @@ def collect_selected_paths(groups: list[DuplicateGroup]) -> list[str]:
     return effective_selected_paths(groups)
 
 
-def _unique_dest(dest_dir: Path, name: str) -> Path:
+def _unique_dest(dest_dir: Path, name: str, reserved: set[str] | None = None) -> Path:
+    """Free destination path. ``reserved`` holds names already handed out this batch."""
+    taken = reserved or set()
     candidate = dest_dir / name
-    if not candidate.exists():
+    if not candidate.exists() and str(candidate) not in taken:
         return candidate
     stem = Path(name).stem
     suffix = Path(name).suffix
     n = 1
     while True:
         candidate = dest_dir / f"{stem}_{n}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and str(candidate) not in taken:
             return candidate
         n += 1
 
@@ -93,11 +116,13 @@ def _write_action_log(
     result: ActionResult,
     log_dir: str | Path | None = None,
 ) -> None:
-    log_base = Path(log_dir) if log_dir else Path.home() / ".cache" / "dedupe" / "logs"
+    log_base = resolve_log_dir(log_dir)
     try:
         log_base.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        log_path = log_base / f"action-{stamp}-{result.session_id[:8]}.json"
+        log_path = log_base / receipt_filename(
+            dry_run=result.dry_run, stamp=stamp, session_id=result.session_id
+        )
         result.log_path = str(log_path)
         temp_path = log_path.with_suffix(".json.tmp")
         temp_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
@@ -135,6 +160,75 @@ def _volume_root(path: Path) -> Path:
             break
         cur = cur.parent
     return cur
+
+
+def _device_of(path: Path) -> int | None:
+    """``st_dev`` of ``path`` or of its nearest existing ancestor."""
+    current = path
+    while True:
+        try:
+            return os.stat(current).st_dev
+        except OSError:
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
+
+def _device_for_dir(directory: Path, cache: dict[str, int | None]) -> int | None:
+    """Cached ``st_dev`` lookup; every file in a directory shares its filesystem."""
+    key = str(directory)
+    if key not in cache:
+        cache[key] = _device_of(directory)
+    return cache[key]
+
+
+def cross_device_error(
+    src: Path,
+    dest_dir: Path,
+    cache: dict[str, int | None] | None = None,
+) -> str | None:
+    """Return an actionable message when moving ``src`` into ``dest_dir`` crosses volumes."""
+    cache = {} if cache is None else cache
+    src_device = _device_for_dir(src.parent, cache)
+    dest_device = _device_for_dir(dest_dir, cache)
+    if src_device is None or dest_device is None or src_device == dest_device:
+        return None
+    return (
+        f"cross-device move refused: {src} is on a different volume than {dest_dir}. "
+        "Pick a destination on the same volume, or re-run with cross-device moves "
+        "allowed (copy, verify, then delete the original)."
+    )
+
+
+def _move_file(src: Path, dest: Path, *, allow_cross_device: bool = False) -> None:
+    """Move ``src`` onto ``dest``.
+
+    Same-volume moves are an atomic rename. Cross-volume moves are refused unless
+    ``allow_cross_device`` is set, in which case the file is copied, verified by
+    size, and only then unlinked, so a failure never loses the original.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src, dest)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    if not allow_cross_device:
+        raise CrossDeviceError(
+            errno.EXDEV,
+            cross_device_error(src, dest.parent) or "cross-device move refused",
+        )
+    size = src.stat().st_size
+    shutil.copy2(src, dest)
+    copied = dest.stat().st_size
+    if copied != size:
+        dest.unlink(missing_ok=True)
+        raise OSError(
+            f"cross-device copy verification failed for {src} ({size} -> {copied} bytes)"
+        )
+    src.unlink()
 
 
 def _trash_dirs_for(path: Path) -> list[Path]:
@@ -178,92 +272,225 @@ def _trash_dirs_for(path: Path) -> list[Path]:
     return dirs
 
 
+def _list_names(directory: Path) -> set[str]:
+    try:
+        return {p.name for p in directory.iterdir()}
+    except OSError:
+        return set()
+
+
 def _snapshot_trash(dirs: list[Path]) -> dict[Path, set[str]]:
-    listing: dict[Path, set[str]] = {}
-    for d in dirs:
-        try:
-            listing[d] = {p.name for p in d.iterdir()}
-        except OSError:
-            listing[d] = set()
-    return listing
+    return {d: _list_names(d) for d in dirs}
 
 
-def _send_to_trash(src: Path) -> Path | None:
+class TrashBatch:
+    """Trash many files while listing each Trash directory as rarely as possible.
+
+    Each Trash directory is enumerated once, when it is first used. Every send
+    then tries the predicted destination (``<trash>/<name>``) and only falls back
+    to a directory listing when that misses (e.g. send2trash had to rename because
+    of a collision); the listing refreshes the snapshot, so repeated collisions
+    still cost one listing each rather than one per file.
+
+    ``send2trash`` and the destination lookup run under one lock, so concurrent
+    workers cannot claim each other's freshly trashed entries.
+    """
+
+    def __init__(self) -> None:
+        self._dirs_by_parent: dict[str, list[Path]] = {}
+        self._known: dict[Path, set[str]] = {}
+        self._lock = threading.Lock()
+
+    def _dirs_for(self, src: Path) -> list[Path]:
+        key = str(src.parent)
+        dirs = self._dirs_by_parent.get(key)
+        if dirs is None:
+            dirs = _trash_dirs_for(src)
+            self._dirs_by_parent[key] = dirs
+            for directory in dirs:
+                self._known.setdefault(directory, _list_names(directory))
+        return dirs
+
+    def send(self, src: Path) -> Path | None:
+        """Trash ``src`` and return where it landed (``None`` if undeterminable)."""
+        from send2trash import send2trash
+
+        if not src.exists():
+            raise FileNotFoundError(str(src))
+        size = src.stat().st_size
+        with self._lock:
+            dirs = self._dirs_for(src)
+            send2trash(str(src))
+            return self._locate(dirs, src.name, src.stem, size)
+
+    def _locate(self, dirs: list[Path], name: str, stem: str, size: int) -> Path | None:
+        for directory in dirs:
+            known = self._known.setdefault(directory, set())
+            if name in known:
+                continue
+            candidate = directory / name
+            try:
+                if candidate.stat().st_size == size:
+                    known.add(name)
+                    return candidate
+            except OSError:
+                continue
+
+        for directory in dirs:
+            current = _list_names(directory)
+            added = current - self._known.get(directory, set())
+            self._known[directory] = current
+            for entry in sorted(added):
+                candidate = directory / entry
+                try:
+                    if candidate.stat().st_size == size:
+                        return candidate
+                except OSError:
+                    continue
+
+        # Last resort: newest entry whose name matches, in case send2trash chose a
+        # Trash directory we never enumerated.
+        best: tuple[float, Path] | None = None
+        for directory in dirs:
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                continue
+            for p in entries:
+                if p.name == name or p.name.startswith(f"{stem} "):
+                    try:
+                        mtime = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if best is None or mtime > best[0]:
+                        best = (mtime, p)
+        return best[1] if best else None
+
+
+def _send_to_trash(src: Path, batch: TrashBatch | None = None) -> Path | None:
     """Move ``src`` to the system Trash and return its resulting Trash path.
 
     Uses send2trash so the file lands in the OS Trash (Finder Trash on macOS,
     the XDG/FreeDesktop trash on Linux). Returns ``None`` when the file was trashed
     successfully but its precise destination could not be determined, so callers can
-    still report success without a recoverable path.
+    still report success without a recoverable path. Pass a shared :class:`TrashBatch`
+    when trashing many files so the Trash directories are only enumerated once.
     """
-    from send2trash import send2trash
+    return (batch or TrashBatch()).send(src)
 
-    if not src.exists():
-        raise FileNotFoundError(str(src))
-    size = src.stat().st_size
-    name = src.name
-    stem = src.stem
-    dirs = _trash_dirs_for(src)
-    before = _snapshot_trash(dirs)
-    send2trash(str(src))
-    after = _snapshot_trash(dirs)
 
-    # The newly added entry (matched by size to avoid Finder's stray .DS_Store and
-    # concurrent trashes of same-named files) is our file.
-    for d in dirs:
-        for added in after.get(d, set()) - before.get(d, set()):
-            candidate = d / added
-            try:
-                if candidate.stat().st_size == size:
-                    return candidate
-            except OSError:
-                continue
+SYMLINK_REFUSAL = "refusing to act on a symbolic link"
 
-    # Fallback: most recently added matching entry by name, in case the size match
-    # missed it (e.g. send2trash chose a Trash dir we did not enumerate).
-    best: tuple[float, Path] | None = None
-    for d in dirs:
-        try:
-            entries = list(d.iterdir())
-        except OSError:
-            continue
-        for p in entries:
-            if p.name == name or p.name.startswith(f"{stem} "):
-                try:
-                    mtime = p.stat().st_mtime
-                except OSError:
-                    continue
-                if best is None or mtime > best[0]:
-                    best = (mtime, p)
-    return best[1] if best else None
+
+def validate_record_with_stat(
+    record: FileRecord, roots: list[str] | None = None
+) -> tuple[str | None, os.stat_result | None]:
+    """Validate ``record`` from a single ``lstat`` and return that stat alongside.
+
+    One ``lstat`` answers "is it a symlink", "is it a regular file", and every
+    identity comparison, so callers never need to stat the same file again.
+    """
+    path = Path(record.path)
+    try:
+        st = os.lstat(path)
+        if S_ISLNK(st.st_mode):
+            return SYMLINK_REFUSAL, None
+        if not S_ISREG(st.st_mode):
+            return "file no longer exists", None
+        if not _path_in_roots(path, roots):
+            return "file is outside the scanned roots", st
+    except OSError as exc:
+        return str(exc), None
+
+    if int(st.st_size) != int(record.size):
+        return f"file changed since scan (size {record.size} -> {st.st_size})", st
+    if record.device is not None and int(st.st_dev) != int(record.device):
+        return "file changed since scan (device differs)", st
+    if record.inode is not None and int(st.st_ino) != int(record.inode):
+        return "file changed since scan (inode differs)", st
+    if record.mtime_ns is not None:
+        if int(st.st_mtime_ns) != int(record.mtime_ns):
+            return "file changed since scan (modified time differs)", st
+    elif abs(float(st.st_mtime) - float(record.mtime)) >= 0.001:
+        return "file changed since scan (modified time differs)", st
+    return None, st
 
 
 def validate_file_record(record: FileRecord, roots: list[str] | None = None) -> str | None:
     """Side-effect-free validation of a scanned file's identity and root scope."""
-    path = Path(record.path)
-    try:
-        if path.is_symlink():
-            return "refusing to act on a symbolic link"
-        if not path.is_file():
-            return "file no longer exists"
-        if not _path_in_roots(path, roots):
-            return "file is outside the scanned roots"
-        stat = path.stat()
-    except OSError as exc:
-        return str(exc)
+    return validate_record_with_stat(record, roots)[0]
 
-    if int(stat.st_size) != int(record.size):
-        return f"file changed since scan (size {record.size} -> {stat.st_size})"
-    if record.device is not None and int(stat.st_dev) != int(record.device):
-        return "file changed since scan (device differs)"
-    if record.inode is not None and int(stat.st_ino) != int(record.inode):
-        return "file changed since scan (inode differs)"
-    if record.mtime_ns is not None:
-        if int(stat.st_mtime_ns) != int(record.mtime_ns):
-            return "file changed since scan (modified time differs)"
-    elif abs(float(stat.st_mtime) - float(record.mtime)) >= 0.001:
-        return "file changed since scan (modified time differs)"
-    return None
+
+def _is_metadata_drift_error(error: str, stat, record: FileRecord) -> bool:
+    """True when ``error`` only reports mtime/inode/device drift and size matches."""
+    if stat is None:
+        return False
+    lowered = error.lower()
+    has_drift = any(
+        phrase in lowered
+        for phrase in ("modified time", "inode", "device")
+    )
+    if not has_drift:
+        return False
+    return int(stat.st_size) == int(record.size)
+
+
+def _refresh_keeper_stats(keep: FileRecord, st: os.stat_result | None = None) -> None:
+    """Update ``keep`` stat fields from the file's current metadata."""
+    st = st if st is not None else Path(keep.path).stat()
+    keep.size = int(st.st_size)
+    keep.mtime_ns = int(st.st_mtime_ns)
+    keep.mtime = float(st.st_mtime)
+    keep.inode = int(st.st_ino)
+    keep.device = int(st.st_dev)
+
+
+def _revalidate_keeper(
+    keep: FileRecord,
+    group: DuplicateGroup,
+    st: os.stat_result | None = None,
+) -> tuple[bool, str | None]:
+    """Rehash ``keep`` to tolerate mtime/inode/device drift.
+
+    Returns ``(valid, error)``. ``error`` is set when the keeper cannot be
+    hashed (e.g., an evicted iCloud dataless file), so the caller can skip
+    the group rather than abort the whole batch. ``st`` reuses a stat the
+    caller already took.
+    """
+    path = keep.path
+    try:
+        if keep.sha256:
+            if file_sha256(path) == keep.sha256:
+                _refresh_keeper_stats(keep, st)
+                return True, None
+            return False, "retained member content no longer matches its scan hash"
+
+        if keep.phash:
+            current_phash, *_ = compute_image_hashes(path)
+            if current_phash:
+                import imagehash
+
+                distance = imagehash.hex_to_hash(keep.phash) - imagehash.hex_to_hash(current_phash)
+                if distance <= IMG_THRESHOLD:
+                    _refresh_keeper_stats(keep, st)
+                    return True, None
+            return False, "retained member perceptual hash no longer matches"
+
+        if keep.video_fingerprint:
+            current_fp, *_ = compute_video_fingerprint(path)
+            if current_fp:
+                distances = video_fingerprint_distances(keep.video_fingerprint, current_fp)
+                if distances and all(d <= VID_THRESHOLD for d in distances):
+                    _refresh_keeper_stats(keep, st)
+                    return True, None
+            return False, "retained member video fingerprint no longer matches"
+
+        # No hashes available: the keeper exists and size matches, which is
+        # sufficient because the retained copy is never being deleted.
+        _refresh_keeper_stats(keep, st)
+        return True, None
+    except Exception as exc:
+        return False, f"retained member is unavailable: {exc}"
 
 
 def _preflight_action(
@@ -272,8 +499,14 @@ def _preflight_action(
     roots: list[str] | None,
     *,
     check_paths: set[str] | None = None,
+    dest_dir: Path | None = None,
+    device_cache: dict[str, int | None] | None = None,
 ) -> dict[str, str]:
-    """Return path -> error for stale, out-of-scope, or no-longer-exact selections."""
+    """Return path -> error for stale, out-of-scope, or no-longer-exact selections.
+
+    When ``dest_dir`` is given, selections that would have to cross a filesystem
+    boundary to reach it are rejected here, before anything is touched.
+    """
     records = {member.path: member for group in groups for member in group.members}
     errors: dict[str, str] = {}
     paths_to_check = paths if check_paths is None else [p for p in paths if p in check_paths]
@@ -283,6 +516,8 @@ def _preflight_action(
             errors[path] = "selection is not present in the scan result"
             continue
         error = validate_file_record(record, roots)
+        if not error and dest_dir is not None:
+            error = cross_device_error(Path(path), dest_dir, device_cache)
         if error:
             errors[path] = error
 
@@ -306,10 +541,21 @@ def _preflight_action(
             continue
         keep_error = validate_file_record(keep, roots)
         if keep_error:
-            for path in touched:
-                if check_paths is None or path in check_paths:
-                    errors[path] = f"retained member is stale: {keep_error}"
-            continue
+            try:
+                current_stat = Path(keep.path).stat()
+            except OSError:
+                current_stat = None
+            if _is_metadata_drift_error(keep_error, current_stat, keep):
+                valid, rehash_error = _revalidate_keeper(keep, group, current_stat)
+                if valid:
+                    keep_error = None
+                else:
+                    keep_error = rehash_error
+            if keep_error:
+                for path in touched:
+                    if check_paths is None or path in check_paths:
+                        errors[path] = f"retained member is stale: {keep_error}"
+                continue
         if group.kind != GroupKind.EXACT:
             continue
         current_hashes: dict[str, str] = {}
@@ -351,12 +597,20 @@ def apply_actions(
     roots: list[str] | None = None,
     kinds: set[str] | None = None,
     safety_groups: list[DuplicateGroup] | None = None,
+    allow_cross_device: bool = False,
+    workers: int | None = None,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
     dry_run: if True, only report what would happen
     kinds: optional set of group kinds (exact/similar/no_humans) to act on;
         None acts on every group.
+    allow_cross_device: quarantine onto another filesystem by copying, verifying
+        the copy, then unlinking the original. Off by default, in which case
+        cross-device selections fail in preflight before anything is touched.
+    workers: bounded thread pool size for the per-file work (None/0 = auto).
+        Each file is still revalidated immediately before its own operation and
+        results stay in input order.
     """
     action = action.lower().strip()
     if action not in ("trash", "quarantine"):
@@ -380,7 +634,6 @@ def apply_actions(
             selected.discard(keep)
     paths = [path for path in paths if path in selected]
     result = ActionResult(dry_run=dry_run, action=action)
-    preflight_errors = _preflight_action(all_safety_groups, paths, roots)
 
     qdir: Path | None = None
     if action == "quarantine":
@@ -390,96 +643,89 @@ def apply_actions(
         if not dry_run:
             qdir.mkdir(parents=True, exist_ok=True)
 
-    if preflight_errors and not dry_run:
-        for path_str in paths:
-            result.items.append(
-                ActionItem(
-                    path=path_str,
-                    ok=False,
-                    action=action,
-                    error=preflight_errors.get(
-                        path_str, "action cancelled because another selected file failed preflight"
-                    ),
-                )
-            )
-        result.completed_at = datetime.now(timezone.utc).isoformat()
-        _write_action_log(result, log_dir)
-        return result
+    device_cache: dict[str, int | None] = {}
+    guarded_dest = qdir if (qdir is not None and not allow_cross_device) else None
+    preflight_errors = _preflight_action(
+        all_safety_groups,
+        paths,
+        roots,
+        dest_dir=guarded_dest,
+        device_cache=device_cache,
+    )
 
-    for path_str in paths:
+    sizes = {
+        member.path: member.size
+        for group in all_safety_groups
+        for member in group.members
+    }
+
+    # Names are reserved up front so concurrent workers never pick the same
+    # quarantine destination.
+    destinations: dict[str, Path] = {}
+    if qdir is not None:
+        reserved: set[str] = set()
+        for path_str in paths:
+            dest = _unique_dest(qdir, Path(path_str).name, reserved)
+            reserved.add(str(dest))
+            destinations[path_str] = dest
+
+    trash_batch = TrashBatch()
+
+    def _apply_one(path_str: str) -> ActionItem:
         src = Path(path_str)
+        size = sizes.get(path_str)
         if path_str in preflight_errors:
-            result.items.append(
-                ActionItem(
-                    path=path_str,
-                    ok=False,
-                    action=action,
-                    error=preflight_errors[path_str],
-                )
+            return ActionItem(
+                path=path_str,
+                ok=False,
+                action=action,
+                error=preflight_errors[path_str],
+                size=size,
             )
-            continue
-        if action == "trash":
-            if dry_run:
-                result.items.append(
-                    ActionItem(path=path_str, ok=True, action="trash", destination="Trash")
-                )
-                continue
-            try:
-                immediate_errors = _preflight_action(
-                    all_safety_groups, paths, roots, check_paths={path_str}
-                )
-                if path_str in immediate_errors:
-                    raise RuntimeError(immediate_errors[path_str])
-                destination = _send_to_trash(src)
-                result.items.append(
-                    ActionItem(
-                        path=path_str,
-                        ok=True,
-                        action="trash",
-                        destination=str(destination) if destination else "Trash",
-                    )
-                )
-            except Exception as exc:
-                result.items.append(
-                    ActionItem(path=path_str, ok=False, action="trash", error=str(exc))
-                )
-        else:
-            assert qdir is not None
-            dest = _unique_dest(qdir, src.name)
-            if dry_run:
-                result.items.append(
-                    ActionItem(
-                        path=path_str,
-                        ok=True,
-                        action="quarantine",
-                        destination=str(dest),
-                    )
-                )
-                continue
-            try:
-                immediate_errors = _preflight_action(
-                    all_safety_groups, paths, roots, check_paths={path_str}
-                )
-                if path_str in immediate_errors:
-                    raise RuntimeError(immediate_errors[path_str])
-                shutil.move(str(src), str(dest))
-                result.items.append(
-                    ActionItem(
-                        path=path_str,
-                        ok=True,
-                        action="quarantine",
-                        destination=str(dest),
-                    )
-                )
-            except Exception as exc:
-                result.items.append(
-                    ActionItem(
-                        path=path_str,
-                        ok=False,
-                        action="quarantine",
-                        error=str(exc),
-                    )
-                )
+        if dry_run:
+            destination = "Trash" if action == "trash" else str(destinations[path_str])
+            return ActionItem(
+                path=path_str, ok=True, action=action, destination=destination, size=size
+            )
+        # Revalidate immediately before this file's destructive operation.
+        immediate_errors = _preflight_action(
+            all_safety_groups,
+            paths,
+            roots,
+            check_paths={path_str},
+            dest_dir=guarded_dest,
+            device_cache=device_cache,
+        )
+        if path_str in immediate_errors:
+            return ActionItem(
+                path=path_str,
+                ok=False,
+                action=action,
+                error=immediate_errors[path_str],
+                size=size,
+            )
+        try:
+            if action == "trash":
+                trashed = _send_to_trash(src, trash_batch)
+                destination = str(trashed) if trashed else "Trash"
+            else:
+                dest = destinations[path_str]
+                _move_file(src, dest, allow_cross_device=allow_cross_device)
+                destination = str(dest)
+            return ActionItem(
+                path=path_str, ok=True, action=action, destination=destination, size=size
+            )
+        except Exception as exc:
+            return ActionItem(path=path_str, ok=False, action=action, error=str(exc), size=size)
+
+    if dry_run:
+        result.items = [_apply_one(path_str) for path_str in paths]
+    else:
+        result.items = map_parallel(
+            _apply_one,
+            paths,
+            workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
+        )
 
     result.completed_at = datetime.now(timezone.utc).isoformat()
     _write_action_log(result, log_dir)
@@ -491,24 +737,30 @@ def undo_quarantine(
     *,
     dry_run: bool = True,
     log_dir: str | Path | None = None,
+    receipt_dir: str | Path | None = None,
 ) -> ActionResult:
     """Restore a completed quarantine action from its receipt.
+
+    ``action_log`` may be a path to a receipt or a receipt id (see
+    :mod:`dedupe.receipts`); ids are resolved against ``receipt_dir`` (default:
+    the standard log directory).
 
     Trash restoration remains a Finder operation because send2trash does not expose
     the final per-volume Trash destination reliably across platforms.
     """
-    log_path = Path(action_log).expanduser().resolve()
+    log_path = resolve_receipt_path(action_log, receipt_dir)
     data = json.loads(log_path.read_text(encoding="utf-8"))
     if data.get("action") != "quarantine" or data.get("dry_run"):
         raise ValueError("only executed quarantine receipts can be undone")
 
     result = ActionResult(dry_run=dry_run, action="undo:quarantine")
-    planned: list[tuple[Path, Path]] = []
+    planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
         if not item.get("ok") or not item.get("destination"):
             continue
         quarantined = Path(item["destination"])
         original = Path(item["path"])
+        size = item.get("size")
         error = None
         if not quarantined.is_file():
             error = "quarantined file no longer exists"
@@ -522,13 +774,14 @@ def undo_quarantine(
                     action="undo:quarantine",
                     destination=str(original),
                     error=error,
+                    size=size,
                 )
             )
         else:
-            planned.append((quarantined, original))
+            planned.append((quarantined, original, size))
 
     if result.fail_count and not dry_run:
-        for quarantined, original in planned:
+        for quarantined, original, size in planned:
             result.items.append(
                 ActionItem(
                     path=str(quarantined),
@@ -536,20 +789,24 @@ def undo_quarantine(
                     action="undo:quarantine",
                     destination=str(original),
                     error="undo cancelled because another item failed preflight",
+                    size=size,
                 )
             )
     else:
-        for quarantined, original in planned:
+        for quarantined, original, size in planned:
             try:
                 if not dry_run:
                     original.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(quarantined), str(original))
+                    # Restores are always allowed to cross volumes: the quarantine
+                    # directory may legitimately live on another disk.
+                    _move_file(quarantined, original, allow_cross_device=True)
                 result.items.append(
                     ActionItem(
                         path=str(quarantined),
                         ok=True,
                         action="undo:quarantine",
                         destination=str(original),
+                        size=size,
                     )
                 )
             except OSError as exc:
@@ -560,6 +817,7 @@ def undo_quarantine(
                         action="undo:quarantine",
                         destination=str(original),
                         error=str(exc),
+                        size=size,
                     )
                 )
 
@@ -579,17 +837,22 @@ def _group_folder_name(index: int, group: DuplicateGroup) -> str:
     return f"{index:03d}_{group.kind.value}_{group.media_type.value}_n{len(group.members)}_{_safe_name(keep_name, 40)}_{group.id}"
 
 
-def _link_or_copy(src: Path, dest: Path, mode: str) -> None:
+def _link_or_copy(src: Path, dest: Path, mode: str, *, allow_cross_device: bool = False) -> None:
     """
     mode: 'copy' | 'hardlink' | 'symlink' | 'move'
     Falls back to copy if hardlink fails (e.g. cross-volume).
+
+    Symlinked sources are refused, exactly like the destructive actions: copying
+    or moving one would silently act on the link's target instead.
     """
+    if src.is_symlink():
+        raise ValueError(SYMLINK_REFUSAL)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if mode == "copy":
         shutil.copy2(src, dest)
         return
     if mode == "move":
-        shutil.move(str(src), str(dest))
+        _move_file(src, dest, allow_cross_device=allow_cross_device)
         return
     if mode == "symlink":
         os.symlink(src.resolve(), dest)
@@ -652,11 +915,17 @@ def isolate_groups(
     log_dir: str | Path | None = None,
     mark_keep: bool = True,
     roots: list[str] | None = None,
+    allow_cross_device: bool = False,
+    workers: int | None = None,
 ) -> ActionResult:
     """
     Place each duplicate group into its own subfolder under review_dir for human review.
 
     Default mode is 'copy' (non-destructive). Also supports hardlink, symlink, move.
+
+    ``mode='move'`` refuses to cross a filesystem boundary unless
+    ``allow_cross_device`` is set (then it copies, verifies, and unlinks).
+    ``workers`` bounds the thread pool used to place files; results stay ordered.
 
     Layout:
       review_dir/
@@ -698,9 +967,12 @@ def isolate_groups(
         return result
 
     validation_errors: dict[str, str] = {}
+    device_cache: dict[str, int | None] = {}
     for group in filtered:
         for member in group.members:
             error = validate_file_record(member, roots)
+            if not error and mode == "move" and not allow_cross_device:
+                error = cross_device_error(Path(member.path), root, device_cache)
             if error:
                 validation_errors[member.path] = error
     if validation_errors and not dry_run:
@@ -733,6 +1005,9 @@ def isolate_groups(
     if not dry_run:
         root.mkdir(parents=True, exist_ok=True)
 
+    # Plan every destination serially (folder numbering and name reservation must
+    # be deterministic), then place the files with a bounded pool.
+    plans: list[tuple[DuplicateGroup, Path, list[tuple[FileRecord, Path, bool]]]] = []
     for group in filtered:
         counters[group.kind.value] = counters.get(group.kind.value, 0) + 1
         idx = counters[group.kind.value]
@@ -744,17 +1019,63 @@ def isolate_groups(
         if not dry_run:
             group_dir.mkdir(parents=True, exist_ok=True)
 
-        member_rows: list[dict] = []
+        reserved: set[str] = set()
+        planned_members: list[tuple[FileRecord, Path, bool]] = []
         for member in group.members:
             src = Path(member.path)
             is_keep = member.path == group.suggested_keep
             base = src.name
-            if mark_keep and is_keep:
-                dest_name = f"KEEP__{base}"
+            dest_name = f"KEEP__{base}" if (mark_keep and is_keep) else base
+            if dry_run:
+                dest = group_dir / dest_name
             else:
-                dest_name = base
-            dest = _unique_dest(group_dir, dest_name) if not dry_run else group_dir / dest_name
+                dest = _unique_dest(group_dir, dest_name, reserved)
+                reserved.add(str(dest))
+            planned_members.append((member, dest, is_keep))
+        plans.append((group, group_dir, planned_members))
 
+    def _place(task: tuple[DuplicateGroup, FileRecord, Path]) -> ActionItem:
+        group, member, dest = task
+        try:
+            src = Path(member.path)
+            if not src.exists():
+                raise FileNotFoundError(member.path)
+            _link_or_copy(src, dest, mode, allow_cross_device=allow_cross_device)
+            return ActionItem(
+                path=member.path,
+                ok=True,
+                action=f"isolate:{mode}",
+                destination=str(dest),
+                group_id=group.id,
+                size=member.size,
+            )
+        except Exception as exc:
+            return ActionItem(
+                path=member.path,
+                ok=False,
+                action=f"isolate:{mode}",
+                error=str(exc),
+                group_id=group.id,
+                size=member.size,
+            )
+
+    outcomes: list[ActionItem] = []
+    if not dry_run:
+        tasks = [
+            (group, member, dest)
+            for group, _group_dir, planned_members in plans
+            for member, dest, _is_keep in planned_members
+        ]
+        outcomes = map_parallel(
+            _place,
+            tasks,
+            workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
+        )
+    placed = iter(outcomes)
+
+    for group, group_dir, planned_members in plans:
+        member_rows: list[dict] = []
+        for member, dest, is_keep in planned_members:
             if dry_run:
                 error = validation_errors.get(member.path)
                 result.items.append(
@@ -765,6 +1086,7 @@ def isolate_groups(
                         destination=str(dest),
                         group_id=group.id,
                         error=error,
+                        size=member.size,
                     )
                 )
                 member_rows.append(
@@ -777,19 +1099,9 @@ def isolate_groups(
                 )
                 continue
 
-            try:
-                if not src.exists():
-                    raise FileNotFoundError(member.path)
-                _link_or_copy(src, dest, mode)
-                result.items.append(
-                    ActionItem(
-                        path=member.path,
-                        ok=True,
-                        action=f"isolate:{mode}",
-                        destination=str(dest),
-                        group_id=group.id,
-                    )
-                )
+            item = next(placed)
+            result.items.append(item)
+            if item.ok:
                 member_rows.append(
                     {
                         "source": member.path,
@@ -800,16 +1112,6 @@ def isolate_groups(
                         "height": member.height,
                         "mtime": member.mtime,
                     }
-                )
-            except Exception as exc:
-                result.items.append(
-                    ActionItem(
-                        path=member.path,
-                        ok=False,
-                        action=f"isolate:{mode}",
-                        error=str(exc),
-                        group_id=group.id,
-                    )
                 )
 
         group_meta = {
