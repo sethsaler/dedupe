@@ -200,6 +200,16 @@
     return (p || "").split(/[/\\]/).pop() || p;
   }
 
+  function setPreviewAspectRatio(preview, width, height) {
+    const displayWidth = Number(width);
+    const displayHeight = Number(height);
+    if (!preview || !Number.isFinite(displayWidth) || !Number.isFinite(displayHeight)
+      || displayWidth <= 0 || displayHeight <= 0) return;
+    const aspectRatio = displayWidth / displayHeight;
+    preview.style.setProperty("--preview-aspect-ratio", String(aspectRatio));
+    preview.style.setProperty("--preview-max-width", `${58 * aspectRatio}vh`);
+  }
+
   function isDecisionReview(g) {
     return g?.kind === "low_resolution" || g?.kind === "random_review";
   }
@@ -1206,7 +1216,14 @@
         const reviewed = reviewedPaths.has(m.path);
         const isKeep = (m.path === g.suggested_keep || (decisionReview && reviewed)) && !isSel;
         const deleted = deletedPaths.has(m.path);
-        const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
+        const mediaWidth = Number(m.width);
+        const mediaHeight = Number(m.height);
+        const hasDimensions = Number.isFinite(mediaWidth) && Number.isFinite(mediaHeight)
+          && mediaWidth > 0 && mediaHeight > 0;
+        const dims = hasDimensions ? `${mediaWidth}×${mediaHeight}` : "—";
+        const previewDimensions = hasDimensions
+          ? ` data-preview-width="${mediaWidth}" data-preview-height="${mediaHeight}"`
+          : "";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
         const memberIndex = decisionReview ? state.memberFocus : i;
         const focused = decisionReview || i === state.memberFocus ? "focused" : "";
@@ -1238,8 +1255,8 @@
           ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
           : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />`;
         const preview = deleted
-          ? `<div class="thumb-wrap deleted-preview"><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
-          : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}" type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
+          ? `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
+          : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
               ${mediaPreview}
               ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
@@ -1280,17 +1297,33 @@
       })
       .join("");
 
+    box.querySelectorAll(".thumb-wrap").forEach((preview) => {
+      setPreviewAspectRatio(
+        preview,
+        preview.dataset.previewWidth,
+        preview.dataset.previewHeight,
+      );
+    });
+
     box.querySelectorAll(".thumb-image").forEach((image) => {
+      const syncAspectRatio = () => {
+        setPreviewAspectRatio(image.closest(".thumb-wrap"), image.naturalWidth, image.naturalHeight);
+      };
+      image.addEventListener("load", syncAspectRatio);
       image.addEventListener("error", () => {
         const fallback = document.createElement("div");
         fallback.className = "thumb-fallback";
         fallback.textContent = "No preview";
         image.replaceWith(fallback);
       });
+      if (image.complete) syncAspectRatio();
     });
 
     box.querySelectorAll(".hover-video").forEach((video) => {
       const wrap = video.closest(".thumb-wrap");
+      video.addEventListener("loadedmetadata", () => {
+        setPreviewAspectRatio(wrap, video.videoWidth, video.videoHeight);
+      });
       wrap.addEventListener("pointerenter", () => {
         video.muted = true;
         if (!video.src) video.src = video.dataset.src;

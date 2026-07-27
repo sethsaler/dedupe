@@ -1172,8 +1172,9 @@ kbd {
 }
 
 .decision-card .thumb-wrap {
-  aspect-ratio: 16 / 10;
+  width: min(100%, var(--preview-max-width));
   max-height: 58vh;
+  align-self: center;
 }
 
 .decision-card .card-body { padding: 16px 18px 18px; }
@@ -1229,7 +1230,9 @@ kbd {
   border: 0;
   color: inherit;
   font: inherit;
-  aspect-ratio: 1;
+  --preview-aspect-ratio: 1;
+  --preview-max-width: 58vh;
+  aspect-ratio: var(--preview-aspect-ratio);
   background:
     linear-gradient(45deg, #0c0e13 25%, transparent 25%),
     linear-gradient(-45deg, #0c0e13 25%, transparent 25%),

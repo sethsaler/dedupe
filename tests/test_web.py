@@ -435,10 +435,16 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     script = app.test_client().get("/static/app.js").get_data(as_text=True)
     assert 'class="hover-video"' in script
     assert 'class="thumb-image ${m.media_type === "gif" ? "hover-gif"' in script
+    assert 'data-preview-width="${mediaWidth}"' in script
+    assert 'setPreviewAspectRatio(image.closest(".thumb-wrap")' in script
     assert 'video.muted = true' in script
     assert 'method: "DELETE"' in script
     assert 'dry_run: true' in script
     assert 'await reviewCandidate(current, member.path, e.key === "ArrowLeft")' in script
+
+    stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
+    assert "aspect-ratio: var(--preview-aspect-ratio);" in stylesheet
+    assert "aspect-ratio: 16 / 10;" not in stylesheet
 
 
 def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
@@ -1157,6 +1163,20 @@ def test_thumbnail_is_generated_once_and_served_from_disk(tmp_path: Path, monkey
 
     cached = list((tmp_path / "thumbs").rglob("*.jpg"))
     assert len(cached) == 1
+
+
+def test_image_thumbnail_uses_display_orientation(tmp_path: Path) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    source = tmp_path / "portrait.jpg"
+    exif = Image.Exif()
+    exif[274] = 6  # Stored landscape, displayed 90 degrees clockwise.
+    Image.new("RGB", (80, 40), "navy").save(source, exif=exif)
+
+    with Image.open(BytesIO(web_media.image_thumbnail_bytes(source))) as preview:
+        assert preview.size == (40, 80)
 
 
 def test_thumbnail_cache_key_changes_when_source_file_changes(

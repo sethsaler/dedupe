@@ -18,7 +18,7 @@ VIDEO_EXTENSIONS = {
     ".wmv", ".flv", ".3gp",
 }
 
-THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v1"
+THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v2"
 DEFAULT_THUMBNAIL_BUDGET_BYTES = 512 * 1024 * 1024
 PRUNE_MIN_INTERVAL_SECONDS = 120.0
 PRUNE_EVERY_N_WRITES = 32
@@ -37,7 +37,7 @@ def media_mimetype(path: Path) -> str:
 
 
 def image_thumbnail_bytes(path: Path, *, full: bool = False) -> bytes:
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         from pillow_heif import register_heif_opener
@@ -49,6 +49,7 @@ def image_thumbnail_bytes(path: Path, *, full: bool = False) -> bytes:
     max_edge = 1600 if full else 320
     quality = 88 if full else 80
     with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
         img.thumbnail((max_edge, max_edge))
         output = BytesIO()

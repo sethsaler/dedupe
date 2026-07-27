@@ -75,7 +75,12 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     assert page.locator("#members .card.keep").count() == 1
     assert page.locator("#members .sel-cb:checked").count() == 1
 
-    page.locator("#members .thumb-wrap").first.click()
+    preview = page.locator("#members .thumb-wrap").first
+    preview_box = preview.bounding_box()
+    assert preview_box is not None
+    assert preview_box["width"] / preview_box["height"] == pytest.approx(48 / 32, rel=0.02)
+
+    preview.click()
     page.locator("#lightbox").wait_for(state="visible")
     page.locator("#lbClose").click()
     page.locator("#lightbox").wait_for(state="hidden")
