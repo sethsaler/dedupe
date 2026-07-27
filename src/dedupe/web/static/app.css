@@ -88,6 +88,26 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .result-control-row { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; }
 .inline-check { display: flex; align-items: center; gap: 7px; }
 .non-human-banner { margin-bottom: 12px; padding: 12px; display: flex; flex-direction: column; gap: 3px; border: 1px solid rgba(224,160,58,.45); border-radius: var(--radius-sm); background: rgba(224,160,58,.1); color: #f1cc8e; }
+.candidate-review-banner {
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border: 1px solid rgba(91, 157, 255, 0.38);
+  border-radius: 12px;
+  background:
+    linear-gradient(110deg, rgba(91, 157, 255, 0.16), rgba(62, 207, 142, 0.07)),
+    var(--bg-elev);
+}
+.candidate-review-banner > div:first-child { display: grid; gap: 4px; }
+.candidate-review-banner strong { color: var(--text); }
+.candidate-review-banner span { color: var(--muted); font-size: .8rem; line-height: 1.45; }
+.candidate-key-guide { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.candidate-key-guide > span { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: rgba(8, 11, 16, .62); font-weight: 650; }
+.candidate-key-guide .delete-key { color: #ff9b9b; }
+.candidate-key-guide .keep-key { color: #78dcac; }
 .review-sheet p { line-height: 1.45; }
 
 .skip-link {
@@ -950,6 +970,8 @@ kbd {
 .badge.exact { background: #1e3354; color: #8eb6ff; }
 .badge.similar { background: #1e3a2c; color: #7dcea0; }
 .badge.no_humans { background: #45351d; color: #f0c674; }
+.badge.low_resolution { background: #45282b; color: #ff9b9b; }
+.badge.random_review { background: #26364a; color: #9ec7ff; }
 
 .group-empty {
   padding: 28px 16px;
@@ -1105,6 +1127,11 @@ kbd {
   justify-content: start;
 }
 
+.members:has(.decision-card) {
+  grid-template-columns: minmax(0, 680px);
+  justify-content: center;
+}
+
 /* —— Cards —— */
 .card {
   background: var(--panel-2);
@@ -1138,6 +1165,62 @@ kbd {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+.decision-card {
+  width: 100%;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, .28);
+}
+
+.decision-card .thumb-wrap {
+  aspect-ratio: 16 / 10;
+  max-height: 58vh;
+}
+
+.decision-card .card-body { padding: 16px 18px 18px; }
+.decision-card .name { font-size: .96rem; }
+
+.candidate-actions {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.candidate-decision {
+  min-height: 60px;
+  padding: 10px 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  cursor: pointer;
+  transition: transform .14s var(--ease-out), border-color .14s, background .14s;
+}
+
+.candidate-decision:hover { transform: translateY(-1px); }
+.candidate-decision span { display: grid; gap: 2px; text-align: left; }
+.candidate-decision strong { font-size: .86rem; }
+.candidate-decision small { color: var(--muted); font-size: .68rem; }
+.candidate-decision kbd,
+.candidate-key-guide kbd {
+  min-width: 28px;
+  padding: 4px 7px;
+  border: 1px solid rgba(255,255,255,.16);
+  border-bottom-color: rgba(255,255,255,.3);
+  border-radius: 6px;
+  background: rgba(0,0,0,.24);
+  color: inherit;
+  font-family: var(--mono);
+  text-align: center;
+}
+.candidate-delete { background: rgba(239, 90, 90, .09); }
+.candidate-delete:hover { border-color: rgba(239, 90, 90, .7); background: rgba(239, 90, 90, .16); }
+.candidate-keep { background: rgba(62, 207, 142, .08); }
+.candidate-keep:hover { border-color: rgba(62, 207, 142, .65); background: rgba(62, 207, 142, .15); }
+.candidate-keep span { text-align: right; }
 
 .thumb-wrap {
   position: relative;
@@ -1731,6 +1814,10 @@ kbd {
   .detail-tools select,
   .detail-tools .btn { width: 100%; }
   .members { grid-template-columns: minmax(0, 1fr); }
+  .candidate-review-banner { align-items: flex-start; flex-direction: column; }
+  .candidate-key-guide { width: 100%; }
+  .candidate-key-guide > span { flex: 1; text-align: center; }
+  .candidate-actions { grid-template-columns: 1fr; }
   .action-controls {
     flex: none;
     width: 100%;

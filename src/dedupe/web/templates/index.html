@@ -72,6 +72,11 @@
             <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
           </div>
           <div class="opt-group">
+            <span class="opt-label">Review</span>
+            <label class="chip-check"><input type="checkbox" id="optLowResolution" checked /><span>Low resolution (&lt;1 MP)</span></label>
+            <label class="chip-check"><input type="checkbox" id="optRandomReview" checked /><span>Random set of 50</span></label>
+          </div>
+          <div class="opt-group">
             <span class="opt-label">Types</span>
             <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
             <label class="chip-check"><input type="checkbox" id="optGifs" checked /><span>GIFs</span></label>
@@ -158,7 +163,7 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>[</kbd>/<kbd>]</kbd> needs attention · <kbd>Space</kbd> toggle remove · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · review cards with <kbd>←</kbd> Delete / <kbd>→</kbd> Keep · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
@@ -169,6 +174,8 @@
           <button class="tab active" data-kind="all" type="button">All <span class="tab-count" id="countAll">0</span></button>
           <button class="tab" data-kind="exact" type="button">Exact <span class="tab-count" id="countExact">0</span></button>
           <button class="tab" data-kind="similar" type="button">Similar <span class="tab-count" id="countSimilar">0</span></button>
+          <button class="tab" data-kind="low_resolution" type="button">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
+          <button class="tab" data-kind="random_review" type="button">Random 50 <span class="tab-count" id="countRandomReview">0</span></button>
           <button class="tab" data-kind="no_humans" type="button">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
         </div>
         <div class="result-controls" aria-label="Find and organize results">
@@ -266,6 +273,16 @@
             <strong>Independent Non-Human candidates</strong>
             <span>These are not duplicates. Review every file independently; person detection can be wrong.</span>
           </div>
+          <div class="candidate-review-banner" id="candidateReviewBanner" hidden role="note">
+            <div>
+              <strong id="candidateReviewTitle">Quick review</strong>
+              <span id="candidateReviewDescription"></span>
+            </div>
+            <div class="candidate-key-guide" aria-label="Review shortcuts">
+              <span class="delete-key"><kbd>←</kbd> Delete</span>
+              <span class="keep-key">Keep <kbd>→</kbd></span>
+            </div>
+          </div>
           <div class="selection-toolbar" aria-label="Group selection controls">
             <div class="group-selection-summary">
               <span>Group selection</span>
@@ -293,13 +310,13 @@
               <button class="btn ghost" id="btnSmartAll" type="button">Apply to every group</button>
             </div>
           </div>
-          <nav class="member-pagination" id="memberPagination" aria-label="Non-human result pages" hidden>
+          <nav class="member-pagination" id="memberPagination" aria-label="Review result pages" hidden>
             <button class="btn ghost member-prev" type="button">Previous</button>
             <span class="member-page-summary">1–50 of 50</span>
             <button class="btn ghost member-next" type="button">Next</button>
           </nav>
           <div class="members" id="members"></div>
-          <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="Non-human result pages (bottom)" hidden>
+          <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="Review result pages (bottom)" hidden>
             <button class="btn ghost member-prev" type="button">Previous</button>
             <span class="member-page-summary">1–50 of 50</span>
             <button class="btn ghost member-next" type="button">Next</button>
@@ -315,11 +332,14 @@
         <label class="scope-field">
           Act on
           <select id="actionScope">
+            <option value="all">All selected categories</option>
             <option value="duplicates">Exact + Similar</option>
+            <option value="review_suggestions">Low-res + Random review</option>
             <option value="exact">Exact</option>
             <option value="similar">Similar</option>
+            <option value="low_resolution">Low resolution</option>
+            <option value="random_review">Random review</option>
             <option value="no_humans">Non-Human</option>
-            <option value="all">All categories</option>
           </select>
         </label>
       </div>
@@ -402,7 +422,7 @@
         <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
         <div><dt><kbd>a</kbd></dt><dd>Open the action review sheet (preview trash)</dd></div>
-        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Focus previous / next card · lightbox prev / next</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>

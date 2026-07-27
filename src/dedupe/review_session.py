@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .actions import validate_file_record
-from .models import GroupKind, ScanResult
+from .models import ReviewPolicy, ScanResult
 
 REVIEW_SESSION_VERSION = 1
 MAX_REVIEW_SESSION_BYTES = 64 * 1024 * 1024
@@ -151,7 +151,7 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
         group.reviewed_paths = [p for p in group.reviewed_paths if p in member_paths]
         if group.suggested_keep not in member_paths:
             group.suggested_keep = group.members[0].path if group.members else None
-        minimum = 1 if group.kind == GroupKind.NO_HUMANS else 2
+        minimum = 1 if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES else 2
         if len(group.members) >= minimum:
             groups.append(group)
     result.groups = groups

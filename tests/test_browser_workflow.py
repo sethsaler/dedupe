@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
+from playwright.sync_api import expect
 from werkzeug.serving import make_server
 
 from dedupe.web.app import create_app
@@ -83,8 +84,9 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.locator("#resultSearch").fill("does-not-exist")
     assert page.locator(".group-item").count() == 0
     page.locator("#resultSearch").fill("duplicate.png")
-    assert page.locator(".group-item").count() == 1
+    assert page.locator(".group-item").count() == 3
     page.get_by_role("button", name="Exact 1").click()
+    expect(page.locator(".group-item")).to_have_count(1)
     assert page.locator(".group-item").count() == 1
 
     # Dry-run traverses the action endpoint but cannot move either fixture to Trash.
@@ -96,6 +98,47 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     ]
     assert page_errors == []
     assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_low_resolution_review_uses_left_delete_and_right_keep(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    page.locator('.tab[data-kind="low_resolution"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    page.locator(".group-item").click()
+    page.locator("#members .decision-card").wait_for(state="visible")
+    assert page.locator("#members .decision-card").count() == 1
+
+    page.keyboard.press("ArrowLeft")
+    expect(page.locator("#detailMeta")).to_contain_text("1 reviewed")
+    assert "1 marked Delete" in page.locator("#detailMeta").inner_text()
+
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#detailMeta")).to_contain_text("2 reviewed")
+    assert "1 marked Delete" in page.locator("#detailMeta").inner_text()
+    assert "0 remaining" in page.locator("#detailMeta").inner_text()
+
+    # Revisit and correct the first decision without clearing the whole review.
+    page.locator("#memberPagination .member-prev").click()
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#detailMeta")).to_contain_text("0 marked Delete")
+    assert "2 reviewed" in page.locator("#detailMeta").inner_text()
+
+    # Review shortcuts are inert while the final confirmation sheet is open.
+    page.keyboard.press("ArrowLeft")
+    expect(page.locator("#detailMeta")).to_contain_text("1 marked Delete")
+    before_modal = page.locator("#detailMeta").inner_text()
+    page.locator("#btnTrash").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    page.keyboard.press("ArrowLeft")
+    assert page.locator("#detailMeta").inner_text() == before_modal
+    page.locator("#modalCancel").click()
 
 
 @pytest.mark.e2e
@@ -117,9 +160,12 @@ def test_bulk_selection_and_advanced_filters(
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     assert page.locator(".group-item").count() == 0
     page.locator("#filterPathPattern").fill("*keeper*")
-    assert page.locator(".group-item").count() == 1
+    assert page.locator(".group-item").count() == 3
     page.locator("#btnClearFilters").click()
-    assert page.locator(".group-item").count() == 1
+    assert page.locator(".group-item").count() == 3
+
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
 
     # Bulk operations always leave one member of a duplicate group behind.
     page.locator("#bulkPanel summary").click()
@@ -129,9 +175,7 @@ def test_bulk_selection_and_advanced_filters(
     assert page.locator("#members .sel-cb:checked").count() == 0
     page.locator("#btnBulkAll").click()
     page.locator("#toast").filter(has_text="Select all").wait_for()
-    page.wait_for_function(
-        "document.querySelectorAll('#members .sel-cb:checked').length === 1"
-    )
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
     assert page.locator("#members .card.keep").count() == 1
 
     # The review sheet states how long its server-issued preview stays valid.

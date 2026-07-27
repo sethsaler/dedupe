@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from pathlib import Path
 
 from .human_policy import is_current_no_person_decision
-from .models import DuplicateGroup, FileRecord, GroupKind, MediaType, SmartRule
+from .models import (
+    DuplicateGroup,
+    FileRecord,
+    GroupKind,
+    MediaType,
+    ReviewPolicy,
+    SmartRule,
+)
+
+
+LOW_RESOLUTION_MAX_PIXELS = 1_000_000
+DEFAULT_RANDOM_REVIEW_COUNT = 50
 
 
 def rank_keep_candidate(rec: FileRecord) -> tuple:
@@ -189,6 +201,68 @@ def build_no_human_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
     ]
 
 
+def build_low_resolution_groups(
+    members: list[FileRecord],
+    *,
+    max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+) -> list[DuplicateGroup]:
+    """Build one review collection for media below the configured pixel count."""
+    matching = sorted(
+        (
+            member
+            for member in members
+            if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+            and 0 < member.pixels < max_pixels
+        ),
+        key=lambda member: (member.pixels, member.path),
+    )
+    return _build_independent_group(GroupKind.LOW_RESOLUTION, matching)
+
+
+def build_random_review_groups(
+    members: list[FileRecord],
+    *,
+    count: int = DEFAULT_RANDOM_REVIEW_COUNT,
+    rng: random.Random | None = None,
+) -> list[DuplicateGroup]:
+    """Build one freshly shuffled review collection of up to ``count`` media files."""
+    if count <= 0:
+        return []
+    eligible = [
+        member
+        for member in members
+        if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+    ]
+    eligible = list({member.path: member for member in eligible}.values())
+    if not eligible:
+        return []
+    sampler = rng or random.SystemRandom()
+    matching = sampler.sample(eligible, k=min(count, len(eligible)))
+    return _build_independent_group(GroupKind.RANDOM_REVIEW, matching)
+
+
+def _build_independent_group(
+    kind: GroupKind,
+    members: list[FileRecord],
+) -> list[DuplicateGroup]:
+    members = list({member.path: member for member in members}.values())
+    if not members:
+        return []
+    media_types = {member.media_type for member in members}
+    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
+    return [
+        DuplicateGroup(
+            id=make_group_id(kind, members),
+            kind=kind,
+            media_type=media_type,
+            members=members,
+            selected_for_removal=[],
+            reviewed_paths=[],
+            suggested_keep=None,
+        )
+    ]
+
+
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     """Mutate selected_for_removal. Always keeps at least one file."""
     members = group.members
@@ -200,7 +274,7 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
         group.selected_for_removal = []
         return
 
-    if group.kind == GroupKind.NO_HUMANS:
+    if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
         group.suggested_keep = None
         if rule == SmartRule.SELECT_CANDIDATES:
             reviewed = set(group.reviewed_paths)

@@ -333,6 +333,7 @@ class HashCache:
                 or rec.phash
                 or rec.video_fingerprint
                 or rec.partial_hash
+                or (rec.width and rec.height)
                 or has_person_decision
             ):
                 rows.append(_upsert_row(rec))

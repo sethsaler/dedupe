@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from dedupe.cache import HashCache
-from dedupe.grouping import build_groups, build_no_human_groups
+from dedupe.grouping import (
+    build_groups,
+    build_low_resolution_groups,
+    build_no_human_groups,
+    build_random_review_groups,
+)
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import (
     FileRecord,
@@ -417,6 +422,13 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="similarityPreset"' in html
     assert 'id="btnDiscardSession"' in html
     assert 'id="nonHumanBanner"' in html
+    assert 'id="candidateReviewBanner"' in html
+    assert 'id="optLowResolution"' in html
+    assert 'id="optRandomReview"' in html
+    assert 'data-kind="low_resolution"' in html
+    assert 'data-kind="random_review"' in html
+    assert "←</kbd> Delete" in html
+    assert "Keep <kbd>→" in html
     assert 'id="lbOpacity"' in html
     assert 'id="lbFlicker"' in html
 
@@ -426,6 +438,119 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'video.muted = true' in script
     assert 'method: "DELETE"' in script
     assert 'dry_run: true' in script
+    assert 'await reviewCandidate(current, member.path, e.key === "ArrowLeft")' in script
+
+
+def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    duplicate = result.groups[0]
+    for record in result.files:
+        record.width = 320
+        record.height = 240
+    low_resolution = build_low_resolution_groups(result.files)[0]
+    random_review = build_random_review_groups(result.files, count=2)[0]
+    result.groups = [duplicate, low_resolution, random_review]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    path = duplicate.selected_for_removal[0]
+
+    decision = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "selected": [path],
+            "reviewed": [path],
+            "decision_path": path,
+            "decision_remove": True,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+
+    assert decision.status_code == 200
+    assert decision.get_json()["selected_for_removal"] == [path]
+    assert decision.get_json()["reviewed_paths"] == [path]
+    assert path in random_review.selected_for_removal
+    assert path in random_review.reviewed_paths
+
+    keep = client.post(
+        "/api/selection",
+        json={
+            "group_id": random_review.id,
+            "decision_path": path,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert keep.status_code == 200
+    assert path not in low_resolution.selected_for_removal
+    assert path not in random_review.selected_for_removal
+    assert path not in duplicate.selected_for_removal
+
+    delete_again = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "decision_path": path,
+            "decision_remove": True,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert delete_again.status_code == 200
+    assert path in low_resolution.selected_for_removal
+    assert path in random_review.selected_for_removal
+
+    preview = client.post(
+        "/api/action",
+        json={
+            "action": "trash",
+            "dry_run": True,
+            "kinds": "review_suggestions",
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    assert preview.get_json()["success_count"] == 1
+    assert preview.get_json()["selection_counts"]["low_resolution"] == 1
+
+
+def test_independent_review_rejects_invalid_explicit_decisions(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    random_review = build_random_review_groups(result.files, count=2)[0]
+    result.groups = [random_review]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    unknown_path = client.post(
+        "/api/selection",
+        json={
+            "group_id": random_review.id,
+            "decision_path": str(tmp_path / "unknown.jpg"),
+            "decision_remove": True,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert unknown_path.status_code == 400
+
+    invalid_decision = client.post(
+        "/api/selection",
+        json={
+            "group_id": random_review.id,
+            "decision_path": random_review.members[0].path,
+            "decision_remove": "delete",
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert invalid_decision.status_code == 400
 
 
 def test_media_endpoint_streams_only_scanned_files_with_range_support(tmp_path: Path) -> None:

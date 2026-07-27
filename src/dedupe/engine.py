@@ -10,7 +10,14 @@ import time
 
 from .cache import HashCache
 from .exact import find_exact_groups
-from .grouping import build_no_human_groups, build_one_group
+from .grouping import (
+    DEFAULT_RANDOM_REVIEW_COUNT,
+    LOW_RESOLUTION_MAX_PIXELS,
+    build_low_resolution_groups,
+    build_no_human_groups,
+    build_one_group,
+    build_random_review_groups,
+)
 from .human_detection import (
     DEFAULT_BACKEND as DEFAULT_HUMAN_BACKEND,
     DEFAULT_PHOTON_MODEL,
@@ -28,13 +35,61 @@ from .models import (
 from .parallel import resolve_workers
 from .scanner import inventory, is_in_photos_library
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
-from .similar_image import find_similar_image_groups
+from .similar_image import find_similar_image_groups, probe_image_dimensions
 from .similar_video import DEFAULT_THRESHOLD as VID_THRESHOLD
-from .similar_video import ffmpeg_available, find_similar_video_groups
+from .similar_video import ffmpeg_available, find_similar_video_groups, probe_video
 
 ProgressCb = Callable[[ScanProgress], None]
 GroupCb = Callable[[DuplicateGroup], None]
 StreamProgressCb = Callable[[ScanProgress], None]
+
+
+def _populate_missing_dimensions(
+    records: list,
+    *,
+    workers: int,
+    cancelled: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[str]:
+    """Populate dimensions needed by low-resolution review without full hashing."""
+    missing = [
+        record
+        for record in records
+        if record.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+        and not (record.width and record.height)
+    ]
+    if not missing:
+        return []
+
+    def probe(record):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        try:
+            if record.media_type == MediaType.VIDEO:
+                duration, width, height = probe_video(record.path)
+                if duration is not None:
+                    record.duration = duration
+            else:
+                width, height = probe_image_dimensions(record.path)
+            if not (width and height):
+                return f"resolution probe failed: {record.path}"
+            record.width = width
+            record.height = height
+            return None
+        except Exception as exc:  # noqa: BLE001 - report per-file media failures
+            return f"resolution probe failed for {record.path}: {exc}"
+
+    errors: list[str] = []
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(workers, len(missing))),
+        thread_name_prefix="media-dimensions",
+    ) as pool:
+        for done, error in enumerate(pool.map(probe, missing), start=1):
+            if error:
+                errors.append(error)
+            if progress:
+                progress(done, len(missing))
+    return errors
 
 
 def run_scan(
@@ -43,6 +98,9 @@ def run_scan(
     exact: bool = True,
     similar: bool = True,
     find_no_humans: bool = False,
+    find_low_resolution: bool = True,
+    low_resolution_max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+    random_review_count: int = DEFAULT_RANDOM_REVIEW_COUNT,
     human_backend: str = DEFAULT_HUMAN_BACKEND,
     photon_model: str = DEFAULT_PHOTON_MODEL,
     include_images: bool = True,
@@ -58,6 +116,7 @@ def run_scan(
     cancelled: Callable[[], bool] | None = None,
     progress: ProgressCb | None = None,
     on_group: GroupCb | None = None,
+    _build_review_groups: bool = True,
 ) -> ScanResult:
     """Run a full scan.
 
@@ -80,6 +139,7 @@ def run_scan(
         "similar_image": [],
         "similar_video": [],
         "human_detection": [],
+        "low_resolution": [],
     }
     cache_hits = 0
 
@@ -381,6 +441,55 @@ def run_scan(
                 if record.error and record.error.startswith("video fingerprint failed")
             ]
 
+    if find_low_resolution and records:
+        resolution_started = time.monotonic()
+        check_cancelled()
+        eligible = [
+            record
+            for record in records
+            if record.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+        ]
+        emit(
+            "low-resolution",
+            0,
+            len(eligible),
+            "Reading media dimensions for low-resolution suggestions…",
+        )
+
+        def resolution_progress(processed: int, total: int) -> None:
+            emit(
+                "low-resolution",
+                processed,
+                total,
+                f"Reading dimensions {processed}/{total}",
+            )
+
+        stage_errors["low_resolution"] = _populate_missing_dimensions(
+            records,
+            workers=n_workers,
+            cancelled=cancelled,
+            progress=resolution_progress,
+        )
+        stage_durations["low_resolution"] = time.monotonic() - resolution_started
+
+    if _build_review_groups:
+        review_groups: list[DuplicateGroup] = []
+        if find_low_resolution:
+            review_groups.extend(
+                build_low_resolution_groups(
+                    records,
+                    max_pixels=max(1, int(low_resolution_max_pixels)),
+                )
+            )
+        review_groups.extend(
+            build_random_review_groups(records, count=max(0, int(random_review_count)))
+        )
+        for group in review_groups:
+            groups.append(group)
+            if on_group:
+                on_group(group)
+        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+
     if find_no_humans and records:
         human_started = time.monotonic()
         check_cancelled()
@@ -456,6 +565,14 @@ def run_scan(
         else 0
     )
     human_failures = stage_errors["human_detection"]
+    resolution_records = [
+        record
+        for record in records
+        if record.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+    ]
+    resolution_failures = [
+        record for record in resolution_records if not (record.width and record.height)
+    ]
 
     stages = {
         "inventory": StageDiagnostics(
@@ -518,6 +635,23 @@ def run_scan(
                 else []
             ),
         ),
+        "low_resolution": StageDiagnostics(
+            attempted=len(resolution_records) if find_low_resolution else 0,
+            succeeded=(len(resolution_records) - len(resolution_failures))
+            if find_low_resolution
+            else 0,
+            failed=len(resolution_failures) if find_low_resolution else 0,
+            skipped=0 if find_low_resolution else len(resolution_records),
+            duration_seconds=stage_durations.get("low_resolution", 0.0),
+            warnings=(
+                [
+                    f"{len(resolution_failures)} file(s) could not be checked for "
+                    "low resolution"
+                ]
+                if find_low_resolution and resolution_failures
+                else []
+            ),
+        ),
     }
     if cache_errors:
         # A cache write failure means the next scan silently redoes the work;
@@ -554,7 +688,8 @@ def run_scan(
     prog.groups_found = len(groups)
     prog.message = (
         f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups, "
-        f"{result.no_human_files} non-human "
+        f"{result.low_resolution_files} low-resolution, "
+        f"{result.random_review_files} random review, {result.no_human_files} non-human "
         f"({len(records)} files)"
     )
     prog.elapsed_seconds = total_duration
@@ -590,6 +725,9 @@ def run_scans_parallel(
     exact: bool = True,
     similar: bool = True,
     find_no_humans: bool = False,
+    find_low_resolution: bool = True,
+    low_resolution_max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+    random_review_count: int = DEFAULT_RANDOM_REVIEW_COUNT,
     human_backend: str = DEFAULT_HUMAN_BACKEND,
     photon_model: str = DEFAULT_PHOTON_MODEL,
     include_images: bool = True,
@@ -691,6 +829,9 @@ def run_scans_parallel(
             exact=exact,
             similar=similar,
             find_no_humans=find_no_humans,
+            find_low_resolution=find_low_resolution,
+            low_resolution_max_pixels=low_resolution_max_pixels,
+            random_review_count=random_review_count,
             human_backend=human_backend,
             photon_model=photon_model,
             include_images=include_images,
@@ -706,6 +847,7 @@ def run_scans_parallel(
             cancelled=cancelled,
             progress=stream_progress_cb,
             on_group=stream_group_cb,
+            _build_review_groups=False,
         )
 
     interrupted = False
@@ -733,6 +875,21 @@ def run_scans_parallel(
                     all_groups.extend(sub.groups)
                     stream_errors.extend(sub.errors)
 
+    review_groups: list[DuplicateGroup] = []
+    if find_low_resolution:
+        review_groups.extend(
+            build_low_resolution_groups(
+                all_files,
+                max_pixels=max(1, int(low_resolution_max_pixels)),
+            )
+        )
+    review_groups.extend(
+        build_random_review_groups(all_files, count=max(0, int(random_review_count)))
+    )
+    all_groups.extend(review_groups)
+    if on_group:
+        for group in review_groups:
+            on_group(group)
     all_groups.sort(key=lambda g: g.reclaimable_bytes, reverse=True)
     result = ScanResult(
         roots=[str(root) for root in resolved_roots],
@@ -755,6 +912,8 @@ def run_scans_parallel(
                 else (
                     f"Done — {result.exact_groups} exact, "
                     f"{result.similar_groups} similar groups, "
+                    f"{result.low_resolution_files} low-resolution, "
+                    f"{result.random_review_files} random review, "
                     f"{result.no_human_files} non-human "
                     f"across {n_streams} folder{'s' if n_streams != 1 else ''}"
                 )

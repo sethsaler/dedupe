@@ -55,6 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Surface non-human media: images/videos where OpenCV detects no person",
     )
     scan.add_argument(
+        "--no-low-resolution",
+        action="store_true",
+        help="Do not surface media below 1 megapixel for review",
+    )
+    scan.add_argument(
+        "--random-review-count",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Random media files to review on each scan (default: 50; 0 disables)",
+    )
+    scan.add_argument(
         "--human-backend",
         choices=HUMAN_BACKENDS,
         default="opencv",
@@ -141,7 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument(
         "--isolate-kinds",
-        choices=["all", "exact", "similar", "no_humans"],
+        choices=[
+            "all",
+            "exact",
+            "similar",
+            "no_humans",
+            "low_resolution",
+            "random_review",
+        ],
         default="all",
         help="Which group kinds to isolate (default: all)",
     )
@@ -182,7 +201,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     isolate.add_argument(
         "--isolate-kinds",
-        choices=["all", "exact", "similar", "no_humans"],
+        choices=[
+            "all",
+            "exact",
+            "similar",
+            "no_humans",
+            "low_resolution",
+            "random_review",
+        ],
         default="all",
     )
     isolate.add_argument(
@@ -322,6 +348,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         exact=not args.no_exact,
         similar=not args.no_similar,
         find_no_humans=args.find_no_humans,
+        find_low_resolution=not args.no_low_resolution,
+        random_review_count=max(0, args.random_review_count),
         human_backend=args.human_backend,
         photon_model=args.photon_model,
         include_images=not args.no_images,

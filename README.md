@@ -8,6 +8,8 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
+- **Low-resolution review** — surfaces images, GIFs, and videos below 1 megapixel as independent deletion suggestions
+- **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
@@ -89,7 +91,7 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
-3. Search or sort groups, Smart Select keep/remove, and compare Similar images with the lightbox overlay
+3. Review the **Low-res** and **Random 50** tabs one item at a time with `←` Delete and `→` Keep, or compare duplicate groups and Similar images with the lightbox overlay
 4. Narrow the list with **Advanced filters** (size range in MB, minimum pixel width/height, path substring or glob); a group matches when any of its files match
 5. Use **Bulk selection** to select all / none / invert, or apply one rule (smaller than keeper, larger than … MB, smaller than … MB, path contains …) to every group currently shown
 6. Review the action preview, then **Trash**, **Quarantine**, or **Isolate** (copies into `_Dedupe Review` inside the source)
@@ -120,7 +122,7 @@ Keyboard:
 | `a` | Open the action review sheet (preview trash) |
 | `Space` | Toggle remove on the focused card |
 | `Enter` | Open the lightbox |
-| `←` / `→` | Focus previous / next card · lightbox previous / next |
+| `←` / `→` | Delete / Keep in Low-res and Random 50 review; otherwise focus previous / next card or navigate the lightbox |
 | `Esc` | Close the lightbox, help, or overlay |
 | `?` | Shortcut help |
 
@@ -242,6 +244,8 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
 | Similar videos | Ordered pHashes from direct ffmpeg timeline seeks, compared at normalized positions (default mean Hamming ≤ 8) |
+| Low resolution | Display-oriented dimensions below 1,000,000 total pixels; candidates remain unselected until reviewed |
+| Random review | A fresh, unique sample of up to 50 scanned images, GIFs, and videos; Keep/Delete decisions are staged for the normal preview-and-confirm action flow |
 | No person detected | Offline OpenCV YuNet face + full-body detection on images, representative GIF frames, and up to 16 direct-seek video frames with positive-evidence early exit |
 
 The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 through the local Photon runtime), or `ensemble` (OpenCV positives first, then Photon on uncertain frames). Photon stays opt-in: its first use can download roughly 10 GB of model weights, and detection returns person/face boxes rather than a calibrated confidence score. All processing remains local after the model is available.

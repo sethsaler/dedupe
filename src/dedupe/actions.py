@@ -18,6 +18,7 @@ from .models import (
     DuplicateGroup,
     FileRecord,
     GroupKind,
+    ReviewPolicy,
     ScanResult,
     effective_selected_paths,
 )
@@ -527,7 +528,7 @@ def _preflight_action(
         touched = selected.intersection(member_paths)
         if not touched or (check_paths is not None and not touched.intersection(check_paths)):
             continue
-        if group.kind == GroupKind.NO_HUMANS:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
             continue
         retained = [member for member in group.members if member.path not in selected]
         keep = next(
@@ -621,12 +622,15 @@ def apply_actions(
     if kinds:
         candidate_groups = [g for g in groups if g.kind.value in kinds]
 
-    paths = collect_selected_paths(candidate_groups)
+    paths = effective_selected_paths(
+        candidate_groups,
+        protection_groups=all_safety_groups,
+    )
     # Candidate scope decides what may be acted on; every duplicate group decides
     # whether doing so would still leave a retained copy (including overlaps).
     selected = set(paths)
     for group in all_safety_groups:
-        if group.kind == GroupKind.NO_HUMANS or not group.members:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES or not group.members:
             continue
         member_paths = {member.path for member in group.members}
         if member_paths <= selected:
@@ -957,7 +961,7 @@ def isolate_groups(
     for g in groups:
         if kinds and g.kind.value not in kinds:
             continue
-        if len(g.members) < 2 and g.kind != GroupKind.NO_HUMANS:
+        if len(g.members) < 2 and g.policy != ReviewPolicy.INDEPENDENT_CANDIDATES:
             continue
         filtered.append(g)
 
@@ -999,6 +1003,8 @@ def isolate_groups(
         GroupKind.EXACT.value: 0,
         GroupKind.SIMILAR.value: 0,
         GroupKind.NO_HUMANS.value: 0,
+        GroupKind.LOW_RESOLUTION.value: 0,
+        GroupKind.RANDOM_REVIEW.value: 0,
     }
     index_rows: list[dict] = []
 
@@ -1198,6 +1204,8 @@ def summarize_scan(result: ScanResult) -> str:
         f"Files scanned: {len(result.files)}",
         f"Exact groups: {result.exact_groups}",
         f"Similar groups: {result.similar_groups}",
+        f"Low-resolution files: {result.low_resolution_files}",
+        f"Random review files: {result.random_review_files}",
         f"Non-human files: {result.no_human_files}",
         f"Reclaimable: {format_bytes(result.reclaimable_bytes)}",
     ]

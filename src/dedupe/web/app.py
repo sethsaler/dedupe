@@ -28,7 +28,13 @@ from ..engine import run_scan, run_scans_parallel
 from ..grouping import apply_smart_select, apply_smart_select_all
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
-from ..models import ScanProgress, ScanResult, SmartRule, effective_selected_paths
+from ..models import (
+    ReviewPolicy,
+    ScanProgress,
+    ScanResult,
+    SmartRule,
+    effective_selected_paths,
+)
 from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
@@ -41,7 +47,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 11
+WEB_API_VERSION = 12
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 # Why an execute was refused, phrased so the UI can tell the user what happens next.
@@ -111,7 +117,7 @@ def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
     member always survives. Non-human candidate groups are independent files and
     may have every candidate selected.
     """
-    keep_one = group.kind.value != "no_humans"
+    keep_one = group.policy == ReviewPolicy.KEEP_ONE
     keeper = None
     if keep_one and group.members:
         member_paths = [member.path for member in group.members]
@@ -355,6 +361,8 @@ def create_app(
                     "exact_groups": result.exact_groups,
                     "similar_groups": result.similar_groups,
                     "no_human_files": result.no_human_files,
+                    "low_resolution_files": result.low_resolution_files,
+                    "random_review_files": result.random_review_files,
                     "reclaimable_bytes": result.reclaimable_bytes,
                     "reclaimable_human": format_bytes(result.reclaimable_bytes),
                     "selected_count": len(effective_selected_paths(result.groups)),
@@ -438,7 +446,13 @@ def create_app(
                     }
                 )
             groups = result.groups
-            if kind in ("exact", "similar", "no_humans"):
+            if kind in (
+                "exact",
+                "similar",
+                "no_humans",
+                "low_resolution",
+                "random_review",
+            ):
                 groups = [g for g in groups if g.kind.value == kind]
             total = len(groups)
             if limit is not None:
@@ -594,6 +608,8 @@ def create_app(
                     exact=bool(data.get("exact", True)),
                     similar=bool(data.get("similar", True)),
                     find_no_humans=bool(data.get("find_no_humans", False)),
+                    find_low_resolution=bool(data.get("find_low_resolution", True)),
+                    random_review_count=max(0, int(data.get("random_review_count", 50))),
                     human_backend=human_backend,
                     photon_model=photon_model,
                     include_images=bool(data.get("include_images", True)),
@@ -638,6 +654,8 @@ def create_app(
                         message=(
                             f"Done — {result.exact_groups} exact, "
                             f"{result.similar_groups} similar, "
+                            f"{result.low_resolution_files} low-resolution, "
+                            f"{result.random_review_files} random review, "
                             f"{result.no_human_files} non-human"
                         ),
                         elapsed_seconds=result.diagnostics.total_duration_seconds,
@@ -741,10 +759,52 @@ def create_app(
             for g in result.groups:
                 if g.id == group_id:
                     member_paths = {m.path for m in g.members}
+                    decision_path = data.get("decision_path")
+                    if decision_path is not None:
+                        decision_path = str(decision_path)
+                        if (
+                            g.policy != ReviewPolicy.INDEPENDENT_CANDIDATES
+                            or decision_path not in member_paths
+                        ):
+                            return jsonify({"error": "candidate decision is not in this group"}), 400
+                        remove = data.get("decision_remove")
+                        if not isinstance(remove, bool):
+                            return jsonify({"error": "decision_remove must be a boolean"}), 400
+                        # The newest arrow-key decision wins in every overlapping
+                        # independent branch. Keep also clears duplicate picks;
+                        # effective_selected_paths preserves that veto globally.
+                        for candidate in result.groups:
+                            candidate_paths = {member.path for member in candidate.members}
+                            if decision_path not in candidate_paths:
+                                continue
+                            if candidate.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
+                                candidate.reviewed_paths = list(
+                                    dict.fromkeys([*candidate.reviewed_paths, decision_path])
+                                )
+                                selected_paths = set(candidate.selected_for_removal)
+                                if remove:
+                                    selected_paths.add(decision_path)
+                                else:
+                                    selected_paths.discard(decision_path)
+                                candidate.selected_for_removal = [
+                                    member.path
+                                    for member in candidate.members
+                                    if member.path in selected_paths
+                                ]
+                            elif not remove:
+                                candidate.selected_for_removal = [
+                                    path
+                                    for path in candidate.selected_for_removal
+                                    if path != decision_path
+                                ]
+                        result.recompute_stats()
+                        payload = group_payload(g)
+                        persist_result()
+                        return jsonify(payload)
                     picks = [p for p in selected if p in member_paths]
-                    # Duplicate groups retain one file; no-human candidate groups may remove all.
+                    # Duplicate groups retain one file; independent review candidates may remove all.
                     if (
-                        g.kind.value != "no_humans"
+                        g.policy == ReviewPolicy.KEEP_ONE
                         and len(picks) >= len(member_paths)
                         and member_paths
                     ):
@@ -754,9 +814,9 @@ def create_app(
                         else:
                             picks = picks[:-1]
                     g.selected_for_removal = picks
-                    if g.kind.value == "no_humans":
+                    if g.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
                         if "reviewed" not in data:
-                            return jsonify({"error": "reviewed paths required for Non-Human updates"}), 400
+                            return jsonify({"error": "reviewed paths required for candidate updates"}), 400
                         reviewed = list(data.get("reviewed") or [])
                         g.reviewed_paths = [
                             path for path in reviewed if path in member_paths
@@ -808,7 +868,7 @@ def create_app(
                 if picks == list(group.selected_for_removal):
                     continue
                 group.selected_for_removal = picks
-                if group.kind.value == "no_humans":
+                if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
                     # Selecting a candidate is also a review decision for it.
                     group.reviewed_paths = list(
                         dict.fromkeys([*group.reviewed_paths, *picks])
@@ -1096,6 +1156,8 @@ def create_app(
             kinds_raw = data.get("kinds") or data.get("isolate_kinds") or "all"
             if kinds_raw == "duplicates":
                 kinds = {"exact", "similar"}
+            elif kinds_raw == "review_suggestions":
+                kinds = {"low_resolution", "random_review"}
             else:
                 kinds = None if kinds_raw in ("all", "") else {kinds_raw}
             scoped_groups = (
@@ -1103,23 +1165,40 @@ def create_app(
                 if kinds is None
                 else [group for group in groups if group.kind.value in kinds]
             )
-            selected_paths = effective_selected_paths(scoped_groups)
+            selected_paths = effective_selected_paths(
+                scoped_groups,
+                protection_groups=groups,
+            )
             selected = set(selected_paths)
-            exact_paths = set(effective_selected_paths([
-                group for group in scoped_groups if group.kind.value == "exact"
-            ])) & selected
-            similar_paths = (set(effective_selected_paths([
-                group for group in scoped_groups if group.kind.value == "similar"
-            ])) & selected) - exact_paths
-            no_human_paths = (set(effective_selected_paths([
-                group for group in scoped_groups if group.kind.value == "no_humans"
-            ])) & selected) - exact_paths - similar_paths
+            counted: set[str] = set()
+
+            def count_kind(kind: str) -> int:
+                paths = (
+                    set(
+                        effective_selected_paths(
+                            [group for group in scoped_groups if group.kind.value == kind],
+                            protection_groups=groups,
+                        )
+                    )
+                    & selected
+                ) - counted
+                counted.update(paths)
+                return len(paths)
+
             selection_counts = {
-                "exact": len(exact_paths),
-                "similar": len(similar_paths),
-                "no_humans": len(no_human_paths),
+                "exact": count_kind("exact"),
+                "similar": count_kind("similar"),
+                "no_humans": count_kind("no_humans"),
                 "unique_total": len(selected_paths),
             }
+            low_resolution_count = count_kind("low_resolution")
+            random_review_count = count_kind("random_review")
+            # Keep the established response shape for duplicate-only callers;
+            # expose new categories whenever they contribute a selection.
+            if low_resolution_count:
+                selection_counts["low_resolution"] = low_resolution_count
+            if random_review_count:
+                selection_counts["random_review"] = random_review_count
             if action == "isolate":
                 mode = (data.get("isolate_mode") or "copy").lower()
                 action_result = isolate_groups(
@@ -1170,7 +1249,11 @@ def create_app(
                                 for member in group.members
                                 if member.path not in removed
                             ]
-                            minimum = 1 if group.kind.value == "no_humans" else 2
+                            minimum = (
+                                1
+                                if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+                                else 2
+                            )
                             if len(remaining) >= minimum:
                                 group.members = remaining
                                 group.selected_for_removal = [

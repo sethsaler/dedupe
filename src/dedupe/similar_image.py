@@ -79,6 +79,20 @@ def _downscale_for_hash(img, max_side: int = HASH_MAX_SIDE):
     return rgb
 
 
+def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
+    """Read display-oriented image/GIF dimensions without computing hashes."""
+    _ensure_image_deps()
+    _register_heif()
+
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as img:
+        if not getattr(img, "is_animated", False):
+            img = ImageOps.exif_transpose(img)
+        width, height = img.size
+        return int(width), int(height)
+
+
 def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int | None, int | None]:
     """Return (phash_hex, dhash_hex, width, height).
 

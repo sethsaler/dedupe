@@ -293,11 +293,63 @@ def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> N
     )
 
     assert result.no_human_files == 1
-    assert result.groups[0].kind == GroupKind.NO_HUMANS
-    assert result.groups[0].selected_for_removal == []
+    no_human_group = next(group for group in result.groups if group.kind == GroupKind.NO_HUMANS)
+    assert no_human_group.selected_for_removal == []
     assert captured["backend"] == "photon"
     assert captured["photon_model"] == "test-model"
     assert captured["workers"] >= 1
+
+
+def test_run_scan_builds_low_resolution_and_random_review_branches_without_similarity(
+    tmp_path: Path,
+) -> None:
+    for index in range(55):
+        _save(tmp_path / f"image-{index:02d}.jpg", (index, 80, 120))
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_low_resolution=True,
+        random_review_count=50,
+        use_cache=False,
+    )
+
+    low_resolution = next(
+        group for group in result.groups if group.kind == GroupKind.LOW_RESOLUTION
+    )
+    random_review = next(
+        group for group in result.groups if group.kind == GroupKind.RANDOM_REVIEW
+    )
+    assert len(low_resolution.members) == 55
+    assert len(random_review.members) == 50
+    assert all(member.width == 48 and member.height == 48 for member in low_resolution.members)
+    assert result.low_resolution_files == 55
+    assert result.random_review_files == 50
+
+
+def test_run_scan_probes_video_dimensions_for_low_resolution_review(
+    tmp_path: Path, monkeypatch
+) -> None:
+    video = tmp_path / "small.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr("dedupe.engine.probe_video", lambda _path: (5.0, 640, 360))
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_low_resolution=True,
+        random_review_count=0,
+        use_cache=False,
+    )
+
+    low_resolution = next(
+        group for group in result.groups if group.kind == GroupKind.LOW_RESOLUTION
+    )
+    assert [(member.width, member.height) for member in low_resolution.members] == [
+        (640, 360)
+    ]
 
 
 def test_repeated_human_scan_only_analyzes_new_files(tmp_path: Path, monkeypatch) -> None:

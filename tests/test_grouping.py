@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import random
+
 from dedupe.actions import collect_selected_paths
 from dedupe.grouping import (
     apply_smart_select,
     build_groups,
+    build_low_resolution_groups,
     build_no_human_groups,
+    build_random_review_groups,
     pick_suggested_keep,
 )
 from dedupe.human_detection import human_detection_signature
@@ -17,6 +21,7 @@ from dedupe.models import (
     ReviewGroup,
     ScanResult,
     SmartRule,
+    effective_selected_paths,
 )
 
 
@@ -116,6 +121,71 @@ def test_no_human_candidate_can_be_selected_for_removal_by_itself() -> None:
 
     apply_smart_select(group, SmartRule.DESELECT_ALL)
     assert group.selected_for_removal == []
+
+
+def test_low_resolution_candidates_include_images_gifs_and_videos_below_one_mp() -> None:
+    image = _rec("/small.jpg", 300, 1, w=100, h=100)
+    gif = _rec("/small.gif", 400, 2, w=200, h=200)
+    gif.media_type = MediaType.GIF
+    video = _rec("/small.mp4", 500, 3, w=640, h=360)
+    video.media_type = MediaType.VIDEO
+    boundary = _rec("/one-mp.jpg", 600, 4, w=1000, h=1000)
+    unknown = _rec("/unknown.jpg", 700, 5, w=0, h=0)
+
+    (group,) = build_low_resolution_groups([boundary, video, unknown, gif, image])
+
+    assert group.kind == GroupKind.LOW_RESOLUTION
+    assert group.media_type == MediaType.MIXED
+    assert [member.path for member in group.members] == [image.path, gif.path, video.path]
+    assert group.selected_for_removal == []
+    assert group.reviewed_paths == []
+
+    group.reviewed_paths = [video.path]
+    group.selected_for_removal = [video.path]
+    assert collect_selected_paths([group]) == [video.path]
+    assert group.reclaimable_bytes == video.size
+
+
+def test_random_review_is_unique_bounded_and_reproducible_with_seed() -> None:
+    records = [_rec(f"/{index:03d}.jpg", 100 + index, index) for index in range(80)]
+
+    first = build_random_review_groups(records, count=50, rng=random.Random(7))[0]
+    second = build_random_review_groups(records, count=50, rng=random.Random(7))[0]
+
+    assert first.kind == GroupKind.RANDOM_REVIEW
+    assert len(first.members) == 50
+    assert len({member.path for member in first.members}) == 50
+    assert [member.path for member in first.members] == [
+        member.path for member in second.members
+    ]
+    assert build_random_review_groups(records, count=0) == []
+
+
+def test_independent_review_groups_dedupe_overlapping_scan_paths() -> None:
+    record = _rec("/nested/photo.jpg", 100, 1, w=320, h=240)
+
+    low_resolution = build_low_resolution_groups([record, record])[0]
+    random_review = build_random_review_groups(
+        [record, record], count=50, rng=random.Random(1)
+    )[0]
+
+    assert low_resolution.members == [record]
+    assert random_review.members == [record]
+
+
+def test_explicit_keep_vetoes_overlapping_duplicate_selection() -> None:
+    first = _rec("/first.jpg", 100, 1)
+    second = _rec("/second.jpg", 200, 2)
+    duplicate = build_groups([[first, second]], [])[0]
+    path = duplicate.selected_for_removal[0]
+    random_review = build_random_review_groups([first, second], count=2)[0]
+    random_review.reviewed_paths = [path]
+
+    assert collect_selected_paths([duplicate, random_review]) == []
+    assert effective_selected_paths(
+        [duplicate],
+        protection_groups=[duplicate, random_review],
+    ) == []
 
 
 def test_overlapping_no_human_selection_still_retains_a_duplicate() -> None:

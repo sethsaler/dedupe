@@ -32,6 +32,7 @@
     groupListLimit: GROUP_RENDER_CHUNK, // how many sidebar rows are in the DOM
     groupsLoadToken: 0,
     groupsTotal: 0,
+    reviewingCandidate: false,
   };
 
   // —— Batched rendering ——
@@ -199,6 +200,14 @@
     return (p || "").split(/[/\\]/).pop() || p;
   }
 
+  function isDecisionReview(g) {
+    return g?.kind === "low_resolution" || g?.kind === "random_review";
+  }
+
+  function isIndependentReview(g) {
+    return g?.policy === "independent_candidates";
+  }
+
   function escapeHtml(s) {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -251,6 +260,8 @@
     "optExact",
     "optSimilar",
     "optNoHumans",
+    "optLowResolution",
+    "optRandomReview",
     "optImages",
     "optGifs",
     "optVideos",
@@ -691,7 +702,7 @@
       const scanningNote = s.scanning ? " · live" : "";
       top.innerHTML = `
         <span class="stat-chip"><span class="dot"></span><strong>${s.summary.group_count}</strong> groups${scanningNote}</span>
-        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.no_human_files || 0} non-human</span>
+        <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.low_resolution_files || 0} low-res · ${s.summary.random_review_files || 0} random · ${s.summary.no_human_files || 0} non-human</span>
         <span class="stat-chip reclaim"><span class="dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
         ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
       `;
@@ -706,6 +717,8 @@
       $("countAll").textContent = s.summary.group_count;
       $("countExact").textContent = s.summary.exact_groups;
       $("countSimilar").textContent = s.summary.similar_groups;
+      $("countLowResolution").textContent = s.summary.low_resolution_files || 0;
+      $("countRandomReview").textContent = s.summary.random_review_files || 0;
       $("countNoHumans").textContent = s.summary.no_human_files || 0;
     } else {
       $("scanQuality").hidden = true;
@@ -783,12 +796,20 @@
 
     const exact = state.allGroups.filter((g) => g.kind === "exact").length;
     const similar = state.allGroups.filter((g) => g.kind === "similar").length;
+    const lowResolution = state.allGroups
+      .filter((g) => g.kind === "low_resolution")
+      .reduce((count, g) => count + (g.member_count || 0), 0);
+    const randomReview = state.allGroups
+      .filter((g) => g.kind === "random_review")
+      .reduce((count, g) => count + (g.member_count || 0), 0);
     const noHumans = state.allGroups
       .filter((g) => g.kind === "no_humans")
       .reduce((count, g) => count + (g.member_count || 0), 0);
     $("countAll").textContent = state.allGroups.length;
     $("countExact").textContent = exact;
     $("countSimilar").textContent = similar;
+    $("countLowResolution").textContent = lowResolution;
+    $("countRandomReview").textContent = randomReview;
     $("countNoHumans").textContent = noHumans;
 
     if (state.groups.length) {
@@ -823,7 +844,7 @@
   }
 
   function groupComplete(g) {
-    if (g.kind === "no_humans") return (g.reviewed_paths || []).length >= (g.member_count || 0);
+    if (isIndependentReview(g)) return (g.reviewed_paths || []).length >= (g.member_count || 0);
     return (g.selected_for_removal || []).length >= Math.max(0, (g.member_count || 0) - 1);
   }
 
@@ -919,9 +940,14 @@
   function groupItemHtml(g) {
     const active = g.id === state.currentId ? "active" : "";
     const sel = groupSelectedCount(g);
-    const badgeLabel = g.kind === "no_humans" ? "non-human" : g.kind;
-    const groupSummary = g.kind === "no_humans" && !sel
-      ? `${g.member_count} non-human files to review`
+    const badgeLabel = {
+      no_humans: "non-human",
+      low_resolution: "low-res",
+      random_review: "random",
+    }[g.kind] || g.kind;
+    const reviewed = (g.reviewed_paths || []).length;
+    const groupSummary = isIndependentReview(g)
+      ? `${reviewed}/${g.member_count} reviewed${sel ? ` · ${sel} delete` : ""}`
       : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
     // Status is never colour-only: the glyph and its label carry the same meaning.
     const attention = groupNeedsAttention(g);
@@ -930,7 +956,7 @@
     return `
           <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
             <div class="g-top">
-              <span>${g.member_count} files${g.kind === "no_humans" ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
+              <span>${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
               <span class="badge ${g.kind}">${badgeLabel}</span>
             </div>
             <div class="g-state"><span class="g-state-glyph" aria-hidden="true">${stateGlyph}</span>${stateLabel}</div>
@@ -1058,6 +1084,14 @@
         `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · detector output is not a guarantee`;
       return;
     }
+    if (isDecisionReview(g)) {
+      const reviewed = new Set(g.reviewed_paths || []);
+      const selected = new Set(g.selected_for_removal || []);
+      const remaining = Math.max(0, g.member_count - reviewed.size);
+      $("detailMeta").textContent =
+        `${reviewed.size} reviewed · ${selected.size} marked Delete · ${remaining} remaining · decisions are staged until you confirm a file action`;
+      return;
+    }
 
     const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
     const keeperWhy = keeper
@@ -1074,6 +1108,11 @@
     ensureGroupVisible(id);
     markGroupListActive(id);
     const g = await api(`/api/groups/${id}`);
+    if (isDecisionReview(g)) {
+      const reviewed = new Set(g.reviewed_paths || []);
+      const firstUnreviewed = (g.members || []).findIndex((member) => !reviewed.has(member.path));
+      state.memberFocus = firstUnreviewed >= 0 ? firstUnreviewed : 0;
+    }
     const idx = state.groups.findIndex((group) => group.id === g.id);
     if (idx >= 0) state.groups[idx] = g;
     const allIdx = state.allGroups.findIndex((group) => group.id === g.id);
@@ -1083,8 +1122,12 @@
     scheduleRender({ selection: true });
     $("detailEmpty").hidden = true;
     $("detailBody").hidden = false;
-    const kindLabel = g.kind === "no_humans" ? "Non-Human · no person detected" : g.kind;
-    $("detailTitle").textContent = g.kind === "no_humans"
+    const kindLabel = {
+      no_humans: "Non-Human · no person detected",
+      low_resolution: "Low resolution · under 1 megapixel",
+      random_review: "Random review · fresh sample",
+    }[g.kind] || g.kind;
+    $("detailTitle").textContent = isIndependentReview(g)
       ? `${kindLabel} · ${g.member_count} files`
       : `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
     const deletedPaths = new Set(g.deleted_paths || []);
@@ -1092,16 +1135,27 @@
       g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
     $("btnMarkDistinct").hidden = g.kind !== "similar";
     $("nonHumanBanner").hidden = g.kind !== "no_humans";
-    document.querySelector(".selection-toolbar").hidden = g.kind === "no_humans";
+    $("candidateReviewBanner").hidden = !isDecisionReview(g);
+    if (isDecisionReview(g)) {
+      $("candidateReviewTitle").textContent = g.kind === "low_resolution"
+        ? "Low-resolution deletion suggestions"
+        : `${g.member_count}-file library check-in`;
+      $("candidateReviewDescription").textContent = g.kind === "low_resolution"
+        ? "These files are below 1 megapixel. Decide one at a time; nothing moves until final confirmation."
+        : "A fresh random sample from this scan. Use the arrow keys to decide quickly.";
+    }
+    document.querySelector(".selection-toolbar").hidden = isIndependentReview(g);
     $("smartRule").querySelectorAll("option").forEach((option) => {
       const candidateOnly = option.value === "select_candidates";
-      option.disabled = g.kind === "no_humans" ? !candidateOnly && option.value !== "deselect_all" : candidateOnly;
+      option.disabled = isIndependentReview(g)
+        ? !candidateOnly && option.value !== "deselect_all"
+        : candidateOnly;
     });
     if ($("smartRule").selectedOptions[0]?.disabled) {
-      $("smartRule").value = g.kind === "no_humans" ? "deselect_all" : "automatic";
+      $("smartRule").value = isIndependentReview(g) ? "deselect_all" : "automatic";
     }
     $("btnSelectSuggested").textContent =
-      g.kind === "no_humans" ? "Select reviewed candidates" : "Use suggested";
+      isIndependentReview(g) ? "Select reviewed candidates" : "Use suggested";
     renderMembers(g);
     // keep list item in view
     const active = document.querySelector(`.group-item[data-id="${id}"]`);
@@ -1114,16 +1168,27 @@
     const reviewedPaths = new Set(g.reviewed_paths || []);
     const deletedPaths = new Set(g.deleted_paths || []);
     const allMembers = g.members || [];
-    const pageCount = g.kind === "no_humans"
-      ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
-      : 1;
+    const decisionReview = isDecisionReview(g);
+    const pageCount = decisionReview
+      ? Math.max(1, allMembers.length)
+      : g.kind === "no_humans"
+        ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
+        : 1;
     state.memberPage = Math.max(0, Math.min(pageCount - 1, state.memberPage));
-    const pageStart = state.memberPage * MEMBER_PAGE_SIZE;
-    const members = g.kind === "no_humans"
+    if (decisionReview) {
+      state.memberFocus = Math.max(0, Math.min(allMembers.length - 1, state.memberFocus));
+      state.memberPage = state.memberFocus;
+    }
+    const pageStart = decisionReview ? state.memberFocus : state.memberPage * MEMBER_PAGE_SIZE;
+    const members = decisionReview
+      ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
+      : g.kind === "no_humans"
       ? allMembers.slice(pageStart, pageStart + MEMBER_PAGE_SIZE)
       : allMembers;
     const summaryText = allMembers.length
-      ? `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
+      ? decisionReview
+        ? `${pageStart + 1} of ${allMembers.length}`
+        : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
       : "0 results";
     syncMemberPagination(pageCount, summaryText);
     state.lightboxItems = members
@@ -1131,19 +1196,20 @@
       .map((member) => ({ path: member.path, mediaType: member.media_type, keeper: g.suggested_keep, kind: g.kind }));
     updateDetailMeta(g);
     const reviewedCount = allMembers.filter((member) => reviewedPaths.has(member.path)).length;
-    $("groupSelectionSummary").textContent = g.kind === "no_humans"
+    $("groupSelectionSummary").textContent = isIndependentReview(g)
       ? `${selected.size} selected · ${reviewedCount} of ${allMembers.length} reviewed`
       : `${selected.size} of ${allMembers.length} selected for removal`;
 
     box.innerHTML = members
       .map((m, i) => {
-        const isKeep = m.path === g.suggested_keep && !selected.has(m.path);
         const isSel = selected.has(m.path);
         const reviewed = reviewedPaths.has(m.path);
+        const isKeep = (m.path === g.suggested_keep || (decisionReview && reviewed)) && !isSel;
         const deleted = deletedPaths.has(m.path);
         const dims = m.width && m.height ? `${m.width}×${m.height}` : "—";
         const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
-        const focused = i === state.memberFocus ? "focused" : "";
+        const memberIndex = decisionReview ? state.memberFocus : i;
+        const focused = decisionReview || i === state.memberFocus ? "focused" : "";
         const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);
         const fileName = basename(m.path);
         const badge = isSel
@@ -1157,7 +1223,11 @@
           ? "Byte-identical SHA-256 match"
           : g.kind === "similar"
             ? `Perceptual match to suggested keeper${distanceParts ? ` · ${distanceParts}` : ""} (explanation only, not a probability)`
-            : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
+            : g.kind === "low_resolution"
+              ? `${dims} · ${((m.width || 0) * (m.height || 0) / 1_000_000).toFixed(2)} megapixels · below the 1 MP review threshold`
+              : g.kind === "random_review"
+                ? "Randomly selected from this scan for a quick keep-or-delete check"
+                : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
         const selectionTitle = isSel
           ? (g.kind === "no_humans" ? "Reviewed · selected" : "Selected for removal")
           : (g.kind === "no_humans" && reviewed ? "Reviewed · not selected" : "Not selected");
@@ -1174,7 +1244,12 @@
               ${mediaPreview}
               ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
             </button>`;
-        const actions = g.kind === "no_humans"
+        const actions = decisionReview
+          ? `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
+                <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
+                <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
+              </div>`
+          : g.kind === "no_humans"
           ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
           : `<label class="selection-control">
                   <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
@@ -1185,7 +1260,7 @@
                 </label>
                 <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
         return `
-          <article class="card ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${i}">
+          <article class="card ${decisionReview ? "decision-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
             ${preview}
             <div class="card-body">
               <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
@@ -1275,6 +1350,13 @@
       });
     });
 
+    box.querySelectorAll(".candidate-delete").forEach((btn) => {
+      btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, true));
+    });
+    box.querySelectorAll(".candidate-keep").forEach((btn) => {
+      btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, false));
+    });
+
     box.querySelectorAll(".reveal").forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -1330,7 +1412,7 @@
     box.querySelectorAll("button.thumb-wrap").forEach((el) => {
       el.addEventListener("click", () => {
         const i = Number(el.dataset.index);
-        state.memberFocus = i;
+        state.memberFocus = Number(el.closest(".card")?.dataset.index || 0);
         openLightbox(i);
       });
     });
@@ -1345,9 +1427,91 @@
     });
   }
 
+  async function reviewCandidate(group, path, remove) {
+    if (!isDecisionReview(group) || state.reviewingCandidate) return;
+    state.reviewingCandidate = true;
+    const selected = new Set(group.selected_for_removal || []);
+    const reviewed = new Set(group.reviewed_paths || []);
+    if (remove) selected.add(path);
+    else selected.delete(path);
+    reviewed.add(path);
+    const currentIndex = Math.max(
+      0,
+      (group.members || []).findIndex((member) => member.path === path),
+    );
+    try {
+      const updated = await api("/api/selection", {
+        method: "POST",
+        body: JSON.stringify({
+          group_id: group.id,
+          selected: [...selected],
+          reviewed: [...reviewed],
+          decision_path: path,
+          decision_remove: remove,
+          scan_id: state.scanId,
+        }),
+      });
+      const idx = state.groups.findIndex((candidate) => candidate.id === updated.id);
+      if (idx >= 0) state.groups[idx] = updated;
+      const allIdx = state.allGroups.findIndex((candidate) => candidate.id === updated.id);
+      if (allIdx >= 0) state.allGroups[allIdx] = updated;
+      for (const groups of [state.groups, state.allGroups]) {
+        for (const candidate of groups) {
+          if (!(candidate.members || []).some((member) => member.path === path)) continue;
+          const candidateSelected = new Set(candidate.selected_for_removal || []);
+          if (isIndependentReview(candidate)) {
+            candidate.reviewed_paths = [...new Set([...(candidate.reviewed_paths || []), path])];
+            if (remove) candidateSelected.add(path);
+            else candidateSelected.delete(path);
+          } else if (!remove) {
+            candidateSelected.delete(path);
+          }
+          candidate.selected_for_removal = (candidate.members || [])
+            .map((member) => member.path)
+            .filter((candidatePath) => candidateSelected.has(candidatePath));
+        }
+      }
+
+      const updatedReviewed = new Set(updated.reviewed_paths || []);
+      const count = (updated.members || []).length;
+      let nextIndex = currentIndex;
+      for (let step = 1; step <= count; step += 1) {
+        const candidateIndex = (currentIndex + step) % count;
+        if (!updatedReviewed.has(updated.members[candidateIndex].path)) {
+          nextIndex = candidateIndex;
+          break;
+        }
+      }
+      state.memberFocus = nextIndex;
+      renderMembers(updated);
+      if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+        scheduleRender({ groupList: true });
+      } else {
+        applyResultControls();
+      }
+      scheduleRender({ selection: true });
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      state.reviewingCandidate = false;
+    }
+  }
+
   function changeMemberPage(delta) {
     const current = state.allGroups.find((group) => group.id === state.currentId)
       || state.groups.find((group) => group.id === state.currentId);
+    if (isDecisionReview(current)) {
+      const nextIndex = Math.max(
+        0,
+        Math.min((current.members || []).length - 1, state.memberFocus + delta),
+      );
+      if (nextIndex === state.memberFocus) return;
+      state.memberFocus = nextIndex;
+      state.memberPage = nextIndex;
+      renderMembers(current);
+      $("memberPagination").scrollIntoView({ block: "start", behavior: "smooth" });
+      return;
+    }
     if (!current || current.kind !== "no_humans") return;
     const pageCount = Math.max(1, Math.ceil((current.members || []).length / MEMBER_PAGE_SIZE));
     const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
@@ -1375,13 +1539,16 @@
   function scopeLabelFor(scope) {
     return (
       {
+        all: "All selected categories",
         duplicates: "Exact + Similar",
+        review_suggestions: "Low-res + Random review",
         exact: "Exact",
         similar: "Similar",
+        low_resolution: "Low resolution",
+        random_review: "Random review",
         no_humans: "Non-Human",
-        all: "All",
       }[scope] ||
-      "All"
+      "All selected categories"
     );
   }
 
@@ -1390,21 +1557,34 @@
     const inScope = (g) =>
       scope === "all" ||
       g.kind === scope ||
-      (scope === "duplicates" && (g.kind === "exact" || g.kind === "similar"));
+      (scope === "duplicates" && (g.kind === "exact" || g.kind === "similar")) ||
+      (scope === "review_suggestions" && ["low_resolution", "random_review"].includes(g.kind));
+    const protectedPaths = new Set();
+    for (const g of source) {
+      if (!isIndependentReview(g)) continue;
+      const selectedPaths = new Set(g.selected_for_removal || []);
+      for (const path of g.reviewed_paths || []) {
+        if (!selectedPaths.has(path)) protectedPaths.add(path);
+      }
+    }
     const selected = new Map();
     for (const g of source) {
       if (!inScope(g)) continue;
       const sel = new Set(g.selected_for_removal || []);
       const reviewed = new Set(g.reviewed_paths || []);
       for (const m of g.members || []) {
-        if (sel.has(m.path) && (g.kind !== "no_humans" || reviewed.has(m.path))) {
+        if (
+          !protectedPaths.has(m.path)
+          && sel.has(m.path)
+          && (!isIndependentReview(g) || reviewed.has(m.path))
+        ) {
           selected.set(m.path, m);
         }
       }
     }
     for (const g of source) {
       if (!inScope(g)) continue;
-      if (g.kind === "no_humans" || !(g.members || []).length) continue;
+      if (isIndependentReview(g) || !(g.members || []).length) continue;
       if (g.members.every((m) => selected.has(m.path))) {
         selected.delete(g.suggested_keep || g.members[0].path);
       }
@@ -1479,6 +1659,8 @@
       $("countAll").textContent = "0";
       $("countExact").textContent = "0";
       $("countSimilar").textContent = "0";
+      $("countLowResolution").textContent = "0";
+      $("countRandomReview").textContent = "0";
       $("countNoHumans").textContent = "0";
       state.groups = [];
       state.allGroups = [];
@@ -1494,6 +1676,8 @@
           exact: $("optExact").checked,
           similar: $("optSimilar").checked,
           find_no_humans: $("optNoHumans").checked,
+          find_low_resolution: $("optLowResolution").checked,
+          random_review_count: $("optRandomReview").checked ? 50 : 0,
           human_backend: "opencv",
           include_images: $("optImages").checked,
           include_gifs: $("optGifs").checked,
@@ -1642,13 +1826,13 @@
   async function runBulkSelection(operation, criteria = null, label = "") {
     const groupIds = state.groups.map((group) => group.id);
     if (!groupIds.length) return toast("No groups are shown in this filter");
-    const nonHuman = state.groups.filter((group) => group.kind === "no_humans").length;
-    if (nonHuman && operation !== "select_none") {
+    const independent = state.groups.filter(isIndependentReview).length;
+    if (independent && operation !== "select_none") {
       const ok = await confirmModal({
-        title: "Include Non-Human candidates?",
+        title: "Include independent review candidates?",
         confirmLabel: "Apply to all shown groups",
         danger: false,
-        body: `<div class="review-sheet"><p><strong>${nonHuman} Non-Human group${nonHuman === 1 ? "" : "s"}</strong> ${nonHuman === 1 ? "is" : "are"} in this view.</p><p>Those files are independent candidates, so a bulk selection also marks them reviewed and every candidate can be selected. Detection is heuristic — nothing is deleted until you run an action.</p></div>`,
+        body: `<div class="review-sheet"><p><strong>${independent} independent review group${independent === 1 ? "" : "s"}</strong> ${independent === 1 ? "is" : "are"} in this view.</p><p>A bulk selection also marks those files reviewed, and every candidate can be selected. Nothing is deleted until you run and confirm an action.</p></div>`,
       });
       if (ok !== true) return;
     }
@@ -1806,7 +1990,7 @@
       const counts = preview.selection_counts || {};
       const selectedMembers = effectiveSelection(scope);
       const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
-      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.no_humans || 0} Non-Human`;
+      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.low_resolution || 0} Low-res · ${counts.random_review || 0} Random · ${counts.no_humans || 0} Non-Human`;
       const skippedWarning = (action !== "isolate" && preview.fail_count)
         ? `<p><strong>${eligibleCount} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
         : "";
@@ -2040,6 +2224,8 @@
       if (!$("modalBackdrop").hidden) return; // handled by modal
     }
 
+    if (!$("modalBackdrop").hidden || !$("helpBackdrop").hidden) return;
+
     if (!typing && (e.key === "?" || (e.shiftKey && e.key === "/"))) {
       openHelp();
       e.preventDefault();
@@ -2099,6 +2285,14 @@
       }
       e.preventDefault();
     } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && state.currentId) {
+      const current = state.allGroups.find((group) => group.id === state.currentId)
+        || state.groups.find((group) => group.id === state.currentId);
+      if (isDecisionReview(current)) {
+        const member = (current.members || [])[state.memberFocus];
+        if (member) await reviewCandidate(current, member.path, e.key === "ArrowLeft");
+        e.preventDefault();
+        return;
+      }
       const cards = document.querySelectorAll("#members .card");
       if (!cards.length) return;
       if (e.key === "ArrowRight") state.memberFocus = Math.min(cards.length - 1, state.memberFocus + 1);

@@ -22,6 +22,8 @@ class GroupKind(str, Enum):
     EXACT = "exact"
     SIMILAR = "similar"
     NO_HUMANS = "no_humans"
+    LOW_RESOLUTION = "low_resolution"
+    RANDOM_REVIEW = "random_review"
 
 
 class ReviewPolicy(str, Enum):
@@ -177,7 +179,11 @@ class ReviewGroup:
 
     @property
     def policy(self) -> ReviewPolicy:
-        if self.kind == GroupKind.NO_HUMANS:
+        if self.kind in (
+            GroupKind.NO_HUMANS,
+            GroupKind.LOW_RESOLUTION,
+            GroupKind.RANDOM_REVIEW,
+        ):
             return ReviewPolicy.INDEPENDENT_CANDIDATES
         return ReviewPolicy.KEEP_ONE
 
@@ -193,9 +199,12 @@ class ReviewGroup:
                 for m in self.members
                 if m.path in selected
                 and m.path in reviewed
-                and is_current_no_person_decision(
-                    m.human_detection_status,
-                    m.human_detection_signature,
+                and (
+                    self.kind != GroupKind.NO_HUMANS
+                    or is_current_no_person_decision(
+                        m.human_detection_status,
+                        m.human_detection_signature,
+                    )
                 )
             )
         keep = self.suggested_keep
@@ -263,14 +272,30 @@ class ReviewGroup:
 DuplicateGroup = ReviewGroup
 
 
-def effective_selected_paths(groups: list[DuplicateGroup]) -> list[str]:
+def effective_selected_paths(
+    groups: list[DuplicateGroup],
+    *,
+    protection_groups: list[DuplicateGroup] | None = None,
+) -> list[str]:
     """Return unique selections while retaining one member of every duplicate group."""
+    # An explicit Keep decision in any independent review branch vetoes all
+    # deletion suggestions for that path, including automatic duplicate picks.
+    protection_source = protection_groups if protection_groups is not None else groups
+    protected: set[str] = set()
+    for group in protection_source:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
+            protected.update(set(group.reviewed_paths) - set(group.selected_for_removal))
     ordered: list[str] = []
     sizes: dict[str, int] = {}
     for group in groups:
         members = {member.path: member for member in group.members}
         for path in group.selected_for_removal:
-            if group.kind == GroupKind.NO_HUMANS and path not in group.reviewed_paths:
+            if path in protected:
+                continue
+            if (
+                group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+                and path not in group.reviewed_paths
+            ):
                 continue
             if (
                 group.kind == GroupKind.NO_HUMANS
@@ -381,6 +406,8 @@ class ScanResult:
     exact_groups: int = 0
     similar_groups: int = 0
     no_human_files: int = 0
+    low_resolution_files: int = 0
+    random_review_files: int = 0
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
@@ -390,6 +417,12 @@ class ScanResult:
         self.similar_groups = sum(1 for g in self.groups if g.kind == GroupKind.SIMILAR)
         self.no_human_files = sum(
             len(g.members) for g in self.groups if g.kind == GroupKind.NO_HUMANS
+        )
+        self.low_resolution_files = sum(
+            len(g.members) for g in self.groups if g.kind == GroupKind.LOW_RESOLUTION
+        )
+        self.random_review_files = sum(
+            len(g.members) for g in self.groups if g.kind == GroupKind.RANDOM_REVIEW
         )
         sizes = {member.path: member.size for group in self.groups for member in group.members}
         self.reclaimable_bytes = sum(
@@ -405,6 +438,8 @@ class ScanResult:
             "exact_groups": self.exact_groups,
             "similar_groups": self.similar_groups,
             "no_human_files": self.no_human_files,
+            "low_resolution_files": self.low_resolution_files,
+            "random_review_files": self.random_review_files,
             "reclaimable_bytes": self.reclaimable_bytes,
             "file_count": len(self.files),
             "group_count": len(self.groups),
