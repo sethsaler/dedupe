@@ -23,6 +23,7 @@ from .human_detection import (
     DEFAULT_PHOTON_MODEL,
     find_no_human_files,
 )
+from .keep_decisions import kept_paths
 from .models import (
     DuplicateGroup,
     GroupKind,
@@ -479,6 +480,7 @@ def run_scan(
                 build_low_resolution_groups(
                     records,
                     max_pixels=max(1, int(low_resolution_max_pixels)),
+                    skip_paths=kept_paths(records),
                 )
             )
         review_groups.extend(
@@ -881,6 +883,7 @@ def run_scans_parallel(
             build_low_resolution_groups(
                 all_files,
                 max_pixels=max(1, int(low_resolution_max_pixels)),
+                skip_paths=kept_paths(all_files),
             )
         )
     review_groups.extend(

@@ -2360,10 +2360,18 @@
   refreshStatus().catch(() => {});
 
   // Shut down the server when the tab is closed so the Terminal/.command window closes too.
+  // sendBeacon cannot carry the X-Dedupe-Token header, so use fetch with keepalive,
+  // which survives page teardown and passes the CSRF check.
   window.addEventListener("pagehide", (event) => {
     if (event.persisted) return;
-    const data = JSON.stringify({});
-    const blob = new Blob([data], { type: "application/json" });
-    navigator.sendBeacon("/api/shutdown", blob);
+    fetch("/api/shutdown", {
+      method: "POST",
+      keepalive: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Dedupe-Token": CSRF_TOKEN,
+      },
+      body: "{}",
+    }).catch(() => {});
   });
 })();

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import secrets
 import shutil
+import signal
 import threading
 import time
 import webbrowser
@@ -28,7 +29,9 @@ from ..engine import run_scan, run_scans_parallel
 from ..grouping import apply_smart_select, apply_smart_select_all
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
+from ..keep_decisions import update_keep_decisions
 from ..models import (
+    GroupKind,
     ReviewPolicy,
     ScanProgress,
     ScanResult,
@@ -41,14 +44,18 @@ from ..review_session import (
     load_review_session,
     save_review_session,
 )
-from .media import cached_thumbnail, is_video, media_mimetype
+from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
 
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 12
+WEB_API_VERSION = 13
 PREVIEW_TOKEN_TTL_SECONDS = 600
+
+# How long after the last tab closes before the server exits. Long enough for a
+# page reload to come back and cancel the shutdown, short enough to feel prompt.
+SHUTDOWN_GRACE_SECONDS = 1.5
 
 # Why an execute was refused, phrased so the UI can tell the user what happens next.
 PREVIEW_STALE_MESSAGES = {
@@ -140,6 +147,34 @@ def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
     return picks
 
 
+def sync_low_resolution_keeps(result: ScanResult, paths: set[str]) -> None:
+    """Persist keep decisions for low-resolution candidates among ``paths``.
+
+    A candidate that has been reviewed and left unselected was explicitly kept;
+    that decision is stored durably so future scans stop resurfacing the file.
+    Any other state (selected for removal, or review withdrawn) clears it.
+    """
+    keep = []
+    clear = []
+    for group in result.groups:
+        if group.kind != GroupKind.LOW_RESOLUTION:
+            continue
+        reviewed = set(group.reviewed_paths)
+        selected = set(group.selected_for_removal)
+        for member in group.members:
+            if member.path not in paths:
+                continue
+            if member.path in reviewed and member.path not in selected:
+                keep.append(member)
+            else:
+                clear.append(member.path)
+    try:
+        update_keep_decisions(keep=keep, clear=clear)
+    except OSError:
+        # The durable store is a convenience; never fail the selection request.
+        pass
+
+
 def create_app(
     initial_result: ScanResult | None = None,
     review_session_path: str | Path | None = None,
@@ -172,6 +207,7 @@ def create_app(
         "streams": [],
         "review_session": loaded,
         "preview_tokens": {},
+        "shutdown_timer": None,
     }
     app.extensions["dedupe_state"] = state
 
@@ -243,6 +279,18 @@ def create_app(
                 for group in result.groups:
                     allowed.update(member.path for member in group.members)
         return raw_path in allowed or str(path.resolve()) in allowed
+
+    @app.before_request
+    def cancel_pending_shutdown():
+        """A reloaded/reopened page cancels a shutdown scheduled on pagehide."""
+        if request.path == "/api/shutdown":
+            return None
+        with lock:
+            timer = state.get("shutdown_timer")
+            if timer is not None:
+                timer.cancel()
+                state["shutdown_timer"] = None
+        return None
 
     @app.before_request
     def protect_mutating_api():
@@ -798,6 +846,7 @@ def create_app(
                                     if path != decision_path
                                 ]
                         result.recompute_stats()
+                        sync_low_resolution_keeps(result, {decision_path})
                         payload = group_payload(g)
                         persist_result()
                         return jsonify(payload)
@@ -821,6 +870,8 @@ def create_app(
                         g.reviewed_paths = [
                             path for path in reviewed if path in member_paths
                         ]
+                    if g.kind == GroupKind.LOW_RESOLUTION:
+                        sync_low_resolution_keeps(result, member_paths)
                     payload = group_payload(g)
                     persist_result()
                     return jsonify(payload)
@@ -863,6 +914,7 @@ def create_app(
                 wanted = {str(value) for value in group_ids}
                 scoped = [g for g in result.groups if g.id in wanted]
             changed = 0
+            touched_low_res_paths: set[str] = set()
             for group in scoped:
                 picks = bulk_selection_picks(group, operation, criteria)
                 if picks == list(group.selected_for_removal):
@@ -873,8 +925,12 @@ def create_app(
                     group.reviewed_paths = list(
                         dict.fromkeys([*group.reviewed_paths, *picks])
                     )
+                if group.kind == GroupKind.LOW_RESOLUTION:
+                    touched_low_res_paths.update(member.path for member in group.members)
                 changed += 1
             result.recompute_stats()
+            if touched_low_res_paths:
+                sync_low_resolution_keeps(result, touched_low_res_paths)
             persist_result()
             return jsonify({
                 "ok": True,
@@ -1320,8 +1376,12 @@ def create_app(
         if not is_scanned_file(p, path):
             return jsonify({"error": "not in scan"}), 403
 
-        # ?full=1 → larger lightbox preview
+        # ?full=1 → lightbox preview at Quick Look fidelity. Browsers render
+        # these formats natively, so serve the untouched original; only
+        # formats like HEIC/TIFF need the cached full-resolution transcode.
         variant = "full" if request.args.get("full") == "1" else "thumb"
+        if variant == "full" and not is_video(p) and is_browser_safe_image(p):
+            return send_file(p, mimetype=media_mimetype(p), conditional=True)
         cached = cached_thumbnail(p, variant=variant)
         if cached is None:
             # Videos have no still to fall back to; images can serve the original.
@@ -1382,13 +1442,32 @@ def create_app(
 
     @app.post("/api/shutdown")
     def api_shutdown():
-        """Stop the server process when the browser tab closes."""
-        shutdown = request.environ.get("werkzeug.server.shutdown")
-        if shutdown:
-            shutdown()
-        else:
-            # Fallback for non-Werkzeug runners: kill the process.
-            os.kill(os.getpid(), 9)
+        """Stop the server shortly after the last browser tab closes.
+
+        The page sends this on pagehide, which also fires on reloads and
+        navigation, so wait a grace period; any request that arrives in the
+        meantime (e.g. the reloaded page) cancels the shutdown.
+        """
+
+        def stop() -> None:
+            server = app.extensions.get("dedupe_server")
+            if server is not None:
+                # Unblocks serve_forever() in run_app, so the process exits
+                # cleanly and the launcher can close its Terminal window.
+                server.shutdown()
+            else:
+                # App is being served some other way; SIGINT is the best we
+                # can do (equivalent to Ctrl+C).
+                os.kill(os.getpid(), signal.SIGINT)
+
+        with lock:
+            timer = state.get("shutdown_timer")
+            if timer is not None:
+                timer.cancel()
+            timer = threading.Timer(SHUTDOWN_GRACE_SECONDS, stop)
+            timer.daemon = True
+            state["shutdown_timer"] = timer
+            timer.start()
         return jsonify({"ok": True})
 
     return app
@@ -1401,8 +1480,19 @@ def run_app(
     port: int = 8765,
     open_browser: bool = True,
 ) -> None:
+    from werkzeug.serving import make_server
+
     url = f"http://{host}:{port}/"
     print(f"Dedupe UI: {url}")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+    # make_server (rather than app.run) so /api/shutdown can stop the loop via
+    # server.shutdown() and let the process exit cleanly when the tab closes.
+    server = make_server(host, port, app, threaded=True)
+    app.extensions["dedupe_server"] = server
+    print("Press CTRL+C to quit (closing the browser tab also stops the server)")
+    try:
+        server.serve_forever()
+    finally:
+        app.extensions.pop("dedupe_server", None)
+        server.server_close()

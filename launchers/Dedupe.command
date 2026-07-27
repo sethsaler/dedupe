@@ -116,4 +116,31 @@ echo "────────────────────────�
   open "$URL" 2>/dev/null || true
 ) &
 
-exec "$PYTHON" -m dedupe.cli ui --port "$PORT" --no-browser
+STATUS=0
+"$PYTHON" -m dedupe.cli ui --port "$PORT" --no-browser || STATUS=$?
+
+# On a clean exit (browser tab closed, or Ctrl+C) close this Terminal window
+# so nothing lingers. After an error, leave the window open so the output is
+# readable. The osascript runs in a detached subshell: by the time it fires,
+# this shell has exited, so Terminal closes the window without prompting.
+if [[ "$STATUS" -eq 0 && "${TERM_PROGRAM:-}" == "Apple_Terminal" ]] && command -v osascript >/dev/null 2>&1; then
+  TTY_DEVICE="$(tty 2>/dev/null || true)"
+  if [[ -n "$TTY_DEVICE" && "$TTY_DEVICE" != "not a tty" ]]; then
+    (
+      sleep 0.3
+      osascript >/dev/null 2>&1 <<EOF
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if tty of t is "$TTY_DEVICE" then
+        close w
+        return
+      end if
+    end repeat
+  end repeat
+end tell
+EOF
+    ) &
+  fi
+fi
+exit "$STATUS"

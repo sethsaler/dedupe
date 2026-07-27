@@ -700,6 +700,7 @@ def collect_doctor_report() -> dict[str, object]:
 
     from .cache import default_cache_path
     from .human_detection import YUNET_MODEL_PATH
+    from .keep_decisions import default_keep_decisions_path
     from .review_session import default_review_session_path
 
     try:
@@ -716,6 +717,7 @@ def collect_doctor_report() -> dict[str, object]:
     paths = {
         "cache": _path_status(default_cache_path()),
         "state": _path_status(default_review_session_path()),
+        "keep_decisions": _path_status(default_keep_decisions_path()),
     }
     blockers = [f"cannot import {name}" for name, status in imports.items() if not status["ok"]]
     blockers.extend(

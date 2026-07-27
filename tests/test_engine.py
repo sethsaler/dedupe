@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from PIL import Image
 
 from dedupe.engine import run_scan, run_scans_parallel
 from dedupe.human_detection import human_detection_signature
+from dedupe.keep_decisions import update_keep_decisions
 from dedupe.models import GroupKind, ScanResult
 from dedupe.similar_video import _extract_frames
 
@@ -326,6 +328,39 @@ def test_run_scan_builds_low_resolution_and_random_review_branches_without_simil
     assert all(member.width == 48 and member.height == 48 for member in low_resolution.members)
     assert result.low_resolution_files == 55
     assert result.random_review_files == 50
+
+
+def test_rescan_respects_stored_low_resolution_keep_decisions(tmp_path: Path) -> None:
+    for index in range(3):
+        _save(tmp_path / f"image-{index}.jpg", (index * 20, 80, 120))
+    options = dict(
+        exact=False,
+        similar=False,
+        find_low_resolution=True,
+        random_review_count=0,
+        use_cache=False,
+    )
+
+    first = run_scan([tmp_path], **options)
+    low = next(group for group in first.groups if group.kind == GroupKind.LOW_RESOLUTION)
+    kept = low.members[0]
+    update_keep_decisions(keep=[kept])
+
+    second = run_scan([tmp_path], **options)
+    rescanned = next(
+        group for group in second.groups if group.kind == GroupKind.LOW_RESOLUTION
+    )
+    assert kept.path not in [member.path for member in rescanned.members]
+    assert len(rescanned.members) == len(low.members) - 1
+
+    # Editing the file invalidates the stored decision, so it resurfaces.
+    stat = os.stat(kept.path)
+    os.utime(kept.path, ns=(stat.st_mtime_ns + 1_000_000_000, stat.st_mtime_ns + 1_000_000_000))
+    third = run_scan([tmp_path], **options)
+    resurfaced = next(
+        group for group in third.groups if group.kind == GroupKind.LOW_RESOLUTION
+    )
+    assert kept.path in [member.path for member in resurfaced.members]
 
 
 def test_run_scan_probes_video_dimensions_for_low_resolution_review(

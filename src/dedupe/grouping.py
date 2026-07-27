@@ -205,14 +205,21 @@ def build_low_resolution_groups(
     members: list[FileRecord],
     *,
     max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+    skip_paths: set[str] | None = None,
 ) -> list[DuplicateGroup]:
-    """Build one review collection for media below the configured pixel count."""
+    """Build one review collection for media below the configured pixel count.
+
+    ``skip_paths`` holds files with a durable keep decision from an earlier
+    review; they are never surfaced for low-resolution review again.
+    """
+    skip = skip_paths or set()
     matching = sorted(
         (
             member
             for member in members
             if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
             and 0 < member.pixels < max_pixels
+            and member.path not in skip
         ),
         key=lambda member: (member.pixels, member.path),
     )

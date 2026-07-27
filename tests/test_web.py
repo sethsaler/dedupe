@@ -18,6 +18,7 @@ from dedupe.grouping import (
     build_random_review_groups,
 )
 from dedupe.human_detection import human_detection_signature
+from dedupe.keep_decisions import load_keep_decisions
 from dedupe.models import (
     FileRecord,
     MediaType,
@@ -523,6 +524,60 @@ def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert preview.get_json()["selection_counts"]["low_resolution"] == 1
+
+
+def test_low_resolution_keep_decisions_persist_durably(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    for record in result.files:
+        record.width = 320
+        record.height = 240
+    low_resolution = build_low_resolution_groups(result.files)[0]
+    result.groups = [low_resolution]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    path = low_resolution.members[0].path
+
+    keep = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "decision_path": path,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert keep.status_code == 200
+    assert path in load_keep_decisions()
+
+    stage_removal = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "decision_path": path,
+            "decision_remove": True,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert stage_removal.status_code == 200
+    assert path not in load_keep_decisions()
+
+    # The checkbox flow (reviewed + unselected) also records a durable keep.
+    checkbox_keep = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "selected": [],
+            "reviewed": [path],
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert checkbox_keep.status_code == 200
+    assert path in load_keep_decisions()
 
 
 def test_independent_review_rejects_invalid_explicit_decisions(tmp_path: Path) -> None:
@@ -1198,11 +1253,63 @@ def test_thumbnail_cache_key_changes_when_source_file_changes(
     stat = scanned.stat()
     os.utime(scanned, ns=(stat.st_mtime_ns + 1_000_000_000, stat.st_mtime_ns + 1_000_000_000))
     refreshed = client.get("/api/thumbnail", query_string={"path": str(scanned)})
-    full_variant = client.get("/api/thumbnail", query_string={"path": str(scanned), "full": "1"})
 
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert original.headers["ETag"] != refreshed.headers["ETag"]
-    assert refreshed.headers["ETag"] != full_variant.headers["ETag"]
+
+
+def test_full_thumbnail_serves_original_for_browser_safe_images(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = _result(tmp_path)
+    client = create_app(result).test_client()
+    scanned = Path(result.files[0].path)
+    calls = []
+
+    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
+        calls.append(full)
+        return b"jpeg-bytes"
+
+    monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
+
+    response = client.get("/api/thumbnail", query_string={"path": str(scanned), "full": "1"})
+
+    assert response.status_code == 200
+    assert response.data == scanned.read_bytes()
+    assert calls == []  # Browsers render JPEG natively; no transcode happens.
+
+
+def test_full_thumbnail_transcodes_formats_browsers_cannot_render(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "raw.tif"
+    path.write_bytes(b"tiff bytes")
+    stat = path.stat()
+    record = FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".tif",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[record], groups=[])
+    client = create_app(result).test_client()
+    calls = []
+
+    def fake_thumbnail(source: Path, *, full: bool = False) -> bytes:
+        calls.append(full)
+        return b"transcoded-jpeg"
+
+    monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
+
+    response = client.get("/api/thumbnail", query_string={"path": str(path), "full": "1"})
+
+    assert response.status_code == 200
+    assert response.data == b"transcoded-jpeg"
+    assert calls == [True]
 
 
 def test_thumbnail_rejects_paths_outside_the_scan(tmp_path: Path) -> None:

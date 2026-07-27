@@ -18,7 +18,9 @@ VIDEO_EXTENSIONS = {
     ".wmv", ".flv", ".3gp",
 }
 
-THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v2"
+BROWSER_SAFE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
+
+THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v5"
 DEFAULT_THUMBNAIL_BUDGET_BYTES = 512 * 1024 * 1024
 PRUNE_MIN_INTERVAL_SECONDS = 120.0
 PRUNE_EVERY_N_WRITES = 32
@@ -29,6 +31,11 @@ _prune_state = {"writes": 0, "last_run": 0.0}
 
 def is_video(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def is_browser_safe_image(path: Path) -> bool:
+    """True when browsers can render the original file directly (no transcode)."""
+    return path.suffix.lower() in BROWSER_SAFE_IMAGE_EXTENSIONS
 
 
 def media_mimetype(path: Path) -> str:
@@ -46,12 +53,21 @@ def image_thumbnail_bytes(path: Path, *, full: bool = False) -> bytes:
     except Exception:
         pass
 
-    max_edge = 1600 if full else 320
-    quality = 88 if full else 80
+    # Card thumbs are sized for Retina (2x) displays: decision cards render up
+    # to ~800 CSS px wide (~1600 physical px), so anything smaller gets
+    # upscaled by the browser and looks soft next to Finder's previews. The
+    # full (lightbox) variant is only used for formats browsers cannot render
+    # natively (HEIC, TIFF, …) and keeps the original resolution for
+    # Quick Look-exact fidelity; browser-safe originals are served as-is by
+    # the /api/thumbnail route.
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        img.thumbnail((max_edge, max_edge))
+        if full:
+            quality = 95
+        else:
+            quality = 85
+            img.thumbnail((1600, 1600), Image.Resampling.LANCZOS, reducing_gap=3.0)
         output = BytesIO()
         img.save(output, format="JPEG", quality=quality)
         return output.getvalue()
@@ -66,7 +82,7 @@ def video_thumbnail_bytes(path: Path) -> bytes | None:
         subprocess.run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i",
-                str(path), "-frames:v", "1", "-vf", "scale=320:-1", "-y",
+                str(path), "-frames:v", "1", "-vf", r"scale=min(1600\,iw):-1", "-q:v", "2", "-y",
                 str(output_path),
             ],
             capture_output=True,

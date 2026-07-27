@@ -146,6 +146,16 @@ def test_low_resolution_candidates_include_images_gifs_and_videos_below_one_mp()
     assert group.reclaimable_bytes == video.size
 
 
+def test_low_resolution_groups_skip_paths_with_stored_keep_decisions() -> None:
+    kept = _rec("/kept.jpg", 300, 1, w=100, h=100)
+    fresh = _rec("/fresh.jpg", 400, 2, w=200, h=200)
+
+    (group,) = build_low_resolution_groups([kept, fresh], skip_paths={kept.path})
+
+    assert [member.path for member in group.members] == [fresh.path]
+    assert build_low_resolution_groups([kept], skip_paths={kept.path}) == []
+
+
 def test_random_review_is_unique_bounded_and_reproducible_with_seed() -> None:
     records = [_rec(f"/{index:03d}.jpg", 100 + index, index) for index in range(80)]
 
