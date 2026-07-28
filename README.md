@@ -8,7 +8,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
-- **Low-resolution review** — surfaces images, GIFs, and videos below 1 megapixel as independent deletion suggestions
+- **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
@@ -244,7 +244,7 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
 | Similar videos | Ordered pHashes from direct ffmpeg timeline seeks, compared at normalized positions (default mean Hamming ≤ 8) |
-| Low resolution | Display-oriented dimensions below 1,000,000 total pixels; candidates remain unselected until reviewed |
+| Low resolution | Display-oriented dimensions below the pre-scan megapixel bound for that media type (1 MP by default); candidates remain unselected until reviewed |
 | Random review | A fresh, unique sample of up to 50 scanned images, GIFs, and videos; Keep/Delete decisions are staged for the normal preview-and-confirm action flow |
 | No person detected | Offline OpenCV YuNet face + full-body detection on images, representative GIF frames, and up to 16 direct-seek video frames with positive-evidence early exit |
 

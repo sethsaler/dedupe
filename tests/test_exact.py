@@ -91,6 +91,18 @@ def test_inventory_never_enters_photos_library_packages(tmp_path: Path) -> None:
     assert [Path(record.path).name for record in records] == ["exported.jpg"]
 
 
+def test_inventory_skips_dedupe_quarantine(tmp_path: Path) -> None:
+    quarantine = tmp_path / "_Dedupe Quarantine"
+    quarantine.mkdir()
+    (quarantine / "removed.jpg").write_bytes(b"quarantined")
+    visible = tmp_path / "visible.jpg"
+    visible.write_bytes(b"visible")
+
+    records = inventory([tmp_path])
+
+    assert [Path(record.path).name for record in records] == [visible.name]
+
+
 def test_inventory_rejects_direct_photos_library_descendants(tmp_path: Path) -> None:
     originals = tmp_path / "Photos Library.photoslibrary" / "originals"
     originals.mkdir(parents=True)

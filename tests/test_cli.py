@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from dedupe import cli
+from dedupe.models import ScanResult
 
 
 def test_parser_exposes_doctor_and_similarity_thresholds() -> None:
@@ -27,6 +28,32 @@ def test_parser_exposes_doctor_and_similarity_thresholds() -> None:
 
     assert doctor.command == "doctor" and doctor.json is True
     assert (benchmark.threshold, benchmark.video_threshold, benchmark.workers) == (9, 11, 2)
+
+
+def test_scan_can_target_low_resolution_media_types(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_scan(paths, **kwargs):
+        captured.update(kwargs)
+        return ScanResult(roots=[str(path) for path in paths], files=[], groups=[])
+
+    monkeypatch.setattr(cli, "run_scan", fake_run_scan)
+    args = cli.build_parser().parse_args(
+        [
+            "scan",
+            str(tmp_path),
+            "--low-resolution-types",
+            "videos",
+            "--low-resolution-video-max-mp",
+            "2.5",
+        ]
+    )
+
+    assert cli.cmd_scan(args) == 0
+    assert captured["low_resolution_images"] is False
+    assert captured["low_resolution_gifs"] is False
+    assert captured["low_resolution_videos"] is True
+    assert captured["low_resolution_video_max_pixels"] == 2_500_000
 
 
 def test_doctor_json_exit_status_only_tracks_core_readiness(monkeypatch, capsys) -> None:

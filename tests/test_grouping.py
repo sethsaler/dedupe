@@ -146,6 +146,48 @@ def test_low_resolution_candidates_include_images_gifs_and_videos_below_one_mp()
     assert group.reclaimable_bytes == video.size
 
 
+def test_low_resolution_candidates_can_be_filtered_by_media_type() -> None:
+    image = _rec("/small.jpg", 300, 1, w=100, h=100)
+    gif = _rec("/small.gif", 400, 2, w=200, h=200)
+    gif.media_type = MediaType.GIF
+    video = _rec("/small.mp4", 500, 3, w=640, h=360)
+    video.media_type = MediaType.VIDEO
+
+    (images,) = build_low_resolution_groups(
+        [image, gif, video], media_types={MediaType.IMAGE}
+    )
+    (gifs,) = build_low_resolution_groups(
+        [image, gif, video], media_types={MediaType.GIF}
+    )
+    (videos,) = build_low_resolution_groups(
+        [image, gif, video], media_types={MediaType.VIDEO}
+    )
+
+    assert [member.path for member in images.members] == [image.path]
+    assert [member.path for member in gifs.members] == [gif.path]
+    assert [member.path for member in videos.members] == [video.path]
+    assert build_low_resolution_groups([image], media_types=set()) == []
+
+
+def test_low_resolution_candidates_use_per_type_pixel_bounds() -> None:
+    image = _rec("/image.jpg", 300, 1, w=100, h=100)
+    gif = _rec("/animation.gif", 400, 2, w=200, h=200)
+    gif.media_type = MediaType.GIF
+    video = _rec("/video.mp4", 500, 3, w=640, h=360)
+    video.media_type = MediaType.VIDEO
+
+    (group,) = build_low_resolution_groups(
+        [image, gif, video],
+        max_pixels_by_media_type={
+            MediaType.IMAGE: 20_000,
+            MediaType.GIF: 20_000,
+            MediaType.VIDEO: 300_000,
+        },
+    )
+
+    assert [member.path for member in group.members] == [image.path, video.path]
+
+
 def test_low_resolution_groups_skip_paths_with_stored_keep_decisions() -> None:
     kept = _rec("/kept.jpg", 300, 1, w=100, h=100)
     fresh = _rec("/fresh.jpg", 400, 2, w=200, h=200)

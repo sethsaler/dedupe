@@ -45,9 +45,31 @@ GroupCb = Callable[[DuplicateGroup], None]
 StreamProgressCb = Callable[[ScanProgress], None]
 
 
+def _low_resolution_bounds(
+    *,
+    default_max_pixels: int,
+    images: bool,
+    gifs: bool,
+    videos: bool,
+    image_max_pixels: int | None,
+    gif_max_pixels: int | None,
+    video_max_pixels: int | None,
+) -> dict[MediaType, int]:
+    return {
+        media_type: max(1, int(max_pixels or default_max_pixels))
+        for media_type, enabled, max_pixels in (
+            (MediaType.IMAGE, images, image_max_pixels),
+            (MediaType.GIF, gifs, gif_max_pixels),
+            (MediaType.VIDEO, videos, video_max_pixels),
+        )
+        if enabled
+    }
+
+
 def _populate_missing_dimensions(
     records: list,
     *,
+    media_types: set[MediaType],
     workers: int,
     cancelled: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -56,7 +78,7 @@ def _populate_missing_dimensions(
     missing = [
         record
         for record in records
-        if record.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+        if record.media_type in media_types
         and not (record.width and record.height)
     ]
     if not missing:
@@ -100,7 +122,13 @@ def run_scan(
     similar: bool = True,
     find_no_humans: bool = False,
     find_low_resolution: bool = True,
+    low_resolution_images: bool = True,
+    low_resolution_gifs: bool = True,
+    low_resolution_videos: bool = True,
     low_resolution_max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+    low_resolution_image_max_pixels: int | None = None,
+    low_resolution_gif_max_pixels: int | None = None,
+    low_resolution_video_max_pixels: int | None = None,
     random_review_count: int = DEFAULT_RANDOM_REVIEW_COUNT,
     human_backend: str = DEFAULT_HUMAN_BACKEND,
     photon_model: str = DEFAULT_PHOTON_MODEL,
@@ -128,6 +156,15 @@ def run_scan(
     grouping consults the exact-group membership.
     """
     n_workers = resolve_workers(workers)
+    low_resolution_bounds = _low_resolution_bounds(
+        default_max_pixels=low_resolution_max_pixels,
+        images=low_resolution_images,
+        gifs=low_resolution_gifs,
+        videos=low_resolution_videos,
+        image_max_pixels=low_resolution_image_max_pixels,
+        gif_max_pixels=low_resolution_gif_max_pixels,
+        video_max_pixels=low_resolution_video_max_pixels,
+    )
     prog = ScanProgress(phase="starting", message="Starting scan…")
     started = time.monotonic()
     phase_started = started
@@ -448,7 +485,7 @@ def run_scan(
         eligible = [
             record
             for record in records
-            if record.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+            if record.media_type in low_resolution_bounds
         ]
         emit(
             "low-resolution",
@@ -467,6 +504,7 @@ def run_scan(
 
         stage_errors["low_resolution"] = _populate_missing_dimensions(
             records,
+            media_types=set(low_resolution_bounds),
             workers=n_workers,
             cancelled=cancelled,
             progress=resolution_progress,
@@ -481,6 +519,8 @@ def run_scan(
                     records,
                     max_pixels=max(1, int(low_resolution_max_pixels)),
                     skip_paths=kept_paths(records),
+                    media_types=set(low_resolution_bounds),
+                    max_pixels_by_media_type=low_resolution_bounds,
                 )
             )
         review_groups.extend(
@@ -728,7 +768,13 @@ def run_scans_parallel(
     similar: bool = True,
     find_no_humans: bool = False,
     find_low_resolution: bool = True,
+    low_resolution_images: bool = True,
+    low_resolution_gifs: bool = True,
+    low_resolution_videos: bool = True,
     low_resolution_max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
+    low_resolution_image_max_pixels: int | None = None,
+    low_resolution_gif_max_pixels: int | None = None,
+    low_resolution_video_max_pixels: int | None = None,
     random_review_count: int = DEFAULT_RANDOM_REVIEW_COUNT,
     human_backend: str = DEFAULT_HUMAN_BACKEND,
     photon_model: str = DEFAULT_PHOTON_MODEL,
@@ -832,7 +878,13 @@ def run_scans_parallel(
             similar=similar,
             find_no_humans=find_no_humans,
             find_low_resolution=find_low_resolution,
+            low_resolution_images=low_resolution_images,
+            low_resolution_gifs=low_resolution_gifs,
+            low_resolution_videos=low_resolution_videos,
             low_resolution_max_pixels=low_resolution_max_pixels,
+            low_resolution_image_max_pixels=low_resolution_image_max_pixels,
+            low_resolution_gif_max_pixels=low_resolution_gif_max_pixels,
+            low_resolution_video_max_pixels=low_resolution_video_max_pixels,
             random_review_count=random_review_count,
             human_backend=human_backend,
             photon_model=photon_model,
@@ -879,11 +931,22 @@ def run_scans_parallel(
 
     review_groups: list[DuplicateGroup] = []
     if find_low_resolution:
+        low_resolution_bounds = _low_resolution_bounds(
+            default_max_pixels=low_resolution_max_pixels,
+            images=low_resolution_images,
+            gifs=low_resolution_gifs,
+            videos=low_resolution_videos,
+            image_max_pixels=low_resolution_image_max_pixels,
+            gif_max_pixels=low_resolution_gif_max_pixels,
+            video_max_pixels=low_resolution_video_max_pixels,
+        )
         review_groups.extend(
             build_low_resolution_groups(
                 all_files,
                 max_pixels=max(1, int(low_resolution_max_pixels)),
                 skip_paths=kept_paths(all_files),
+                media_types=set(low_resolution_bounds),
+                max_pixels_by_media_type=low_resolution_bounds,
             )
         )
     review_groups.extend(

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import dedupe.actions as actions_module
 from dedupe.cache import HashCache
 from dedupe.grouping import (
     build_groups,
@@ -180,6 +181,43 @@ def test_parallel_scan_streams_report_per_folder_and_tag_groups(tmp_path: Path) 
     # No cross-folder dedup: one exact group per folder, each tagged with its root.
     assert len(groups) == 2
     assert {Path(group["root"]).name for group in groups} == {"a", "b"}
+
+
+def test_scan_endpoint_forwards_low_resolution_media_types(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured = {}
+
+    def fake_run_scan(paths, **kwargs):
+        captured.update(kwargs)
+        return ScanResult(roots=[str(path) for path in paths], files=[], groups=[])
+
+    monkeypatch.setattr(web_app, "run_scan", fake_run_scan)
+    app = create_app()
+    client = app.test_client()
+    response = client.post(
+        "/api/scan",
+        json={
+            "paths": [str(tmp_path)],
+            "parallel_streams": False,
+            "low_resolution_images": False,
+            "low_resolution_gifs": True,
+            "low_resolution_videos": False,
+            "low_resolution_image_max_pixels": 500_000,
+            "low_resolution_gif_max_pixels": 1_500_000,
+            "low_resolution_video_max_pixels": 3_000_000,
+        },
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+
+    assert response.status_code == 200
+    _wait_idle(client)
+    assert captured["low_resolution_images"] is False
+    assert captured["low_resolution_gifs"] is True
+    assert captured["low_resolution_videos"] is False
+    assert captured["low_resolution_image_max_pixels"] == 500_000
+    assert captured["low_resolution_gif_max_pixels"] == 1_500_000
+    assert captured["low_resolution_video_max_pixels"] == 3_000_000
 
 
 def test_action_endpoint_scopes_by_kinds(tmp_path: Path) -> None:
@@ -425,6 +463,12 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="nonHumanBanner"' in html
     assert 'id="candidateReviewBanner"' in html
     assert 'id="optLowResolution"' in html
+    assert 'id="optLowResolutionImages"' in html
+    assert 'id="optLowResolutionGifs"' in html
+    assert 'id="optLowResolutionVideos"' in html
+    assert 'id="lowResolutionImageMaxMp"' in html
+    assert 'id="lowResolutionGifMaxMp"' in html
+    assert 'id="lowResolutionVideoMaxMp"' in html
     assert 'id="optRandomReview"' in html
     assert 'data-kind="low_resolution"' in html
     assert 'data-kind="random_review"' in html
@@ -441,6 +485,12 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'video.muted = true' in script
     assert 'method: "DELETE"' in script
     assert 'dry_run: true' in script
+    assert 'low_resolution_images: $("optLowResolutionImages").checked' in script
+    assert 'low_resolution_gifs: $("optLowResolutionGifs").checked' in script
+    assert 'low_resolution_videos: $("optLowResolutionVideos").checked' in script
+    assert "low_resolution_image_max_pixels: lowResolutionBounds.images" in script
+    assert "low_resolution_gif_max_pixels: lowResolutionBounds.gifs" in script
+    assert "low_resolution_video_max_pixels: lowResolutionBounds.videos" in script
     assert 'await reviewCandidate(current, member.path, e.key === "ArrowLeft")' in script
 
     stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
@@ -524,6 +574,85 @@ def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert preview.get_json()["selection_counts"]["low_resolution"] == 1
+
+
+@pytest.mark.parametrize("review_kind", ["low_resolution", "random_review"])
+def test_trash_routes_review_decisions_to_dedicated_quarantine(
+    tmp_path: Path, monkeypatch, review_kind: str
+) -> None:
+    result = _result(tmp_path)
+    review_path = tmp_path / f"{review_kind}.jpg"
+    review_path.write_bytes(b"review candidate")
+    stat = review_path.stat()
+    candidate = FileRecord(
+        path=str(review_path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        width=320,
+        height=240,
+    )
+    if review_kind == "low_resolution":
+        review_group = build_low_resolution_groups([candidate])[0]
+    else:
+        review_group = build_random_review_groups([candidate], count=1)[0]
+    review_group.selected_for_removal = [candidate.path]
+    review_group.reviewed_paths = [candidate.path]
+    result.files.append(candidate)
+    result.groups.append(review_group)
+
+    fake_trash = tmp_path / "fake-trash"
+
+    def send_to_fake_trash(path: Path, _batch) -> Path:
+        fake_trash.mkdir(exist_ok=True)
+        destination = fake_trash / path.name
+        path.replace(destination)
+        return destination
+
+    monkeypatch.setattr(actions_module, "_send_to_trash", send_to_fake_trash)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    request_payload = {
+        "action": "trash",
+        "dry_run": True,
+        "kinds": "all",
+        "scan_id": scan_id,
+    }
+
+    preview = client.post("/api/action", json=request_payload, headers=headers)
+
+    assert preview.status_code == 200
+    preview_payload = preview.get_json()
+    quarantine = tmp_path / "_Dedupe Quarantine"
+    assert preview_payload["success_count"] == 2
+    assert preview_payload["review_quarantine_count"] == 1
+    assert preview_payload["review_quarantine_dir"] == str(quarantine)
+    review_item = next(item for item in preview_payload["items"] if item["path"] == candidate.path)
+    assert review_item["action"] == "quarantine"
+    assert Path(review_item["destination"]).parent == quarantine
+
+    executed = client.post(
+        "/api/action",
+        json={
+            **request_payload,
+            "dry_run": False,
+            "preview_token": preview_payload["preview_token"],
+        },
+        headers=headers,
+    )
+
+    assert executed.status_code == 200
+    executed_payload = executed.get_json()
+    assert executed_payload["review_quarantine_count"] == 1
+    assert (quarantine / review_path.name).is_file()
+    assert len(list(fake_trash.iterdir())) == 1
+    assert len(executed_payload["log_paths"]) == 2
 
 
 def test_low_resolution_keep_decisions_persist_durably(tmp_path: Path) -> None:

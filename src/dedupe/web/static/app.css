@@ -429,6 +429,31 @@ input[type="text"]:focus, select:focus {
 
 .chip-check:active span { transform: scale(0.97); }
 
+.low-resolution-bounds {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.low-resolution-bounds label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.low-resolution-bounds input {
+  width: 64px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
 .thresh {
   display: flex;
   align-items: center;

@@ -387,6 +387,59 @@ def test_run_scan_probes_video_dimensions_for_low_resolution_review(
     ]
 
 
+def test_run_scan_skips_disabled_low_resolution_media_types(
+    tmp_path: Path, monkeypatch
+) -> None:
+    video = tmp_path / "small.mp4"
+    video.write_bytes(b"video")
+    probe_calls = []
+
+    def probe_video(path):
+        probe_calls.append(path)
+        return 5.0, 640, 360
+
+    monkeypatch.setattr("dedupe.engine.probe_video", probe_video)
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_low_resolution=True,
+        low_resolution_images=True,
+        low_resolution_gifs=False,
+        low_resolution_videos=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+
+    assert probe_calls == []
+    assert all(group.kind != GroupKind.LOW_RESOLUTION for group in result.groups)
+
+
+def test_run_scan_uses_custom_low_resolution_bound(tmp_path: Path) -> None:
+    _save(tmp_path / "small.jpg", (20, 80, 120))
+
+    below_bound = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        low_resolution_image_max_pixels=3_000,
+        random_review_count=0,
+        use_cache=False,
+    )
+    above_bound = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        low_resolution_image_max_pixels=2_000,
+        random_review_count=0,
+        use_cache=False,
+    )
+
+    assert below_bound.low_resolution_files == 1
+    assert above_bound.low_resolution_files == 0
+
+
 def test_repeated_human_scan_only_analyzes_new_files(tmp_path: Path, monkeypatch) -> None:
     _save(tmp_path / "first.jpg", (30, 120, 60))
     cache_path = tmp_path / "hashes.sqlite3"

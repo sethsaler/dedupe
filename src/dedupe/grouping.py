@@ -206,6 +206,8 @@ def build_low_resolution_groups(
     *,
     max_pixels: int = LOW_RESOLUTION_MAX_PIXELS,
     skip_paths: set[str] | None = None,
+    media_types: set[MediaType] | None = None,
+    max_pixels_by_media_type: dict[MediaType, int] | None = None,
 ) -> list[DuplicateGroup]:
     """Build one review collection for media below the configured pixel count.
 
@@ -213,12 +215,18 @@ def build_low_resolution_groups(
     review; they are never surfaced for low-resolution review again.
     """
     skip = skip_paths or set()
+    allowed_types = media_types if media_types is not None else {
+        MediaType.IMAGE,
+        MediaType.GIF,
+        MediaType.VIDEO,
+    }
+    bounds = max_pixels_by_media_type or {}
     matching = sorted(
         (
             member
             for member in members
-            if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
-            and 0 < member.pixels < max_pixels
+            if member.media_type in allowed_types
+            and 0 < member.pixels < bounds.get(member.media_type, max_pixels)
             and member.path not in skip
         ),
         key=lambda member: (member.pixels, member.path),

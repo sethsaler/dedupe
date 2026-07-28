@@ -73,8 +73,20 @@
           </div>
           <div class="opt-group">
             <span class="opt-label">Review</span>
-            <label class="chip-check"><input type="checkbox" id="optLowResolution" checked /><span>Low resolution (&lt;1 MP)</span></label>
+            <label class="chip-check"><input type="checkbox" id="optLowResolution" checked /><span>Low resolution</span></label>
             <label class="chip-check"><input type="checkbox" id="optRandomReview" checked /><span>Random set of 50</span></label>
+          </div>
+          <div class="opt-group">
+            <span class="opt-label">Low-res types</span>
+            <label class="chip-check"><input type="checkbox" id="optLowResolutionImages" checked /><span>Images</span></label>
+            <label class="chip-check"><input type="checkbox" id="optLowResolutionGifs" checked /><span>GIFs</span></label>
+            <label class="chip-check"><input type="checkbox" id="optLowResolutionVideos" checked /><span>Videos</span></label>
+          </div>
+          <div class="low-resolution-bounds" aria-label="Low-resolution megapixel bounds">
+            <span class="opt-label">Low-res bounds</span>
+            <label>Images below <input id="lowResolutionImageMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
+            <label>GIFs below <input id="lowResolutionGifMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
+            <label>Videos below <input id="lowResolutionVideoMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
           </div>
           <div class="opt-group">
             <span class="opt-label">Types</span>
@@ -349,8 +361,8 @@
           <input id="quarantineDir" type="text" placeholder="~/Duplicates" spellcheck="false" />
         </label>
         <div class="btn-group">
-          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash">Preview trash</button>
-          <button class="btn danger" id="btnTrash" type="button">Move to Trash</button>
+          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash or review quarantine">Preview trash</button>
+          <button class="btn danger" id="btnTrash" type="button">Trash / review quarantine</button>
         </div>
         <div class="btn-group">
           <button class="btn ghost" id="btnDryQuarantine" type="button">Preview quarantine</button>

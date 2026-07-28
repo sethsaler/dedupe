@@ -271,6 +271,12 @@
     "optSimilar",
     "optNoHumans",
     "optLowResolution",
+    "optLowResolutionImages",
+    "optLowResolutionGifs",
+    "optLowResolutionVideos",
+    "lowResolutionImageMaxMp",
+    "lowResolutionGifMaxMp",
+    "lowResolutionVideoMaxMp",
     "optRandomReview",
     "optImages",
     "optGifs",
@@ -1669,6 +1675,12 @@
     if (e.key === "Enter") startScan();
   });
 
+  function lowResolutionMaxPixels(id) {
+    const megapixels = Number($(id).value);
+    if (!Number.isFinite(megapixels) || megapixels <= 0) return null;
+    return Math.round(megapixels * 1_000_000);
+  }
+
   async function startScan() {
     const raw = $("paths").value.trim();
     if (!raw) {
@@ -1677,6 +1689,20 @@
       return;
     }
     const paths = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    const lowResolutionBounds = {
+      images: lowResolutionMaxPixels("lowResolutionImageMaxMp"),
+      gifs: lowResolutionMaxPixels("lowResolutionGifMaxMp"),
+      videos: lowResolutionMaxPixels("lowResolutionVideoMaxMp"),
+    };
+    const invalidLowResolutionBound = $("optLowResolution").checked && [
+      ["optLowResolutionImages", "images", "Images"],
+      ["optLowResolutionGifs", "gifs", "GIFs"],
+      ["optLowResolutionVideos", "videos", "Videos"],
+    ].find(([toggle, key]) => $(toggle).checked && lowResolutionBounds[key] == null);
+    if (invalidLowResolutionBound) {
+      toast(`Set a positive megapixel bound for ${invalidLowResolutionBound[2]}`);
+      return;
+    }
     paths.forEach(saveRecent);
     try {
       $("progressWrap").hidden = false;
@@ -1710,6 +1736,12 @@
           similar: $("optSimilar").checked,
           find_no_humans: $("optNoHumans").checked,
           find_low_resolution: $("optLowResolution").checked,
+          low_resolution_images: $("optLowResolutionImages").checked,
+          low_resolution_gifs: $("optLowResolutionGifs").checked,
+          low_resolution_videos: $("optLowResolutionVideos").checked,
+          low_resolution_image_max_pixels: lowResolutionBounds.images,
+          low_resolution_gif_max_pixels: lowResolutionBounds.gifs,
+          low_resolution_video_max_pixels: lowResolutionBounds.videos,
           random_review_count: $("optRandomReview").checked ? 50 : 0,
           human_backend: "opencv",
           include_images: $("optImages").checked,
@@ -2027,13 +2059,17 @@
       const skippedWarning = (action !== "isolate" && preview.fail_count)
         ? `<p><strong>${eligibleCount} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
         : "";
+      const reviewQuarantineCount = preview.review_quarantine_count || 0;
+      const reviewQuarantineNote = reviewQuarantineCount
+        ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
+        : "";
       const labels = {
         trash: `Move selected ${scopeLabel}files to Trash?`,
         quarantine: `Move selected ${scopeLabel}files to quarantine?`,
         isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p>${reviewQuarantineNote}<p>At least one file is always kept in every duplicate group. Other selected files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
         quarantine: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
         isolate: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
       };

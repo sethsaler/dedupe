@@ -23,7 +23,7 @@ from flask import (
     send_file,
 )
 
-from ..actions import apply_actions, format_bytes, isolate_groups
+from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups
 from ..cache import HashCache
 from ..engine import run_scan, run_scans_parallel
 from ..grouping import apply_smart_select, apply_smart_select_all
@@ -50,8 +50,9 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 13
+WEB_API_VERSION = 16
 PREVIEW_TOKEN_TTL_SECONDS = 600
+REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 
 # How long after the last tab closes before the server exits. Long enough for a
 # page reload to come back and cancel the shutdown, short enough to feel prompt.
@@ -82,6 +83,19 @@ def stale_preview_payload(reason: str) -> dict:
 
 
 BULK_SELECT_OPERATIONS = {"select_all", "select_none", "invert", "criteria"}
+
+
+def review_quarantine_dir(roots: list[str], selected_paths: set[str]) -> Path:
+    """Place heuristic review removals beside the scan, not in system Trash."""
+    for raw_root in roots:
+        root = Path(raw_root).expanduser().resolve(strict=False)
+        if root.is_dir():
+            return root / REVIEW_QUARANTINE_FOLDER
+        if root.parent.is_dir():
+            return root.parent / REVIEW_QUARANTINE_FOLDER
+    if selected_paths:
+        return Path(next(iter(selected_paths))).parent / REVIEW_QUARANTINE_FOLDER
+    return Path.cwd() / REVIEW_QUARANTINE_FOLDER
 
 
 def parse_bulk_criteria(raw: dict) -> dict:
@@ -657,6 +671,18 @@ def create_app(
                     similar=bool(data.get("similar", True)),
                     find_no_humans=bool(data.get("find_no_humans", False)),
                     find_low_resolution=bool(data.get("find_low_resolution", True)),
+                    low_resolution_images=bool(data.get("low_resolution_images", True)),
+                    low_resolution_gifs=bool(data.get("low_resolution_gifs", True)),
+                    low_resolution_videos=bool(data.get("low_resolution_videos", True)),
+                    low_resolution_image_max_pixels=max(
+                        1, int(data.get("low_resolution_image_max_pixels") or 1_000_000)
+                    ),
+                    low_resolution_gif_max_pixels=max(
+                        1, int(data.get("low_resolution_gif_max_pixels") or 1_000_000)
+                    ),
+                    low_resolution_video_max_pixels=max(
+                        1, int(data.get("low_resolution_video_max_pixels") or 1_000_000)
+                    ),
                     random_review_count=max(0, int(data.get("random_review_count", 50))),
                     human_backend=human_backend,
                     photon_model=photon_model,
@@ -1266,16 +1292,81 @@ def create_app(
                     roots=roots,
                 )
             else:
-                preview_result = apply_actions(
-                    groups,
-                    action=action,
-                    quarantine_dir=destination,
-                    dry_run=True,
-                    roots=roots,
-                    kinds=kinds,
-                    safety_groups=groups,
+                review_kinds = {GroupKind.LOW_RESOLUTION, GroupKind.RANDOM_REVIEW}
+                review_groups = [group for group in groups if group.kind in review_kinds]
+                review_paths = (
+                    set(
+                        effective_selected_paths(
+                            review_groups,
+                            protection_groups=groups,
+                        )
+                    )
+                    & selected
+                    if action == "trash"
+                    else set()
                 )
-                manifest = preview_manifest(action, kinds_raw, destination, preview_result)
+                trash_paths = selected - review_paths
+                special_quarantine = (
+                    review_quarantine_dir(roots, review_paths) if review_paths else None
+                )
+
+                def groups_selecting(paths: set[str]):
+                    return [
+                        replace(
+                            group,
+                            selected_for_removal=[
+                                path for path in group.selected_for_removal if path in paths
+                            ],
+                        )
+                        for group in scoped_groups
+                    ]
+
+                def run_action_parts(part_dry_run: bool):
+                    if action != "trash":
+                        return [
+                            apply_actions(
+                                groups,
+                                action=action,
+                                quarantine_dir=destination,
+                                dry_run=part_dry_run,
+                                roots=roots,
+                                kinds=kinds,
+                                safety_groups=groups,
+                            )
+                        ]
+                    partitions = []
+                    if review_paths:
+                        partitions.append(
+                            (review_paths, "quarantine", special_quarantine)
+                        )
+                    if trash_paths:
+                        partitions.append((trash_paths, "trash", None))
+                    return [
+                        apply_actions(
+                            groups_selecting(paths),
+                            action=part_action,
+                            quarantine_dir=part_destination,
+                            dry_run=part_dry_run,
+                            roots=roots,
+                            safety_groups=groups,
+                            allow_cross_device=part_action == "quarantine",
+                        )
+                        for paths, part_action, part_destination in partitions
+                    ]
+
+                preview_results = run_action_parts(True)
+                preview_result = ActionResult(dry_run=True, action=action)
+                preview_result.items = [
+                    item for partial in preview_results for item in partial.items
+                ]
+                manifest_destination = (
+                    destination,
+                    str(special_quarantine) if special_quarantine else None,
+                    tuple(sorted(review_paths)),
+                )
+                manifest = preview_manifest(
+                    action, kinds_raw, manifest_destination, preview_result
+                )
                 if dry_run:
                     action_result = preview_result
                     with lock:
@@ -1285,9 +1376,14 @@ def create_app(
                         verdict = consume_preview_token(data.get("preview_token"), manifest)
                         if verdict != "valid":
                             return jsonify(stale_preview_payload(verdict)), 409
-                    action_result = apply_actions(
-                        groups, action=action, quarantine_dir=destination,
-                        dry_run=False, roots=roots, kinds=kinds, safety_groups=groups,
+                    executed_results = run_action_parts(False)
+                    action_result = ActionResult(dry_run=False, action=action)
+                    action_result.items = [
+                        item for partial in executed_results for item in partial.items
+                    ]
+                    action_result.log_path = next(
+                        (partial.log_path for partial in executed_results if partial.log_path),
+                        None,
                     )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400
@@ -1345,6 +1441,19 @@ def create_app(
             payload = action_result.to_dict()
             if action in ("trash", "quarantine"):
                 payload["selection_counts"] = selection_counts
+                if action == "trash" and special_quarantine:
+                    payload["review_quarantine_dir"] = str(special_quarantine)
+                    payload["review_quarantine_count"] = sum(
+                        1
+                        for item in action_result.items
+                        if item.action == "quarantine" and item.ok
+                    )
+                    if not dry_run:
+                        payload["log_paths"] = [
+                            partial.log_path
+                            for partial in executed_results
+                            if partial.log_path
+                        ]
                 if dry_run:
                     payload["preview_token"] = preview_token
                     payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS

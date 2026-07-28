@@ -71,6 +71,8 @@ def inventory(
         "for deletion",
         "_dedupe review",
         "dedupe review",
+        "_dedupe quarantine",
+        "dedupe quarantine",
     }
 
     records: list[FileRecord] = []

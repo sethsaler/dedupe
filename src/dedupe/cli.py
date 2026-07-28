@@ -6,6 +6,7 @@ import argparse
 import importlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import shutil
@@ -57,7 +58,36 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--no-low-resolution",
         action="store_true",
-        help="Do not surface media below 1 megapixel for review",
+        help="Disable low-resolution review",
+    )
+    scan.add_argument(
+        "--low-resolution-types",
+        nargs="+",
+        choices=("images", "gifs", "videos"),
+        default=("images", "gifs", "videos"),
+        metavar="TYPE",
+        help="Media types for low-resolution review (default: images gifs videos)",
+    )
+    scan.add_argument(
+        "--low-resolution-image-max-mp",
+        type=float,
+        default=1.0,
+        metavar="MP",
+        help="Flag images below this megapixel count (default: 1.0)",
+    )
+    scan.add_argument(
+        "--low-resolution-gif-max-mp",
+        type=float,
+        default=1.0,
+        metavar="MP",
+        help="Flag GIFs below this megapixel count (default: 1.0)",
+    )
+    scan.add_argument(
+        "--low-resolution-video-max-mp",
+        type=float,
+        default=1.0,
+        metavar="MP",
+        help="Flag videos below this megapixel count (default: 1.0)",
     )
     scan.add_argument(
         "--random-review-count",
@@ -336,6 +366,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
+    low_resolution_bounds = {
+        "images": args.low_resolution_image_max_mp,
+        "gifs": args.low_resolution_gif_max_mp,
+        "videos": args.low_resolution_video_max_mp,
+    }
+    invalid_bound = next(
+        (
+            media_type
+            for media_type in args.low_resolution_types
+            if not math.isfinite(low_resolution_bounds[media_type])
+            or low_resolution_bounds[media_type] <= 0
+        ),
+        None,
+    )
+    if invalid_bound:
+        print(
+            f"error: low-resolution {invalid_bound} megapixel bound must be positive",
+            file=sys.stderr,
+        )
+        return 2
+
     def on_progress(prog) -> None:
         pct = ""
         if prog.files_found:
@@ -349,6 +400,18 @@ def cmd_scan(args: argparse.Namespace) -> int:
         similar=not args.no_similar,
         find_no_humans=args.find_no_humans,
         find_low_resolution=not args.no_low_resolution,
+        low_resolution_images="images" in args.low_resolution_types,
+        low_resolution_gifs="gifs" in args.low_resolution_types,
+        low_resolution_videos="videos" in args.low_resolution_types,
+        low_resolution_image_max_pixels=round(
+            args.low_resolution_image_max_mp * 1_000_000
+        ),
+        low_resolution_gif_max_pixels=round(
+            args.low_resolution_gif_max_mp * 1_000_000
+        ),
+        low_resolution_video_max_pixels=round(
+            args.low_resolution_video_max_mp * 1_000_000
+        ),
         random_review_count=max(0, args.random_review_count),
         human_backend=args.human_backend,
         photon_model=args.photon_model,
