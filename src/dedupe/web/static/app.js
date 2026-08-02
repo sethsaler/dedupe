@@ -651,6 +651,7 @@
     const fill = $("progressFill");
     const msg = $("progressMsg");
     const top = $("topStats");
+    const scanCompleted = state.scanning && !s.scanning && s.progress?.done;
 
     state.scanning = !!s.scanning;
     state.acting = !!s.acting;
@@ -760,6 +761,10 @@
     if (!s.scanning && state.pollTimer) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
+    }
+    if (scanCompleted) {
+      if (s.error) toast(s.error, "error");
+      else toast(s.progress.message || "Scan complete", "ok");
     }
     return s;
   }
@@ -1757,16 +1762,11 @@
         }),
       });
       state.scanId = started.scan_id || state.scanId;
+      state.scanning = true;
       if (state.pollTimer) clearInterval(state.pollTimer);
       state.pollTimer = setInterval(async () => {
         try {
-          const s = await refreshStatus();
-          if (!s.scanning && s.progress?.done) {
-            clearInterval(state.pollTimer);
-            state.pollTimer = null;
-            if (s.error) toast(s.error, "error");
-            else toast(s.progress.message || "Scan complete", "ok");
-          }
+          await refreshStatus();
         } catch {
           /* ignore transient */
         }

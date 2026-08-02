@@ -66,6 +66,7 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     page.locator(".group-item").first.click()
     page.locator("#members .card").first.wait_for(state="visible")
 
