@@ -1367,6 +1367,11 @@ kbd {
   font-size: 0.75rem;
 }
 
+.card-meta .face-count.multi {
+  color: var(--warn, #b45309);
+  font-weight: 600;
+}
+
 .card-actions {
   display: flex;
   justify-content: space-between;

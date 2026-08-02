@@ -77,6 +77,25 @@ def test_cache_round_trips_person_decision_without_hashes(tmp_path: Path) -> Non
     cache.close()
 
 
+def test_cache_round_trips_face_count_without_hashes(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    original = _record(tmp_path / "photo.jpg", inode=10)
+    original.phash = None
+    original.face_count = 3
+    original.face_detector = "opencv_yunet"
+    original.face_detection_signature = "face-count-v1|opencv_yunet|yunet=abc"
+    cache.store_all([original])
+
+    same = _record(tmp_path / "photo.jpg", inode=10)
+    same.phash = None
+
+    assert cache.hydrate([same]) == 1
+    assert same.face_count == 3
+    assert same.face_detector == "opencv_yunet"
+    assert same.face_detection_signature == original.face_detection_signature
+    cache.close()
+
+
 def test_cache_round_trips_distinct_pair_until_a_file_changes(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     left = _record(tmp_path / "left.jpg", inode=10)

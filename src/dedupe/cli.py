@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Surface non-human media: images/videos where OpenCV detects no person",
     )
     scan.add_argument(
+        "--count-faces",
+        dest="count_faces",
+        action="store_true",
+        help="Count faces in images and GIFs with OpenCV (stored per file)",
+    )
+    scan.add_argument(
         "--no-low-resolution",
         action="store_true",
         help="Disable low-resolution review",
@@ -399,6 +405,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         exact=not args.no_exact,
         similar=not args.no_similar,
         find_no_humans=args.find_no_humans,
+        count_faces=args.count_faces,
         find_low_resolution=not args.no_low_resolution,
         low_resolution_images="images" in args.low_resolution_types,
         low_resolution_gifs="gifs" in args.low_resolution_types,
@@ -437,6 +444,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     apply_smart_select_all(result.groups, SmartRule(args.smart))
     print(summarize_scan(result))
+    if args.count_faces:
+        counted = [f for f in result.files if f.face_count is not None]
+        with_faces = sum(1 for f in counted if f.face_count > 0)
+        multi_face = sum(1 for f in counted if f.face_count > 1)
+        print(
+            f"Faces: {with_faces} file(s) with faces, "
+            f"{multi_face} with more than one face ({len(counted)} analyzed)"
+        )
     diagnostics = result.diagnostics
     failed = sum(stage.failed for stage in diagnostics.stages.values())
     warnings = [

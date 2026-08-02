@@ -19,8 +19,8 @@ _UPSERT_SQL = """
         media_type, width, height, sha256, partial_hash, phash, dhash,
         tile_phashes, video_fingerprint, duration, human_detection_status,
         human_detector, human_detection_signature, human_frames_analyzed,
-        human_max_confidence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        human_max_confidence, face_count, face_detector, face_detection_signature
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
@@ -42,7 +42,10 @@ _UPSERT_SQL = """
         human_detector=excluded.human_detector,
         human_detection_signature=excluded.human_detection_signature,
         human_frames_analyzed=excluded.human_frames_analyzed,
-        human_max_confidence=excluded.human_max_confidence
+        human_max_confidence=excluded.human_max_confidence,
+        face_count=excluded.face_count,
+        face_detector=excluded.face_detector,
+        face_detection_signature=excluded.face_detection_signature
 """
 
 
@@ -70,6 +73,9 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.human_detection_signature,
         rec.human_frames_analyzed,
         rec.human_max_confidence,
+        rec.face_count,
+        rec.face_detector,
+        rec.face_detection_signature,
     )
 
 
@@ -120,7 +126,10 @@ class HashCache:
                 human_detector TEXT,
                 human_detection_signature TEXT,
                 human_frames_analyzed INTEGER,
-                human_max_confidence REAL
+                human_max_confidence REAL,
+                face_count INTEGER,
+                face_detector TEXT,
+                face_detection_signature TEXT
             )
             """
         )
@@ -149,6 +158,9 @@ class HashCache:
             "human_detection_signature": "TEXT",
             "human_frames_analyzed": "INTEGER",
             "human_max_confidence": "REAL",
+            "face_count": "INTEGER",
+            "face_detector": "TEXT",
+            "face_detection_signature": "TEXT",
         }
         for column, declaration in migrations.items():
             if column not in existing:
@@ -311,6 +323,13 @@ class HashCache:
                 if row["human_max_confidence"] is not None
                 else rec.human_max_confidence
             )
+            rec.face_count = (
+                row["face_count"] if row["face_count"] is not None else rec.face_count
+            )
+            rec.face_detector = row["face_detector"] or rec.face_detector
+            rec.face_detection_signature = (
+                row["face_detection_signature"] or rec.face_detection_signature
+            )
             if row["media_type"]:
                 try:
                     rec.media_type = MediaType(row["media_type"])
@@ -328,6 +347,9 @@ class HashCache:
                     and bool(rec.human_detection_signature)
                 )
             )
+            has_face_count = (
+                rec.face_count is not None and bool(rec.face_detection_signature)
+            )
             if (
                 rec.sha256
                 or rec.phash
@@ -335,6 +357,7 @@ class HashCache:
                 or rec.partial_hash
                 or (rec.width and rec.height)
                 or has_person_decision
+                or has_face_count
             ):
                 rows.append(_upsert_row(rec))
         # One statement per batch instead of one round trip per record.

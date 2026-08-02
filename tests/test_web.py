@@ -1784,3 +1784,33 @@ def test_stale_scan_worker_never_overwrites_a_newer_scan(
     assert after["groups_version"] == before["groups_version"]
     assert group_ids == [group.id for group in fresh.groups]
     assert stale.groups[0].id not in group_ids
+
+
+def test_bulk_min_faces_rule_only_selects_analyzed_multi_face_files(tmp_path: Path) -> None:
+    from dedupe.web.app import bulk_member_matches, parse_bulk_criteria
+
+    def record(name: str, face_count: int | None) -> FileRecord:
+        return FileRecord(
+            path=str(tmp_path / name),
+            size=100,
+            mtime=1.0,
+            media_type=MediaType.IMAGE,
+            extension=".jpg",
+            face_count=face_count,
+        )
+
+    two_faces = record("two.jpg", 2)
+    one_face = record("one.jpg", 1)
+    unanalyzed = record("unknown.jpg", None)
+    group = build_groups([[two_faces, one_face, unanalyzed]], [])[0]
+
+    criteria = parse_bulk_criteria({"min_faces": "2"})
+    assert criteria == {"min_faces": 2}
+    assert bulk_member_matches(two_faces, group, criteria)
+    assert not bulk_member_matches(one_face, group, criteria)
+    assert not bulk_member_matches(unanalyzed, group, criteria)
+
+    with pytest.raises(ValueError):
+        parse_bulk_criteria({"min_faces": 0})
+    with pytest.raises(ValueError):
+        parse_bulk_criteria({"min_faces": "not-a-number"})

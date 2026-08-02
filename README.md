@@ -11,6 +11,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
+- **Face counts** — optional OpenCV pass counts faces in images and GIFs; every file card shows its count, and a bulk rule ("at least … faces") selects group-photo shots in one click
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media

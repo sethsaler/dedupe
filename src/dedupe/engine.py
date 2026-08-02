@@ -10,6 +10,7 @@ import time
 
 from .cache import HashCache
 from .exact import find_exact_groups
+from .face_detection import FACE_MEDIA_TYPES, count_faces_in_files
 from .grouping import (
     DEFAULT_RANDOM_REVIEW_COUNT,
     LOW_RESOLUTION_MAX_PIXELS,
@@ -121,6 +122,7 @@ def run_scan(
     exact: bool = True,
     similar: bool = True,
     find_no_humans: bool = False,
+    count_faces: bool = False,
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -177,6 +179,7 @@ def run_scan(
         "similar_image": [],
         "similar_video": [],
         "human_detection": [],
+        "face_detection": [],
         "low_resolution": [],
     }
     cache_hits = 0
@@ -571,6 +574,45 @@ def run_scan(
             if record.human_detection_status == "analysis_failed"
         ]
 
+    if count_faces and records:
+        face_started = time.monotonic()
+        check_cancelled()
+        face_candidates = [
+            record for record in records if record.media_type in FACE_MEDIA_TYPES
+        ]
+        emit(
+            "face-detection",
+            0,
+            len(face_candidates),
+            "Counting faces (OpenCV)…",
+        )
+
+        def face_progress(phase: str, processed: int, total: int) -> None:
+            emit(phase, processed, total, f"Face counting {processed}/{total}")
+
+        count_faces_in_files(
+            records,
+            workers=n_workers,
+            progress=face_progress,
+            cancelled=cancelled,
+        )
+        files_with_faces = sum(
+            1 for record in face_candidates if (record.face_count or 0) > 0
+        )
+        emit(
+            "face-detection",
+            len(face_candidates),
+            len(face_candidates),
+            f"Found faces in {files_with_faces} "
+            f"file{'s' if files_with_faces != 1 else ''}",
+        )
+        stage_durations["face_detection"] = time.monotonic() - face_started
+        stage_errors["face_detection"] = [
+            record.error or "face counting failed"
+            for record in face_candidates
+            if record.face_count is None
+        ]
+
     cache_errors: list[str] = []
     if cache is not None:
         try:
@@ -607,6 +649,10 @@ def run_scan(
         else 0
     )
     human_failures = stage_errors["human_detection"]
+    face_failures = stage_errors["face_detection"]
+    face_records = [
+        record for record in records if record.media_type in FACE_MEDIA_TYPES
+    ]
     resolution_records = [
         record
         for record in records
@@ -674,6 +720,18 @@ def run_scan(
             warnings=(
                 [f"{len(human_failures)} file(s) could not be analyzed for people"]
                 if human_failures
+                else []
+            ),
+        ),
+        "face_detection": StageDiagnostics(
+            attempted=len(face_records) if count_faces else 0,
+            succeeded=(len(face_records) - len(face_failures)) if count_faces else 0,
+            failed=len(face_failures) if count_faces else 0,
+            skipped=len(records) - (len(face_records) if count_faces else 0),
+            duration_seconds=stage_durations.get("face_detection", 0.0),
+            warnings=(
+                [f"{len(face_failures)} file(s) could not be analyzed for faces"]
+                if face_failures
                 else []
             ),
         ),
@@ -767,6 +825,7 @@ def run_scans_parallel(
     exact: bool = True,
     similar: bool = True,
     find_no_humans: bool = False,
+    count_faces: bool = False,
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -877,6 +936,7 @@ def run_scans_parallel(
             exact=exact,
             similar=similar,
             find_no_humans=find_no_humans,
+            count_faces=count_faces,
             find_low_resolution=find_low_resolution,
             low_resolution_images=low_resolution_images,
             low_resolution_gifs=low_resolution_gifs,

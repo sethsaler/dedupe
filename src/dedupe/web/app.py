@@ -114,6 +114,12 @@ def parse_bulk_criteria(raw: dict) -> dict:
         criteria["path_contains"] = str(contains).lower()
     if raw.get("smaller_than_keeper"):
         criteria["smaller_than_keeper"] = True
+    min_faces = raw.get("min_faces")
+    if min_faces not in (None, ""):
+        faces = int(min_faces)
+        if faces < 1:
+            raise ValueError("min_faces must be at least 1")
+        criteria["min_faces"] = faces
     return criteria
 
 
@@ -127,6 +133,11 @@ def bulk_member_matches(member, group, criteria: dict) -> bool:
     if criteria.get("smaller_than_keeper"):
         keeper = next((m for m in group.members if m.path == group.suggested_keep), None)
         if keeper is None or member.size >= keeper.size:
+            return False
+    if "min_faces" in criteria:
+        # Files without a trusted face count never match; a bulk deletion rule
+        # must not select media the face counter did not actually analyze.
+        if member.face_count is None or member.face_count < criteria["min_faces"]:
             return False
     return True
 
@@ -670,6 +681,7 @@ def create_app(
                     exact=bool(data.get("exact", True)),
                     similar=bool(data.get("similar", True)),
                     find_no_humans=bool(data.get("find_no_humans", False)),
+                    count_faces=bool(data.get("count_faces", False)),
                     find_low_resolution=bool(data.get("find_low_resolution", True)),
                     low_resolution_images=bool(data.get("low_resolution_images", True)),
                     low_resolution_gifs=bool(data.get("low_resolution_gifs", True)),

@@ -580,3 +580,36 @@ def test_run_scan_rejects_photos_library_root(tmp_path: Path) -> None:
     assert "export media from Photos.app" in descendant_result.errors[0]
     assert file_result.files == []
     assert "export media from Photos.app" in file_result.errors[0]
+
+
+def test_run_scan_counts_faces_and_reports_stage(tmp_path: Path) -> None:
+    import pytest
+
+    pytest.importorskip("cv2")
+    _save(tmp_path / "photo.jpg", (30, 60, 90))
+    (tmp_path / "clip.mp4").write_bytes(b"fake video bytes")
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        count_faces=True,
+        include_videos=True,
+        use_cache=False,
+    )
+
+    photo = next(f for f in result.files if f.path.endswith("photo.jpg"))
+    video = next(f for f in result.files if f.path.endswith("clip.mp4"))
+    assert photo.face_count == 0
+    assert photo.face_detection_signature
+    assert video.face_count is None
+
+    stage = result.diagnostics.stages["face_detection"]
+    assert stage.attempted == 1
+    assert stage.succeeded == 1
+    assert stage.skipped == 1
+
+    serialized = result.to_dict()
+    faces = {f["path"]: f["face_count"] for f in serialized["files"]}
+    assert faces[photo.path] == 0
+    assert faces[video.path] is None

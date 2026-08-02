@@ -1292,6 +1292,7 @@
                 <span>${formatBytes(m.size)}</span>
                 <span>${dims}</span>
                 <span title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
+                ${m.face_count != null ? `<span class="face-count ${m.face_count > 1 ? "multi" : ""}" title="Faces detected by OpenCV (heuristic)">${m.face_count === 0 ? "No faces" : `${m.face_count} face${m.face_count === 1 ? "" : "s"}`}</span>` : ""}
               </div>
               <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
@@ -1735,6 +1736,7 @@
           exact: $("optExact").checked,
           similar: $("optSimilar").checked,
           find_no_humans: $("optNoHumans").checked,
+          count_faces: $("optCountFaces").checked,
           find_low_resolution: $("optLowResolution").checked,
           low_resolution_images: $("optLowResolutionImages").checked,
           low_resolution_gifs: $("optLowResolutionGifs").checked,
@@ -1932,7 +1934,11 @@
     const rule = $("bulkCriteria").value;
     const needsValue = rule !== "smaller_than_keeper";
     $("bulkValueRow").hidden = !needsValue;
-    $("bulkValue").placeholder = rule === "path_contains" ? "text or /folder/" : "MB";
+    $("bulkValue").placeholder = rule === "path_contains"
+      ? "text or /folder/"
+      : rule === "min_faces"
+        ? "faces (e.g. 2)"
+        : "MB";
   }
   $("bulkCriteria").addEventListener("change", syncBulkValueRow);
   syncBulkValueRow();
@@ -1946,6 +1952,10 @@
     } else if (rule === "path_contains") {
       if (!raw) return toast("Enter the text a path must contain");
       criteria.path_contains = raw;
+    } else if (rule === "min_faces") {
+      const faces = Number(raw);
+      if (!Number.isInteger(faces) || faces < 1) return toast("Enter a face count of 1 or more");
+      criteria.min_faces = faces;
     } else {
       const megabytes = Number(raw);
       if (!Number.isFinite(megabytes) || megabytes < 0) return toast("Enter a size in MB");
