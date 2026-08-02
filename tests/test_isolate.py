@@ -114,7 +114,7 @@ def _pair(tmp_path: Path, payload: bytes = b"shared-payload") -> tuple[Path, lis
 
 
 def test_isolate_hardlink_shares_inodes(tmp_path: Path) -> None:
-    src, groups = _pair(tmp_path)
+    _src, groups = _pair(tmp_path)
     result = isolate_groups(groups, tmp_path / "review", mode="hardlink", dry_run=False)
 
     assert result.success_count == 2 and result.fail_count == 0
@@ -126,7 +126,7 @@ def test_isolate_hardlink_shares_inodes(tmp_path: Path) -> None:
 
 
 def test_isolate_symlink_points_at_source(tmp_path: Path) -> None:
-    src, groups = _pair(tmp_path)
+    _src, groups = _pair(tmp_path)
     result = isolate_groups(groups, tmp_path / "review", mode="symlink", dry_run=False)
 
     assert result.success_count == 2
@@ -151,7 +151,7 @@ def test_isolate_move_relocates_originals(tmp_path: Path) -> None:
 def test_isolate_hardlink_falls_back_to_copy_across_volumes(
     tmp_path: Path, monkeypatch
 ) -> None:
-    src, groups = _pair(tmp_path)
+    _src, groups = _pair(tmp_path)
 
     def _cross_volume_link(source, target):
         raise OSError(18, "Invalid cross-device link")
@@ -220,7 +220,7 @@ def test_isolate_move_refuses_cross_device(tmp_path: Path, monkeypatch) -> None:
 def test_isolate_move_cross_device_allowed_copies_and_verifies(
     tmp_path: Path, monkeypatch
 ) -> None:
-    src, groups = _pair(tmp_path)
+    _src, groups = _pair(tmp_path)
     review = tmp_path / "review"
     real_replace = os.replace
 

@@ -9,7 +9,7 @@ import shutil
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 
@@ -24,13 +24,15 @@ from .models import (
 )
 from .parallel import map_parallel, resolve_workers
 from .receipts import receipt_filename, resolve_log_dir, resolve_receipt_path
-from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD, compute_image_hashes
+from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
+from .similar_image import compute_image_hashes
 from .similar_video import (
     DEFAULT_THRESHOLD as VID_THRESHOLD,
+)
+from .similar_video import (
     compute_video_fingerprint,
     video_fingerprint_distances,
 )
-
 
 # Destructive file work is I/O bound; a small pool hides move/copy latency
 # without saturating the disk or the system Trash service.
@@ -62,7 +64,7 @@ class ActionResult:
     group_dirs: list[str] = field(default_factory=list)
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     started_at: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+        default_factory=lambda: datetime.now(UTC).isoformat()
     )
     completed_at: str | None = None
     log_error: str | None = None
@@ -120,7 +122,7 @@ def _write_action_log(
     log_base = resolve_log_dir(log_dir)
     try:
         log_base.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         log_path = log_base / receipt_filename(
             dry_run=result.dry_run, stamp=stamp, session_id=result.session_id
         )
@@ -259,8 +261,10 @@ def _trash_dirs_for(path: Path) -> list[Path]:
                 dirs.append(vol_trash)
     elif sys.platform.startswith("linux"):
         home_trash = Path.home() / ".local" / "share" / "Trash" / "files"
-        if home_trash.exists():
-            dirs.append(home_trash)
+        # send2trash creates this directory on first use, so include it even
+        # when it does not exist yet — _list_names and _locate handle missing
+        # directories gracefully, and the file will be present after the send.
+        dirs.append(home_trash)
         try:
             dev = path.stat().st_dev
             home_dev = Path.home().stat().st_dev
@@ -731,7 +735,7 @@ def apply_actions(
             workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
         )
 
-    result.completed_at = datetime.now(timezone.utc).isoformat()
+    result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir)
     return result
 
@@ -825,7 +829,7 @@ def undo_quarantine(
                     )
                 )
 
-    result.completed_at = datetime.now(timezone.utc).isoformat()
+    result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir or log_path.parent)
     return result
 
@@ -951,7 +955,7 @@ def isolate_groups(
         base_root = default_review_dir(roots, groups)
     else:
         base_root = Path(review_dir).expanduser().resolve()
-    session_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    session_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
     session_id = uuid.uuid4().hex
     root = base_root / f"session-{session_stamp}-{session_id[:8]}"
     result = ActionResult(dry_run=dry_run, action=f"isolate:{mode}", review_root=str(root))
@@ -966,7 +970,7 @@ def isolate_groups(
         filtered.append(g)
 
     if not filtered:
-        result.completed_at = datetime.now(timezone.utc).isoformat()
+        result.completed_at = datetime.now(UTC).isoformat()
         _write_action_log(result, log_dir)
         return result
 
@@ -994,7 +998,7 @@ def isolate_groups(
                         ),
                     )
                 )
-        result.completed_at = datetime.now(timezone.utc).isoformat()
+        result.completed_at = datetime.now(UTC).isoformat()
         _write_action_log(result, log_dir)
         return result
 
@@ -1166,7 +1170,7 @@ def isolate_groups(
     if not dry_run:
         try:
             index = {
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
                 "mode": mode,
                 "session_id": result.session_id,
                 "review_base": str(base_root),
@@ -1180,7 +1184,7 @@ def isolate_groups(
         except OSError:
             pass
 
-    result.completed_at = datetime.now(timezone.utc).isoformat()
+    result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir)
     return result
 

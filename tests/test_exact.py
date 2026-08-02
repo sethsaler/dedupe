@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dedupe.exact import find_exact_groups, file_sha256
+from dedupe.exact import file_sha256, find_exact_groups
 from dedupe.models import FileRecord, MediaType, classify_media
 from dedupe.scanner import inventory
 

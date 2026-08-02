@@ -139,7 +139,7 @@ def test_receipts_list_json_is_newest_first(tmp_path: Path, capsys) -> None:
     assert cli.main(["receipts", "list", "--log-dir", str(logs), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
 
-    assert [entry["log_path"] for entry in payload][0] == executed.log_path
+    assert next(entry["log_path"] for entry in payload) == executed.log_path
     assert payload[0]["undoable"] is True
     assert any(entry["dry_run"] for entry in payload)
 

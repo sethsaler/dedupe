@@ -333,13 +333,13 @@ def test_run_scan_builds_low_resolution_and_random_review_branches_without_simil
 def test_rescan_respects_stored_low_resolution_keep_decisions(tmp_path: Path) -> None:
     for index in range(3):
         _save(tmp_path / f"image-{index}.jpg", (index * 20, 80, 120))
-    options = dict(
-        exact=False,
-        similar=False,
-        find_low_resolution=True,
-        random_review_count=0,
-        use_cache=False,
-    )
+    options = {
+        "exact": False,
+        "similar": False,
+        "find_low_resolution": True,
+        "random_review_count": 0,
+        "use_cache": False,
+    }
 
     first = run_scan([tmp_path], **options)
     low = next(group for group in first.groups if group.kind == GroupKind.LOW_RESOLUTION)

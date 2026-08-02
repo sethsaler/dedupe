@@ -12,8 +12,8 @@ from PIL import Image
 
 from dedupe.human_detection import (
     _EnsemblePersonDetector,
-    _OpenCVPersonDetector,
     _media_person_evidence,
+    _OpenCVPersonDetector,
     _person_sample_timestamps,
     create_person_detector,
     find_no_human_files,

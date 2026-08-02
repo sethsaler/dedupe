@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .actions import validate_file_record
@@ -82,7 +82,7 @@ def save_review_session(result: ScanResult, path: str | Path | None = None) -> d
     target = Path(path).expanduser() if path is not None else default_review_session_path()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(target.parent, 0o700)
-    saved_at = datetime.now(timezone.utc).isoformat()
+    saved_at = datetime.now(UTC).isoformat()
     envelope = {
         "version": REVIEW_SESSION_VERSION,
         "saved_at": saved_at,
@@ -140,8 +140,8 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
             valid_paths.add(record.path)
         else:
             invalid.setdefault(record.path, error)
-    for path in valid_paths:
-        invalid.pop(path, None)
+    for valid_path in valid_paths:
+        invalid.pop(valid_path, None)
     result.files = [record for record in result.files if record.path in valid_paths]
     groups = []
     for group in result.groups:

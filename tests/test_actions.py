@@ -658,7 +658,7 @@ def test_receipts_list_show_and_prune(tmp_path: Path) -> None:
     assert len(executed) == 1
     assert executed[0].undoable is True
     assert executed[0].bytes == len(b"same-bytes")
-    preview = [s for s in summaries if s.dry_run][0]
+    preview = next(s for s in summaries if s.dry_run)
     assert preview.undoable is False
     assert "dry-run" in (preview.undo_blocked_reason or "")
 

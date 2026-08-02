@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 EXECUTED_PREFIX = "action"
@@ -282,7 +282,7 @@ def prune_receipts(
     removed: list[PrunedReceipt] = []
     errors: list[str] = []
     cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=float(older_than_days))
+        datetime.now(UTC) - timedelta(days=float(older_than_days))
         if older_than_days is not None
         else None
     )
@@ -330,5 +330,5 @@ def _started_at(summary: ReceiptSummary) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed

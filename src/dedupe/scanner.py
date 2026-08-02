@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-from fnmatch import fnmatch
 from collections.abc import Callable, Iterable
+from fnmatch import fnmatch
 from pathlib import Path
 
 from .models import (

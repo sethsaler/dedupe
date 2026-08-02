@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import os
 import secrets
 import shutil
 import signal
@@ -10,7 +11,6 @@ import threading
 import time
 import webbrowser
 from dataclasses import replace
-import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,7 +46,6 @@ from ..review_session import (
 )
 from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
-
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
@@ -134,12 +133,12 @@ def bulk_member_matches(member, group, criteria: dict) -> bool:
         keeper = next((m for m in group.members if m.path == group.suggested_keep), None)
         if keeper is None or member.size >= keeper.size:
             return False
-    if "min_faces" in criteria:
-        # Files without a trusted face count never match; a bulk deletion rule
-        # must not select media the face counter did not actually analyze.
-        if member.face_count is None or member.face_count < criteria["min_faces"]:
-            return False
-    return True
+    # Files without a trusted face count never match; a bulk deletion rule
+    # must not select media the face counter did not actually analyze.
+    return not (
+        "min_faces" in criteria
+        and (member.face_count is None or member.face_count < criteria["min_faces"])
+    )
 
 
 def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
@@ -309,13 +308,13 @@ def create_app(
     def cancel_pending_shutdown():
         """A reloaded/reopened page cancels a shutdown scheduled on pagehide."""
         if request.path == "/api/shutdown":
-            return None
+            return
         with lock:
             timer = state.get("shutdown_timer")
             if timer is not None:
                 timer.cancel()
                 state["shutdown_timer"] = None
-        return None
+        return
 
     @app.before_request
     def protect_mutating_api():
@@ -677,45 +676,45 @@ def create_app(
                 if isinstance(raw_exclusions, str):
                     raw_exclusions = raw_exclusions.split(",")
 
-                scan_kwargs = dict(
-                    exact=bool(data.get("exact", True)),
-                    similar=bool(data.get("similar", True)),
-                    find_no_humans=bool(data.get("find_no_humans", False)),
-                    count_faces=bool(data.get("count_faces", False)),
-                    find_low_resolution=bool(data.get("find_low_resolution", True)),
-                    low_resolution_images=bool(data.get("low_resolution_images", True)),
-                    low_resolution_gifs=bool(data.get("low_resolution_gifs", True)),
-                    low_resolution_videos=bool(data.get("low_resolution_videos", True)),
-                    low_resolution_image_max_pixels=max(
+                scan_kwargs = {
+                    "exact": bool(data.get("exact", True)),
+                    "similar": bool(data.get("similar", True)),
+                    "find_no_humans": bool(data.get("find_no_humans", False)),
+                    "count_faces": bool(data.get("count_faces", False)),
+                    "find_low_resolution": bool(data.get("find_low_resolution", True)),
+                    "low_resolution_images": bool(data.get("low_resolution_images", True)),
+                    "low_resolution_gifs": bool(data.get("low_resolution_gifs", True)),
+                    "low_resolution_videos": bool(data.get("low_resolution_videos", True)),
+                    "low_resolution_image_max_pixels": max(
                         1, int(data.get("low_resolution_image_max_pixels") or 1_000_000)
                     ),
-                    low_resolution_gif_max_pixels=max(
+                    "low_resolution_gif_max_pixels": max(
                         1, int(data.get("low_resolution_gif_max_pixels") or 1_000_000)
                     ),
-                    low_resolution_video_max_pixels=max(
+                    "low_resolution_video_max_pixels": max(
                         1, int(data.get("low_resolution_video_max_pixels") or 1_000_000)
                     ),
-                    random_review_count=max(0, int(data.get("random_review_count", 50))),
-                    human_backend=human_backend,
-                    photon_model=photon_model,
-                    include_images=bool(data.get("include_images", True)),
-                    include_gifs=bool(data.get("include_gifs", True)),
-                    include_videos=bool(data.get("include_videos", True)),
-                    include_hidden=bool(data.get("include_hidden", False)),
-                    image_threshold=int(data.get("threshold", 6)),
-                    video_threshold=int(data.get("video_threshold", 8)),
-                    use_cache=bool(data.get("use_cache", True)),
-                    cache_path=app.config["DEDUPE_CACHE_PATH"],
-                    workers=workers,
-                    exclusions=[
+                    "random_review_count": max(0, int(data.get("random_review_count", 50))),
+                    "human_backend": human_backend,
+                    "photon_model": photon_model,
+                    "include_images": bool(data.get("include_images", True)),
+                    "include_gifs": bool(data.get("include_gifs", True)),
+                    "include_videos": bool(data.get("include_videos", True)),
+                    "include_hidden": bool(data.get("include_hidden", False)),
+                    "image_threshold": int(data.get("threshold", 6)),
+                    "video_threshold": int(data.get("video_threshold", 8)),
+                    "use_cache": bool(data.get("use_cache", True)),
+                    "cache_path": app.config["DEDUPE_CACHE_PATH"],
+                    "workers": workers,
+                    "exclusions": [
                         str(pattern).strip()
                         for pattern in raw_exclusions
                         if str(pattern).strip()
                     ],
-                    cancelled=cancel_event.is_set,
-                    progress=on_progress,
-                    on_group=on_group,
-                )
+                    "cancelled": cancel_event.is_set,
+                    "progress": on_progress,
+                    "on_group": on_group,
+                }
                 if parallel_streams:
                     result = run_scans_parallel(
                         paths,

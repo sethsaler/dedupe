@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .models import FileRecord
@@ -77,7 +77,7 @@ def _identity(record: FileRecord) -> dict:
     return {
         "size": int(record.size),
         "mtime_ns": record.mtime_sort_stamp,
-        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "decided_at": datetime.now(UTC).isoformat(),
     }
 
 

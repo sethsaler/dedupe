@@ -16,7 +16,6 @@ from .models import (
     SmartRule,
 )
 
-
 LOW_RESOLUTION_MAX_PIXELS = 1_000_000
 DEFAULT_RANDOM_REVIEW_COUNT = 50
 

@@ -274,9 +274,7 @@ def is_near_identical(
         return False
     if max(dists) > tile_max:
         return False
-    if (sum(dists) / len(dists)) > tile_mean:
-        return False
-    return True
+    return not sum(dists) / len(dists) > tile_mean
 
 
 def encode_tile_phashes(values: tuple[str, ...]) -> str:
@@ -496,9 +494,10 @@ def _bruteforce_groups(
             hb = imagehash.hex_to_hash(b.phash)  # type: ignore[arg-type]
             if (ha - hb) > threshold:
                 continue
-            if a.dhash and b.dhash:
-                if (imagehash.hex_to_hash(a.dhash) - imagehash.hex_to_hash(b.dhash)) > dhash_threshold:
-                    continue
+            if a.dhash and b.dhash and (
+                imagehash.hex_to_hash(a.dhash) - imagehash.hex_to_hash(b.dhash)
+            ) > dhash_threshold:
+                continue
             if not is_near_identical(
                 a.path, b.path, tile_max=tile_max, tile_mean=tile_mean
             ):

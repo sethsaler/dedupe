@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-import time
 
 from .cache import HashCache
 from .exact import find_exact_groups
@@ -21,6 +21,8 @@ from .grouping import (
 )
 from .human_detection import (
     DEFAULT_BACKEND as DEFAULT_HUMAN_BACKEND,
+)
+from .human_detection import (
     DEFAULT_PHOTON_MODEL,
     find_no_human_files,
 )
@@ -100,7 +102,7 @@ def _populate_missing_dimensions(
             record.width = width
             record.height = height
             return None
-        except Exception as exc:  # noqa: BLE001 - report per-file media failures
+        except Exception as exc:
             return f"resolution probe failed for {record.path}: {exc}"
 
     errors: list[str] = []
@@ -745,8 +747,8 @@ def run_scan(
             duration_seconds=stage_durations.get("low_resolution", 0.0),
             warnings=(
                 [
-                    f"{len(resolution_failures)} file(s) could not be checked for "
-                    "low resolution"
+                    (f"{len(resolution_failures)} file(s) could not be checked for "
+                    "low resolution")
                 ]
                 if find_low_resolution and resolution_failures
                 else []
@@ -974,12 +976,12 @@ def run_scans_parallel(
         while pending:
             finished, pending = wait(pending, return_when=FIRST_COMPLETED)
             for fut in finished:
-                i, root = futures[fut]
+                _i, root = futures[fut]
                 try:
                     sub = fut.result()
                 except InterruptedError:
                     interrupted = True
-                except Exception as exc:  # noqa: BLE001 - surface per-folder failures
+                except Exception as exc:
                     stream_errors.append(f"{root}: {exc}")
                     continue
                 with lock:

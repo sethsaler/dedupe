@@ -40,13 +40,13 @@ def load_benchmark_manifest(path: str | Path) -> list[BenchmarkItem]:
     items: list[BenchmarkItem] = []
     for index, raw in enumerate(raw_items, start=1):
         if not isinstance(raw, dict):
-            raise ValueError(f"benchmark item {index} must be an object")
+            raise TypeError(f"benchmark item {index} must be an object")
         raw_path = raw.get("path")
         has_person = raw.get("has_person")
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError(f"benchmark item {index} needs a non-empty path")
         if not isinstance(has_person, bool):
-            raise ValueError(f"benchmark item {index} has_person must be true or false")
+            raise TypeError(f"benchmark item {index} has_person must be true or false")
         media_path = Path(raw_path).expanduser()
         if not media_path.is_absolute():
             media_path = manifest_path.parent / media_path

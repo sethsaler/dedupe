@@ -401,38 +401,38 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if prog.done:
             print()
 
-    scan_kwargs = dict(
-        exact=not args.no_exact,
-        similar=not args.no_similar,
-        find_no_humans=args.find_no_humans,
-        count_faces=args.count_faces,
-        find_low_resolution=not args.no_low_resolution,
-        low_resolution_images="images" in args.low_resolution_types,
-        low_resolution_gifs="gifs" in args.low_resolution_types,
-        low_resolution_videos="videos" in args.low_resolution_types,
-        low_resolution_image_max_pixels=round(
+    scan_kwargs = {
+        "exact": not args.no_exact,
+        "similar": not args.no_similar,
+        "find_no_humans": args.find_no_humans,
+        "count_faces": args.count_faces,
+        "find_low_resolution": not args.no_low_resolution,
+        "low_resolution_images": "images" in args.low_resolution_types,
+        "low_resolution_gifs": "gifs" in args.low_resolution_types,
+        "low_resolution_videos": "videos" in args.low_resolution_types,
+        "low_resolution_image_max_pixels": round(
             args.low_resolution_image_max_mp * 1_000_000
         ),
-        low_resolution_gif_max_pixels=round(
+        "low_resolution_gif_max_pixels": round(
             args.low_resolution_gif_max_mp * 1_000_000
         ),
-        low_resolution_video_max_pixels=round(
+        "low_resolution_video_max_pixels": round(
             args.low_resolution_video_max_mp * 1_000_000
         ),
-        random_review_count=max(0, args.random_review_count),
-        human_backend=args.human_backend,
-        photon_model=args.photon_model,
-        include_images=not args.no_images,
-        include_gifs=not args.no_gifs,
-        include_videos=not args.no_videos,
-        include_hidden=args.hidden,
-        image_threshold=args.threshold,
-        video_threshold=args.video_threshold,
-        use_cache=not args.no_cache,
-        workers=args.workers,
-        exclusions=args.exclude,
-        progress=on_progress,
-    )
+        "random_review_count": max(0, args.random_review_count),
+        "human_backend": args.human_backend,
+        "photon_model": args.photon_model,
+        "include_images": not args.no_images,
+        "include_gifs": not args.no_gifs,
+        "include_videos": not args.no_videos,
+        "include_hidden": args.hidden,
+        "image_threshold": args.threshold,
+        "video_threshold": args.video_threshold,
+        "use_cache": not args.no_cache,
+        "workers": args.workers,
+        "exclusions": args.exclude,
+        "progress": on_progress,
+    }
     if args.parallel:
         result = run_scans_parallel(
             args.paths,
@@ -536,8 +536,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    from .web.app import create_app, run_app
     from .models import ScanResult
+    from .web.app import create_app, run_app
 
     initial = None
     if args.load:

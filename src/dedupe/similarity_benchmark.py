@@ -39,10 +39,10 @@ def load_similarity_manifest(path: str | Path) -> list[SimilarityBenchmarkPair]:
     pairs: list[SimilarityBenchmarkPair] = []
     for index, raw in enumerate(raw_pairs, start=1):
         if not isinstance(raw, dict):
-            raise ValueError(f"benchmark pair {index} must be an object")
+            raise TypeError(f"benchmark pair {index} must be an object")
         expected = raw.get("similar")
         if not isinstance(expected, bool):
-            raise ValueError(f"benchmark pair {index} similar must be true or false")
+            raise TypeError(f"benchmark pair {index} similar must be true or false")
 
         paths: list[Path] = []
         for field in ("path_a", "path_b"):
