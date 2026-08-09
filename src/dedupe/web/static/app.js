@@ -1456,20 +1456,23 @@
       btn.addEventListener("click", async () => {
         const member = allMembers.find((item) => item.path === btn.dataset.path);
         try {
-          const preview = await api("/api/non-human/delete", { method: "POST", body: JSON.stringify({
+          const preview = await api("/api/review-candidate/delete", { method: "POST", body: JSON.stringify({
             group_id: g.id, path: btn.dataset.path, scan_id: state.scanId, dry_run: true,
           }) });
           if (!preview.success_count) return toast("This file is not safely eligible for deletion", "error");
+          const heuristicWarning = g.kind === "faces"
+            ? "Face counting is heuristic and may miscount."
+            : "Non-Human detection is heuristic and may miss people.";
           const ok = await confirmModal({ title: "Move this file to Trash?", danger: true,
-            confirmLabel: "Move to Trash", body: `<div class="review-sheet"><p><strong>${escapeHtml(basename(member.path))} · ${formatBytes(member.size)}</strong></p><p class="heuristic-warning"><strong>Review carefully:</strong> Non-Human detection is heuristic and may miss people.</p></div>` });
-          if (ok) await updateDeletedCandidate(btn.dataset.path, "/api/non-human/delete", preview.preview_token);
+            confirmLabel: "Move to Trash", body: `<div class="review-sheet"><p><strong>${escapeHtml(basename(member.path))} · ${formatBytes(member.size)}</strong></p><p class="heuristic-warning"><strong>Review carefully:</strong> ${heuristicWarning}</p></div>` });
+          if (ok) await updateDeletedCandidate(btn.dataset.path, "/api/review-candidate/delete", preview.preview_token);
         } catch (err) { toast(err.message, "error"); }
       });
     });
 
     box.querySelectorAll(".undo-delete").forEach((btn) => {
       btn.addEventListener("click", () => {
-        updateDeletedCandidate(btn.dataset.path, "/api/non-human/undo");
+        updateDeletedCandidate(btn.dataset.path, "/api/review-candidate/undo");
       });
     });
 

@@ -89,6 +89,29 @@ def _non_human_result(tmp_path: Path) -> ScanResult:
     )
 
 
+def _faces_result(tmp_path: Path) -> ScanResult:
+    path = tmp_path / "group_photo.jpg"
+    path.write_bytes(b"group photo")
+    stat = path.stat()
+    record = FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        face_count=3,
+        face_detection_signature="face-count-v1|test",
+    )
+    return ScanResult(
+        roots=[str(tmp_path)],
+        files=[record],
+        groups=build_faces_groups([record]),
+    )
+
+
 def test_status_transports_diagnostics_and_completed_elapsed(tmp_path: Path) -> None:
     result = _result(tmp_path)
     result.diagnostics = ScanDiagnostics(
@@ -825,17 +848,17 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
 
     rejected = client.post(
-        "/api/non-human/delete", json={**payload, "dry_run": False}, headers=headers
+        "/api/review-candidate/delete", json={**payload, "dry_run": False}, headers=headers
     )
     assert rejected.status_code == 409
     assert original.exists()
 
-    preview = client.post("/api/non-human/delete", json=payload, headers=headers)
+    preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert original.exists()
     deleted = client.post(
-        "/api/non-human/delete",
+        "/api/review-candidate/delete",
         json={**payload, "dry_run": False, "preview_token": preview.get_json()["preview_token"]},
         headers=headers,
     )
@@ -846,10 +869,48 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     fetched = client.get(f"/api/groups/{group.id}").get_json()
     assert fetched["deleted_paths"] == [str(original)]
 
-    undone = client.post("/api/non-human/undo", json=payload, headers=headers)
+    undone = client.post("/api/review-candidate/undo", json=payload, headers=headers)
     assert undone.status_code == 200
     assert undone.get_json()["deleted_paths"] == []
     assert original.read_bytes() == b"landscape"
+
+
+def test_faces_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
+    result = _faces_result(tmp_path)
+    group = result.groups[0]
+    original = Path(group.members[0].path)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
+
+    rejected = client.post(
+        "/api/review-candidate/delete", json={**payload, "dry_run": False}, headers=headers
+    )
+    assert rejected.status_code == 409
+    assert original.exists()
+
+    preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
+    assert preview.status_code == 200
+    assert preview.get_json()["success_count"] == 1
+    assert original.exists()
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "dry_run": False, "preview_token": preview.get_json()["preview_token"]},
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted_paths"] == [str(original)]
+    assert not original.exists()
+
+    fetched = client.get(f"/api/groups/{group.id}").get_json()
+    assert fetched["deleted_paths"] == [str(original)]
+
+    undone = client.post("/api/review-candidate/undo", json=payload, headers=headers)
+    assert undone.status_code == 200
+    assert undone.get_json()["deleted_paths"] == []
+    assert original.read_bytes() == b"group photo"
 
 
 def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path) -> None:
@@ -881,12 +942,12 @@ def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path)
     group_id = result.groups[0].id
 
     preview = client.post(
-        "/api/non-human/delete",
+        "/api/review-candidate/delete",
         json={"group_id": group_id, "path": deleted_record.path, "scan_id": scan_id},
         headers=headers,
     )
     deleted = client.post(
-        "/api/non-human/delete",
+        "/api/review-candidate/delete",
         json={
             "group_id": group_id,
             "path": deleted_record.path,
@@ -931,7 +992,7 @@ def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path)
 
     # Restore the trashed file so the test does not leave junk in the real Trash.
     client.post(
-        "/api/non-human/undo",
+        "/api/review-candidate/undo",
         json={"group_id": group_id, "path": deleted_record.path, "scan_id": scan_id},
         headers=headers,
     )

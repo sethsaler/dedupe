@@ -51,6 +51,9 @@ from .native_picker import pick_native_paths
 # this to avoid pairing static files from the working tree with a stale Flask process.
 WEB_API_VERSION = 16
 PREVIEW_TOKEN_TTL_SECONDS = 600
+
+#: Independent review flows whose cards support direct per-file Trash + undo.
+INDEPENDENT_DELETE_KINDS = {"no_humans", "faces"}
 REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 
 # How long after the last tab closes before the server exits. Long enough for a
@@ -978,9 +981,12 @@ def create_app(
                 "selected_count": len(effective_selected_paths(result.groups)),
             })
 
-    @app.post("/api/non-human/delete")
-    def api_delete_non_human():
-        """Move one non-human candidate to the system Trash (Finder Trash on macOS)."""
+    @app.post("/api/review-candidate/delete")
+    def api_delete_review_candidate():
+        """Move one independent review candidate to the system Trash (Finder Trash on macOS).
+
+        Serves both the Non-Human and Faces review flows.
+        """
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         path = data.get("path")
@@ -995,12 +1001,13 @@ def create_app(
                 (
                     candidate
                     for candidate in (result.groups if result else [])
-                    if candidate.id == group_id and candidate.kind.value == "no_humans"
+                    if candidate.id == group_id
+                    and candidate.kind.value in INDEPENDENT_DELETE_KINDS
                 ),
                 None,
             )
             if group is None or path not in {member.path for member in group.members}:
-                return jsonify({"error": "non-human candidate not found"}), 404
+                return jsonify({"error": "review candidate not found"}), 404
             if path in state["deleted_files"]:
                 return jsonify(group_payload(group))
             state["acting"] = True
@@ -1056,8 +1063,9 @@ def create_app(
             with lock:
                 state["acting"] = False
 
-    @app.post("/api/non-human/undo")
-    def api_undo_non_human():
+    @app.post("/api/review-candidate/undo")
+    def api_undo_review_candidate():
+        """Restore one trashed Non-Human or Faces review candidate to its original path."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         path = data.get("path")
@@ -1071,7 +1079,8 @@ def create_app(
                 (
                     candidate
                     for candidate in (result.groups if result else [])
-                    if candidate.id == group_id and candidate.kind.value == "no_humans"
+                    if candidate.id == group_id
+                    and candidate.kind.value in INDEPENDENT_DELETE_KINDS
                 ),
                 None,
             )
