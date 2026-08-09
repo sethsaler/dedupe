@@ -1,10 +1,12 @@
-"""Count faces in images and GIFs with the bundled OpenCV YuNet model."""
+"""Count faces in images, GIFs, and videos with the bundled OpenCV YuNet model."""
 
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import threading
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 
 from .human_detection import (
@@ -19,13 +21,23 @@ from .human_detection import (
 )
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
+from .similar_video import (
+    _extract_frames,
+    _extract_seek_frame_ppm,
+    _sample_timestamps,
+    ffmpeg_available,
+    probe_video,
+)
 
 ProgressCb = Callable[[str, int, int], None]
 
 FACE_COUNT_CACHE_VERSION = "face-count-v1"
-# Videos are excluded on purpose: counting faces needs every sampled frame
-# decoded (no early exit), which is disproportionately expensive for video.
-FACE_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF)
+# Face counting has no early exit (the count is the busiest sampled frame), so
+# videos get a bounded sample of frames rather than a full decode.
+FACE_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
+FACE_VIDEO_MAX_FRAMES = 16
+# Sample video frames wide enough for YuNet's full-size detection pass.
+FACE_VIDEO_FRAME_WIDTH = DETECT_MAX_SIDE
 
 
 def face_detection_signature() -> str:
@@ -112,6 +124,58 @@ class _YuNetFaceCounter:
         return best
 
 
+def _video_face_counts(record: FileRecord, counter: _YuNetFaceCounter) -> list[int]:
+    """Count faces across sampled video frames.
+
+    Person detection can stop at the first positive frame; face counting needs
+    the busiest frame, so every sampled frame must decode successfully.
+    """
+    import numpy as np
+    from PIL import Image
+
+    if not ffmpeg_available():
+        raise RuntimeError("face counting in videos requires ffmpeg on PATH")
+
+    duration = record.duration
+    if duration is None or duration <= 0:
+        duration, width, height = probe_video(record.path)
+        record.duration = duration
+        record.width = width or record.width
+        record.height = height or record.height
+
+    counts: list[int] = []
+
+    def count_ppm(ppm: bytes) -> None:
+        with Image.open(BytesIO(ppm)) as image:
+            counts.append(counter.count(np.asarray(image.convert("RGB"))))
+
+    if duration is not None and duration > 0:
+        for timestamp in _sample_timestamps(duration, FACE_VIDEO_MAX_FRAMES):
+            ppm = _extract_seek_frame_ppm(
+                record.path, timestamp, frame_width=FACE_VIDEO_FRAME_WIDTH
+            )
+            if ppm is None:
+                raise RuntimeError(f"frame decode failed at {timestamp:.2f}s")
+            count_ppm(ppm)
+        return counts
+
+    # Rare fallback for containers without a probeable duration.
+    with tempfile.TemporaryDirectory(prefix="dedupe-face-video-") as tmp:
+        frame_paths = _extract_frames(
+            record.path,
+            Path(tmp),
+            max_frames=FACE_VIDEO_MAX_FRAMES,
+            frame_width=FACE_VIDEO_FRAME_WIDTH,
+            require_complete=True,
+        )
+        if not frame_paths:
+            raise RuntimeError("no video frames could be sampled")
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                counts.append(counter.count(np.asarray(image.convert("RGB"))))
+    return counts
+
+
 def analyze_face_count(
     record: FileRecord,
     counter: _YuNetFaceCounter,
@@ -126,7 +190,10 @@ def analyze_face_count(
     if record.media_type not in FACE_MEDIA_TYPES:
         return None
     try:
-        counts = [counter.count(frame) for frame in _pil_frames(Path(record.path))]
+        if record.media_type == MediaType.VIDEO:
+            counts = _video_face_counts(record, counter)
+        else:
+            counts = [counter.count(frame) for frame in _pil_frames(Path(record.path))]
     except Exception as exc:
         record.error = f"face counting failed: {exc}"
         return None
@@ -145,7 +212,7 @@ def count_faces_in_files(
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[FileRecord]:
-    """Count faces in every image/GIF, reusing trusted cached counts."""
+    """Count faces in every image, GIF, and video, reusing trusted cached counts."""
     candidates = [
         record for record in records if record.media_type in FACE_MEDIA_TYPES
     ]

@@ -22,7 +22,7 @@ DEFAULT_RANDOM_REVIEW_COUNT = 50
 # Mirrors face_detection.FACE_MEDIA_TYPES; importing that module here would
 # create a grouping -> face_detection -> human_detection -> similar_video ->
 # grouping import cycle.
-FACE_COUNTED_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF)
+FACE_COUNTED_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
 
 
 def rank_keep_candidate(rec: FileRecord) -> tuple:

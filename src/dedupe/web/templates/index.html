@@ -232,7 +232,15 @@
               <label for="filterPathPattern">Path</label>
               <input id="filterPathPattern" type="text" spellcheck="false" placeholder="*/Screenshots/* or .heic" />
             </div>
-            <span class="thresh-hint">A group matches when any of its files match. Path accepts a substring or a glob.</span>
+            <div class="result-control-row">
+              <label for="filterFaces">Faces</label>
+              <select id="filterFaces" aria-label="Filter by detected face count">
+                <option value="any">Any</option>
+                <option value="has">1+ faces</option>
+                <option value="none">No faces (0)</option>
+              </select>
+            </div>
+            <span class="thresh-hint">A group matches when any of its files match. Path accepts a substring or a glob. Face filters only apply to files scanned with Count faces.</span>
             <button class="btn ghost" id="btnClearFilters" type="button">Clear advanced filters</button>
           </details>
           <details class="sidebar-panel" id="bulkPanel">

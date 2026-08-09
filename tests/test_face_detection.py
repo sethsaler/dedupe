@@ -116,11 +116,111 @@ def test_decode_failure_clears_count_and_records_error(tmp_path: Path) -> None:
     assert "face counting failed" in (record.error or "")
 
 
-def test_videos_are_not_face_candidates(tmp_path: Path) -> None:
-    video = tmp_path / "clip.mp4"
-    video.write_bytes(b"fake video bytes")
-    record = inventory([video])[0]
+def _video_record(path: Path) -> FileRecord:
+    path.write_bytes(b"fake video bytes")
+    record = inventory([path])[0]
     assert record.media_type == MediaType.VIDEO
+    return record
 
-    assert count_faces_in_files([record], workers=1) == []
+
+def _ppm_bytes() -> bytes:
+    return b"P6\n1 1\n255\n\x00\x00\x00"
+
+
+def _stub_video_frames(monkeypatch, timestamps: list[float]) -> None:
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.face_detection._sample_timestamps",
+        lambda duration, max_frames: list(timestamps),
+    )
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frame_ppm",
+        lambda path, timestamp, frame_width: _ppm_bytes(),
+    )
+
+
+def test_video_face_count_is_max_across_sampled_frames(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 6.0
+    _stub_video_frames(monkeypatch, [0.0, 3.0, 5.9])
+    counter = _StubCounter([0, 2, 1])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 2
+    assert record.face_count == 2
+    assert record.face_detection_signature == "sig"
+    assert counter.calls == 3
+
+
+def test_video_frame_decode_failure_clears_count(tmp_path: Path, monkeypatch) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 4.0
+    record.face_count = 3
+    record.face_detection_signature = "sig"
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.face_detection._sample_timestamps",
+        lambda duration, max_frames: [0.0, 2.0],
+    )
+    decoded = iter([_ppm_bytes(), None])
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frame_ppm",
+        lambda path, timestamp, frame_width: next(decoded),
+    )
+    counter = _StubCounter([1])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count is None
     assert record.face_count is None
+    assert record.face_detection_signature is None
+    assert "face counting failed" in (record.error or "")
+
+
+def test_video_face_count_requires_ffmpeg(tmp_path: Path, monkeypatch) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 6.0
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: False)
+    counter = _StubCounter([])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count is None
+    assert record.face_count is None
+    assert "ffmpeg" in (record.error or "")
+
+
+def test_video_duration_probed_when_missing(tmp_path: Path, monkeypatch) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    assert record.duration is None
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.face_detection.probe_video", lambda path: (4.0, 320, 240)
+    )
+    _stub_video_frames(monkeypatch, [1.0])
+    counter = _StubCounter([0])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 0
+    assert record.duration == 4.0
+    assert record.width == 320
+    assert record.height == 240
+
+
+def test_count_faces_in_files_includes_videos(tmp_path: Path, monkeypatch) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 2.0
+    _stub_video_frames(monkeypatch, [0.0])
+    monkeypatch.setattr(
+        "dedupe.face_detection._YuNetFaceCounter", lambda: _StubCounter([0])
+    )
+
+    analyzed = count_faces_in_files([record], workers=1)
+
+    assert analyzed == [record]
+    assert record.face_count == 0
+    assert record.face_detection_signature == face_detection_signature()

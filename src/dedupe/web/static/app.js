@@ -917,13 +917,15 @@
       minWidth: numericFilter("filterMinWidth"),
       minHeight: numericFilter("filterMinHeight"),
       matchPath: pathMatcher(),
+      faces: $("filterFaces").value === "any" ? null : $("filterFaces").value,
     };
     filters.active =
       filters.minSize != null ||
       filters.maxSize != null ||
       filters.minWidth != null ||
       filters.minHeight != null ||
-      !!filters.matchPath;
+      !!filters.matchPath ||
+      filters.faces != null;
     return filters;
   }
 
@@ -933,6 +935,13 @@
     if (filters.minWidth != null && (member.width || 0) < filters.minWidth) return false;
     if (filters.minHeight != null && (member.height || 0) < filters.minHeight) return false;
     if (filters.matchPath && !filters.matchPath(member.path)) return false;
+    if (filters.faces) {
+      // Files without a trusted face count never match: "No faces" must mean
+      // the counter actually ran and found zero, not "never analyzed".
+      if (member.face_count == null) return false;
+      if (filters.faces === "has" && member.face_count < 1) return false;
+      if (filters.faces === "none" && member.face_count !== 0) return false;
+    }
     return true;
   }
 
@@ -1820,7 +1829,7 @@
     "filterPathPattern",
   ];
   // Filters render synchronously so the list matches the inputs on the next tick.
-  [...LIVE_FILTER_IDS, "resultSort", "selectionFilter", "issuesOnly", "hideCompleted"].forEach((id) => {
+  [...LIVE_FILTER_IDS, "resultSort", "selectionFilter", "filterFaces", "issuesOnly", "hideCompleted"].forEach((id) => {
     $(id).addEventListener(LIVE_FILTER_IDS.includes(id) ? "input" : "change", () => {
       resetGroupListWindow();
       renderGroupList();
@@ -1828,6 +1837,7 @@
   });
   $("btnClearFilters").addEventListener("click", () => {
     for (const id of LIVE_FILTER_IDS.filter((value) => value !== "resultSearch")) $(id).value = "";
+    $("filterFaces").value = "any";
     resetGroupListWindow();
     renderGroupList();
   });

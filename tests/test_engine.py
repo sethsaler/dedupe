@@ -602,12 +602,13 @@ def test_run_scan_counts_faces_and_reports_stage(tmp_path: Path) -> None:
     video = next(f for f in result.files if f.path.endswith("clip.mp4"))
     assert photo.face_count == 0
     assert photo.face_detection_signature
+    # The fake video cannot decode, so it is attempted and fails cleanly.
     assert video.face_count is None
 
     stage = result.diagnostics.stages["face_detection"]
-    assert stage.attempted == 1
+    assert stage.attempted == 2
     assert stage.succeeded == 1
-    assert stage.skipped == 1
+    assert stage.failed == 1
 
     serialized = result.to_dict()
     faces = {f["path"]: f["face_count"] for f in serialized["files"]}
@@ -638,11 +639,12 @@ def test_run_scan_publishes_faces_review_group(tmp_path: Path, monkeypatch) -> N
 
     faces_groups = [g for g in result.groups if g.kind == GroupKind.FACES]
     assert len(faces_groups) == 1
-    # Busiest shot first.
-    assert [m.face_count for m in faces_groups[0].members] == [2, 1]
+    # Busiest shot first; videos with trusted counts join the review flow.
+    assert [m.face_count for m in faces_groups[0].members] == [2, 1, 1]
+    assert faces_groups[0].members[0].path.endswith("group-shot.jpg")
     assert faces_groups[0].selected_for_removal == []
-    assert result.faces_files == 2
-    assert result.to_dict()["faces_files"] == 2
+    assert result.faces_files == 3
+    assert result.to_dict()["faces_files"] == 3
 
 
 def test_run_scan_without_count_faces_publishes_no_faces_group(

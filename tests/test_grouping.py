@@ -413,7 +413,9 @@ def test_build_faces_groups_orders_by_face_count_and_excludes_unanalyzed() -> No
     assert len(groups) == 1
     group = groups[0]
     assert group.kind == GroupKind.FACES
+    # Videos with trusted face counts join the Faces review flow too.
     assert [member.path for member in group.members] == [
+        "/clip.mp4",
         "/busy.jpg",
         "/pair.jpg",
         "/solo.jpg",
@@ -421,7 +423,7 @@ def test_build_faces_groups_orders_by_face_count_and_excludes_unanalyzed() -> No
     assert group.selected_for_removal == []
     assert group.reviewed_paths == []
 
-    assert build_faces_groups([faceless, unanalyzed, video]) == []
+    assert build_faces_groups([faceless, unanalyzed]) == []
 
 
 def test_loaded_scan_drops_faces_group_with_no_current_face_counts() -> None:
