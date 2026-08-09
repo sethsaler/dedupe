@@ -24,6 +24,7 @@ class GroupKind(str, Enum):
     NO_HUMANS = "no_humans"
     LOW_RESOLUTION = "low_resolution"
     RANDOM_REVIEW = "random_review"
+    FACES = "faces"
 
 
 class ReviewPolicy(str, Enum):
@@ -189,6 +190,7 @@ class ReviewGroup:
             GroupKind.NO_HUMANS,
             GroupKind.LOW_RESOLUTION,
             GroupKind.RANDOM_REVIEW,
+            GroupKind.FACES,
         ):
             return ReviewPolicy.INDEPENDENT_CANDIDATES
         return ReviewPolicy.KEEP_ONE
@@ -254,6 +256,21 @@ class ReviewGroup:
                     )
                 ),
                 key=lambda member: (-member.mtime_sort_stamp, member.path),
+            )
+        elif kind == GroupKind.FACES:
+            # Cached results may predate a re-analysis. A member without a
+            # current face count no longer belongs in the Faces review flow.
+            members = sorted(
+                (
+                    member
+                    for member in members
+                    if member.face_count is not None and member.face_count >= 1
+                ),
+                key=lambda member: (
+                    -member.face_count,
+                    -member.mtime_sort_stamp,
+                    member.path,
+                ),
             )
         member_paths = {member.path for member in members}
         return cls(
@@ -414,6 +431,7 @@ class ScanResult:
     no_human_files: int = 0
     low_resolution_files: int = 0
     random_review_files: int = 0
+    faces_files: int = 0
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
@@ -429,6 +447,9 @@ class ScanResult:
         )
         self.random_review_files = sum(
             len(g.members) for g in self.groups if g.kind == GroupKind.RANDOM_REVIEW
+        )
+        self.faces_files = sum(
+            len(g.members) for g in self.groups if g.kind == GroupKind.FACES
         )
         sizes = {member.path: member.size for group in self.groups for member in group.members}
         self.reclaimable_bytes = sum(
@@ -446,6 +467,7 @@ class ScanResult:
             "no_human_files": self.no_human_files,
             "low_resolution_files": self.low_resolution_files,
             "random_review_files": self.random_review_files,
+            "faces_files": self.faces_files,
             "reclaimable_bytes": self.reclaimable_bytes,
             "file_count": len(self.files),
             "group_count": len(self.groups),
@@ -459,7 +481,8 @@ class ScanResult:
         groups = [
             group
             for group in groups
-            if group.kind != GroupKind.NO_HUMANS or group.members
+            if group.members
+            or group.kind not in (GroupKind.NO_HUMANS, GroupKind.FACES)
         ]
         result = cls(
             roots=list(data.get("roots", [])),

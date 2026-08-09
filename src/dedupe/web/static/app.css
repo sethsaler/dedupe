@@ -997,6 +997,7 @@ kbd {
 .badge.no_humans { background: #45351d; color: #f0c674; }
 .badge.low_resolution { background: #45282b; color: #ff9b9b; }
 .badge.random_review { background: #26364a; color: #9ec7ff; }
+.badge.faces { background: #3a2b4a; color: #d3a6ff; }
 
 .group-empty {
   padding: 28px 16px;

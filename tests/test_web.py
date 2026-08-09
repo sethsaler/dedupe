@@ -13,6 +13,7 @@ import pytest
 import dedupe.actions as actions_module
 from dedupe.cache import HashCache
 from dedupe.grouping import (
+    build_faces_groups,
     build_groups,
     build_low_resolution_groups,
     build_no_human_groups,
@@ -472,6 +473,8 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="optRandomReview"' in html
     assert 'data-kind="low_resolution"' in html
     assert 'data-kind="random_review"' in html
+    assert 'data-kind="faces"' in html
+    assert 'id="countFaces"' in html
     assert "←</kbd> Delete" in html
     assert "Keep <kbd>→" in html
     assert 'id="lbOpacity"' in html
@@ -574,6 +577,54 @@ def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert preview.get_json()["selection_counts"]["low_resolution"] == 1
+
+
+def test_faces_review_group_is_served_and_actionable(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    duplicate = result.groups[0]
+    for index, record in enumerate(result.files):
+        record.face_count = index + 1
+        record.face_detection_signature = "face-count-v1|test"
+    faces_group = build_faces_groups(result.files)[0]
+    result.groups = [*result.groups, faces_group]
+    result.recompute_stats()
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    groups = client.get("/api/groups?kind=faces").get_json()["groups"]
+    assert len(groups) == 1
+    assert groups[0]["kind"] == "faces"
+    assert groups[0]["policy"] == "independent_candidates"
+    assert groups[0]["member_count"] == 2
+
+    # Never select the duplicate keeper; the server would drop it anyway.
+    path = next(
+        member.path for member in faces_group.members if member.path != duplicate.suggested_keep
+    )
+    select = client.post(
+        "/api/selection",
+        json={
+            "group_id": faces_group.id,
+            "selected": [path],
+            "reviewed": [path],
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert select.status_code == 200
+    assert select.get_json()["selected_for_removal"] == [path]
+
+    preview = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "kinds": "faces", "scan_id": scan_id},
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    payload = preview.get_json()
+    assert payload["success_count"] == 1
+    assert payload["selection_counts"]["faces"] == 1
 
 
 @pytest.mark.parametrize("review_kind", ["low_resolution", "random_review"])

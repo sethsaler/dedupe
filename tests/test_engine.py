@@ -613,3 +613,53 @@ def test_run_scan_counts_faces_and_reports_stage(tmp_path: Path) -> None:
     faces = {f["path"]: f["face_count"] for f in serialized["files"]}
     assert faces[photo.path] == 0
     assert faces[video.path] is None
+
+
+def test_run_scan_publishes_faces_review_group(tmp_path: Path, monkeypatch) -> None:
+    _save(tmp_path / "solo.jpg", (30, 60, 90))
+    _save(tmp_path / "group-shot.jpg", (60, 90, 30))
+    (tmp_path / "clip.mp4").write_bytes(b"fake video bytes")
+
+    def fake_count(records, *, progress=None, **_kwargs):
+        for record in records:
+            record.face_count = 2 if record.path.endswith("group-shot.jpg") else 1
+            record.face_detection_signature = "test-signature"
+        return records
+
+    monkeypatch.setattr("dedupe.engine.count_faces_in_files", fake_count)
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        count_faces=True,
+        include_videos=True,
+        use_cache=False,
+    )
+
+    faces_groups = [g for g in result.groups if g.kind == GroupKind.FACES]
+    assert len(faces_groups) == 1
+    # Busiest shot first.
+    assert [m.face_count for m in faces_groups[0].members] == [2, 1]
+    assert faces_groups[0].selected_for_removal == []
+    assert result.faces_files == 2
+    assert result.to_dict()["faces_files"] == 2
+
+
+def test_run_scan_without_count_faces_publishes_no_faces_group(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    pytest.importorskip("cv2")
+    _save(tmp_path / "photo.jpg", (30, 60, 90))
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        count_faces=False,
+        use_cache=False,
+    )
+
+    assert result.faces_files == 0
+    assert all(g.kind != GroupKind.FACES for g in result.groups)

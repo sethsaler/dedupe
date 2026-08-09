@@ -1009,6 +1009,7 @@ def isolate_groups(
         GroupKind.NO_HUMANS.value: 0,
         GroupKind.LOW_RESOLUTION.value: 0,
         GroupKind.RANDOM_REVIEW.value: 0,
+        GroupKind.FACES.value: 0,
     }
     index_rows: list[dict] = []
 
@@ -1211,6 +1212,7 @@ def summarize_scan(result: ScanResult) -> str:
         f"Low-resolution files: {result.low_resolution_files}",
         f"Random review files: {result.random_review_files}",
         f"Non-human files: {result.no_human_files}",
+        f"Faces files: {result.faces_files}",
         f"Reclaimable: {format_bytes(result.reclaimable_bytes)}",
     ]
     if result.errors:

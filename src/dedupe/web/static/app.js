@@ -218,6 +218,10 @@
     return g?.policy === "independent_candidates";
   }
 
+  function isPagedIndependentReview(g) {
+    return g?.kind === "no_humans" || g?.kind === "faces";
+  }
+
   function escapeHtml(s) {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -826,12 +830,16 @@
     const noHumans = state.allGroups
       .filter((g) => g.kind === "no_humans")
       .reduce((count, g) => count + (g.member_count || 0), 0);
+    const faces = state.allGroups
+      .filter((g) => g.kind === "faces")
+      .reduce((count, g) => count + (g.member_count || 0), 0);
     $("countAll").textContent = state.allGroups.length;
     $("countExact").textContent = exact;
     $("countSimilar").textContent = similar;
     $("countLowResolution").textContent = lowResolution;
     $("countRandomReview").textContent = randomReview;
     $("countNoHumans").textContent = noHumans;
+    $("countFaces").textContent = faces;
 
     if (state.groups.length) {
       $("emptyState").hidden = true;
@@ -965,6 +973,7 @@
       no_humans: "non-human",
       low_resolution: "low-res",
       random_review: "random",
+      faces: "faces",
     }[g.kind] || g.kind;
     const reviewed = (g.reviewed_paths || []).length;
     const groupSummary = isIndependentReview(g)
@@ -1105,6 +1114,13 @@
         `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · detector output is not a guarantee`;
       return;
     }
+    if (g.kind === "faces") {
+      const reviewed = new Set(g.reviewed_paths || []);
+      const selected = new Set(g.selected_for_removal || []);
+      $("detailMeta").textContent =
+        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · face counts are heuristic, not a guarantee`;
+      return;
+    }
     if (isDecisionReview(g)) {
       const reviewed = new Set(g.reviewed_paths || []);
       const selected = new Set(g.selected_for_removal || []);
@@ -1147,6 +1163,7 @@
       no_humans: "Non-Human · no person detected",
       low_resolution: "Low resolution · under 1 megapixel",
       random_review: "Random review · fresh sample",
+      faces: "Faces · OpenCV face counts",
     }[g.kind] || g.kind;
     $("detailTitle").textContent = isIndependentReview(g)
       ? `${kindLabel} · ${g.member_count} files`
@@ -1192,7 +1209,7 @@
     const decisionReview = isDecisionReview(g);
     const pageCount = decisionReview
       ? Math.max(1, allMembers.length)
-      : g.kind === "no_humans"
+      : isPagedIndependentReview(g)
         ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
         : 1;
     state.memberPage = Math.max(0, Math.min(pageCount - 1, state.memberPage));
@@ -1203,7 +1220,7 @@
     const pageStart = decisionReview ? state.memberFocus : state.memberPage * MEMBER_PAGE_SIZE;
     const members = decisionReview
       ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
-      : g.kind === "no_humans"
+      : isPagedIndependentReview(g)
       ? allMembers.slice(pageStart, pageStart + MEMBER_PAGE_SIZE)
       : allMembers;
     const summaryText = allMembers.length
@@ -1255,13 +1272,15 @@
               ? `${dims} · ${((m.width || 0) * (m.height || 0) / 1_000_000).toFixed(2)} megapixels · below the 1 MP review threshold`
               : g.kind === "random_review"
                 ? "Randomly selected from this scan for a quick keep-or-delete check"
-                : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
+                : g.kind === "faces"
+                  ? `OpenCV face detection found ${m.face_count} face${m.face_count === 1 ? "" : "s"} (heuristic, not a guarantee)`
+                  : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
         const selectionTitle = isSel
-          ? (g.kind === "no_humans" ? "Reviewed · selected" : "Selected for removal")
-          : (g.kind === "no_humans" && reviewed ? "Reviewed · not selected" : "Not selected");
+          ? (isPagedIndependentReview(g) ? "Reviewed · selected" : "Selected for removal")
+          : (isPagedIndependentReview(g) && reviewed ? "Reviewed · not selected" : "Not selected");
         const selectionHint = isSel
           ? "Click to keep this file"
-          : (g.kind === "no_humans" ? "Click to review and remove" : "Click to remove this file");
+          : (isPagedIndependentReview(g) ? "Click to review and remove" : "Click to remove this file");
         const mediaPreview = m.media_type === "video"
           ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
           : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />`;
@@ -1277,7 +1296,7 @@
                 <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
                 <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
               </div>`
-          : g.kind === "no_humans"
+          : isPagedIndependentReview(g)
           ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
           : `<label class="selection-control">
                   <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
@@ -1592,6 +1611,7 @@
         low_resolution: "Low resolution",
         random_review: "Random review",
         no_humans: "Non-Human",
+        faces: "Faces",
       }[scope] ||
       "All selected categories"
     );
@@ -1861,10 +1881,14 @@
   $("btnSelectSuggested").addEventListener("click", async () => {
     const current = state.allGroups.find((group) => group.id === state.currentId)
       || state.groups.find((group) => group.id === state.currentId);
-    const rule = current?.kind === "no_humans" ? "select_candidates" : "automatic";
+    const rule = current?.kind === "no_humans" || current?.kind === "faces"
+      ? "select_candidates"
+      : "automatic";
     const message = current?.kind === "no_humans"
       ? "Reviewed non-human candidates selected"
-      : "Suggested selection applied";
+      : current?.kind === "faces"
+        ? "Reviewed face candidates selected"
+        : "Suggested selection applied";
     await applyRuleToCurrentGroup(rule, message);
   });
 
@@ -2065,7 +2089,8 @@
       const counts = preview.selection_counts || {};
       const selectedMembers = effectiveSelection(scope);
       const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
-      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.low_resolution || 0} Low-res · ${counts.random_review || 0} Random · ${counts.no_humans || 0} Non-Human`;
+      const facesBreakdown = counts.faces ? ` · ${counts.faces} Faces` : "";
+      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.low_resolution || 0} Low-res · ${counts.random_review || 0} Random · ${counts.no_humans || 0} Non-Human${facesBreakdown}`;
       const skippedWarning = (action !== "isolate" && preview.fail_count)
         ? `<p><strong>${eligibleCount} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
         : "";
@@ -2079,8 +2104,8 @@
         isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
       };
       const bodies = {
-        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p>${reviewQuarantineNote}<p>At least one file is always kept in every duplicate group. Other selected files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
-        quarantine: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching and Non-Human detection are heuristic, not guarantees.</p>' : ""}</div>`,
+        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p>${reviewQuarantineNote}<p>At least one file is always kept in every duplicate group. Other selected files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans || counts.faces) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching, Non-Human detection, and face counting are heuristic, not guarantees.</p>' : ""}</div>`,
+        quarantine: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans || counts.faces) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching, Non-Human detection, and face counting are heuristic, not guarantees.</p>' : ""}</div>`,
         isolate: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
       };
       const ok = await confirmModal({

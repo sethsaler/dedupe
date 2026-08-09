@@ -19,6 +19,11 @@ from .models import (
 LOW_RESOLUTION_MAX_PIXELS = 1_000_000
 DEFAULT_RANDOM_REVIEW_COUNT = 50
 
+# Mirrors face_detection.FACE_MEDIA_TYPES; importing that module here would
+# create a grouping -> face_detection -> human_detection -> similar_video ->
+# grouping import cycle.
+FACE_COUNTED_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF)
+
 
 def rank_keep_candidate(rec: FileRecord) -> tuple:
     """
@@ -253,6 +258,29 @@ def build_random_review_groups(
     sampler = rng or random.SystemRandom()
     matching = sampler.sample(eligible, k=min(count, len(eligible)))
     return _build_independent_group(GroupKind.RANDOM_REVIEW, matching)
+
+
+def build_faces_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
+    """Build one review collection of media with at least one detected face.
+
+    Members are ordered busiest-shot first (highest face count, then newest),
+    so group photos surface at the top of the Faces review pages.
+    """
+    matching = sorted(
+        (
+            member
+            for member in members
+            if member.media_type in FACE_COUNTED_MEDIA_TYPES
+            and member.face_count is not None
+            and member.face_count >= 1
+        ),
+        key=lambda member: (
+            -member.face_count,
+            -member.mtime_sort_stamp,
+            member.path,
+        ),
+    )
+    return _build_independent_group(GroupKind.FACES, matching)
 
 
 def _build_independent_group(

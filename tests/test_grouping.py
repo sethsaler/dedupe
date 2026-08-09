@@ -7,6 +7,7 @@ import random
 from dedupe.actions import collect_selected_paths
 from dedupe.grouping import (
     apply_smart_select,
+    build_faces_groups,
     build_groups,
     build_low_resolution_groups,
     build_no_human_groups,
@@ -390,3 +391,70 @@ def test_loaded_scan_drops_non_human_group_with_only_stale_decisions() -> None:
 
     assert loaded.groups == []
     assert loaded.no_human_files == 0
+
+
+def test_build_faces_groups_orders_by_face_count_and_excludes_unanalyzed() -> None:
+    busy = _rec("/busy.jpg", 500, 5)
+    busy.face_count = 3
+    pair = _rec("/pair.jpg", 500, 9)
+    pair.face_count = 2
+    solo = _rec("/solo.jpg", 500, 1)
+    solo.face_count = 1
+    faceless = _rec("/faceless.jpg", 500, 20)
+    faceless.face_count = 0
+    unanalyzed = _rec("/unanalyzed.jpg", 500, 30)
+    video = _rec("/clip.mp4", 500, 40)
+    video.media_type = MediaType.VIDEO
+    video.extension = ".mp4"
+    video.face_count = 4
+
+    groups = build_faces_groups([faceless, solo, video, busy, unanalyzed, pair])
+
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.kind == GroupKind.FACES
+    assert [member.path for member in group.members] == [
+        "/busy.jpg",
+        "/pair.jpg",
+        "/solo.jpg",
+    ]
+    assert group.selected_for_removal == []
+    assert group.reviewed_paths == []
+
+    assert build_faces_groups([faceless, unanalyzed, video]) == []
+
+
+def test_loaded_scan_drops_faces_group_with_no_current_face_counts() -> None:
+    with_faces = _rec("/faces.jpg", 600, 4)
+    with_faces.face_count = 2
+    lost_count = _rec("/lost.jpg", 600, 8)
+
+    raw = ScanResult(
+        roots=["/"],
+        files=[with_faces, lost_count],
+        groups=[
+            ReviewGroup(
+                id="faces-group",
+                kind=GroupKind.FACES,
+                media_type=MediaType.IMAGE,
+                members=[with_faces, lost_count],
+            )
+        ],
+    ).to_dict()
+
+    loaded = ScanResult.from_dict(raw)
+
+    assert len(loaded.groups) == 1
+    assert [member.path for member in loaded.groups[0].members] == ["/faces.jpg"]
+    assert loaded.faces_files == 1
+
+    stale_only = dict(raw)
+    stale_only["groups"] = [
+        ReviewGroup(
+            id="stale-faces",
+            kind=GroupKind.FACES,
+            media_type=MediaType.IMAGE,
+            members=[lost_count],
+        ).to_dict()
+    ]
+    assert ScanResult.from_dict(stale_only).groups == []

@@ -524,6 +524,7 @@ def create_app(
                 "no_humans",
                 "low_resolution",
                 "random_review",
+                "faces",
             ):
                 groups = [g for g in groups if g.kind.value == kind]
             total = len(groups)
@@ -1286,12 +1287,15 @@ def create_app(
             }
             low_resolution_count = count_kind("low_resolution")
             random_review_count = count_kind("random_review")
+            faces_count = count_kind("faces")
             # Keep the established response shape for duplicate-only callers;
             # expose new categories whenever they contribute a selection.
             if low_resolution_count:
                 selection_counts["low_resolution"] = low_resolution_count
             if random_review_count:
                 selection_counts["random_review"] = random_review_count
+            if faces_count:
+                selection_counts["faces"] = faces_count
             if action == "isolate":
                 mode = (data.get("isolate_mode") or "copy").lower()
                 action_result = isolate_groups(

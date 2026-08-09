@@ -14,6 +14,7 @@ from .face_detection import FACE_MEDIA_TYPES, count_faces_in_files
 from .grouping import (
     DEFAULT_RANDOM_REVIEW_COUNT,
     LOW_RESOLUTION_MAX_PIXELS,
+    build_faces_groups,
     build_low_resolution_groups,
     build_no_human_groups,
     build_one_group,
@@ -614,6 +615,11 @@ def run_scan(
             for record in face_candidates
             if record.face_count is None
         ]
+        for group in build_faces_groups(face_candidates):
+            groups.append(group)
+            if on_group:
+                on_group(group)
+        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
 
     cache_errors: list[str] = []
     if cache is not None:
@@ -791,8 +797,9 @@ def run_scan(
     prog.message = (
         f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups, "
         f"{result.low_resolution_files} low-resolution, "
-        f"{result.random_review_files} random review, {result.no_human_files} non-human "
-        f"({len(records)} files)"
+        f"{result.random_review_files} random review, {result.no_human_files} non-human"
+        + (f", {result.faces_files} faces" if count_faces else " ")
+        + f" ({len(records)} files)"
     )
     prog.elapsed_seconds = total_duration
     prog.eta_seconds = 0.0
@@ -1042,7 +1049,8 @@ def run_scans_parallel(
                     f"{result.similar_groups} similar groups, "
                     f"{result.low_resolution_files} low-resolution, "
                     f"{result.random_review_files} random review, "
-                    f"{result.no_human_files} non-human "
+                    f"{result.no_human_files} non-human, "
+                    f"{result.faces_files} faces "
                     f"across {n_streams} folder{'s' if n_streams != 1 else ''}"
                 )
             ),
