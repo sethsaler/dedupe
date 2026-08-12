@@ -39,7 +39,10 @@ def application_version() -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="dedupe",
-        description="Find duplicate images, videos, and GIFs (Gemini-style).",
+        description=(
+            "Find duplicate images, videos, and GIFs (Gemini-style). "
+            "`dedupe PATH...` is a shortcut for `dedupe scan PATH...`."
+        ),
     )
     p.add_argument("--version", action="version", version=f"dedupe {application_version()}")
     sub = p.add_subparsers(dest="command", required=True)
@@ -881,9 +884,27 @@ def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
     return 1 if report["errors"] else 0
 
 
+_COMMANDS = frozenset(
+    {
+        "scan",
+        "ui",
+        "isolate",
+        "undo",
+        "receipts",
+        "benchmark-humans",
+        "doctor",
+        "benchmark-similarity",
+    }
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    # `dedupe <path>...` is shorthand for `dedupe scan <path>...` (no web UI).
+    if args_list and not args_list[0].startswith("-") and args_list[0] not in _COMMANDS:
+        args_list.insert(0, "scan")
+    args = parser.parse_args(args_list)
     if args.command == "scan":
         return cmd_scan(args)
     if args.command == "ui":

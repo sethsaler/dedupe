@@ -30,6 +30,34 @@ def test_parser_exposes_doctor_and_similarity_thresholds() -> None:
     assert (benchmark.threshold, benchmark.video_threshold, benchmark.workers) == (9, 11, 2)
 
 
+def test_bare_path_argument_runs_scan_without_ui(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_scan(paths, **kwargs):
+        captured.update(kwargs)
+        captured["paths"] = paths
+        return ScanResult(roots=[str(path) for path in paths], files=[], groups=[])
+
+    monkeypatch.setattr(cli, "run_scan", fake_run_scan)
+
+    assert cli.main([str(tmp_path)]) == 0
+    assert captured["paths"] == [str(tmp_path)]
+    assert captured["exact"] is True
+    assert captured["similar"] is True
+
+    assert cli.main([str(tmp_path), "--no-similar", "--json", str(tmp_path / "out.json")]) == 0
+    assert captured["similar"] is False
+    assert (tmp_path / "out.json").exists()
+
+
+def test_bare_path_arguments_do_not_shadow_commands(monkeypatch) -> None:
+    called = []
+    monkeypatch.setattr(cli, "cmd_doctor", lambda args: called.append(args.command) or 0)
+
+    assert cli.main(["doctor", "--json"]) == 0
+    assert called == ["doctor"]
+
+
 def test_scan_can_target_low_resolution_media_types(tmp_path: Path, monkeypatch) -> None:
     captured = {}
 
