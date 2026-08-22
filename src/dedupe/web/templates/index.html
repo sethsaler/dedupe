@@ -237,6 +237,7 @@
               <select id="filterFaces" aria-label="Filter by detected face count">
                 <option value="any">Any</option>
                 <option value="has">1+ faces</option>
+                <option value="has_male">1+ male faces</option>
                 <option value="none">No faces (0)</option>
               </select>
             </div>
@@ -337,6 +338,11 @@
             <button class="btn ghost member-prev" type="button">Previous</button>
             <span class="member-page-summary">1–50 of 50</span>
             <button class="btn ghost member-next" type="button">Next</button>
+            <select id="memberSort" aria-label="Sort Faces results" hidden>
+              <option value="faces-desc">Most faces first</option>
+              <option value="faces-asc">Fewest faces first</option>
+              <option value="newest">Newest first</option>
+            </select>
           </nav>
           <div class="members" id="members"></div>
           <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="Review result pages (bottom)" hidden>

@@ -111,6 +111,8 @@ class FileRecord:
     human_frames_analyzed: int | None = None
     human_max_confidence: float | None = None
     face_count: int | None = None
+    male_face_count: int | None = None
+    female_face_count: int | None = None
     face_detector: str | None = None
     face_detection_signature: str | None = None
     error: str | None = None
@@ -166,6 +168,8 @@ class FileRecord:
             human_frames_analyzed=data.get("human_frames_analyzed"),
             human_max_confidence=data.get("human_max_confidence"),
             face_count=data.get("face_count"),
+            male_face_count=data.get("male_face_count"),
+            female_face_count=data.get("female_face_count"),
             face_detector=data.get("face_detector"),
             face_detection_signature=data.get("face_detection_signature"),
             error=data.get("error"),

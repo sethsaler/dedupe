@@ -1,4 +1,8 @@
-"""Count faces in images, GIFs, and videos with the bundled OpenCV YuNet model."""
+"""Count faces in images, GIFs, and videos with the bundled OpenCV YuNet model.
+
+Detected faces are also classified with the bundled InsightFace genderage
+model so files can be filtered by male/female face counts.
+"""
 
 from __future__ import annotations
 
@@ -31,13 +35,23 @@ from .similar_video import (
 
 ProgressCb = Callable[[str, int, int], None]
 
-FACE_COUNT_CACHE_VERSION = "face-count-v1"
+FACE_COUNT_CACHE_VERSION = "face-count-v2"
 # Face counting has no early exit (the count is the busiest sampled frame), so
 # videos get a bounded sample of frames rather than a full decode.
 FACE_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
 FACE_VIDEO_MAX_FRAMES = 16
 # Sample video frames wide enough for YuNet's full-size detection pass.
 FACE_VIDEO_FRAME_WIDTH = DETECT_MAX_SIDE
+
+GENDERAGE_MODEL_PATH = (
+    Path(__file__).parent / "assets" / "genderage_buffalo_l.onnx"
+)
+GENDERAGE_MODEL_SHA256 = (
+    "4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb"
+)
+GENDERAGE_INPUT_SIZE = 96
+# InsightFace loose crop: a square 1.5x the face box, centered on the face.
+GENDERAGE_CROP_SCALE = 1.5
 
 
 def face_detection_signature() -> str:
@@ -47,13 +61,14 @@ def face_detection_signature() -> str:
             FACE_COUNT_CACHE_VERSION,
             "opencv_yunet",
             f"yunet={YUNET_MODEL_SHA256[:12]}",
+            f"genderage={GENDERAGE_MODEL_SHA256[:12]}",
             f"face-confidence={YUNET_SCORE_THRESHOLD:g}",
         )
     )
 
 
 class _YuNetFaceCounter:
-    """CPU-only face counter backed by the bundled YuNet model."""
+    """CPU-only face counter backed by the bundled YuNet and genderage models."""
 
     backend = "opencv_yunet"
 
@@ -78,6 +93,18 @@ class _YuNetFaceCounter:
                 "the bundled OpenCV YuNet face model failed its integrity check; "
                 "refusing to count faces"
             )
+        if not GENDERAGE_MODEL_PATH.is_file():
+            raise RuntimeError(
+                "the bundled InsightFace genderage model is missing; "
+                "refusing to count faces without it"
+            )
+        with GENDERAGE_MODEL_PATH.open("rb") as model_file:
+            gender_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
+        if gender_sha256 != GENDERAGE_MODEL_SHA256:
+            raise RuntimeError(
+                "the bundled InsightFace genderage model failed its integrity check; "
+                "refusing to count faces"
+            )
         try:
             self.face = cv2.FaceDetectorYN.create(
                 str(YUNET_MODEL_PATH),
@@ -87,31 +114,35 @@ class _YuNetFaceCounter:
                 YUNET_NMS_THRESHOLD,
                 YUNET_TOP_K,
             )
+            self.gender = cv2.dnn.readNetFromONNX(str(GENDERAGE_MODEL_PATH))
         except (AttributeError, cv2.error) as exc:
             raise RuntimeError(
                 "OpenCV YuNet face detection could not start; "
                 "install OpenCV 4.5.4 or newer"
             ) from exc
 
-    def count(self, rgb_frame) -> int:
-        """Return the largest face count seen across the two detection scales."""
-        # Small faces resolve better at full size, close-up faces at the
-        # smaller pass — the same two scales the person detector uses.
-        frame = self.cv2.cvtColor(rgb_frame, self.cv2.COLOR_RGB2BGR)
-        best = 0
+    def _detect_best(self, bgr_frame):
+        """Detect faces at both scales; keep the busiest pass.
+
+        Small faces resolve better at full size, close-up faces at the
+        smaller pass — the same two scales the person detector uses.
+        Returns the faces and the (possibly resized) image they came from.
+        """
+        best_faces = None
+        best_candidate = bgr_frame
         checked_sizes: set[tuple[int, int]] = set()
         for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
-            height, width = frame.shape[:2]
+            height, width = bgr_frame.shape[:2]
             longest = max(width, height)
             if longest > max_side:
                 scale = max_side / longest
                 candidate = self.cv2.resize(
-                    frame,
+                    bgr_frame,
                     (max(1, round(width * scale)), max(1, round(height * scale))),
                     interpolation=self.cv2.INTER_AREA,
                 )
             else:
-                candidate = frame
+                candidate = bgr_frame
             candidate_height, candidate_width = candidate.shape[:2]
             size = (candidate_width, candidate_height)
             if size in checked_sizes:
@@ -119,13 +150,61 @@ class _YuNetFaceCounter:
             checked_sizes.add(size)
             self.face.setInputSize(size)
             _result, faces = self.face.detect(candidate)
-            if faces is not None:
-                best = max(best, len(faces))
-        return best
+            if faces is not None and (best_faces is None or len(faces) > len(best_faces)):
+                best_faces = faces
+                best_candidate = candidate
+        return best_faces, best_candidate
+
+    def _classify_faces(self, bgr_image, faces) -> tuple[int, int]:
+        """Classify each detected face; return (male_count, female_count)."""
+        import numpy as np
+
+        males = 0
+        females = 0
+        size = GENDERAGE_INPUT_SIZE
+        for face in faces:
+            x, y, face_width, face_height = (float(value) for value in face[:4])
+            center_x = x + face_width / 2
+            center_y = y + face_height / 2
+            scale = size / (max(face_width, face_height) * GENDERAGE_CROP_SCALE)
+            matrix = np.array(
+                [
+                    [scale, 0, size / 2 - center_x * scale],
+                    [0, scale, size / 2 - center_y * scale],
+                ],
+                dtype=np.float32,
+            )
+            crop = self.cv2.warpAffine(
+                bgr_image, matrix, (size, size), borderValue=0
+            )
+            # genderage normalizes pixels inside its graph (_minusscalar0/
+            # _mulscalar0); normalizing again collapses every input toward
+            # ~60% female, so the crop goes in as raw pixels.
+            blob = self.cv2.dnn.blobFromImage(
+                crop, scalefactor=1.0, size=(size, size), swapRB=True
+            )
+            self.gender.setInput(blob)
+            logits = self.gender.forward().reshape(-1)  # [female, male, age/100]
+            if logits[1] > logits[0]:
+                males += 1
+            else:
+                females += 1
+        return males, females
+
+    def analyze_frame(self, rgb_frame) -> tuple[int, int, int]:
+        """Return (total, male, female) face counts for one frame."""
+        frame = self.cv2.cvtColor(rgb_frame, self.cv2.COLOR_RGB2BGR)
+        faces, candidate = self._detect_best(frame)
+        if faces is None or len(faces) == 0:
+            return (0, 0, 0)
+        males, females = self._classify_faces(candidate, faces)
+        return (len(faces), males, females)
 
 
-def _video_face_counts(record: FileRecord, counter: _YuNetFaceCounter) -> list[int]:
-    """Count faces across sampled video frames.
+def _video_face_frames(
+    record: FileRecord, counter: _YuNetFaceCounter
+) -> list[tuple[int, int, int]]:
+    """Analyze faces across sampled video frames.
 
     Person detection can stop at the first positive frame; face counting needs
     the busiest frame, so every sampled frame must decode successfully.
@@ -143,11 +222,11 @@ def _video_face_counts(record: FileRecord, counter: _YuNetFaceCounter) -> list[i
         record.width = width or record.width
         record.height = height or record.height
 
-    counts: list[int] = []
+    frames: list[tuple[int, int, int]] = []
 
-    def count_ppm(ppm: bytes) -> None:
+    def analyze_ppm(ppm: bytes) -> None:
         with Image.open(BytesIO(ppm)) as image:
-            counts.append(counter.count(np.asarray(image.convert("RGB"))))
+            frames.append(counter.analyze_frame(np.asarray(image.convert("RGB"))))
 
     if duration is not None and duration > 0:
         for timestamp in _sample_timestamps(duration, FACE_VIDEO_MAX_FRAMES):
@@ -156,8 +235,8 @@ def _video_face_counts(record: FileRecord, counter: _YuNetFaceCounter) -> list[i
             )
             if ppm is None:
                 raise RuntimeError(f"frame decode failed at {timestamp:.2f}s")
-            count_ppm(ppm)
-        return counts
+            analyze_ppm(ppm)
+        return frames
 
     # Rare fallback for containers without a probeable duration.
     with tempfile.TemporaryDirectory(prefix="dedupe-face-video-") as tmp:
@@ -172,8 +251,10 @@ def _video_face_counts(record: FileRecord, counter: _YuNetFaceCounter) -> list[i
             raise RuntimeError("no video frames could be sampled")
         for frame_path in frame_paths:
             with Image.open(frame_path) as image:
-                counts.append(counter.count(np.asarray(image.convert("RGB"))))
-    return counts
+                frames.append(
+                    counter.analyze_frame(np.asarray(image.convert("RGB")))
+                )
+    return frames
 
 
 def analyze_face_count(
@@ -182,25 +263,31 @@ def analyze_face_count(
     *,
     cache_signature: str | None = None,
 ) -> int | None:
-    """Count faces for one record, update its fields, and return the count."""
+    """Count and classify faces for one record, update its fields, return the count."""
     # A re-analysis must never keep a stale trusted count if decoding fails.
     record.face_count = None
+    record.male_face_count = None
+    record.female_face_count = None
     record.face_detection_signature = None
     record.face_detector = counter.backend
     if record.media_type not in FACE_MEDIA_TYPES:
         return None
     try:
         if record.media_type == MediaType.VIDEO:
-            counts = _video_face_counts(record, counter)
+            frames = _video_face_frames(record, counter)
         else:
-            counts = [counter.count(frame) for frame in _pil_frames(Path(record.path))]
+            frames = [
+                counter.analyze_frame(frame) for frame in _pil_frames(Path(record.path))
+            ]
     except Exception as exc:
         record.error = f"face counting failed: {exc}"
         return None
-    if not counts:
+    if not frames:
         record.error = "face counting failed: no frames decoded"
         return None
-    record.face_count = max(counts)
+    record.face_count = max(total for total, _males, _females in frames)
+    record.male_face_count = max(males for _total, males, _females in frames)
+    record.female_face_count = max(females for _total, _males, females in frames)
     record.face_detection_signature = cache_signature
     return record.face_count
 

@@ -20,6 +20,7 @@
     pollTimer: null,
     memberFocus: 0,
     memberPage: 0,
+    memberSort: "faces-desc", // server order for Faces; only re-sort on demand
     lightboxItems: [],
     lightboxIndex: 0,
     scanning: false,
@@ -940,6 +941,9 @@
       // the counter actually ran and found zero, not "never analyzed".
       if (member.face_count == null) return false;
       if (filters.faces === "has" && member.face_count < 1) return false;
+      // Male matching needs the genderage pass; scans predating it report no
+      // male count and never match.
+      if (filters.faces === "has_male" && (member.male_face_count || 0) < 1) return false;
       if (filters.faces === "none" && member.face_count !== 0) return false;
     }
     return true;
@@ -1214,7 +1218,14 @@
     const selected = new Set(g.selected_for_removal || []);
     const reviewedPaths = new Set(g.reviewed_paths || []);
     const deletedPaths = new Set(g.deleted_paths || []);
-    const allMembers = g.members || [];
+    let allMembers = g.members || [];
+    if (g.kind === "faces" && state.memberSort !== "faces-desc") {
+      allMembers = [...allMembers].sort(
+        state.memberSort === "newest"
+          ? (a, b) => (b.mtime || 0) - (a.mtime || 0)
+          : (a, b) => (a.face_count || 0) - (b.face_count || 0),
+      );
+    }
     const decisionReview = isDecisionReview(g);
     const pageCount = decisionReview
       ? Math.max(1, allMembers.length)
@@ -1238,6 +1249,12 @@
         : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
       : "0 results";
     syncMemberPagination(pageCount, summaryText);
+    const sortSelect = $("memberSort");
+    if (sortSelect) {
+      sortSelect.hidden = g.kind !== "faces";
+      sortSelect.value = state.memberSort;
+    }
+    if (g.kind === "faces" && $("memberPagination")) $("memberPagination").hidden = false;
     state.lightboxItems = members
       .filter((member) => !deletedPaths.has(member.path))
       .map((member) => ({ path: member.path, mediaType: member.media_type, keeper: g.suggested_keep, kind: g.kind }));
@@ -1326,6 +1343,7 @@
                 <span>${dims}</span>
                 <span title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
                 ${m.face_count != null ? `<span class="face-count ${m.face_count > 1 ? "multi" : ""}" title="Faces detected by OpenCV (heuristic)">${m.face_count === 0 ? "No faces" : `${m.face_count} face${m.face_count === 1 ? "" : "s"}`}</span>` : ""}
+                ${(m.male_face_count || 0) > 0 ? `<span class="face-count multi" title="Male faces estimated by InsightFace genderage (heuristic)">${m.male_face_count} male${m.male_face_count === 1 ? "" : "s"}</span>` : ""}
               </div>
               <div class="evidence">${escapeHtml(evidence)}</div>
               <div class="card-actions">
@@ -1588,7 +1606,7 @@
       $("memberPagination").scrollIntoView({ block: "start", behavior: "smooth" });
       return;
     }
-    if (!current || current.kind !== "no_humans") return;
+    if (!current || !isPagedIndependentReview(current)) return;
     const pageCount = Math.max(1, Math.ceil((current.members || []).length / MEMBER_PAGE_SIZE));
     const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
     if (nextPage === state.memberPage) return;
@@ -1605,6 +1623,14 @@
   });
   document.querySelectorAll(".member-next").forEach((btn) => {
     btn.addEventListener("click", () => changeMemberPage(1));
+  });
+
+  $("memberSort")?.addEventListener("change", (event) => {
+    state.memberSort = event.target.value;
+    state.memberPage = 0;
+    const current = state.allGroups.find((group) => group.id === state.currentId)
+      || state.groups.find((group) => group.id === state.currentId);
+    if (current) renderMembers(current);
   });
 
   function currentScope() {

@@ -1,0 +1,12 @@
+genderage_buffalo_l.onnx
+========================
+
+Gender/age attribute model from InsightFace "buffalo_l"
+(https://github.com/deepinsight/insightface, model zoo).
+
+The InsightFace code is MIT licensed, but the InsightFace team's pretrained
+models are released for non-commercial research purposes only. This bundled
+copy inherits that restriction: do not redistribute Dedupe with this model
+for commercial use.
+
+SHA-256: 4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb

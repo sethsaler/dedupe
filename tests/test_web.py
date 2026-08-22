@@ -478,6 +478,8 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="memberPaginationBottom"' in html
     assert 'class="btn ghost member-prev"' in html
     assert 'class="btn ghost member-next"' in html
+    assert 'id="memberSort"' in html
+    assert 'value="has_male"' in html
     assert 'id="lbVideo"' in html
     assert 'id="lbSpeed"' in html
     assert 'id="scanQuality"' in html
