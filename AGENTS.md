@@ -1,5 +1,9 @@
 # AGENTS
 
+The product description — user-experience documents, verification checklists, and
+bug triage for this tool — lives in `docs/product-description/`; start at its
+`README.md`, then `goal.md`.
+
 Verification commands for this repository (run from the repo root, using the
 checked-in virtualenv at `.venv/`):
 

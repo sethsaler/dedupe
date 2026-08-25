@@ -1,0 +1,77 @@
+# Verification: cli and cross-cutting
+
+How to run this file: items are commands with expected output and exit codes; most were runnable in the scripted first pass (see [README](README.md#results-so-far)). Device column: `cli` = TTY terminal, `pipe` = stdout redirected, `disk` = inspect files. Items marked TTY-only (progress line behavior) must be watched in a real terminal.
+
+## cli/doctor.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DOCTOR-01 | P1 | cli | The report lists version, Python, platform, five imports, ffmpeg/ffprobe, OpenCV, three paths, and the final core line ([The simple case](../cli/doctor.md#the-simple-case)). | Default machine. | 1. Run `.venv/bin/dedupe doctor`. | Lines in the documented order; `Core operation: ready`; exit 0. | pass (scripted pass, 2026-08-24: all lines present, exit 0) |
+| DOCTOR-02 | P1 | pipe | `--json` prints one object with the same facts and identical exit codes ([Finish](../cli/doctor.md#finish)). | Default machine. | 1. `.venv/bin/dedupe doctor --json \| python3 -m json.tool`.<br>2. Check `$?`. | Valid JSON with keys application/python/platform/imports/ffmpeg/ffprobe/opencv/paths/core_ready/blockers; exit 0. | — |
+| DOCTOR-03 | P2 | disk | The command creates missing application directories ([Begin running](../cli/doctor.md#begin-running)). | Remove `~/.cache/dedupe` and `~/.local/state/dedupe` (back them up first). | 1. Run `doctor`.<br>2. `ls` both parents. | Directories recreated; report says writable. | — |
+| DOCTOR-04 | P3 | cli | The keep-decisions path label prints as `Keep decisions` ([The simple case](../cli/doctor.md#the-simple-case)). | Default machine. | 1. Read the path lines. | `Keep decisions path: …` — no underscore, no double capitalization. | — |
+
+## cli/scan.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| SCAN-01 | P1 | cli | Bare path runs a scan ([Invoke](../cli/scan.md#invoke)). | Scratch fixture. | 1. `.venv/bin/dedupe /tmp/…/media`. | Same summary as `dedupe scan …`; exit 0. | pass (scripted pass: summary + diagnostics printed, exit 0) |
+| SCAN-02 | P1 | cli | Summary, faces line (when enabled), diagnostics, and JSON note print in order ([Finish](../cli/scan.md#finish)). | Scratch fixture. | 1. `dedupe scan FOLDER --json out.json`. | Summary block; `Diagnostics: N failed … cache hits … duration`; `Wrote out.json`; the JSON parses and contains roots/files/groups. | pass (scripted pass: exact order observed; results.json written and consumed by isolate) |
+| SCAN-03 | P1 | pipe | Progress prints as carriage-returned phases ([While running](../cli/scan.md#while-running)). | Scratch fixture, piped output. | 1. `dedupe scan FOLDER 2>&1 \| cat -v`. | One long line with `^M` separators; phases in order ending `done`. | pass (scripted pass: all intermediate states captured in one line) |
+| SCAN-04 | P1 | cli | A negative/zero low-res bound exits 2 before scanning ([Exit immediately](../cli/scan.md#exit-immediately)). | Any folder. | 1. `dedupe scan FOLDER --low-resolution-image-max-mp 0`. | Exit 2; "error: low-resolution images megapixel bound must be positive" on stderr; nothing scanned. | — |
+| SCAN-05 | P2 | cli | `--action trash` defaults to dry run; `--execute` is required to move files ([Modifiers](../cli/scan.md#modifiers)). | Fixture with an exact pair. | 1. `dedupe scan FOLDER --action trash`.<br>2. Verify both files still exist.<br>3. Repeat with `--execute` (scratch files only). | First run prints `DRY-RUN trash: 1 ok, 0 failed`, files untouched; second moves the selected copy. | — |
+| SCAN-06 | P2 | cli | `--action quarantine` without `--quarantine-dir` exits 2 ([Edge cases](../cli/scan.md#edge-cases)). | Fixture. | 1. `dedupe scan FOLDER --action quarantine --execute`. | Exit 2, "error: --quarantine-dir required for quarantine". | — |
+| SCAN-07 | P2 | cli | `--parallel` scans folders independently ([Modifiers](../cli/scan.md#modifiers)). | Two folders each holding one copy of the same image. | 1. `dedupe scan A B --parallel`. | No cross-folder group; per-stream messages in progress. | — |
+| SCAN-08 | P2 | cli | Ctrl+C prints `cancelled` on stderr and exits 130 ([Cancel and interrupt](../cli/scan.md#cancel-and-interrupt)). | A large folder. | 1. Start a scan in a TTY.<br>2. Ctrl+C mid-run.<br>3. Check the message and exit code. | `cancelled` on stderr, no traceback, exit 130. | — |
+
+## cli/ui-command.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| UICMD-01 | P1 | cli | Startup prints the URL and the Ctrl+C line, then opens the browser ([Begin running](../cli/ui-command.md#begin-running)). | Port free. | 1. `.venv/bin/dedupe ui`.<br>2. Watch terminal and browser. | `Dedupe UI: http://127.0.0.1:8765/` and `Press CTRL+C to quit (closing the browser tab also stops the server)`; browser opens ~1 s later. | — |
+| UICMD-02 | P1 | tabs | Closing the last tab stops the server after the 1.5 s grace; a reload cancels it ([Finish](../cli/ui-command.md#finish)). | The server running with one tab. | 1. Close the tab; watch the terminal ≥ 2 s.<br>2. Repeat, but reopen the URL within 1 s. | First case: process exits cleanly. Second case: server keeps running, tab works. | — |
+| UICMD-03 | P2 | cli | A busy port fails at bind ([Exit immediately](../cli/ui-command.md#exit-immediately)). | `python3 -m http.server 8765` running. | 1. `dedupe ui`. | Process exits with an OS error about the address in use. | — |
+| UICMD-04 | P2 | cli | `--load JSON` starts with results installed ([Invoke](../cli/ui-command.md#invoke)). | A results.json from a prior scan. | 1. `dedupe ui --load results.json --no-browser`.<br>2. Open the URL. | Group list shows the loaded scan; status "Loaded previous scan". | — |
+
+## cli/isolate.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ISOLATE-01 | P1 | cli | Default is dry run: nothing created, layout printed ([The simple case](../cli/isolate.md#the-simple-case)). | results.json from a scratch scan. | 1. `dedupe isolate results.json --review-dir DIR`.<br>2. `ls DIR`. | `DRY-RUN isolate: N ok, 0 failed`; review root and ≤20 folder names; DIR does not exist. | pass (scripted pass: "DRY-RUN isolate: 10 ok, 0 failed", no directory created) |
+| ISOLATE-02 | P1 | cli | `--execute` creates the session tree with KEEP__ keepers ([While running](../cli/isolate.md#while-running)). | Same. | 1. Repeat with `--execute`.<br>2. Inspect the tree. | `session-{stamp}-{id}/{kind}/NNN_{kind}_{media}_n{count}_{keeper}_{id}/` folders; `KEEP__`-prefixed keeper in each duplicate group; `_group.json` and `_review_index.json` present; exit 0. | pass (scripted pass: exact layout observed, KEEP__ confirmed via receipts show) |
+| ISOLATE-03 | P2 | cli | Running twice creates two session folders, never merged ([Edge cases](../cli/isolate.md#edge-cases)). | ISOLATE-02 done. | 1. Run `--execute` again. | A second `session-…` folder; the first untouched. | pass (scripted pass: second run used a new session stamp) |
+| ISOLATE-04 | P2 | cli | One stale file cancels the whole execute ([Begin running](../cli/isolate.md#begin-running)). | Modify one file listed in results.json (change its size). | 1. `dedupe isolate results.json --execute`. | Exit 1; every item failed — the stale one with its reason, the rest with "isolate cancelled because another file failed preflight"; nothing placed. | — |
+
+## cli/undo.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| UNDO-01 | P1 | cli | Non-quarantine receipts are refused with exit 2 ([Exit immediately](../cli/undo.md#exit-immediately)). | An executed isolate receipt. | 1. `dedupe undo RECEIPT`; check the exit code directly (no pipe). | `error: only executed quarantine receipts can be undone`; exit 2. | pass (scripted pass: message and exit 2 observed against an isolate:copy receipt) |
+| UNDO-02 | P1 | cli | Dry-run previews the restore without moving ([The simple case](../cli/undo.md#the-simple-case)). | An executed quarantine receipt (create one with `scan --action quarantine --quarantine-dir … --execute` on scratch files). | 1. `dedupe undo RECEIPT`.<br>2. Verify files unmoved. | `DRY-RUN undo: N ok, 0 failed`; quarantine files still in place. | — |
+| UNDO-03 | P1 | cli | `--execute` restores files to their original paths in reverse order and writes a receipt ([While running](../cli/undo.md#while-running)). | UNDO-02 setup. | 1. `dedupe undo RECEIPT --execute`.<br>2. Check originals and `receipts list`. | `EXECUTED undo: N ok, 0 failed`; originals back; a new `undo:quarantine` receipt listed. | — |
+| UNDO-04 | P1 | cli | An occupied original path refuses the entire restore ([While running](../cli/undo.md#while-running)). | UNDO-03 undone state re-quarantined; recreate one original path with a placeholder file. | 1. Preview the undo. | Occupied item reports "original path is already occupied"; all others "undo cancelled because another item failed preflight"; exit 1. | — |
+
+## cli/receipts.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| RECEIPTS-01 | P1 | cli | `list` prints one line per receipt, newest first ([While running](../cli/receipts.md#while-running)). | A receipts directory with executed and preview receipts. | 1. `dedupe receipts list`. | Lines `{id}  {timestamp}  {action}  {executed\|preview}  {N ok / M failed}  {bytes}` in newest-first order; timestamp blank when the receipt lacks `started_at`. | pass (scripted pass: order and columns observed; blank timestamp on older receipts) |
+| RECEIPTS-02 | P1 | cli | `show` prints identity, action, timestamps, counts, and items with KEEP__ destinations ([While running](../cli/receipts.md#while-running)). | An isolate receipt. | 1. `dedupe receipts show ID`. | `Receipt:`, `Path:`, `Action: isolate:copy (executed)`, Started/Completed, `Result: N ok, M failed`, per-item `[ok  ]` lines with KEEP__ names. | pass (scripted pass: full output observed) |
+| RECEIPTS-03 | P2 | cli | `prune` previews by default; `--execute` deletes ([While running](../cli/receipts.md#while-running)). | ≥ 3 receipts. | 1. `dedupe receipts prune --keep 1`.<br>2. Verify nothing deleted.<br>3. Repeat with `--execute`. | `DRY-RUN prune: N receipts (…), M kept` with reasons; then `EXECUTED prune:` and only the newest remains. | — |
+| RECEIPTS-04 | P2 | cli | `--undoable` filters to restorable quarantine receipts ([While running](../cli/receipts.md#while-running)). | Mixed receipts. | 1. `dedupe receipts list --undoable`. | Only executed quarantine receipts with restorable items. | — |
+| RECEIPTS-05 | P2 | cli | Unreadable receipts are warned about and prunable ([Edge cases](../cli/receipts.md#edge-cases)). | Place a `action-broken.json` containing `not json` in the log dir. | 1. `dedupe receipts list`.<br>2. `dedupe receipts prune --older-than 1 --execute`. | Step 1: a stderr warning names the unreadable file. Step 2: the file is removed with reason "unreadable receipt". | — |
+
+## cross-cutting/caches-and-files.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FILES-01 | P1 | disk | The full inventory exists at the documented paths ([The inventory](../cross-cutting/caches-and-files.md)). | A machine that has scanned and acted. | 1. `ls ~/.cache/dedupe ~/.local/state/dedupe`. | `hashes.sqlite3`, `logs/`, `review-session.json`, `keep-decisions.json` as documented. | pass (scripted pass: all four observed on the drafting machine) |
+| FILES-02 | P2 | disk | Deleting the hash cache is safe: the next scan recomputes ([The hash cache](../cross-cutting/caches-and-files.md#the-hash-cache)). | Move `hashes.sqlite3` aside. | 1. Scan the fixture.<br>2. Compare duration with a cached run. | Scan succeeds; "Cache hits: 0/N"; duration back to first-scan levels. | — |
+
+## cross-cutting/optional-dependencies.md
+
+| ID | P | Device | Claim | Setup | Steps | Expected | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DEPS-01 | P1 | pipe | Without ffmpeg, video similarity is skipped with the diagnostic warning ([ffmpeg and ffprobe](../cross-cutting/optional-dependencies.md#ffmpeg-and-ffprobe)). | Temporarily hide ffmpeg/ffprobe from PATH. | 1. Scan a folder with videos.<br>2. Read diagnostics. | Warning "ffmpeg/ffprobe unavailable; eligible videos were not analyzed"; scan completes. | — |
+| DEPS-02 | P1 | pipe | A missing Moondream SDK makes Photon backends refuse with the install message ([Photon](../cross-cutting/optional-dependencies.md#photon)). | The SDK extra not installed. | 1. `dedupe scan FOLDER --find-no-person --human-backend photon`. | Error naming "Photon detection requires the Moondream SDK" and the pip install command. | — |
+| DEPS-03 | P2 | cli | Ensemble fails entirely when Photon cannot initialize ([Edge cases](../cross-cutting/optional-dependencies.md#edge-cases)). | Same as DEPS-02. | 1. `dedupe scan FOLDER --find-no-person --human-backend ensemble`. | Refusal, not a degraded OpenCV-only run. | — |
