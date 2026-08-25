@@ -55,6 +55,8 @@ class ReviewSessionLoad:
     pruned_samples: list[dict] = field(default_factory=list)
     error: str | None = None
     corrupt: bool = False
+    # Trashed review candidates (path -> Trash destination) from the saved scan.
+    deleted_files: dict[str, str] = field(default_factory=dict)
 
     @property
     def available(self) -> bool:
@@ -77,7 +79,11 @@ class ReviewSessionLoad:
         }
 
 
-def save_review_session(result: ScanResult, path: str | Path | None = None) -> dict:
+def save_review_session(
+    result: ScanResult,
+    path: str | Path | None = None,
+    deleted_files: dict[str, str] | None = None,
+) -> dict:
     """Atomically save a completed result with private directory/file permissions."""
     target = Path(path).expanduser() if path is not None else default_review_session_path()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -88,6 +94,8 @@ def save_review_session(result: ScanResult, path: str | Path | None = None) -> d
         "saved_at": saved_at,
         "result": result.to_dict(),
     }
+    if deleted_files:
+        envelope["deleted_files"] = dict(deleted_files)
     payload = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
@@ -128,6 +136,14 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
         report.corrupt = True
         return report
 
+    raw_deleted = envelope.get("deleted_files") or {}
+    if isinstance(raw_deleted, dict):
+        report.deleted_files = {
+            str(path_key): str(destination)
+            for path_key, destination in raw_deleted.items()
+            if isinstance(destination, str)
+        }
+
     valid_paths: set[str] = set()
     invalid: dict[str, str] = {}
     # Group members can exist outside result.files in older exports; validate them too.
@@ -135,6 +151,11 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
         member for group in result.groups for member in group.members
     ]
     for record in records:
+        # Trashed review candidates are absent from their original path on
+        # purpose; keep them so the per-candidate undo survives a restart.
+        if record.path in report.deleted_files:
+            valid_paths.add(record.path)
+            continue
         error = validate_file_record(record, result.roots)
         if error is None:
             valid_paths.add(record.path)
@@ -170,7 +191,9 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
     ]
     if report.pruned_files:
         try:
-            saved = save_review_session(result, target)
+            saved = save_review_session(
+                result, target, deleted_files=report.deleted_files
+            )
             report.saved_at = saved["saved_at"]
         except OSError as exc:
             report.error = f"loaded but could not persist stale-file pruning: {exc}"

@@ -245,7 +245,9 @@ def create_app(
             if result is None:
                 return False
             try:
-                metadata = save_review_session(result, review_session_path)
+                metadata = save_review_session(
+                    result, review_session_path, deleted_files=state["deleted_files"]
+                )
                 state["review_session"] = ReviewSessionLoad(
                     result=result,
                     path=Path(metadata["path"]),
@@ -373,6 +375,7 @@ def create_app(
     elif loaded.result is not None:
         with lock:
             state["result"] = loaded.result
+            state["deleted_files"] = dict(loaded.deleted_files)
             state["scan_id"] = secrets.token_hex(12)
             state["progress"] = ScanProgress(
                 phase="done",
@@ -462,7 +465,7 @@ def create_app(
                 return jsonify(report.metadata()), 404
             state["result"] = report.result
             state["scan_id"] = secrets.token_hex(12)
-            state["deleted_files"] = {}
+            state["deleted_files"] = dict(report.deleted_files)
             state["groups_version"] += 1
             state["progress"] = ScanProgress(
                 phase="done",
@@ -1102,6 +1105,7 @@ def create_app(
             shutil.move(str(recoverable), str(original))
             with lock:
                 state["deleted_files"].pop(path, None)
+                persist_result()
                 return jsonify(group_payload(group))
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400

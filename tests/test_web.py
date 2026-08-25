@@ -915,6 +915,45 @@ def test_faces_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
     assert original.read_bytes() == b"group photo"
 
 
+def test_candidate_trash_undo_survives_a_restart(tmp_path: Path) -> None:
+    result = _faces_result(tmp_path)
+    group = result.groups[0]
+    original = Path(group.members[0].path)
+    review_path = tmp_path / "review.json"
+    app = create_app(result, review_session_path=review_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
+
+    preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "dry_run": False, "preview_token": preview.get_json()["preview_token"]},
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert not original.exists()
+
+    # "Restart": a fresh app resumes from the saved session with no initial result.
+    restarted = create_app(review_session_path=review_path)
+    client2 = restarted.test_client()
+    headers2 = {"X-Dedupe-Token": restarted.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id2 = client2.get("/api/status").get_json()["scan_id"]
+
+    fetched = client2.get(f"/api/groups/{group.id}").get_json()
+    assert fetched["deleted_paths"] == [str(original)]
+
+    undone = client2.post(
+        "/api/review-candidate/undo",
+        json={**payload, "scan_id": scan_id2},
+        headers=headers2,
+    )
+    assert undone.status_code == 200
+    assert undone.get_json()["deleted_paths"] == []
+    assert original.exists()
+
+
 def test_remaining_non_human_images_can_be_batch_marked_as_human(tmp_path: Path) -> None:
     result = _non_human_result(tmp_path)
     deleted_record = result.files[0]

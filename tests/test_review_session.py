@@ -158,3 +158,28 @@ def test_discard_review_session_is_idempotent(tmp_path: Path) -> None:
 
     assert discard_review_session(session_path) is True
     assert discard_review_session(session_path) is False
+
+
+def test_deleted_files_round_trip_survives_resume(tmp_path: Path) -> None:
+    session_path = tmp_path / "state" / "review.json"
+    result = _result(tmp_path)
+    trashed = result.groups[0].members[0].path
+    Path(trashed).unlink()  # simulate the move to the Trash
+    deleted = {trashed: str(tmp_path / "Trash" / "a.jpg")}
+
+    save_review_session(result, session_path, deleted_files=deleted)
+    loaded = load_review_session(session_path)
+
+    assert loaded.deleted_files == deleted
+    assert loaded.pruned_files == 0
+    member_paths = {member.path for member in loaded.result.groups[0].members}
+    assert trashed in member_paths  # kept for the undo control, not pruned
+
+
+def test_session_without_deleted_files_loads_an_empty_map(tmp_path: Path) -> None:
+    session_path = tmp_path / "state" / "review.json"
+    save_review_session(_result(tmp_path), session_path)
+
+    loaded = load_review_session(session_path)
+
+    assert loaded.deleted_files == {}
