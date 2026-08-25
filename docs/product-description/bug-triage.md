@@ -1,6 +1,6 @@
 # Bug triage
 
-A consolidated list of the defects and inconsistencies that the feature documents raised in their "Open questions and verification" sections and in their bodies. Each entry was drafted from the dedupe source repository as of commit `e8969e4` and its tests; none has been confirmed by a hand-verification pass — the confirmation rows in the checklists ([verification/](verification/)) are still pending. Every entry was filed as an issue on [sethsaler/dedupe](https://github.com/sethsaler/dedupe) on 2026-08-24 (#3–#7); the Issue lines link them. B-01 through B-04 were subsequently fixed in the source repo (commits `719cf43`–`2a6cede`), and this set of documents was re-pinned to `2a6cede` and revised to describe the fixed behavior. The list exists so the product team can decide, item by item, whether to fix, to document as intended, or to leave.
+A consolidated list of the defects and inconsistencies that the feature documents raised in their "Open questions and verification" sections and in their bodies. Each entry was drafted from the dedupe source repository as of commit `e8969e4` and its tests; none has been confirmed by a hand-verification pass — the confirmation rows in the checklists ([verification/](verification/)) are still pending. Every entry was filed as an issue on [sethsaler/dedupe](https://github.com/sethsaler/dedupe) on 2026-08-24 (#3–#7); the Issue lines link them. B-01 through B-04 were subsequently fixed in the source repo (commits `719cf43`–`2a6cede`), and this set of documents was re-pinned to `2a6cede` and revised to describe the fixed behavior; B-05 was resolved by a product call as a copy-only preview change (`518b958`, post-pin, no behavior change). The list exists so the product team can decide, item by item, whether to fix, to document as intended, or to leave.
 
 ## Summary
 
@@ -12,7 +12,7 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 | B-02 | Ctrl+C during a CLI scan exits with a raw KeyboardInterrupt traceback | medium | cli | fix (done) | [#4](https://github.com/sethsaler/dedupe/issues/4) |
 | B-03 | Corrupt receipts are invisible to `receipts list` and survive `prune` | low | cli | fix (done) | [#5](https://github.com/sethsaler/dedupe/issues/5) |
 | B-04 | `doctor` prints the keep-decisions label as "Keep_Decisions" | low | cli | fix (done) | [#6](https://github.com/sethsaler/dedupe/issues/6) |
-| B-05 | The review-quarantine split of Trash is only explained after the fact | low | ui | product call | [#7](https://github.com/sethsaler/dedupe/issues/7) |
+| B-05 | The review-quarantine split of Trash is only explained after the fact | low | ui | product call (done: keep one button, lead with the split) | [#7](https://github.com/sethsaler/dedupe/issues/7) |
 
 ## Medium
 
@@ -75,5 +75,5 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 - **Severity:** `low`. Behavior is safe and documented in the preview; the issue is framing.
 - **Decision needed:** `product call`. Keep one button with the split explained in the preview (status quo, possibly reworded), or split the UI into two explicit actions.
 - **Raised by:** [ui/action-sheet.md](ui/action-sheet.md#open-questions-and-verification), [ui/low-res-review.md](ui/low-res-review.md#while-extended), [ui/random-review.md](ui/random-review.md#while-extended)
-- **Status:** Filed for a product decision; no code change.
+- **Status:** Resolved as a product call on 2026-08-24: keep one Trash button and make the split visible — the review-quarantine note now leads the Trash preview sheet whenever it applies ([sethsaler/dedupe@518b958](https://github.com/sethsaler/dedupe/commit/518b958), copy-only, post-pin). The documents' claim that the preview states the split remains correct.
 - **Issue:** [sethsaler/dedupe#7](https://github.com/sethsaler/dedupe/issues/7)
