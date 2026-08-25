@@ -840,8 +840,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"OpenCV/YuNet (optional): "
             f"{'ready' if cv.get('available') and cv.get('yunet_ready') else 'not ready'}"
         )
+        path_labels = {"cache": "Cache", "state": "State", "keep_decisions": "Keep decisions"}
         for name, status in report["paths"].items():
-            print(f"{name.title()} path: {status['path']} ({'writable' if status['writable'] else 'NOT writable'})")
+            label = path_labels.get(name, name.replace("_", " ").capitalize())
+            print(f"{label} path: {status['path']} ({'writable' if status['writable'] else 'NOT writable'})")
         print(f"Core operation: {'ready' if report['core_ready'] else 'BLOCKED'}")
     return 0 if report["core_ready"] else 1
 
@@ -905,6 +907,10 @@ def main(argv: list[str] | None = None) -> int:
     if args_list and not args_list[0].startswith("-") and args_list[0] not in _COMMANDS:
         args_list.insert(0, "scan")
     args = parser.parse_args(args_list)
+    return _dispatch(parser, args)
+
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "scan":
         return cmd_scan(args)
     if args.command == "ui":

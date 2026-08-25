@@ -97,6 +97,31 @@ def test_doctor_json_exit_status_only_tracks_core_readiness(monkeypatch, capsys)
     assert json.loads(capsys.readouterr().out) == report
 
 
+def test_doctor_plain_output_uses_plain_path_labels(monkeypatch, capsys) -> None:
+    report = {
+        "application": {"name": "dedupe", "version": "1.2.3"},
+        "python": {"version": "3.14", "executable": "/usr/bin/python3"},
+        "platform": {"system": "Darwin", "release": "27"},
+        "imports": {},
+        "ffmpeg": {},
+        "ffprobe": {},
+        "opencv": {},
+        "paths": {
+            "cache": {"path": "/tmp/cache.sqlite3", "writable": True},
+            "state": {"path": "/tmp/review-session.json", "writable": True},
+            "keep_decisions": {"path": "/tmp/keep-decisions.json", "writable": True},
+        },
+        "core_ready": True,
+        "blockers": [],
+    }
+    monkeypatch.setattr(cli, "collect_doctor_report", lambda: report)
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "Keep decisions path: /tmp/keep-decisions.json (writable)" in out
+    assert "Keep_Decisions" not in out
+
+
 def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
