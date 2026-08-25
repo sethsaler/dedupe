@@ -907,7 +907,11 @@ def main(argv: list[str] | None = None) -> int:
     if args_list and not args_list[0].startswith("-") and args_list[0] not in _COMMANDS:
         args_list.insert(0, "scan")
     args = parser.parse_args(args_list)
-    return _dispatch(parser, args)
+    try:
+        return _dispatch(parser, args)
+    except KeyboardInterrupt:
+        print("\ncancelled", file=sys.stderr)
+        return 130
 
 
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:

@@ -122,6 +122,17 @@ def test_doctor_plain_output_uses_plain_path_labels(monkeypatch, capsys) -> None
     assert "Keep_Decisions" not in out
 
 
+def test_main_reports_keyboard_interrupt_cleanly(monkeypatch, capsys) -> None:
+    def boom(args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "cmd_scan", boom)
+
+    assert cli.main(["scan", "/tmp"]) == 130
+    captured = capsys.readouterr()
+    assert "cancelled" in captured.err
+
+
 def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
