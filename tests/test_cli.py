@@ -133,6 +133,18 @@ def test_main_reports_keyboard_interrupt_cleanly(monkeypatch, capsys) -> None:
     assert "cancelled" in captured.err
 
 
+def test_receipts_list_warns_about_unreadable_receipts(tmp_path: Path, capsys) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "action-broken.json").write_text("{not json", encoding="utf-8")
+
+    assert cli.main(["receipts", "list", "--log-dir", str(logs)]) == 0
+    captured = capsys.readouterr()
+    assert "No action receipts found." in captured.out
+    assert "1 unreadable receipt(s) not listed" in captured.err
+    assert "action-broken.json" in captured.err
+
+
 def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

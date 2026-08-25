@@ -126,6 +126,11 @@ def iter_receipt_paths(log_dir: str | Path | None = None) -> list[Path]:
     ]
 
 
+def unreadable_receipt_paths(log_dir: str | Path | None = None) -> list[Path]:
+    """Receipt files that exist but cannot be parsed into a summary."""
+    return [path for path in iter_receipt_paths(log_dir) if summarize_receipt(path) is None]
+
+
 def _sort_key(summary: ReceiptSummary) -> str:
     return summary.started_at or summary.id
 
@@ -286,6 +291,29 @@ def prune_receipts(
         if older_than_days is not None
         else None
     )
+
+    # With any criterion active, unreadable receipts join the cleanup: they can
+    # never match a parsed rule, so left alone they would linger forever.
+    if older_than_days is not None or keep is not None or drop_previews:
+        for path in unreadable_receipt_paths(log_dir):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            if not dry_run:
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    errors.append(f"{path.stem}: {exc}")
+                    continue
+            removed.append(
+                PrunedReceipt(
+                    id=path.stem,
+                    log_path=str(path),
+                    reason="unreadable receipt",
+                    receipt_bytes=size,
+                )
+            )
 
     for index, summary in enumerate(summaries):
         reason: str | None = None

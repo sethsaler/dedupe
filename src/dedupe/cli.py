@@ -629,7 +629,13 @@ def _receipt_line(summary) -> str:
 
 
 def cmd_receipts(args: argparse.Namespace) -> int:
-    from .receipts import ReceiptError, list_receipts, load_receipt, prune_receipts
+    from .receipts import (
+        ReceiptError,
+        list_receipts,
+        load_receipt,
+        prune_receipts,
+        unreadable_receipt_paths,
+    )
 
     if args.receipts_command == "list":
         summaries = list_receipts(
@@ -638,6 +644,15 @@ def cmd_receipts(args: argparse.Namespace) -> int:
             include_previews=not args.no_previews,
             undoable_only=args.undoable,
         )
+        unreadable = unreadable_receipt_paths(args.log_dir)
+        if unreadable:
+            names = ", ".join(sorted(p.name for p in unreadable)[:5])
+            suffix = f" (+{len(unreadable) - 5} more)" if len(unreadable) > 5 else ""
+            print(
+                f"warning: {len(unreadable)} unreadable receipt(s) not listed: "
+                f"{names}{suffix}",
+                file=sys.stderr,
+            )
         if args.json:
             print(json.dumps([s.to_dict() for s in summaries], indent=2))
             return 0

@@ -712,6 +712,27 @@ def test_receipts_ignores_unreadable_files(tmp_path: Path) -> None:
     assert receipts_module.list_receipts(tmp_path / "missing") == []
 
 
+def test_unreadable_receipts_are_visible_and_prunable(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "action-broken.json").write_text("{not json", encoding="utf-8")
+
+    unreadable = receipts_module.unreadable_receipt_paths(logs)
+    assert [path.name for path in unreadable] == ["action-broken.json"]
+
+    # No criterion: nothing is removed, unreadable receipts included.
+    assert receipts_module.prune_receipts(logs).removed_count == 0
+    assert (logs / "action-broken.json").exists()
+
+    preview = receipts_module.prune_receipts(logs, older_than_days=1, dry_run=True)
+    assert [r.reason for r in preview.removed] == ["unreadable receipt"]
+    assert (logs / "action-broken.json").exists()
+
+    executed = receipts_module.prune_receipts(logs, older_than_days=1, dry_run=False)
+    assert [r.reason for r in executed.removed] == ["unreadable receipt"]
+    assert not (logs / "action-broken.json").exists()
+
+
 def test_large_selection_is_ordered_and_complete(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
