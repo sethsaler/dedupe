@@ -387,7 +387,7 @@ def test_photon_detector_loads_local_model_and_checks_person_then_face(monkeypat
     class FakeModel:
         def detect(self, _image, target):
             calls["targets"].append(target)
-            return {"objects": [] if target == "person" else [{"x_min": 0.1}]}
+            return {"objects": [{"x_min": 0.1}] if target == "face" else []}
 
     def fake_vl(**kwargs):
         calls["init"] = kwargs
