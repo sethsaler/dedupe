@@ -302,6 +302,56 @@ def test_run_scan_surfaces_no_human_candidates(tmp_path: Path, monkeypatch) -> N
     assert captured["workers"] >= 1
 
 
+def test_run_scan_keeps_female_faces_out_of_non_human(tmp_path: Path, monkeypatch) -> None:
+    _save(tmp_path / "landscape.jpg", (30, 120, 60))
+    _save(tmp_path / "portrait.jpg", (200, 40, 80))
+
+    def fake_find(records, *, progress=None, **_kwargs):
+        signature = human_detection_signature("opencv")
+        for record in records:
+            record.human_detection_status = "no_person_detected"
+            record.human_detection_signature = signature
+        if progress:
+            progress("human-detection", len(records), len(records))
+        return list(records)
+
+    def fake_count(records, *, progress=None, **_kwargs):
+        for record in records:
+            if record.path.endswith("portrait.jpg"):
+                record.face_count = 1
+                record.male_face_count = 0
+                record.female_face_count = 1
+                record.face_detection_signature = "face-test"
+            else:
+                record.face_count = 0
+                record.male_face_count = 0
+                record.female_face_count = 0
+                record.face_detection_signature = "face-test"
+        if progress:
+            progress("face-detection", len(records), len(records))
+        return list(records)
+
+    monkeypatch.setattr("dedupe.engine.find_no_human_files", fake_find)
+    monkeypatch.setattr("dedupe.engine.count_faces_in_files", fake_count)
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        count_faces=True,
+        random_review_count=0,
+        use_cache=False,
+    )
+
+    no_human = next(group for group in result.groups if group.kind == GroupKind.NO_HUMANS)
+    faces = next(group for group in result.groups if group.kind == GroupKind.FACES)
+    assert [Path(member.path).name for member in no_human.members] == ["landscape.jpg"]
+    assert [Path(member.path).name for member in faces.members] == ["portrait.jpg"]
+    assert result.no_human_files == 1
+    assert result.faces_files == 1
+
+
 def test_run_scan_builds_low_resolution_and_random_review_branches_without_similarity(
     tmp_path: Path,
 ) -> None:

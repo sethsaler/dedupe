@@ -28,7 +28,7 @@ The page loads with whatever the server already holds: nothing (the setup form p
 - **Choose…** opens the native folder picker; **Choose files…** opens a file picker for scanning specific files. Picked paths are appended to the field. Dragging folders from Finder onto the field inserts their paths.
 - **Recent folders** appear as chips below the field; clicking one fills the path field. Recent paths are remembered in the browser's local storage.
 - **Exclusions** — glob patterns, one per line — remove matching paths from the scan.
-- **Scan options** (collapsible): exact and similar detection on/off; no-person review with its backend choice; faces counting; low-resolution review with per-type pixel bounds; random review count; images/GIFs/videos toggles; hidden files; similarity thresholds (image default 6, video default 8); worker count; cache on/off. Scan option values are remembered in the browser's local storage and restored on the next visit.
+- **Scan options** (collapsible): exact and similar detection on/off; no-person review, which reveals a person-detector dropdown (`opencv`, `photon`, `ensemble`); faces counting; low-resolution review with per-type pixel bounds; random review count; images/GIFs/videos toggles; hidden files; similarity thresholds (image default 6, video default 8); worker count; cache on/off. Scan option values are remembered in the browser's local storage and restored on the next visit.
 
 Pressing Scan with an empty path list does nothing server-side: the request is rejected with "paths required".
 

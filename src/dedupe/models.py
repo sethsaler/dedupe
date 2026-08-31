@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .human_policy import is_current_no_person_decision
+from .human_policy import may_enter_no_person_review
 
 
 class MediaType(str, Enum):
@@ -213,10 +213,7 @@ class ReviewGroup:
                 and m.path in reviewed
                 and (
                     self.kind != GroupKind.NO_HUMANS
-                    or is_current_no_person_decision(
-                        m.human_detection_status,
-                        m.human_detection_signature,
-                    )
+                    or may_enter_no_person_review(m)
                 )
             )
         keep = self.suggested_keep
@@ -254,10 +251,7 @@ class ReviewGroup:
                 (
                     member
                     for member in members
-                    if is_current_no_person_decision(
-                        member.human_detection_status,
-                        member.human_detection_signature,
-                    )
+                    if may_enter_no_person_review(member)
                 ),
                 key=lambda member: (-member.mtime_sort_stamp, member.path),
             )
@@ -327,10 +321,7 @@ def effective_selected_paths(
             if (
                 group.kind == GroupKind.NO_HUMANS
                 and members.get(path)
-                and not is_current_no_person_decision(
-                    members[path].human_detection_status,
-                    members[path].human_detection_signature,
-                )
+                and not may_enter_no_person_review(members[path])
             ):
                 continue
             if path in members and path not in sizes:
