@@ -559,16 +559,27 @@ def run_scan(
             progress=human_progress,
             cancelled=cancelled,
         )
-        for group in build_no_human_groups(no_human_files):
-            groups.append(group)
-            if on_group:
-                on_group(group)
-        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+        # When faces are also being counted, wait until those counts land so a
+        # female (or any) face can veto Non-Human membership in the same scan.
+        if not count_faces:
+            for group in build_no_human_groups(no_human_files):
+                groups.append(group)
+                if on_group:
+                    on_group(group)
+            groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
         emit(
             "human-detection",
             len(records),
             len(records),
-            f"Found {len(no_human_files)} file{'s' if len(no_human_files) != 1 else ''} without detected people",
+            (
+                "Person detection finished; face counts will confirm Non-Human "
+                "candidates"
+                if count_faces
+                else (
+                    f"Found {len(no_human_files)} file"
+                    f"{'' if len(no_human_files) == 1 else 's'} without detected people"
+                )
+            ),
         )
         stage_durations["human_detection"] = time.monotonic() - human_started
         stage_errors["human_detection"] = [
@@ -619,6 +630,22 @@ def run_scan(
             groups.append(group)
             if on_group:
                 on_group(group)
+        if find_no_humans:
+            confirmed = build_no_human_groups(records)
+            confirmed_count = sum(len(group.members) for group in confirmed)
+            for group in confirmed:
+                groups.append(group)
+                if on_group:
+                    on_group(group)
+            emit(
+                "human-detection",
+                len(records),
+                len(records),
+                (
+                    f"Found {confirmed_count} file"
+                    f"{'' if confirmed_count == 1 else 's'} without detected people"
+                ),
+            )
         groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
 
     cache_errors: list[str] = []

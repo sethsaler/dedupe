@@ -256,6 +256,44 @@ def test_overlapping_no_human_selection_still_retains_a_duplicate() -> None:
     assert duplicate.suggested_keep not in selected
 
 
+def test_no_human_groups_reject_counted_female_faces() -> None:
+    safe = _mark_no_person(_rec("/landscape.jpg", 300, 1))
+    woman = _mark_no_person(_rec("/portrait.jpg", 400, 2))
+    woman.face_count = 1
+    woman.female_face_count = 1
+    man = _mark_no_person(_rec("/group.jpg", 500, 3))
+    man.face_count = 2
+    man.male_face_count = 2
+    man.female_face_count = 0
+
+    groups = build_no_human_groups([safe, woman, man])
+
+    assert len(groups) == 1
+    assert groups[0].members == [safe]
+
+
+def test_loaded_no_human_group_drops_female_face_records() -> None:
+    safe = _mark_no_person(_rec("/landscape.jpg", 300, 1))
+    woman = _mark_no_person(_rec("/portrait.jpg", 400, 2))
+    woman.face_count = 1
+    woman.female_face_count = 1
+    raw = ReviewGroup(
+        id="no-human-female",
+        kind=GroupKind.NO_HUMANS,
+        media_type=MediaType.IMAGE,
+        members=[safe, woman],
+        selected_for_removal=[safe.path, woman.path],
+        reviewed_paths=[safe.path, woman.path],
+    ).to_dict()
+
+    loaded = ReviewGroup.from_dict(raw)
+
+    assert loaded.members == [safe]
+    assert loaded.selected_for_removal == [safe.path]
+    assert woman.path not in loaded.selected_for_removal
+    assert collect_selected_paths([loaded]) == [safe.path]
+
+
 def test_no_human_groups_reject_positive_and_unverified_records() -> None:
     safe = _mark_no_person(_rec("/landscape.jpg", 300, 1))
     human = _rec("/portrait.jpg", 400, 2)

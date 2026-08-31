@@ -6,7 +6,7 @@ import hashlib
 import random
 from pathlib import Path
 
-from .human_policy import is_current_no_person_decision
+from .human_policy import may_enter_no_person_review
 from .models import (
     DuplicateGroup,
     FileRecord,
@@ -180,10 +180,7 @@ def build_no_human_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
             member
             for member in members
             if member.media_type in (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
-            and is_current_no_person_decision(
-                member.human_detection_status,
-                member.human_detection_signature,
-            )
+            and may_enter_no_person_review(member)
         ),
         key=lambda member: (-member.mtime_sort_stamp, member.path),
     )

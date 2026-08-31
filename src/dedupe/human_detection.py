@@ -14,6 +14,7 @@ from .human_policy import (
     CACHEABLE_HUMAN_STATUSES,
     HUMAN_DETECTION_CACHE_VERSION,
     MANUALLY_CONFIRMED_HUMAN_STATUS,
+    may_enter_no_person_review,
 )
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
@@ -33,9 +34,19 @@ DEFAULT_PHOTON_MODEL = "moondream3.1-9B-A2B"
 HUMAN_BACKENDS = ("opencv", "photon", "ensemble")
 DETECT_MAX_SIDE = 960
 YUNET_SECOND_PASS_MAX_SIDE = 480
+YUNET_CLOSE_UP_MAX_SIDE = 320
 YUNET_SCORE_THRESHOLD = 0.55
+# Person *presence* is recall-first: a missed woman is a deletion candidate.
+# Face *counting* keeps the stricter 0.55 threshold.
+YUNET_PRESENCE_SCORE_THRESHOLD = 0.35
+YUNET_PRESENCE_SCALES = (
+    DETECT_MAX_SIDE,
+    YUNET_SECOND_PASS_MAX_SIDE,
+    YUNET_CLOSE_UP_MAX_SIDE,
+)
 YUNET_NMS_THRESHOLD = 0.3
 YUNET_TOP_K = 5000
+PHOTON_DETECT_TARGETS = ("woman", "girl", "person", "face")
 YUNET_MODEL_PATH = (
     Path(__file__).parent / "assets" / "face_detection_yunet_2023mar.onnx"
 )
@@ -85,7 +96,7 @@ class _OpenCVPersonDetector:
                 str(YUNET_MODEL_PATH),
                 "",
                 (320, 320),
-                YUNET_SCORE_THRESHOLD,
+                YUNET_PRESENCE_SCORE_THRESHOLD,
                 YUNET_NMS_THRESHOLD,
                 YUNET_TOP_K,
             )
@@ -94,29 +105,37 @@ class _OpenCVPersonDetector:
                 "OpenCV YuNet face detection could not start; install OpenCV 4.5.4 "
                 "or newer. No media was classified as non-human."
             ) from exc
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        # OpenCV 5 removed HOGDescriptor. YuNet remains required; body
+        # detectors are extra recall when the build still ships them.
+        self.hog = None
+        self.hog_daimler = None
+        if hasattr(cv2, "HOGDescriptor"):
+            self.hog = cv2.HOGDescriptor()
+            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            try:
+                daimler = cv2.HOGDescriptor((48, 96), (16, 16), (8, 8), (8, 8), 9)
+                daimler.setSVMDetector(cv2.HOGDescriptor_getDaimlerPeopleDetector())
+                self.hog_daimler = daimler
+            except cv2.error:
+                self.hog_daimler = None
         self.backend = "opencv_yunet_hog"
 
-    def _face_score(self, rgb_frame) -> float:
-        """Run two face scales so both small and close-up faces are conservative hits."""
+    def _yunet_best(self, bgr_frame) -> float:
+        """Score faces at several scales; any presence-threshold hit is enough."""
         best = 0.0
-        # Color conversion is linear, so convert once before deriving the two
-        # detection scales rather than converting each resized candidate.
-        frame = self.cv2.cvtColor(rgb_frame, self.cv2.COLOR_RGB2BGR)
         checked_sizes: set[tuple[int, int]] = set()
-        for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
-            height, width = frame.shape[:2]
+        for max_side in YUNET_PRESENCE_SCALES:
+            height, width = bgr_frame.shape[:2]
             longest = max(width, height)
             if longest > max_side:
                 scale = max_side / longest
                 candidate = self.cv2.resize(
-                    frame,
+                    bgr_frame,
                     (max(1, round(width * scale)), max(1, round(height * scale))),
                     interpolation=self.cv2.INTER_AREA,
                 )
             else:
-                candidate = frame
+                candidate = bgr_frame
             candidate_height, candidate_width = candidate.shape[:2]
             size = (candidate_width, candidate_height)
             if size in checked_sizes:
@@ -126,9 +145,61 @@ class _OpenCVPersonDetector:
             _result, faces = self.face.detect(candidate)
             if faces is not None and len(faces):
                 best = max(best, max(float(face[-1]) for face in faces))
-                if best >= YUNET_SCORE_THRESHOLD:
+                if best >= YUNET_PRESENCE_SCORE_THRESHOLD:
                     return best
         return best
+
+    def _yunet_tiles(self, bgr_frame) -> float:
+        """Look for small or off-center faces the full-frame passes missed."""
+        height, width = bgr_frame.shape[:2]
+        if height < 160 or width < 160:
+            return 0.0
+        overlap_y = max(1, height // 5)
+        overlap_x = max(1, width // 5)
+        tile_h = min(height, (height + overlap_y) // 2)
+        tile_w = min(width, (width + overlap_x) // 2)
+        best = 0.0
+        for top in (0, height - tile_h):
+            for left in (0, width - tile_w):
+                crop = bgr_frame[top : top + tile_h, left : left + tile_w]
+                best = max(best, self._yunet_best(crop))
+                if best >= YUNET_PRESENCE_SCORE_THRESHOLD:
+                    return best
+        return best
+
+    def _face_score(self, rgb_frame) -> float:
+        """Upright scales, then a mirrored pass, then overlapping tiles."""
+        # Color conversion is linear, so convert once before deriving the
+        # detection scales rather than converting each resized candidate.
+        frame = self.cv2.cvtColor(rgb_frame, self.cv2.COLOR_RGB2BGR)
+        best = self._yunet_best(frame)
+        if best >= YUNET_PRESENCE_SCORE_THRESHOLD:
+            return best
+        flipped = self.cv2.flip(frame, 1)
+        best = max(best, self._yunet_best(flipped))
+        if best >= YUNET_PRESENCE_SCORE_THRESHOLD:
+            return best
+        return max(best, self._yunet_tiles(frame))
+
+    def _hog_weights(self, hog, frame) -> float:
+        _boxes, weights = hog.detectMultiScale(
+            frame,
+            winStride=(8, 8),
+            padding=(8, 8),
+            scale=1.05,
+        )
+        if weights is None or len(weights) == 0:
+            return 0.0
+        return max(float(weight) for weight in weights)
+
+    def _body_score(self, frame) -> float:
+        """INRIA HOG plus Daimler, which catches a different set of poses."""
+        if self.hog is None or frame.shape[0] < 128 or frame.shape[1] < 64:
+            return 0.0
+        best = self._hog_weights(self.hog, frame)
+        if self.hog_daimler is not None:
+            best = max(best, self._hog_weights(self.hog_daimler, frame))
+        return best if best >= self.confidence else 0.0
 
     def score(self, rgb_frame) -> float:
         import numpy as np
@@ -148,19 +219,11 @@ class _OpenCVPersonDetector:
         if face_score > 0:
             return face_score
 
-        # HOG needs a moderately sized frame and targets upright full-body people.
-        if frame.shape[0] < 128 or frame.shape[1] < 64:
-            return 0.0
-        _boxes, weights = self.hog.detectMultiScale(
-            frame,
-            winStride=(8, 8),
-            padding=(8, 8),
-            scale=1.05,
-        )
-        if weights is None or len(weights) == 0:
-            return 0.0
-        score = max(float(weight) for weight in weights)
-        return score if score >= self.confidence else 0.0
+        # HOG needs a moderately sized frame and targets upright people.
+        body_score = self._body_score(frame)
+        if body_score > 0:
+            return body_score
+        return self._body_score(self.cv2.flip(frame, 1))
 
     def close(self) -> None:
         return None
@@ -192,8 +255,9 @@ class _PhotonPersonDetector:
 
         image = Image.fromarray(rgb_frame).convert("RGB")
         # Photon detect() currently returns boxes rather than calibrated scores.
-        # A face-only crop still counts as human evidence, so query both targets.
-        for target in ("person", "face"):
+        # Query woman/girl first so body-only or styled photos of women are kept
+        # even when the generic "person" label misses.
+        for target in PHOTON_DETECT_TARGETS:
             result = self.model.detect(image, target)
             if isinstance(result, dict) and result.get("objects"):
                 return 1.0
@@ -265,7 +329,9 @@ def human_detection_signature(
     if normalized in {"opencv", "ensemble"}:
         parts.append(f"confidence={max(0.0, float(confidence)):g}")
         parts.append(f"yunet={YUNET_MODEL_SHA256[:12]}")
-        parts.append(f"face-confidence={YUNET_SCORE_THRESHOLD:g}")
+        parts.append(f"face-confidence={YUNET_PRESENCE_SCORE_THRESHOLD:g}")
+        parts.append("face-flip=1")
+        parts.append("face-tiles=2x2")
     if normalized in {"photon", "ensemble"}:
         parts.append(f"model={photon_model.strip() or DEFAULT_PHOTON_MODEL}")
     return "|".join(parts)
@@ -520,9 +586,11 @@ def find_no_human_files(
         finally:
             detector.close()
 
-    return [
-        record
-        for record in candidates
-        if record.human_detection_signature == signature
-        and record.human_detection_status == "no_person_detected"
-    ]
+    if normalized_backend in {"photon", "ensemble"}:
+        # YuNet + genderage is a cheap second opinion on Photon's no-person
+        # pile: any counted face, especially a female face, is kept.
+        from .face_detection import protect_no_person_candidates
+
+        protect_no_person_candidates(candidates)
+
+    return [record for record in candidates if may_enter_no_person_review(record)]

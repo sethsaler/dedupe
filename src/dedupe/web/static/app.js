@@ -332,6 +332,8 @@
     "optExact",
     "optSimilar",
     "optNoHumans",
+    "optCountFaces",
+    "humanBackend",
     "optLowResolution",
     "optLowResolutionImages",
     "optLowResolutionGifs",
@@ -379,6 +381,13 @@
   for (const id of settingIds) {
     $(id).addEventListener($(id).type === "range" ? "input" : "change", saveScanSettings);
   }
+
+  function syncHumanBackendVisibility() {
+    const field = $("humanBackendField");
+    if (field) field.hidden = !$("optNoHumans").checked;
+  }
+  $("optNoHumans").addEventListener("change", syncHumanBackendVisibility);
+  syncHumanBackendVisibility();
 
   // —— Recent paths ——
   function loadRecent() {
@@ -1971,7 +1980,7 @@
           low_resolution_gif_max_pixels: lowResolutionBounds.gifs,
           low_resolution_video_max_pixels: lowResolutionBounds.videos,
           random_review_count: $("optRandomReview").checked ? 50 : 0,
-          human_backend: "opencv",
+          human_backend: $("humanBackend") ? $("humanBackend").value : "opencv",
           include_images: $("optImages").checked,
           include_gifs: $("optGifs").checked,
           include_videos: $("optVideos").checked,

@@ -12,6 +12,7 @@ from dedupe.face_detection import (
     analyze_face_count,
     count_faces_in_files,
     face_detection_signature,
+    protect_no_person_candidates,
 )
 from dedupe.models import FileRecord, MediaType
 from dedupe.scanner import inventory
@@ -42,6 +43,34 @@ def test_signature_pins_version_and_model() -> None:
     assert "yunet=" in signature
     assert "genderage=" in signature
     assert "face-confidence=" in signature
+
+
+def test_protect_no_person_overrides_when_female_face_is_counted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    kept = _image_record(tmp_path / "woman.jpg")
+    kept.human_detection_status = "no_person_detected"
+    empty = _image_record(tmp_path / "empty.jpg")
+    empty.human_detection_status = "no_person_detected"
+
+    def fake_count(records, **_kwargs):
+        for record in records:
+            if record.path.endswith("woman.jpg"):
+                record.face_count = 1
+                record.female_face_count = 1
+                record.male_face_count = 0
+            else:
+                record.face_count = 0
+                record.female_face_count = 0
+                record.male_face_count = 0
+        return list(records)
+
+    monkeypatch.setattr("dedupe.face_detection.count_faces_in_files", fake_count)
+
+    protect_no_person_candidates([kept, empty])
+
+    assert kept.human_detection_status == "person_detected"
+    assert empty.human_detection_status == "no_person_detected"
 
 
 def test_blank_image_counts_zero_faces(tmp_path: Path) -> None:

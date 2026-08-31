@@ -356,3 +356,27 @@ def count_faces_in_files(
                 progress("face-detection", index, len(candidates))
 
     return candidates
+
+
+def protect_no_person_candidates(records: list[FileRecord]) -> None:
+    """Keep any file whose YuNet pass finds a face, especially a female face.
+
+    Used as a second opinion on Photon / ensemble no-person decisions. A
+    counted face overrides ``no_person_detected`` so the file never enters
+    Non-Human review. Missing OpenCV or a model failure leaves the original
+    verdict in place (fail closed for this extra check only).
+    """
+    pending = [
+        record
+        for record in records
+        if record.human_detection_status == "no_person_detected"
+    ]
+    if not pending:
+        return
+    try:
+        count_faces_in_files(pending)
+    except RuntimeError:
+        return
+    for record in pending:
+        if (record.female_face_count or 0) >= 1 or (record.face_count or 0) >= 1:
+            record.human_detection_status = "person_detected"

@@ -72,6 +72,15 @@
             <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
             <label class="chip-check"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
           </div>
+          <label class="preset-field" id="humanBackendField" hidden>
+            <span class="opt-label">Person detector</span>
+            <select id="humanBackend">
+              <option value="opencv" selected>OpenCV (fast)</option>
+              <option value="photon">Photon (Moondream)</option>
+              <option value="ensemble">Ensemble (safest for people)</option>
+            </select>
+            <span class="thresh-hint">Ensemble keeps more photos of people, including women whose faces are turned away or cropped. First Photon use downloads ~10 GB.</span>
+          </label>
           <div class="opt-group">
             <span class="opt-label">Review</span>
             <label class="chip-check"><input type="checkbox" id="optLowResolution" checked /><span>Low resolution</span></label>

@@ -11,6 +11,8 @@ import pytest
 from PIL import Image
 
 from dedupe.human_detection import (
+    PHOTON_DETECT_TARGETS,
+    YUNET_PRESENCE_SCORE_THRESHOLD,
     _EnsemblePersonDetector,
     _media_person_evidence,
     _OpenCVPersonDetector,
@@ -21,6 +23,14 @@ from dedupe.human_detection import (
 )
 from dedupe.models import FileRecord, MediaType
 from dedupe.scanner import inventory
+
+
+def test_detector_signature_pins_recall_settings() -> None:
+    signature = human_detection_signature("opencv")
+    assert signature.startswith("human-presence-v4-recall|")
+    assert "face-confidence=0.35" in signature
+    assert "face-flip=1" in signature
+    assert "face-tiles=2x2" in signature
 
 
 def test_blank_landscape_is_review_candidate(tmp_path: Path) -> None:
@@ -97,6 +107,85 @@ def test_opencv_detector_short_circuits_full_body_pass_after_face_hit() -> None:
     assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(
         0.92
     )
+
+
+def test_opencv_presence_keeps_mid_confidence_faces() -> None:
+    class MidConfidenceFace:
+        def setInputSize(self, _size):
+            return None
+
+        def detect(self, _frame):
+            face = np.zeros((1, 15), dtype=np.float32)
+            face[0, -1] = 0.40
+            return 1, face
+
+    class FakeCV2:
+        COLOR_RGB2BGR = 1
+        INTER_AREA = 2
+
+        @staticmethod
+        def cvtColor(frame, _code):
+            return frame
+
+        @staticmethod
+        def resize(frame, _size, interpolation=None):
+            return frame
+
+        @staticmethod
+        def flip(frame, _code):
+            raise AssertionError("a presence-threshold face must not need a flip pass")
+
+    detector = _OpenCVPersonDetector.__new__(_OpenCVPersonDetector)
+    detector.cv2 = FakeCV2()
+    detector.confidence = 0.25
+    detector.face = MidConfidenceFace()
+    detector.hog = None
+    detector.hog_daimler = None
+    detector.backend = "opencv_yunet_hog"
+
+    assert 0.40 >= YUNET_PRESENCE_SCORE_THRESHOLD
+    assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(0.40)
+
+
+def test_opencv_face_flip_fallback_keeps_mirrored_faces() -> None:
+    class FlipOnlyFace:
+        def setInputSize(self, _size):
+            return None
+
+        def detect(self, frame):
+            if frame is not None and frame[0, 0, 0] == 9:
+                face = np.zeros((1, 15), dtype=np.float32)
+                face[0, -1] = 0.80
+                return 1, face
+            return 1, None
+
+    class FakeCV2:
+        COLOR_RGB2BGR = 1
+        INTER_AREA = 2
+
+        @staticmethod
+        def cvtColor(frame, _code):
+            return frame
+
+        @staticmethod
+        def resize(frame, _size, interpolation=None):
+            return frame
+
+        @staticmethod
+        def flip(frame, _code):
+            mirrored = frame.copy()
+            mirrored[:] = 9
+            return mirrored
+
+    detector = _OpenCVPersonDetector.__new__(_OpenCVPersonDetector)
+    detector.cv2 = FakeCV2()
+    detector.confidence = 0.25
+    detector.face = FlipOnlyFace()
+    detector.hog = None
+    detector.hog_daimler = None
+    detector.backend = "opencv_yunet_hog"
+
+    assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(0.80)
 
 
 def test_video_person_detection_seeks_and_stops_after_positive(
@@ -298,7 +387,7 @@ def test_photon_detector_loads_local_model_and_checks_person_then_face(monkeypat
     class FakeModel:
         def detect(self, _image, target):
             calls["targets"].append(target)
-            return {"objects": [] if target == "person" else [{"x_min": 0.1}]}
+            return {"objects": [{"x_min": 0.1}] if target == "face" else []}
 
     def fake_vl(**kwargs):
         calls["init"] = kwargs
@@ -309,8 +398,43 @@ def test_photon_detector_loads_local_model_and_checks_person_then_face(monkeypat
 
     assert detector.score(np.zeros((24, 24, 3), dtype=np.uint8)) == 1.0
     assert calls["init"] == {"local": True, "model": "test-model"}
-    assert calls["targets"] == ["person", "face"]
+    assert calls["targets"] == list(PHOTON_DETECT_TARGETS)
     assert detector.backend == "photon:test-model"
+
+
+def test_photon_queries_woman_before_generic_person(monkeypatch) -> None:
+    calls: dict = {"targets": []}
+
+    class FakeModel:
+        def detect(self, _image, target):
+            calls["targets"].append(target)
+            return {"objects": [{"x_min": 0.2}] if target == "woman" else []}
+
+    monkeypatch.setitem(sys.modules, "moondream", SimpleNamespace(vl=lambda **_k: FakeModel()))
+    detector = create_person_detector("photon", photon_model="test-model")
+
+    assert detector.score(np.zeros((24, 24, 3), dtype=np.uint8)) == 1.0
+    assert calls["targets"] == ["woman"]
+
+
+def test_find_no_human_files_drops_counted_female_faces(tmp_path: Path, monkeypatch) -> None:
+    signature = human_detection_signature("opencv")
+    path = tmp_path / "woman.jpg"
+    Image.new("RGB", (40, 40), "white").save(path)
+    record = inventory([path])[0]
+    record.human_detection_status = "no_person_detected"
+    record.human_detection_signature = signature
+    record.face_count = 1
+    record.female_face_count = 1
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached files must not create the detector")
+        ),
+    )
+
+    assert find_no_human_files([record]) == []
 
 
 def test_ensemble_short_circuits_photon_after_opencv_positive() -> None:
