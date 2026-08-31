@@ -871,6 +871,15 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     assert undone.get_json()["deleted_paths"] == []
     assert original.read_bytes() == b"landscape"
 
+    deleted_again = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "dry_run": False},
+        headers=headers,
+    )
+    assert deleted_again.status_code == 200
+    assert not original.exists()
+    client.post("/api/review-candidate/undo", json=payload, headers=headers)
+
 
 def test_immediate_review_delete_refuses_a_changed_file(tmp_path: Path) -> None:
     result = _non_human_result(tmp_path)

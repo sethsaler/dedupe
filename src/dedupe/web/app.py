@@ -1025,7 +1025,12 @@ def create_app(
                 reviewed_paths=[path],
             )
             roots = list(result.roots)
-            safety_groups = list(result.groups)
+            # An explicit one-click trash must not be vetoed by a prior Keep on
+            # this same candidate (reviewed + unselected after an earlier trash).
+            safety_groups = [
+                action_group if candidate.id == group.id else candidate
+                for candidate in result.groups
+            ]
 
         try:
             preview = apply_actions(
@@ -1119,8 +1124,37 @@ def create_app(
                }), 404
             original.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(recoverable), str(original))
+            restored = original.stat()
             with lock:
                 state["deleted_files"].pop(path, None)
+                current = next(
+                    (member for member in group.members if member.path == path),
+                    None,
+                )
+                if current is not None:
+                    refreshed = replace(
+                        current,
+                        size=restored.st_size,
+                        mtime=restored.st_mtime,
+                        device=restored.st_dev,
+                        inode=restored.st_ino,
+                        mtime_ns=restored.st_mtime_ns,
+                    )
+                    group.members = [
+                        refreshed if member.path == path else member
+                        for member in group.members
+                    ]
+                    if result is not None:
+                        result.files = [
+                            refreshed if file.path == path else file
+                            for file in result.files
+                        ]
+                group.reviewed_paths = [
+                    reviewed for reviewed in group.reviewed_paths if reviewed != path
+                ]
+                group.selected_for_removal = [
+                    selected for selected in group.selected_for_removal if selected != path
+                ]
                 persist_result()
                 return jsonify(group_payload(group))
         except OSError as exc:

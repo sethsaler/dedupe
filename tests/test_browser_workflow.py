@@ -272,7 +272,7 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         expect(page.locator("#members .card")).to_have_count(2)
         assert newest.exists()
 
-        page.locator("#members .card").first.click()
+        page.locator("#members .card .name").nth(1).click()
         page.keyboard.press("d")
         expect(page.locator("#modalBackdrop")).to_be_hidden()
         page.locator("#toast").filter(has_text="Moved").wait_for()
