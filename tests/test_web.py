@@ -849,19 +849,14 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     scan_id = client.get("/api/status").get_json()["scan_id"]
     payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
 
-    rejected = client.post(
-        "/api/review-candidate/delete", json={**payload, "dry_run": False}, headers=headers
-    )
-    assert rejected.status_code == 409
-    assert original.exists()
-
     preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert original.exists()
+
     deleted = client.post(
         "/api/review-candidate/delete",
-        json={**payload, "dry_run": False, "preview_token": preview.get_json()["preview_token"]},
+        json={**payload, "dry_run": False},
         headers=headers,
     )
     assert deleted.status_code == 200
@@ -877,6 +872,30 @@ def test_non_human_image_can_be_deleted_and_undone(tmp_path: Path) -> None:
     assert original.read_bytes() == b"landscape"
 
 
+def test_immediate_review_delete_refuses_a_changed_file(tmp_path: Path) -> None:
+    result = _non_human_result(tmp_path)
+    group = result.groups[0]
+    original = Path(group.members[0].path)
+    original.write_bytes(b"changed after the scan recorded this file")
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={
+            "group_id": group.id,
+            "path": str(original),
+            "scan_id": scan_id,
+            "dry_run": False,
+        },
+        headers=headers,
+    )
+    assert deleted.status_code == 400
+    assert original.exists()
+
+
 def test_faces_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
     result = _faces_result(tmp_path)
     group = result.groups[0]
@@ -887,16 +906,11 @@ def test_faces_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
     scan_id = client.get("/api/status").get_json()["scan_id"]
     payload = {"group_id": group.id, "path": str(original), "scan_id": scan_id}
 
-    rejected = client.post(
-        "/api/review-candidate/delete", json={**payload, "dry_run": False}, headers=headers
-    )
-    assert rejected.status_code == 409
-    assert original.exists()
-
     preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
     assert preview.status_code == 200
     assert preview.get_json()["success_count"] == 1
     assert original.exists()
+
     deleted = client.post(
         "/api/review-candidate/delete",
         json={**payload, "dry_run": False, "preview_token": preview.get_json()["preview_token"]},

@@ -34,6 +34,9 @@
     groupsLoadToken: 0,
     groupsTotal: 0,
     reviewingCandidate: false,
+    showDeleted: false,
+    deleteBusy: new Set(),
+    lastTrash: null,
   };
 
   // —— Batched rendering ——
@@ -131,21 +134,41 @@
   });
 
   // —— Toast ——
-  function toast(msg, kind = "") {
+  function hideToast() {
     const el = $("toast");
-    el.textContent = msg;
+    el.classList.remove("show");
+    clearTimeout(el._t);
+    el._t = setTimeout(() => {
+      el.hidden = true;
+    }, 220);
+  }
+
+  function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
+    const el = $("toast");
+    const message = $("toastMessage") || el;
+    const action = $("toastAction");
+    message.textContent = msg;
     el.className = "toast" + (kind ? ` ${kind}` : "");
+    if (action) {
+      action.hidden = !actionLabel;
+      action.textContent = actionLabel || "Undo";
+      action.onclick = actionLabel && onAction
+        ? () => {
+            hideToast();
+            onAction();
+          }
+        : null;
+      el.classList.toggle("has-action", Boolean(actionLabel));
+    }
     el.hidden = false;
-    // force reflow for transition
     void el.offsetWidth;
     el.classList.add("show");
     clearTimeout(el._t);
-    el._t = setTimeout(() => {
-      el.classList.remove("show");
-      setTimeout(() => {
-        el.hidden = true;
-      }, 220);
-    }, 3400);
+    el._t = setTimeout(hideToast, duration || (actionLabel ? 8000 : 3400));
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function formatBytes(n) {
@@ -221,6 +244,40 @@
 
   function isPagedIndependentReview(g) {
     return g?.kind === "no_humans" || g?.kind === "faces";
+  }
+
+  function currentGroup() {
+    return state.allGroups.find((group) => group.id === state.currentId)
+      || state.groups.find((group) => group.id === state.currentId);
+  }
+
+  function patchGroup(updated) {
+    const idx = state.groups.findIndex((candidate) => candidate.id === updated.id);
+    if (idx >= 0) state.groups[idx] = updated;
+    const allIdx = state.allGroups.findIndex((candidate) => candidate.id === updated.id);
+    if (allIdx >= 0) state.allGroups[allIdx] = updated;
+  }
+
+  function syncDeletedToggle(g) {
+    const btn = $("btnToggleDeleted");
+    if (!btn) return;
+    const count = (g?.deleted_paths || []).length;
+    const show = isPagedIndependentReview(g) && count > 0;
+    btn.hidden = !show;
+    if (show) {
+      btn.textContent = state.showDeleted
+        ? `Hide ${count} in Trash`
+        : `${count} in Trash · Show`;
+    }
+  }
+
+  function prefetchThumbnails(members) {
+    for (const member of (members || []).slice(0, 8)) {
+      if (!member?.path) continue;
+      const image = new Image();
+      image.decoding = "async";
+      image.src = `/api/thumbnail?path=${encodeURIComponent(member.path)}`;
+    }
   }
 
   function escapeHtml(s) {
@@ -1124,14 +1181,14 @@
       const reviewed = new Set(g.reviewed_paths || []);
       const selected = new Set(g.selected_for_removal || []);
       $("detailMeta").textContent =
-        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · detector output is not a guarantee`;
+        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · Trash is one click and undoable · detector output is not a guarantee`;
       return;
     }
     if (g.kind === "faces") {
       const reviewed = new Set(g.reviewed_paths || []);
       const selected = new Set(g.selected_for_removal || []);
       $("detailMeta").textContent =
-        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · face counts are heuristic, not a guarantee`;
+        `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · Trash is one click and undoable · face counts are heuristic`;
       return;
     }
     if (isDecisionReview(g)) {
@@ -1186,6 +1243,7 @@
       g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
     $("btnMarkDistinct").hidden = g.kind !== "similar";
     $("nonHumanBanner").hidden = g.kind !== "no_humans";
+    syncDeletedToggle(g);
     $("candidateReviewBanner").hidden = !isDecisionReview(g);
     if (isDecisionReview(g)) {
       $("candidateReviewTitle").textContent = g.kind === "low_resolution"
@@ -1226,6 +1284,12 @@
           : (a, b) => (a.face_count || 0) - (b.face_count || 0),
       );
     }
+    const triage = isPagedIndependentReview(g);
+    box.classList.toggle("triage-grid", triage);
+    if (triage && !state.showDeleted) {
+      allMembers = allMembers.filter((member) => !deletedPaths.has(member.path));
+    }
+    syncDeletedToggle(g);
     const decisionReview = isDecisionReview(g);
     const pageCount = decisionReview
       ? Math.max(1, allMembers.length)
@@ -1255,14 +1319,27 @@
       sortSelect.value = state.memberSort;
     }
     if (g.kind === "faces" && $("memberPagination")) $("memberPagination").hidden = false;
+    if (isPagedIndependentReview(g)) {
+      prefetchThumbnails(allMembers.slice(pageStart + members.length, pageStart + members.length + 8));
+    }
     state.lightboxItems = members
       .filter((member) => !deletedPaths.has(member.path))
       .map((member) => ({ path: member.path, mediaType: member.media_type, keeper: g.suggested_keep, kind: g.kind }));
     updateDetailMeta(g);
-    const reviewedCount = allMembers.filter((member) => reviewedPaths.has(member.path)).length;
+    const sourceMembers = g.members || [];
+    const reviewedCount = sourceMembers.filter((member) => reviewedPaths.has(member.path)).length;
     $("groupSelectionSummary").textContent = isIndependentReview(g)
-      ? `${selected.size} selected · ${reviewedCount} of ${allMembers.length} reviewed`
-      : `${selected.size} of ${allMembers.length} selected for removal`;
+      ? `${selected.size} selected · ${reviewedCount} of ${sourceMembers.length} reviewed`
+      : `${selected.size} of ${sourceMembers.length} selected for removal`;
+    if (triage && !members.length) {
+      const hiddenDeleted = !state.showDeleted && deletedPaths.size;
+      box.innerHTML = `<div class="triage-empty">${
+        hiddenDeleted
+          ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`
+          : "Nothing left in this review pile."
+      }</div>`;
+      return;
+    }
 
     box.innerHTML = members
       .map((m, i) => {
@@ -1310,20 +1387,26 @@
         const mediaPreview = m.media_type === "video"
           ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
           : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />`;
+        const overlayDelete = isPagedIndependentReview(g) && !deleted
+          ? `<button class="thumb-delete delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click, undo from the toast" aria-label="Move ${escapeHtml(fileName)} to Trash">Trash</button>`
+          : "";
         const preview = deleted
           ? `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
-          : `<button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
-              ${badge}
-              ${mediaPreview}
-              ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
-            </button>`;
+          : `<div class="thumb-stack">
+              <button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
+                ${badge}
+                ${mediaPreview}
+                ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
+              </button>
+              ${overlayDelete}
+            </div>`;
         const actions = decisionReview
           ? `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
                 <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
                 <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
               </div>`
           : isPagedIndependentReview(g)
-          ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button">${deleted ? "Undo" : "Delete"}</button>`
+          ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button" title="${deleted ? "Restore from Trash" : "Move to Trash — one click"}">${deleted ? "Undo" : "Trash"}</button>`
           : `<label class="selection-control">
                   <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
                   <span class="selection-copy">
@@ -1333,7 +1416,7 @@
                 </label>
                 <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
         return `
-          <article class="card ${decisionReview ? "decision-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
+          <article class="card ${decisionReview ? "decision-card" : ""} ${isPagedIndependentReview(g) ? "triage-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
             ${preview}
             <div class="card-body">
               <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
@@ -1459,47 +1542,17 @@
       });
     });
 
-    async function updateDeletedCandidate(path, endpoint, previewToken = null) {
-      try {
-        const updated = await api(endpoint, {
-          method: "POST",
-          body: JSON.stringify({ group_id: g.id, path, scan_id: state.scanId,
-            dry_run: endpoint.endsWith("delete") ? !previewToken : undefined,
-            preview_token: previewToken }),
-        });
-        const idx = state.groups.findIndex((candidate) => candidate.id === g.id);
-        if (idx >= 0) state.groups[idx] = updated;
-        const allIdx = state.allGroups.findIndex((candidate) => candidate.id === g.id);
-        if (allIdx >= 0) state.allGroups[allIdx] = updated;
-        renderMembers(updated);
-        scheduleRender({ groupList: true, selection: true });
-        toast(endpoint.endsWith("undo") ? "Image restored" : "Moved to Trash", "ok");
-      } catch (err) {
-        toast(err.message, "error");
-      }
-    }
-
     box.querySelectorAll(".delete-candidate").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const member = allMembers.find((item) => item.path === btn.dataset.path);
-        try {
-          const preview = await api("/api/review-candidate/delete", { method: "POST", body: JSON.stringify({
-            group_id: g.id, path: btn.dataset.path, scan_id: state.scanId, dry_run: true,
-          }) });
-          if (!preview.success_count) return toast("This file is not safely eligible for deletion", "error");
-          const heuristicWarning = g.kind === "faces"
-            ? "Face counting is heuristic and may miscount."
-            : "Non-Human detection is heuristic and may miss people.";
-          const ok = await confirmModal({ title: "Move this file to Trash?", danger: true,
-            confirmLabel: "Move to Trash", body: `<div class="review-sheet"><p><strong>${escapeHtml(basename(member.path))} · ${formatBytes(member.size)}</strong></p><p class="heuristic-warning"><strong>Review carefully:</strong> ${heuristicWarning}</p></div>` });
-          if (ok) await updateDeletedCandidate(btn.dataset.path, "/api/review-candidate/delete", preview.preview_token);
-        } catch (err) { toast(err.message, "error"); }
+      btn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        trashReviewCandidate(g, btn.dataset.path);
       });
     });
 
     box.querySelectorAll(".undo-delete").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        updateDeletedCandidate(btn.dataset.path, "/api/review-candidate/undo");
+      btn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        undoReviewCandidate(g, btn.dataset.path);
       });
     });
 
@@ -1591,6 +1644,113 @@
     }
   }
 
+  function optimisticTrashGroup(group, path) {
+    return {
+      ...group,
+      deleted_paths: [...new Set([...(group.deleted_paths || []), path])],
+      selected_for_removal: (group.selected_for_removal || []).filter((item) => item !== path),
+      reviewed_paths: [...new Set([...(group.reviewed_paths || []), path])],
+    };
+  }
+
+  async function requestWithLockRetry(path, body) {
+    let lastError;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        return await api(path, { method: "POST", body: JSON.stringify(body) });
+      } catch (error) {
+        lastError = error;
+        if (error.status !== 409 || !/locked during active work/i.test(error.message || "")) {
+          throw error;
+        }
+        await sleep(70 * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) {
+    if (!group || !path || (group.deleted_paths || []).includes(path) || state.deleteBusy.has(path)) {
+      return;
+    }
+    state.deleteBusy.add(path);
+    const previous = group;
+    const optimistic = optimisticTrashGroup(group, path);
+    patchGroup(optimistic);
+    renderMembers(optimistic);
+    scheduleRender({ groupList: true, selection: true });
+    if (fromLightbox) {
+      state.lightboxItems = state.lightboxItems.filter((item) => item.path !== path);
+      if (!state.lightboxItems.length) closeLightbox();
+      else {
+        state.lightboxIndex = Math.min(state.lightboxIndex, state.lightboxItems.length - 1);
+        updateLightbox();
+      }
+    }
+    try {
+      const updated = await requestWithLockRetry("/api/review-candidate/delete", {
+        group_id: group.id,
+        path,
+        scan_id: state.scanId,
+        dry_run: false,
+      });
+      patchGroup(updated);
+      renderMembers(updated);
+      scheduleRender({ groupList: true, selection: true });
+      state.lastTrash = { groupId: updated.id, path };
+      toast(`Moved ${basename(path)} to Trash`, "ok", {
+        actionLabel: "Undo",
+        onAction: () => undoReviewCandidate(updated, path, { fromLightbox }),
+      });
+    } catch (error) {
+      patchGroup(previous);
+      renderMembers(previous);
+      scheduleRender({ groupList: true, selection: true });
+      if (fromLightbox && !$("lightbox").hidden) {
+        state.lightboxItems = [
+          { path, mediaType: (previous.members || []).find((member) => member.path === path)?.media_type, keeper: previous.suggested_keep, kind: previous.kind },
+          ...state.lightboxItems,
+        ];
+        updateLightbox();
+      }
+      toast(error.message || "Could not move that file to Trash", "error");
+    } finally {
+      state.deleteBusy.delete(path);
+    }
+  }
+
+  async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
+    if (!group || !path) return;
+    while (state.deleteBusy.has(path)) await sleep(40);
+    const live = currentGroup()?.id === group.id ? currentGroup() : group;
+    try {
+      const updated = await requestWithLockRetry("/api/review-candidate/undo", {
+        group_id: live.id,
+        path,
+        scan_id: state.scanId,
+      });
+      patchGroup(updated);
+      if (state.lastTrash?.path === path) state.lastTrash = null;
+      renderMembers(updated);
+      scheduleRender({ groupList: true, selection: true });
+      if (fromLightbox) {
+        const member = (updated.members || []).find((item) => item.path === path);
+        if (member && !state.lightboxItems.some((item) => item.path === path)) {
+          state.lightboxItems.splice(state.lightboxIndex, 0, {
+            path,
+            mediaType: member.media_type,
+            keeper: updated.suggested_keep,
+            kind: updated.kind,
+          });
+          updateLightbox();
+        }
+      }
+      toast("Image restored", "ok");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   function changeMemberPage(delta) {
     const current = state.allGroups.find((group) => group.id === state.currentId)
       || state.groups.find((group) => group.id === state.currentId);
@@ -1607,7 +1767,10 @@
       return;
     }
     if (!current || !isPagedIndependentReview(current)) return;
-    const pageCount = Math.max(1, Math.ceil((current.members || []).length / MEMBER_PAGE_SIZE));
+    const visible = !state.showDeleted
+      ? (current.members || []).filter((member) => !(current.deleted_paths || []).includes(member.path))
+      : (current.members || []);
+    const pageCount = Math.max(1, Math.ceil(visible.length / MEMBER_PAGE_SIZE));
     const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
     if (nextPage === state.memberPage) return;
     state.memberPage = nextPage;
@@ -2027,6 +2190,15 @@
     runBulkSelection("criteria", criteria, "Rule applied");
   });
 
+  $("btnToggleDeleted").addEventListener("click", () => {
+    const current = currentGroup();
+    if (!isPagedIndependentReview(current)) return;
+    state.showDeleted = !state.showDeleted;
+    state.memberPage = 0;
+    state.memberFocus = 0;
+    renderMembers(current);
+  });
+
   $("btnMarkRemainingHuman").addEventListener("click", async () => {
     const remaining = state.allGroups
       .filter((group) => group.kind === "no_humans")
@@ -2286,6 +2458,9 @@
     $("lbMeta").textContent = item.path;
     $("lbPrev").disabled = state.lightboxIndex <= 0;
     $("lbNext").disabled = state.lightboxIndex >= state.lightboxItems.length - 1;
+    const canTrash = isPagedIndependentReview(item) || isPagedIndependentReview(currentGroup());
+    $("lbActions").hidden = !canTrash;
+    $("lbDelete").disabled = state.deleteBusy.has(item.path);
   }
 
   try {
@@ -2335,6 +2510,12 @@
   $("lightbox").addEventListener("click", (e) => {
     if (e.target === $("lightbox")) closeLightbox();
   });
+  $("lbDelete").addEventListener("click", () => {
+    const item = state.lightboxItems[state.lightboxIndex];
+    const group = currentGroup();
+    if (!item || !isPagedIndependentReview(group)) return;
+    trashReviewCandidate(group, item.path, { fromLightbox: true });
+  });
 
   // —— Help ——
   function openHelp() {
@@ -2383,6 +2564,9 @@
       } else if (e.key === "ArrowRight") {
         $("lbNext").click();
         e.preventDefault();
+      } else if (["d", "Delete", "Backspace"].includes(e.key)) {
+        $("lbDelete").click();
+        e.preventDefault();
       }
       return;
     }
@@ -2414,8 +2598,19 @@
       $("btnTrash").click();
       e.preventDefault();
     } else if (e.key === "Enter" && state.currentId) {
-      openLightbox(state.memberFocus || 0);
+      const focused = document.querySelector("#members .card.focused .thumb-wrap");
+      const index = Number(focused?.dataset.index ?? state.memberFocus ?? 0);
+      openLightbox(Number.isFinite(index) ? index : 0);
       e.preventDefault();
+    } else if (["d", "Delete", "Backspace"].includes(e.key) && state.currentId) {
+      const group = currentGroup();
+      if (!isPagedIndependentReview(group)) return;
+      const cards = [...document.querySelectorAll("#members .card:not(.deleted)")];
+      const card = document.querySelector("#members .card.focused:not(.deleted)") || cards[state.memberFocus] || cards[0];
+      if (card?.dataset.path) {
+        trashReviewCandidate(group, card.dataset.path);
+        e.preventDefault();
+      }
     } else if (e.key === " " && state.currentId) {
       const cards = [...document.querySelectorAll("#members .card")];
       const card = cards[state.memberFocus] || cards[0];

@@ -52,7 +52,7 @@ The rule behind all four: a bulk-deletable view must never be built from files t
 
 **Bulk selection by face count.** The bulk criteria include a minimum face count: select every shown candidate with at least N faces (minimum 1). A file with no recorded count never matches, for the same reason as the filter.
 
-**Per-candidate Trash and undo.** Each card's delete button runs the same flow as the [no-person review](no-person-review.md#while-extended): a dry-run preview first, refusal when the file is not safely eligible, then a confirmation carrying the category's own warning — "Face counting is heuristic and may miscount." — and only then a move to the macOS Trash, with a per-candidate restore control on the deleted card. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it (after which the file is still recoverable from the Trash by hand).
+**Per-candidate Trash and undo.** Each card's Trash control runs the same one-click flow as the [no-person review](no-person-review.md#while-extended): the server preflights the file, refuses it when it is not safely eligible, and otherwise moves it to the macOS Trash in the same request. There is no confirmation sheet. A toast offers Undo; showing deleted cards restores the per-candidate control. Face counts remain heuristic. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it (after which the file is still recoverable from the Trash by hand).
 
 ### Complete
 
@@ -64,7 +64,7 @@ The category is consumed like any other: reviewed-and-selected candidates flow i
 | --- | --- | --- |
 | Face counting enabled at scan time | Defines whether this category exists at all; counts come from that run. | Fixed for these results; the next scan counts again. |
 | List filters (including the Faces dropdown) | Narrow what is shown without changing what exists. | Live; hidden candidates keep their selections, and bulk operations apply to shown candidates only. |
-| Keyboard vs mouse | Equivalent paths to the same decisions; `←`/`→` move card focus in this paged category, they do not Delete/Keep. | Fully interchangeable mid-review. |
+| Keyboard vs mouse | Equivalent paths to the same decisions; `←`/`→` move card focus in this paged category; `d` / `Delete` / `Backspace` trash the focused card. | Fully interchangeable mid-review. |
 | Saved review session | Restores candidates, selections, and reviewed paths, pruned per [Review session](../foundations/review-session.md). | Every decision saves it again. |
 | Scan or action running | Candidates sit locked; decision requests are refused with "locked during active work". | The lock releases when the scan or action ends. |
 
@@ -72,7 +72,7 @@ The category is consumed like any other: reviewed-and-selected candidates flow i
 
 | Event | Before decisions | While reviewing |
 | --- | --- | --- |
-| The user aborts explicitly | No effect. | No cancel exists for a decision: deselecting undoes a selection; a trashed candidate has its own restore control; closing a confirmation dialog discards that one preview and its token. |
+| The user aborts explicitly | No effect. | No cancel exists for a decision: deselecting undoes a selection; a just-trashed candidate is restored from the toast or its card. |
 | The user does something else mid-way | No effect. | Switching tabs or filters keeps all state; selections follow their candidates, not the view. |
 | A clean complete happens elsewhere | No effect. | An executed action removes acted-on candidates and may dissolve the group; bulk rules rewrite what they touch; both persist immediately. |
 | The environment fails | If face counting cannot run (OpenCV unavailable), the category has no candidates rather than wrong ones; files with failed counts stay out. | A per-candidate trash that fails preflight is refused with its reason; bulk criteria never select unanalyzed files, so a counting gap cannot become a deletion. |

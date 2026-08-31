@@ -87,7 +87,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .result-controls > input, .result-controls select { width: 100%; min-width: 0; }
 .result-control-row { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; }
 .inline-check { display: flex; align-items: center; gap: 7px; }
-.non-human-banner { margin-bottom: 12px; padding: 12px; display: flex; flex-direction: column; gap: 3px; border: 1px solid rgba(224,160,58,.45); border-radius: var(--radius-sm); background: rgba(224,160,58,.1); color: #f1cc8e; }
+.non-human-banner {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid rgba(224,160,58,.45);
+  border-radius: var(--radius-sm);
+  background: rgba(224,160,58,.1);
+  color: #f1cc8e;
+}
+.non-human-banner > div:first-child { display: grid; gap: 3px; min-width: 0; }
+.triage-guide { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.triage-guide > span {
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(8, 11, 16, .62);
+  font-weight: 650;
+  color: var(--text);
+}
+.triage-guide .delete-key { color: #ff9b9b; }
+.triage-guide .keep-key { color: #9ec4ff; }
 .candidate-review-banner {
   margin-bottom: 18px;
   padding: 14px 16px;
@@ -835,7 +858,7 @@ kbd {
 /* —— Results —— */
 .results {
   display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
+  grid-template-columns: 300px minmax(0, 1fr);
   gap: 18px;
   min-height: 480px;
   flex: 1;
@@ -1153,6 +1176,24 @@ kbd {
   justify-content: start;
 }
 
+.members.triage-grid {
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.triage-empty {
+  grid-column: 1 / -1;
+  padding: 36px 18px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+}
+
+.triage-card .card-body { padding: 10px 12px 12px; }
+.triage-card .evidence { font-size: 0.7rem; padding: 6px 8px; }
+
 .members:has(.decision-card) {
   grid-template-columns: minmax(0, 680px);
   justify-content: center;
@@ -1166,10 +1207,20 @@ kbd {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  content-visibility: auto;
+  contain-intrinsic-size: 320px;
   transition:
     border-color 0.15s var(--ease-out),
     box-shadow 0.15s var(--ease-out),
     transform 0.15s var(--ease-out);
+}
+
+.triage-card {
+  contain-intrinsic-size: 360px;
+}
+
+.thumb-stack {
+  position: relative;
 }
 
 .card:hover {
@@ -1456,8 +1507,47 @@ kbd {
   min-height: 48px;
 }
 
+.thumb-delete {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid rgba(239, 90, 90, 0.55);
+  border-radius: 999px;
+  background: rgba(20, 8, 10, 0.78);
+  color: #ffd5d5;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-4px);
+  backdrop-filter: blur(10px);
+  transition: opacity 0.16s var(--ease-out), transform 0.16s var(--ease-out), background 0.16s;
+}
+
+.card:hover .thumb-delete,
+.card.focused .thumb-delete,
+.thumb-delete:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.thumb-delete:hover {
+  background: rgba(239, 90, 90, 0.92);
+  color: #fff;
+}
+
 .card.deleted {
   opacity: 0.72;
+}
+
+.card.deleted .card-body .evidence,
+.card.deleted .card-meta {
+  display: none;
 }
 
 .deleted-preview {
@@ -1573,14 +1663,35 @@ kbd {
   border-radius: 12px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
   z-index: 40;
-  max-width: min(90vw, 480px);
+  max-width: min(90vw, 520px);
   font-size: 0.9rem;
   opacity: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   transition:
     opacity 0.2s var(--ease-out),
     transform 0.2s var(--ease-out);
   pointer-events: none;
 }
+
+.toast.has-action { pointer-events: auto; }
+
+.toast-action {
+  appearance: none;
+  border: 1px solid rgba(91, 157, 255, 0.45);
+  background: var(--accent-soft);
+  color: #cfe2ff;
+  border-radius: 8px;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.toast-action:hover { background: rgba(91, 157, 255, 0.24); }
 
 .toast.show {
   opacity: 1;
@@ -1666,6 +1777,21 @@ kbd {
   text-align: center;
   max-width: 90%;
   word-break: break-all;
+}
+
+.lb-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.lb-actions[hidden] { display: none; }
+
+.lb-action-hint {
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .lb-close {
@@ -1848,7 +1974,10 @@ kbd {
   .detail-tools select,
   .detail-tools .btn { width: 100%; }
   .members { grid-template-columns: minmax(0, 1fr); }
-  .candidate-review-banner { align-items: flex-start; flex-direction: column; }
+  .candidate-review-banner,
+  .non-human-banner { align-items: flex-start; flex-direction: column; }
+  .triage-guide { width: 100%; }
+  .triage-guide > span { flex: 1; text-align: center; }
   .candidate-key-guide { width: 100%; }
   .candidate-key-guide > span { flex: 1; text-align: center; }
   .candidate-actions { grid-template-columns: 1fr; }
