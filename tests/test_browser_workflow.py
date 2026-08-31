@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import threading
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ from PIL import Image
 from playwright.sync_api import expect
 from werkzeug.serving import make_server
 
+from dedupe.grouping import build_no_human_groups
+from dedupe.human_detection import human_detection_signature
+from dedupe.models import FileRecord, MediaType, ScanResult
 from dedupe.web.app import create_app
 
 
@@ -195,3 +199,81 @@ def test_bulk_selection_and_advanced_filters(
         "keeper.png",
     ]
     assert page_errors == []
+
+
+@contextmanager
+def _serve_app(app):
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    server.daemon_threads = True
+    server.block_on_close = False
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert response.status == 200
+        yield url
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        assert not thread.is_alive()
+
+
+@pytest.mark.e2e
+def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index, color in enumerate(((36, 128, 72), (110, 92, 28))):
+        path = media / f"landscape-{index}.png"
+        Image.new("RGB", (72, 48), color).save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                human_detection_status="no_person_detected",
+                human_detection_signature=human_detection_signature(),
+            )
+        )
+    result = ScanResult(
+        roots=[str(media)],
+        files=records,
+        groups=build_no_human_groups(records),
+    )
+    newest = Path(max(records, key=lambda record: record.mtime_ns).path)
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        assert page.locator("#members .card").count() == 2
+        assert page.locator("#modalBackdrop").is_hidden()
+
+        page.locator("#members .card-actions .delete-candidate").first.click()
+        expect(page.locator("#modalBackdrop")).to_be_hidden()
+        page.locator("#toast").filter(has_text="Moved").wait_for()
+        expect(page.locator("#toastAction")).to_be_visible()
+        expect(page.locator("#members .card")).to_have_count(1)
+        assert not newest.exists()
+
+        page.locator("#toastAction").click()
+        page.locator("#toast").filter(has_text="restored").wait_for()
+        expect(page.locator("#members .card")).to_have_count(2)
+        assert newest.exists()
+
+        page.locator("#members .card .name").nth(1).click()
+        page.keyboard.press("d")
+        expect(page.locator("#modalBackdrop")).to_be_hidden()
+        page.locator("#toast").filter(has_text="Moved").wait_for()
+        expect(page.locator("#members .card")).to_have_count(1)

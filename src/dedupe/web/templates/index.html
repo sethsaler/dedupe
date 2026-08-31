@@ -176,7 +176,7 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · review cards with <kbd>←</kbd> Delete / <kbd>→</kbd> Keep · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>d</kbd> Trash Non-Human · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
@@ -286,6 +286,7 @@
               <h2 id="detailTitle">Group</h2>
               <p class="muted" id="detailMeta"></p>
             </div>
+            <button class="btn ghost" id="btnToggleDeleted" type="button" hidden>0 in Trash</button>
             <button class="btn primary-soft" id="btnMarkRemainingHuman" type="button" hidden>
               Mark all remaining as human
             </button>
@@ -294,8 +295,14 @@
             </button>
           </div>
           <div class="non-human-banner" id="nonHumanBanner" hidden role="note">
-            <strong>Independent Non-Human candidates</strong>
-            <span>These are not duplicates. Review every file independently; person detection can be wrong.</span>
+            <div>
+              <strong>Independent Non-Human candidates</strong>
+              <span>One click — or <kbd>d</kbd> / <kbd>⌫</kbd> — moves a file to Trash. Undo from the toast or the card. Detection can miss people.</span>
+            </div>
+            <div class="triage-guide" aria-label="Triage shortcuts">
+              <span class="delete-key"><kbd>d</kbd> Trash</span>
+              <span class="keep-key">Lightbox <kbd>Enter</kbd></span>
+            </div>
           </div>
           <div class="candidate-review-banner" id="candidateReviewBanner" hidden role="note">
             <div>
@@ -422,6 +429,10 @@
         <span>Use the video timeline to scrub quickly</span>
       </div>
       <div class="lb-meta" id="lbMeta"></div>
+      <div class="lb-actions" id="lbActions" hidden>
+        <button class="btn danger" id="lbDelete" type="button">Move to Trash</button>
+        <span class="lb-action-hint">One click · recoverable from Trash · <kbd>d</kbd> or <kbd>⌫</kbd></span>
+      </div>
     </div>
     <button class="lb-nav next" id="lbNext" type="button" aria-label="Next">›</button>
   </div>
@@ -453,6 +464,7 @@
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
         <div><dt><kbd>a</kbd></dt><dd>Open the action review sheet (preview trash)</dd></div>
         <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card</dd></div>
+        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human or Faces file to Trash (one click, undo from the toast)</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>
@@ -462,7 +474,10 @@
     </div>
   </div>
 
-  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden>
+    <span id="toastMessage"></span>
+    <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>
+  </div>
   <script src="/static/app.js"></script>
 </body>
 </html>

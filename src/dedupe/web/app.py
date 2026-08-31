@@ -988,7 +988,10 @@ def create_app(
     def api_delete_review_candidate():
         """Move one independent review candidate to the system Trash (Finder Trash on macOS).
 
-        Serves both the Non-Human and Faces review flows.
+        Serves both the Non-Human and Faces review flows. A dry-run still issues a
+        preview token for callers that want the two-step sheet. One-click review
+        sends ``dry_run=false`` with no token; the server still preflights, then
+        executes in the same request.
         """
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
@@ -1022,7 +1025,12 @@ def create_app(
                 reviewed_paths=[path],
             )
             roots = list(result.roots)
-            safety_groups = list(result.groups)
+            # An explicit one-click trash must not be vetoed by a prior Keep on
+            # this same candidate (reviewed + unselected after an earlier trash).
+            safety_groups = [
+                action_group if candidate.id == group.id else candidate
+                for candidate in result.groups
+            ]
 
         try:
             preview = apply_actions(
@@ -1041,10 +1049,23 @@ def create_app(
                     payload["preview_token"] = issue_preview_token(manifest)
                 payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
                 return jsonify(payload)
-            with lock:
-                verdict = consume_preview_token(data.get("preview_token"), manifest)
-                if verdict != "valid":
-                    return jsonify(stale_preview_payload(verdict)), 409
+            preview_token = data.get("preview_token")
+            if preview_token:
+                with lock:
+                    verdict = consume_preview_token(preview_token, manifest)
+                    if verdict != "valid":
+                        return jsonify(stale_preview_payload(verdict)), 409
+            else:
+                eligible = next(
+                    (item for item in preview.items if item.path == path and item.ok),
+                    None,
+                )
+                if eligible is None:
+                    error = next(
+                        (item.error for item in preview.items if item.path == path),
+                        "This file is not safely eligible for deletion",
+                    )
+                    return jsonify({"error": error}), 400
             action_result = apply_actions(
                 [action_group], action="trash", dry_run=False, roots=roots,
                 safety_groups=safety_groups,
@@ -1103,8 +1124,37 @@ def create_app(
                }), 404
             original.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(recoverable), str(original))
+            restored = original.stat()
             with lock:
                 state["deleted_files"].pop(path, None)
+                current = next(
+                    (member for member in group.members if member.path == path),
+                    None,
+                )
+                if current is not None:
+                    refreshed = replace(
+                        current,
+                        size=restored.st_size,
+                        mtime=restored.st_mtime,
+                        device=restored.st_dev,
+                        inode=restored.st_ino,
+                        mtime_ns=restored.st_mtime_ns,
+                    )
+                    group.members = [
+                        refreshed if member.path == path else member
+                        for member in group.members
+                    ]
+                    if result is not None:
+                        result.files = [
+                            refreshed if file.path == path else file
+                            for file in result.files
+                        ]
+                group.reviewed_paths = [
+                    reviewed for reviewed in group.reviewed_paths if reviewed != path
+                ]
+                group.selected_for_removal = [
+                    selected for selected in group.selected_for_removal if selected != path
+                ]
                 persist_result()
                 return jsonify(group_payload(group))
         except OSError as exc:

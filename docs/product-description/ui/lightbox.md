@@ -2,7 +2,7 @@
 
 ## Summary
 
-The lightbox is the full-screen overlay for looking at one member of the focused group at full fidelity — comparing candidates before deciding what stays and what goes. It opens from the [group list](group-list.md) with Enter on a member card (or the equivalent click), shows that member large, and steps through the group's members with the arrow keys or the on-screen previous/next buttons. It is a viewing tool: nothing about the selection changes while it is open. Esc returns to the group list exactly as it was.
+The lightbox is the full-screen overlay for looking at one member of the focused group at full fidelity — comparing candidates before deciding what stays and what goes. It opens from the [group list](group-list.md) with Enter on a member card (or the equivalent click), shows that member large, and steps through the group's members with the arrow keys or the on-screen previous/next buttons. In Non-Human and Faces review it also offers one-click Trash (`d` / `Delete` / `Backspace`, or the on-screen button), then advances to the next remaining file. Elsewhere it is a viewing tool: nothing about the selection changes while it is open. Esc returns to the group list exactly as it was.
 
 ## The simple case
 
@@ -15,7 +15,8 @@ stateDiagram-v2
     [*] --> closed : group in focus
     closed --> open : Enter / click on a member
     open --> open : ← / → / prev / next (change member)
-    open --> closed : Esc
+    open --> open : Trash in Non-Human / Faces (advance)
+    open --> closed : Esc / Trash of last remaining candidate
 ```
 
 ### Start
@@ -39,6 +40,7 @@ The lightbox has no threshold between short and long use — it is "extended" fo
 - **Navigation.** `←` / `→` and the previous/next buttons move through the group's members. While the lightbox is open these keys navigate it and nothing else: the group-list bindings for the same keys (member focus, low-res/random Delete-Keep decisions) do not fire.
 - **Videos.** A video member plays in place with the browser's native controls and seeking; while the video itself has keyboard focus, the arrow keys go to the player, not the lightbox navigation.
 - **Flicker compare.** A dedicated control alternates the views being compared so subtle differences become visible; it can be held with the pointer and is also operable from the keyboard (Space / Enter on the control).
+- **One-click Trash (Non-Human and Faces).** A Trash button and the `d` / `Delete` / `Backspace` keys move the current file to the system Trash immediately, then show the next remaining member. Undo is offered on the toast. Duplicate-group lightboxes do not offer this control.
 - **Everything else keeps running.** The scan's progress, other browser tabs, and server state are unaffected by the overlay being open.
 
 ### Complete
@@ -71,7 +73,7 @@ The lightbox does not commit; it ends. Esc closes it, returning to the group lis
 
 **Files on disk.** The lightbox writes nothing; preview transcodes are cached server-side (immutable, keyed by file identity) and are described in [Files Dedupe writes](../cross-cutting/caches-and-files.md).
 
-**Safety and undo.** None: viewing never moves files, and the lightbox offers no destructive controls.
+**Safety and undo.** Viewing never moves files. In Non-Human and Faces review the overlay's Trash control is the same one-click per-candidate trash as the card, with the same restore path.
 
 **Review sessions.** None directly; the members it shows belong to the current result, whether scanned fresh or [resumed](session-resume.md).
 

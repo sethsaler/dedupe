@@ -6,7 +6,7 @@ The no-person review — the **Non-Human** tab — is a computer-vision-assisted
 
 ## The simple case
 
-In [Scan setup](scan-setup.md) the user enables the no-person review, leaves the backend on OpenCV (the default), and scans. When the scan finishes, the Non-Human tab lists every file whose analysis found no person, newest first, with nothing selected. The user pages through the candidates, looks at each one — the card shows how many frames were analyzed — and either trashes the ones they agree contain no people, one at a time, or selects some for a bulk action later, or leaves them alone. When the pile is exhausted, **Mark all remaining as human** records the rest as reviewed in a single confirmed step. Trashed candidates can be restored from their cards; marked and kept files do not resurface in future scans unless they change.
+In [Scan setup](scan-setup.md) the user enables the no-person review, leaves the backend on OpenCV (the default), and scans. When the scan finishes, the Non-Human tab lists every file whose analysis found no person, newest first, with nothing selected. The user pages through the candidates, looks at each one — the card shows how many frames were analyzed — and either trashes the ones they agree contain no people with a single click (or `d`), or selects some for a bulk action later, or leaves them alone. When the pile is exhausted, **Mark all remaining as human** records the rest as reviewed in a single confirmed step. Trashed candidates can be restored from their cards; marked and kept files do not resurface in future scans unless they change.
 
 ## The interaction, event by event
 
@@ -39,7 +39,7 @@ The review becomes consequential at the first persisted decision: toggling a can
 
 **Selecting.** Checkboxes and bulk operations work as in [Group list](group-list.md#while-extended), with one load-bearing rule from [Duplicate group](../foundations/duplicate-group.md#what-actually-acts-the-effective-selection): a candidate only counts toward an action when it is both selected *and* reviewed. Bulk-selecting candidates also marks them reviewed. A candidate that is reviewed and left unselected becomes a durable [Keep decision](../glossary.md): it is vetoed out of every deletion suggestion anywhere, including duplicate groups it may also belong to. The arrow-key Delete/Keep decisions belong to the low-resolution and random reviews; here `←`/`→` move the card focus and `Space` toggles the focused card's selection.
 
-**Per-candidate Trash.** Each card offers a delete button. Pressing it first asks the server for a dry-run preview of trashing that one file, under the same [safety model](../foundations/actions-and-undo.md#the-safety-model) as any action. If the preview reports the file is not safely eligible, the delete stops with "This file is not safely eligible for deletion." Otherwise a confirmation appears, carrying the warning plainly: "Non-Human detection is heuristic and may miss people." Confirming spends the preview's token and moves the file to the macOS Trash. The card becomes a deleted candidate — deleted files keep the group flagged as needing attention — and an undo control appears on it.
+**Per-candidate Trash.** Each card offers a one-click Trash control (also `d`, `Delete`, or `Backspace` on the focused card, and the same keys or button inside the lightbox). Pressing it preflights the file under the same [safety model](../foundations/actions-and-undo.md#the-safety-model) as any action, then moves it to the macOS Trash in the same request — there is no confirmation sheet. If the file is not safely eligible, the delete stops with that reason and the card stays. Otherwise the card leaves the working pile immediately; a toast offers Undo for a few seconds, and **N in Trash · Show** reveals deleted cards with their restore control. Detection can miss people; the banner says so, and Trash remains recoverable.
 
 **Per-candidate undo.** The restore control moves the file back from the Trash to its original path. It refuses if the original path is now occupied and reports "there is no deleted file to undo" when there is nothing to restore.
 
@@ -56,7 +56,7 @@ The category is consumed two ways: selections that are both reviewed and selecte
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
 | Backend (opencv / photon / ensemble) | Chosen in scan setup; defines how the candidates were found. Photon's possible 10 GB download happens at scan time, never here. | Fixed for these results; the next scan chooses again. |
-| Keyboard vs mouse | Equivalent paths to the same decisions. | Fully interchangeable mid-review. |
+| Keyboard vs mouse | Equivalent paths to the same decisions; `d` / `Delete` / `Backspace` trash the focused card. | Fully interchangeable mid-review. |
 | Saved review session | A resumed session restores candidates with their selections, pruned per [Review session](../foundations/review-session.md). | Every decision saves it again. |
 | Scan or action running | Candidates stream or sit locked; decision requests are refused with "locked during active work". | The lock releases the moment the scan or action ends. |
 
@@ -64,7 +64,7 @@ The category is consumed two ways: selections that are both reviewed and selecte
 
 | Event | Before decisions | While reviewing |
 | --- | --- | --- |
-| The user aborts explicitly | No effect. | There is no cancel for a decision: deselecting is the undo for a selection, and a trashed candidate has its own restore control. Closing the confirmation dialog discards that one trash preview and its token; nothing moves. |
+| The user aborts explicitly | No effect. | There is no cancel for a decision: deselecting is the undo for a selection, and a just-trashed candidate is restored from the toast or its card. |
 | The user does something else mid-way | No effect. | Switching tabs or filters keeps all selections and deleted-candidate state; they follow the category, not the view. The mark-remaining button acts on whatever candidates remain undeleted at the moment it is confirmed. |
 | A clean complete happens elsewhere | No effect. | An executed action removes acted-on candidates and may dissolve the group; a bulk selection rewrites whatever it touches; both persist immediately. |
 | The environment fails | A failed-closed detector (YuNet missing or corrupt) yields an empty category rather than wrong candidates. | A per-candidate trash that fails preflight is refused with the file's reason; a cache failure during mark-remaining rolls the markings back and reports the error — the candidates stay. |

@@ -10,7 +10,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
-- **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected (a high-likelihood "not a human" filter)
+- **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected; one click (or `d`) moves a file to Trash, with Undo on the toast
 - **Face counts** — optional OpenCV pass counts faces in images and GIFs; every file card shows its count, files with detected faces get their own Faces review tab (busiest shots first), and a bulk rule ("at least … faces") selects group-photo shots in one click
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
