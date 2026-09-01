@@ -1194,6 +1194,14 @@ kbd {
 .triage-card .card-body { padding: 10px 12px 12px; }
 .triage-card .evidence { font-size: 0.7rem; padding: 6px 8px; }
 
+/* Triage piles mix portrait/landscape media; a fixed square keeps every card the
+   same size so trashing one never reflows the grid. Media letterboxes via
+   object-fit: contain. Beats the inline --preview-aspect-ratio custom property
+   because aspect-ratio itself is set here, not the variable. */
+.triage-card .thumb-wrap {
+  aspect-ratio: 1 / 1;
+}
+
 .members:has(.decision-card) {
   grid-template-columns: minmax(0, 680px);
   justify-content: center;

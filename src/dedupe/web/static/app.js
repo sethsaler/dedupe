@@ -37,6 +37,9 @@
     showDeleted: false,
     deleteBusy: new Set(),
     lastTrash: null,
+    // Paths trashed on the current triage page: their cards stay in place as
+    // "Moved to Trash" placeholders so the grid never reflows mid-review.
+    trashedInPlace: new Set(),
   };
 
   // —— Batched rendering ——
@@ -1221,6 +1224,7 @@
     state.currentId = id;
     state.memberFocus = 0;
     state.memberPage = 0;
+    state.trashedInPlace.clear();
     ensureGroupVisible(id);
     markGroupListActive(id);
     const g = await api(`/api/groups/${id}`);
@@ -1296,7 +1300,9 @@
     const triage = isPagedIndependentReview(g);
     box.classList.toggle("triage-grid", triage);
     if (triage && !state.showDeleted) {
-      allMembers = allMembers.filter((member) => !deletedPaths.has(member.path));
+      allMembers = allMembers.filter(
+        (member) => !deletedPaths.has(member.path) || state.trashedInPlace.has(member.path),
+      );
     }
     syncDeletedToggle(g);
     const decisionReview = isDecisionReview(g);
@@ -1683,6 +1689,7 @@
       return;
     }
     state.deleteBusy.add(path);
+    state.trashedInPlace.add(path);
     const previous = group;
     const optimistic = optimisticTrashGroup(group, path);
     patchGroup(optimistic);
@@ -1712,6 +1719,7 @@
         onAction: () => undoReviewCandidate(updated, path, { fromLightbox }),
       });
     } catch (error) {
+      state.trashedInPlace.delete(path);
       patchGroup(previous);
       renderMembers(previous);
       scheduleRender({ groupList: true, selection: true });
@@ -1740,6 +1748,7 @@
       });
       patchGroup(updated);
       if (state.lastTrash?.path === path) state.lastTrash = null;
+      state.trashedInPlace.delete(path);
       renderMembers(updated);
       scheduleRender({ groupList: true, selection: true });
       if (fromLightbox) {
@@ -1784,6 +1793,7 @@
     if (nextPage === state.memberPage) return;
     state.memberPage = nextPage;
     state.memberFocus = 0;
+    state.trashedInPlace.clear();
     renderMembers(current);
     // Jump to the top pager so the next page of results is immediately visible.
     const topPager = $("memberPagination");
@@ -1800,6 +1810,7 @@
   $("memberSort")?.addEventListener("change", (event) => {
     state.memberSort = event.target.value;
     state.memberPage = 0;
+    state.trashedInPlace.clear();
     const current = state.allGroups.find((group) => group.id === state.currentId)
       || state.groups.find((group) => group.id === state.currentId);
     if (current) renderMembers(current);
@@ -2205,6 +2216,7 @@
     state.showDeleted = !state.showDeleted;
     state.memberPage = 0;
     state.memberFocus = 0;
+    state.trashedInPlace.clear();
     renderMembers(current);
   });
 

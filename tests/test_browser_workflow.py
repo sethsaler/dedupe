@@ -225,9 +225,12 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
     media = tmp_path / "media"
     media.mkdir()
     records = []
-    for index, color in enumerate(((36, 128, 72), (110, 92, 28))):
-        path = media / f"landscape-{index}.png"
-        Image.new("RGB", (72, 48), color).save(path)
+    # Mixed orientations: previews must still render at one uniform size.
+    for index, (color, size) in enumerate(
+        (((36, 128, 72), (72, 48)), ((110, 92, 28), (48, 72)))
+    ):
+        path = media / f"mixed-{index}.png"
+        Image.new("RGB", size, color).save(path)
         stat = path.stat()
         records.append(
             FileRecord(
@@ -260,20 +263,32 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         assert page.locator("#members .card").count() == 2
         assert page.locator("#modalBackdrop").is_hidden()
 
+        # Landscape and portrait media get identical preview boxes.
+        boxes = [
+            page.locator("#members .thumb-wrap").nth(i).bounding_box() for i in range(2)
+        ]
+        assert boxes[0]["width"] == boxes[1]["width"]
+        assert boxes[0]["height"] == boxes[1]["height"]
+
         page.locator("#members .card-actions .delete-candidate").first.click()
         expect(page.locator("#modalBackdrop")).to_be_hidden()
         page.locator("#toast").filter(has_text="Moved").wait_for()
         expect(page.locator("#toastAction")).to_be_visible()
-        expect(page.locator("#members .card")).to_have_count(1)
+        # The trashed card stays in place as a placeholder so the grid never reflows.
+        expect(page.locator("#members .card")).to_have_count(2)
+        expect(page.locator("#members .card.deleted")).to_have_count(1)
+        expect(page.locator("#members .deleted-preview")).to_contain_text("Moved to Trash")
         assert not newest.exists()
 
         page.locator("#toastAction").click()
         page.locator("#toast").filter(has_text="restored").wait_for()
         expect(page.locator("#members .card")).to_have_count(2)
+        expect(page.locator("#members .card.deleted")).to_have_count(0)
         assert newest.exists()
 
         page.locator("#members .card .name").nth(1).click()
         page.keyboard.press("d")
         expect(page.locator("#modalBackdrop")).to_be_hidden()
         page.locator("#toast").filter(has_text="Moved").wait_for()
-        expect(page.locator("#members .card")).to_have_count(1)
+        expect(page.locator("#members .card")).to_have_count(2)
+        expect(page.locator("#members .card.deleted")).to_have_count(1)
