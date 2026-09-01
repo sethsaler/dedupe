@@ -267,25 +267,22 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         assert page.locator("#members .card").count() == 2
         assert page.locator("#modalBackdrop").is_hidden()
 
-        # Selecting a group re-renders members after the follow-up fetch, and
-        # content-visibility can skip an off-screen preview's box. Wait for two
-        # laid-out squares, then compare sizes — do not scroll a stale node.
+        # Results auto-select the first group, then the click fetches it again.
+        # Each selectGroup replaces the member DOM. Playwright bounding_box()
+        # returns None on a detached node, so measure sizes in this wait —
+        # a mid-wait re-render just retries instead of failing the assertion.
         page.wait_for_function(
             """() => {
               const wraps = [...document.querySelectorAll("#members .triage-card .thumb-wrap")];
-              return wraps.length === 2 && wraps.every((el) => {
-                const box = el.getBoundingClientRect();
-                return box.width > 0 && box.height > 0;
-              });
+              if (wraps.length !== 2) return false;
+              const boxes = wraps.map((el) => el.getBoundingClientRect());
+              return (
+                boxes.every((box) => box.width > 0 && box.height > 0)
+                && boxes[0].width === boxes[1].width
+                && boxes[0].height === boxes[1].height
+              );
             }"""
         )
-        boxes = [
-            page.locator("#members .triage-card .thumb-wrap").nth(index).bounding_box()
-            for index in range(2)
-        ]
-        assert boxes[0] is not None and boxes[1] is not None
-        assert boxes[0]["width"] == boxes[1]["width"]
-        assert boxes[0]["height"] == boxes[1]["height"]
 
         page.locator("#members .card-actions .delete-candidate").first.click()
         expect(page.locator("#modalBackdrop")).to_be_hidden()
