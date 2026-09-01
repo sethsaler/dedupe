@@ -16,6 +16,7 @@ from dedupe.parallel import (
     DEFAULT_WORKERS_CAP,
     map_parallel,
     resolve_workers,
+    split_cpu_budget,
 )
 from dedupe.similar_image import find_similar_image_groups
 
@@ -66,6 +67,18 @@ def test_resolve_workers() -> None:
     assert resolve_workers(64, cap=DEFAULT_VIDEO_WORKERS_CAP) == DEFAULT_VIDEO_WORKERS_CAP
     assert resolve_workers(64, cap=DEFAULT_HUMAN_WORKERS_CAP) == DEFAULT_HUMAN_WORKERS_CAP
     assert resolve_workers(1, cap=DEFAULT_VIDEO_WORKERS_CAP) == 1
+
+
+def test_split_cpu_budget_divides_between_concurrent_cpu_stages() -> None:
+    # Zero or one CPU-bound stage keeps the full budget.
+    assert split_cpu_budget(8, 0) == 8
+    assert split_cpu_budget(8, 1) == 8
+    # Concurrent CPU-bound stages share it equally.
+    assert split_cpu_budget(8, 2) == 4
+    assert split_cpu_budget(8, 3) == 2
+    # Never below one worker.
+    assert split_cpu_budget(1, 3) == 1
+    assert split_cpu_budget(0, 2) == 1
 
 
 def test_map_parallel_preserves_order() -> None:

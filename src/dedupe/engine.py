@@ -37,7 +37,7 @@ from .models import (
     ScanResult,
     StageDiagnostics,
 )
-from .parallel import resolve_workers
+from .parallel import resolve_workers, split_cpu_budget
 from .scanner import inventory, is_in_photos_library
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import find_similar_image_groups, probe_image_dimensions
@@ -154,11 +154,15 @@ def run_scan(
 ) -> ScanResult:
     """Run a full scan.
 
-    Exact hashing, image/GIF similarity, and video similarity all run
-    concurrently. ``on_group`` is called as soon as each duplicate group is
-    finalized so UIs can stream results instead of waiting for the whole scan;
-    exact groups are always published before similar groups because similar
-    grouping consults the exact-group membership.
+    Every enabled check — exact hashing, image/GIF similarity, video
+    similarity, dimension probing, person detection, and face counting — runs
+    concurrently on one stage pool. ``on_group`` is called as soon as each
+    duplicate group is finalized so UIs can stream results instead of waiting
+    for the whole scan. Result-affecting order is kept with events: exact
+    groups are always published before similar groups because similar grouping
+    consults the exact-group membership, and Non-Human groups wait for face
+    counts when faces are also being counted (a counted face vetoes
+    membership).
     """
     n_workers = resolve_workers(workers)
     low_resolution_bounds = _low_resolution_bounds(
@@ -294,8 +298,19 @@ def run_scan(
 
     run_exact = exact and bool(records)
     run_similar = similar
+    run_dimensions = find_low_resolution and bool(records)
+    run_human = find_no_humans and bool(records)
+    run_faces = count_faces and bool(records)
+    run_any_stage = (
+        run_exact
+        or run_similar
+        or run_dimensions
+        or run_human
+        or run_faces
+        or _build_review_groups
+    )
 
-    if run_exact or run_similar:
+    if run_any_stage:
         check_cancelled()
         distinct_pairs = (
             cache.distinct_pairs(records)
@@ -306,21 +321,50 @@ def run_scan(
             [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
         )
         video_count = len([r for r in records if r.media_type == MediaType.VIDEO])
+        face_candidates = [
+            record for record in records if record.media_type in FACE_MEDIA_TYPES
+        ]
+        normalized_human_backend = human_backend.strip().lower()
 
-        # Exact hashing (disk-bound), image/GIF hashing (CPU-bound), and video
-        # fingerprinting (ffmpeg subprocess-bound) all run concurrently. Images
-        # /GIFs and videos are disjoint file sets that can never share a
-        # duplicate group, and exact hashing touches different record fields
-        # than the similarity stages (a same-record ``error`` write can race,
-        # which is a benign last-writer-wins, same as sequential overwrites).
-        # Similar groups are only *published* after exact groups exist because
-        # build_one_group consults exact_path_sets; the expensive hashing work
-        # itself never waits. Progress from all stages is merged into one
-        # "processing" phase so combined counts/ETA stay meaningful.
+        # Every enabled check runs concurrently on one stage pool. Exact
+        # hashing is disk-bound, video fingerprinting is ffmpeg-subprocess-
+        # bound, and Photon person inference is single-threaded, so they
+        # overlap the CPU-bound stages nearly for free. Image hashing, OpenCV
+        # person detection, and face counting are all image-decode + CPU
+        # work, so they split one worker budget instead of stacking their
+        # private caps (split_cpu_budget). Stages write disjoint record
+        # fields (a same-record ``error`` write can race, which is a benign
+        # last-writer-wins, same as sequential overwrites). Ordering that
+        # affects results is enforced with events, never by serializing the
+        # expensive analysis:
+        #   - similar groups publish after exact groups exist because
+        #     build_one_group consults exact_path_sets,
+        #   - dimension probing waits for image/video hashing, which fills
+        #     most dimensions as a side effect,
+        #   - when faces are also counted, Non-Human groups publish only
+        #     after face counts land (a counted face vetoes membership).
+        # Progress from all stages is merged into one "processing" phase so
+        # combined counts/ETA stay meaningful.
+        cpu_stage_count = sum(
+            (
+                1 if run_similar and image_count else 0,
+                1 if run_human and normalized_human_backend == "opencv" else 0,
+                1 if run_faces else 0,
+            )
+        )
+        cpu_workers = split_cpu_budget(n_workers, cpu_stage_count)
+        human_workers = (
+            cpu_workers if normalized_human_backend == "opencv" else n_workers
+        )
+
         stage_lock = threading.Lock()
         stage_text: dict[str, str] = {}
         stage_counts: dict[str, tuple[int, int]] = {}
         exact_done = threading.Event()
+        image_done = threading.Event()
+        video_done = threading.Event()
+        dims_done = threading.Event()
+        human_done = threading.Event()
 
         def _emit_stages_locked() -> None:
             processed = sum(done for done, _total in stage_counts.values())
@@ -331,6 +375,9 @@ def run_scan(
                     stage_text.get("exact"),
                     stage_text.get("image"),
                     stage_text.get("video"),
+                    stage_text.get("dims"),
+                    stage_text.get("human"),
+                    stage_text.get("face"),
                 )
                 if text
             )
@@ -343,6 +390,17 @@ def run_scan(
                     stage_counts[stage] = (processed, total)
                 _emit_stages_locked()
 
+        def publish_prebuilt(new_groups: list[DuplicateGroup]) -> None:
+            """Append already-built review groups and stream them (thread-safe)."""
+            if not new_groups:
+                return
+            with publish_lock:
+                for group in new_groups:
+                    groups.append(group)
+                    if on_group:
+                        on_group(group)
+                groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+
         with stage_lock:
             if run_exact:
                 stage_text["exact"] = "Finding exact duplicates…"
@@ -353,6 +411,16 @@ def run_scan(
             if run_similar and video_count:
                 stage_text["video"] = f"Fingerprinting {video_count} videos…"
                 stage_counts["video"] = (0, video_count)
+            if run_dimensions:
+                stage_text["dims"] = "Reading media dimensions…"
+            if run_human:
+                stage_text["human"] = (
+                    f"Looking for media without people ({human_backend})…"
+                )
+                stage_counts["human"] = (0, len(records))
+            if run_faces:
+                stage_text["face"] = "Counting faces (OpenCV)…"
+                stage_counts["face"] = (0, len(face_candidates))
             _emit_stages_locked()
 
         def exact_progress(phase: str, processed: int, total: int) -> None:
@@ -383,7 +451,7 @@ def run_scan(
             text = message or f"Videos {label}: {processed}/{total}"
             _stage_progress("video", text, processed, total)
 
-        def _exact_stage() -> tuple[int, float]:
+        def _exact_stage() -> float:
             started_at = time.monotonic()
             try:
                 exact_member_lists = find_exact_groups(
@@ -399,52 +467,212 @@ def run_scan(
                     0,
                     0,
                 )
-                return count, time.monotonic() - started_at
+                return time.monotonic() - started_at
             finally:
                 # Always unblock similar publishing, even on cancel/error.
                 exact_done.set()
 
-        def _image_stage() -> tuple[int, float]:
+        def _image_stage() -> float:
             started_at = time.monotonic()
-            img_groups = find_similar_image_groups(
+            try:
+                img_groups = find_similar_image_groups(
+                    records,
+                    threshold=image_threshold,
+                    distinct_pairs=distinct_pairs,
+                    progress=img_progress,
+                    workers=cpu_workers,
+                    cancelled=cancelled,
+                )
+                exact_done.wait()
+                count = publish(GroupKind.SIMILAR, img_groups)
+                _stage_progress(
+                    "image",
+                    f"Found {count} similar image group{'s' if count != 1 else ''}",
+                    0,
+                    0,
+                )
+                return time.monotonic() - started_at
+            finally:
+                # Always unblock dimension probing, even on cancel/error.
+                image_done.set()
+
+        def _video_stage() -> float:
+            started_at = time.monotonic()
+            try:
+                vid_groups = find_similar_video_groups(
+                    records,
+                    threshold=video_threshold,
+                    distinct_pairs=distinct_pairs,
+                    progress=vid_progress,
+                    workers=n_workers,
+                    cancelled=cancelled,
+                )
+                exact_done.wait()
+                count = publish(GroupKind.SIMILAR, vid_groups)
+                _stage_progress(
+                    "video",
+                    f"Found {count} similar video group{'s' if count != 1 else ''}",
+                    0,
+                    0,
+                )
+                return time.monotonic() - started_at
+            finally:
+                # Always unblock dimension probing, even on cancel/error.
+                video_done.set()
+
+        def _dimensions_stage() -> float:
+            # Image/video hashing fills most dimensions as a side effect, so
+            # probe only the leftovers once those stages are done. The waits
+            # are excluded from the recorded duration.
+            image_done.wait()
+            video_done.wait()
+            check_cancelled()
+            started_at = time.monotonic()
+            try:
+
+                def resolution_progress(processed: int, total: int) -> None:
+                    _stage_progress(
+                        "dims",
+                        f"Dimensions {processed}/{total}",
+                        processed,
+                        total,
+                    )
+
+                stage_errors["low_resolution"] = _populate_missing_dimensions(
+                    records,
+                    media_types=set(low_resolution_bounds),
+                    workers=n_workers,
+                    cancelled=cancelled,
+                    progress=resolution_progress,
+                )
+                _stage_progress("dims", "Dimensions ready", 0, 0)
+                return time.monotonic() - started_at
+            finally:
+                # Always unblock review-group publishing, even on cancel/error.
+                dims_done.set()
+
+        def _review_stage() -> float:
+            # Low-resolution membership needs dimensions; random review does
+            # not, but both publish together as one cheap step.
+            dims_done.wait()
+            check_cancelled()
+            started_at = time.monotonic()
+            review_groups: list[DuplicateGroup] = []
+            if find_low_resolution:
+                review_groups.extend(
+                    build_low_resolution_groups(
+                        records,
+                        max_pixels=max(1, int(low_resolution_max_pixels)),
+                        skip_paths=kept_paths(records),
+                        media_types=set(low_resolution_bounds),
+                        max_pixels_by_media_type=low_resolution_bounds,
+                    )
+                )
+            review_groups.extend(
+                build_random_review_groups(
+                    records, count=max(0, int(random_review_count))
+                )
+            )
+            publish_prebuilt(review_groups)
+            return time.monotonic() - started_at
+
+        def _human_stage() -> float:
+            started_at = time.monotonic()
+            try:
+
+                def human_progress(phase: str, processed: int, total: int) -> None:
+                    _stage_progress(
+                        "human",
+                        f"Person detection {processed}/{total}",
+                        processed,
+                        total,
+                    )
+
+                no_human_files = find_no_human_files(
+                    records,
+                    backend=human_backend,
+                    photon_model=photon_model,
+                    workers=human_workers,
+                    progress=human_progress,
+                    cancelled=cancelled,
+                    # When faces are also being counted, the face stage
+                    # supplies the counts and a counted face vetoes membership
+                    # at group build time, so the in-stage YuNet confirmation
+                    # pass would only duplicate that work.
+                    confirm_with_faces=not run_faces,
+                )
+                if run_faces:
+                    # Confirmed Non-Human groups publish from the face stage
+                    # once face counts land.
+                    _stage_progress(
+                        "human",
+                        "Person detection finished; face counts will confirm "
+                        "Non-Human candidates",
+                        0,
+                        0,
+                    )
+                else:
+                    publish_prebuilt(build_no_human_groups(no_human_files))
+                    _stage_progress(
+                        "human",
+                        f"Found {len(no_human_files)} file"
+                        f"{'' if len(no_human_files) == 1 else 's'} "
+                        "without detected people",
+                        0,
+                        0,
+                    )
+                return time.monotonic() - started_at
+            finally:
+                # Always unblock Non-Human publishing in the face stage.
+                human_done.set()
+
+        def _face_stage() -> float:
+            started_at = time.monotonic()
+
+            def face_progress(phase: str, processed: int, total: int) -> None:
+                _stage_progress(
+                    "face",
+                    f"Face counting {processed}/{total}",
+                    processed,
+                    total,
+                )
+
+            count_faces_in_files(
                 records,
-                threshold=image_threshold,
-                distinct_pairs=distinct_pairs,
-                progress=img_progress,
-                workers=n_workers,
+                workers=cpu_workers,
+                progress=face_progress,
                 cancelled=cancelled,
             )
-            exact_done.wait()
-            count = publish(GroupKind.SIMILAR, img_groups)
+            files_with_faces = sum(
+                1 for record in face_candidates if (record.face_count or 0) > 0
+            )
             _stage_progress(
-                "image",
-                f"Found {count} similar image group{'s' if count != 1 else ''}",
+                "face",
+                f"Found faces in {files_with_faces} "
+                f"file{'s' if files_with_faces != 1 else ''}",
                 0,
                 0,
             )
-            return count, time.monotonic() - started_at
+            duration = time.monotonic() - started_at
+            publish_prebuilt(build_faces_groups(face_candidates))
+            if find_no_humans:
+                # A counted face vetoes Non-Human membership, so confirmed
+                # groups publish only after person detection lands too.
+                human_done.wait()
+                confirmed = build_no_human_groups(records)
+                confirmed_count = sum(len(group.members) for group in confirmed)
+                publish_prebuilt(confirmed)
+                _stage_progress(
+                    "human",
+                    f"Found {confirmed_count} file"
+                    f"{'' if confirmed_count == 1 else 's'} "
+                    "without detected people",
+                    0,
+                    0,
+                )
+            return duration
 
-        def _video_stage() -> tuple[int, float]:
-            started_at = time.monotonic()
-            vid_groups = find_similar_video_groups(
-                records,
-                threshold=video_threshold,
-                distinct_pairs=distinct_pairs,
-                progress=vid_progress,
-                workers=n_workers,
-                cancelled=cancelled,
-            )
-            exact_done.wait()
-            count = publish(GroupKind.SIMILAR, vid_groups)
-            _stage_progress(
-                "video",
-                f"Found {count} similar video group{'s' if count != 1 else ''}",
-                0,
-                0,
-            )
-            return count, time.monotonic() - started_at
-
-        stage_jobs: dict[str, Callable[[], tuple[int, float]]] = {}
+        stage_jobs: dict[str, Callable[[], float]] = {}
         if run_exact:
             stage_jobs["exact"] = _exact_stage
         else:
@@ -452,19 +680,35 @@ def run_scan(
         if run_similar:
             stage_jobs["image"] = _image_stage
             stage_jobs["video"] = _video_stage
+        else:
+            image_done.set()
+            video_done.set()
+        if run_dimensions:
+            stage_jobs["dims"] = _dimensions_stage
+        else:
+            dims_done.set()
+        if run_human:
+            stage_jobs["human"] = _human_stage
+        else:
+            human_done.set()
+        if run_faces:
+            stage_jobs["face"] = _face_stage
+        if _build_review_groups:
+            stage_jobs["review"] = _review_stage
 
-        stage_results: dict[str, tuple[int, float]] = {}
-        with ThreadPoolExecutor(
-            max_workers=len(stage_jobs), thread_name_prefix="scan-stage"
-        ) as stage_pool:
-            futures = {
-                name: stage_pool.submit(fn) for name, fn in stage_jobs.items()
-            }
-            for name, future in futures.items():
-                stage_results[name] = future.result()
+        stage_results: dict[str, float] = {}
+        if stage_jobs:
+            with ThreadPoolExecutor(
+                max_workers=len(stage_jobs), thread_name_prefix="scan-stage"
+            ) as stage_pool:
+                futures = {
+                    name: stage_pool.submit(fn) for name, fn in stage_jobs.items()
+                }
+                for name, future in futures.items():
+                    stage_results[name] = future.result()
 
         if run_exact:
-            stage_durations["exact"] = stage_results["exact"][1]
+            stage_durations["exact"] = stage_results["exact"]
             stage_errors["exact"] = [
                 record.error
                 for record in records
@@ -472,8 +716,8 @@ def run_scan(
                 and record.error.startswith(("partial hash failed", "sha256 failed"))
             ]
         if run_similar:
-            stage_durations["similar_image"] = stage_results["image"][1]
-            stage_durations["similar_video"] = stage_results["video"][1]
+            stage_durations["similar_image"] = stage_results["image"]
+            stage_durations["similar_video"] = stage_results["video"]
             stage_errors["similar_image"] = [
                 record.error
                 for record in records
@@ -484,169 +728,22 @@ def run_scan(
                 for record in records
                 if record.error and record.error.startswith("video fingerprint failed")
             ]
-
-    if find_low_resolution and records:
-        resolution_started = time.monotonic()
-        check_cancelled()
-        eligible = [
-            record
-            for record in records
-            if record.media_type in low_resolution_bounds
-        ]
-        emit(
-            "low-resolution",
-            0,
-            len(eligible),
-            "Reading media dimensions for low-resolution suggestions…",
-        )
-
-        def resolution_progress(processed: int, total: int) -> None:
-            emit(
-                "low-resolution",
-                processed,
-                total,
-                f"Reading dimensions {processed}/{total}",
-            )
-
-        stage_errors["low_resolution"] = _populate_missing_dimensions(
-            records,
-            media_types=set(low_resolution_bounds),
-            workers=n_workers,
-            cancelled=cancelled,
-            progress=resolution_progress,
-        )
-        stage_durations["low_resolution"] = time.monotonic() - resolution_started
-
-    if _build_review_groups:
-        review_groups: list[DuplicateGroup] = []
-        if find_low_resolution:
-            review_groups.extend(
-                build_low_resolution_groups(
-                    records,
-                    max_pixels=max(1, int(low_resolution_max_pixels)),
-                    skip_paths=kept_paths(records),
-                    media_types=set(low_resolution_bounds),
-                    max_pixels_by_media_type=low_resolution_bounds,
-                )
-            )
-        review_groups.extend(
-            build_random_review_groups(records, count=max(0, int(random_review_count)))
-        )
-        for group in review_groups:
-            groups.append(group)
-            if on_group:
-                on_group(group)
-        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
-
-    if find_no_humans and records:
-        human_started = time.monotonic()
-        check_cancelled()
-        emit(
-            "human-detection",
-            0,
-            len(records),
-            f"Looking for media without people ({human_backend})…",
-        )
-
-        def human_progress(phase: str, processed: int, total: int) -> None:
-            emit(phase, processed, total, f"Person detection {processed}/{total}")
-
-        no_human_files = find_no_human_files(
-            records,
-            backend=human_backend,
-            photon_model=photon_model,
-            workers=n_workers,
-            progress=human_progress,
-            cancelled=cancelled,
-        )
-        # When faces are also being counted, wait until those counts land so a
-        # female (or any) face can veto Non-Human membership in the same scan.
-        if not count_faces:
-            for group in build_no_human_groups(no_human_files):
-                groups.append(group)
-                if on_group:
-                    on_group(group)
-            groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
-        emit(
-            "human-detection",
-            len(records),
-            len(records),
-            (
-                "Person detection finished; face counts will confirm Non-Human "
-                "candidates"
-                if count_faces
-                else (
-                    f"Found {len(no_human_files)} file"
-                    f"{'' if len(no_human_files) == 1 else 's'} without detected people"
-                )
-            ),
-        )
-        stage_durations["human_detection"] = time.monotonic() - human_started
-        stage_errors["human_detection"] = [
-            record.error or "person analysis failed"
-            for record in records
-            if record.human_detection_status == "analysis_failed"
-        ]
-
-    if count_faces and records:
-        face_started = time.monotonic()
-        check_cancelled()
-        face_candidates = [
-            record for record in records if record.media_type in FACE_MEDIA_TYPES
-        ]
-        emit(
-            "face-detection",
-            0,
-            len(face_candidates),
-            "Counting faces (OpenCV)…",
-        )
-
-        def face_progress(phase: str, processed: int, total: int) -> None:
-            emit(phase, processed, total, f"Face counting {processed}/{total}")
-
-        count_faces_in_files(
-            records,
-            workers=n_workers,
-            progress=face_progress,
-            cancelled=cancelled,
-        )
-        files_with_faces = sum(
-            1 for record in face_candidates if (record.face_count or 0) > 0
-        )
-        emit(
-            "face-detection",
-            len(face_candidates),
-            len(face_candidates),
-            f"Found faces in {files_with_faces} "
-            f"file{'s' if files_with_faces != 1 else ''}",
-        )
-        stage_durations["face_detection"] = time.monotonic() - face_started
-        stage_errors["face_detection"] = [
-            record.error or "face counting failed"
-            for record in face_candidates
-            if record.face_count is None
-        ]
-        for group in build_faces_groups(face_candidates):
-            groups.append(group)
-            if on_group:
-                on_group(group)
-        if find_no_humans:
-            confirmed = build_no_human_groups(records)
-            confirmed_count = sum(len(group.members) for group in confirmed)
-            for group in confirmed:
-                groups.append(group)
-                if on_group:
-                    on_group(group)
-            emit(
-                "human-detection",
-                len(records),
-                len(records),
-                (
-                    f"Found {confirmed_count} file"
-                    f"{'' if confirmed_count == 1 else 's'} without detected people"
-                ),
-            )
-        groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+        if run_dimensions:
+            stage_durations["low_resolution"] = stage_results["dims"]
+        if run_human:
+            stage_durations["human_detection"] = stage_results["human"]
+            stage_errors["human_detection"] = [
+                record.error or "person analysis failed"
+                for record in records
+                if record.human_detection_status == "analysis_failed"
+            ]
+        if run_faces:
+            stage_durations["face_detection"] = stage_results["face"]
+            stage_errors["face_detection"] = [
+                record.error or "face counting failed"
+                for record in face_candidates
+                if record.face_count is None
+            ]
 
     cache_errors: list[str] = []
     if cache is not None:

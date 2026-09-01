@@ -151,6 +151,125 @@ def test_exact_stage_overlaps_similarity_hashing(tmp_path: Path, monkeypatch) ->
     assert image_started.is_set()
 
 
+def test_person_detection_overlaps_similarity_hashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Person detection runs concurrently with similarity hashing."""
+    import threading
+
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "a.jpg", (30, 60, 90))
+
+    human_started = threading.Event()
+    image_started = threading.Event()
+
+    def fake_find(records, **_kwargs):
+        human_started.set()
+        assert image_started.wait(timeout=10), "image stage did not overlap human"
+        return []
+
+    def fake_images(records, **_kwargs):
+        image_started.set()
+        assert human_started.wait(timeout=10), "human stage did not overlap image"
+        return []
+
+    monkeypatch.setattr(engine_mod, "find_no_human_files", fake_find)
+    monkeypatch.setattr(engine_mod, "find_similar_image_groups", fake_images)
+    monkeypatch.setattr(
+        engine_mod, "find_similar_video_groups", lambda records, **_kwargs: []
+    )
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=True,
+        find_no_humans=True,
+        use_cache=False,
+    )
+
+    assert human_started.is_set()
+    assert image_started.is_set()
+
+
+def test_face_counting_overlaps_person_detection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Face counting and person detection analyze files at the same time."""
+    import threading
+
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "a.jpg", (30, 60, 90))
+
+    human_started = threading.Event()
+    face_started = threading.Event()
+
+    def fake_find(records, **_kwargs):
+        human_started.set()
+        assert face_started.wait(timeout=10), "face stage did not overlap human"
+        return []
+
+    def fake_count(records, **_kwargs):
+        face_started.set()
+        assert human_started.wait(timeout=10), "human stage did not overlap face"
+        return list(records)
+
+    monkeypatch.setattr(engine_mod, "find_no_human_files", fake_find)
+    monkeypatch.setattr(engine_mod, "count_faces_in_files", fake_count)
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        count_faces=True,
+        use_cache=False,
+    )
+
+    assert human_started.is_set()
+    assert face_started.is_set()
+
+
+def test_face_stage_supersedes_in_stage_face_confirmation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With faces counted in the same scan, the human stage skips its own
+    YuNet confirmation pass; without them it keeps it."""
+    _save(tmp_path / "a.jpg", (30, 60, 90))
+    captured = {}
+
+    def fake_find(records, *, progress=None, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("dedupe.engine.find_no_human_files", fake_find)
+    monkeypatch.setattr(
+        "dedupe.engine.count_faces_in_files",
+        lambda records, **_kwargs: list(records),
+    )
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        count_faces=True,
+        use_cache=False,
+    )
+    assert captured["confirm_with_faces"] is False
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_no_humans=True,
+        count_faces=False,
+        use_cache=False,
+    )
+    assert captured["confirm_with_faces"] is True
+
+
 def test_similar_groups_publish_after_slow_exact(tmp_path: Path, monkeypatch) -> None:
     """Even when exact is slow, similar groups are published after exact groups."""
     import time as time_mod

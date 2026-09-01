@@ -491,8 +491,16 @@ def find_no_human_files(
     workers: int | None = None,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
+    confirm_with_faces: bool = True,
 ) -> list[FileRecord]:
-    """Return files where no person was found, reusing trusted prior checks."""
+    """Return files where no person was found, reusing trusted prior checks.
+
+    ``confirm_with_faces=False`` skips the YuNet second-opinion pass on
+    Photon/ensemble no-person candidates. Callers set it when a full face
+    count runs in the same scan anyway (the face veto is enforced at group
+    build time via ``may_enter_no_person_review``), so the same files are
+    not analyzed for faces twice.
+    """
     candidates = [
         record
         for record in records
@@ -586,7 +594,7 @@ def find_no_human_files(
         finally:
             detector.close()
 
-    if normalized_backend in {"photon", "ensemble"}:
+    if confirm_with_faces and normalized_backend in {"photon", "ensemble"}:
         # YuNet + genderage is a cheap second opinion on Photon's no-person
         # pile: any counted face, especially a female face, is kept.
         from .face_detection import protect_no_person_candidates

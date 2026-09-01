@@ -381,6 +381,50 @@ def test_manual_human_confirmation_skips_every_detector_version(
     assert find_no_human_files([record], backend="photon") == []
 
 
+def test_confirm_with_faces_flag_controls_yunet_second_opinion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """confirm_with_faces=False skips the Photon second-opinion face pass.
+
+    Callers set it when a full face count runs in the same scan, so the same
+    files are not analyzed for faces twice.
+    """
+    path = tmp_path / "landscape.jpg"
+    Image.new("RGB", (40, 40), "white").save(path)
+    record = inventory([path])[0]
+    record.human_detection_status = "no_person_detected"
+    record.human_detection_signature = human_detection_signature(
+        "photon", photon_model="test-model"
+    )
+
+    def fail_if_created(*_args, **_kwargs):
+        raise AssertionError("cached decision must not run the detector")
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector", fail_if_created
+    )
+    calls: list[list] = []
+    monkeypatch.setattr(
+        "dedupe.face_detection.protect_no_person_candidates",
+        lambda records: calls.append(list(records)),
+    )
+
+    found = find_no_human_files(
+        [record],
+        backend="photon",
+        photon_model="test-model",
+        confirm_with_faces=False,
+    )
+    assert calls == []
+    assert found == [record]
+
+    found = find_no_human_files(
+        [record], backend="photon", photon_model="test-model"
+    )
+    assert calls == [[record]]
+    assert found == [record]
+
+
 def test_photon_detector_loads_local_model_and_checks_person_then_face(monkeypatch) -> None:
     calls: dict = {"targets": []}
 

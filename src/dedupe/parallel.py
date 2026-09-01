@@ -54,6 +54,20 @@ def resolve_workers(
     return n
 
 
+def split_cpu_budget(total: int, stages: int) -> int:
+    """Per-stage worker budget when several CPU-bound stages run concurrently.
+
+    Image hashing, OpenCV person detection, and face counting are all
+    image-decode + CPU work. When more than one runs at the same time, each
+    gets an equal share of the overall budget (at least 1) so the combined
+    thread count stays within the machine-wide budget instead of every stage
+    claiming its full private cap.
+    """
+    if stages <= 1:
+        return max(1, int(total))
+    return max(1, int(total) // stages)
+
+
 def map_parallel(
     fn: Callable[[T], R],
     items: Sequence[T],
