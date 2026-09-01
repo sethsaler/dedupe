@@ -1224,6 +1224,11 @@ kbd {
 }
 
 .triage-card {
+  /* Square previews only keep the grid stable if every card is actually laid
+     out. content-visibility: auto on .card skips off-screen paint and uses
+     contain-intrinsic-size instead of the real square+body height, so
+     scrolling a Non-Human pile would reflow the grid. */
+  content-visibility: visible;
   contain-intrinsic-size: 360px;
 }
 
