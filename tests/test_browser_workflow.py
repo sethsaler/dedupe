@@ -263,20 +263,23 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         assert page.locator("#members .card").count() == 2
         assert page.locator("#modalBackdrop").is_hidden()
 
-        # Landscape and portrait media get identical preview boxes. Cards below
-        # the fold can look "visible" via contain-intrinsic-size while
-        # content-visibility still skips their inner layout, so scroll each
-        # preview into view and require a real box before comparing sizes.
-        previews = page.locator("#members .triage-card .thumb-wrap")
-        expect(previews).to_have_count(2)
-        boxes = []
-        for index in range(2):
-            preview = previews.nth(index)
-            preview.scroll_into_view_if_needed()
-            expect(preview).to_be_visible()
-            box = preview.bounding_box()
-            assert box is not None
-            boxes.append(box)
+        # Selecting a group re-renders members after the follow-up fetch, and
+        # content-visibility can skip an off-screen preview's box. Wait for two
+        # laid-out squares, then compare sizes — do not scroll a stale node.
+        page.wait_for_function(
+            """() => {
+              const wraps = [...document.querySelectorAll("#members .triage-card .thumb-wrap")];
+              return wraps.length === 2 && wraps.every((el) => {
+                const box = el.getBoundingClientRect();
+                return box.width > 0 && box.height > 0;
+              });
+            }"""
+        )
+        boxes = [
+            page.locator("#members .triage-card .thumb-wrap").nth(index).bounding_box()
+            for index in range(2)
+        ]
+        assert boxes[0] is not None and boxes[1] is not None
         assert boxes[0]["width"] == boxes[1]["width"]
         assert boxes[0]["height"] == boxes[1]["height"]
 
