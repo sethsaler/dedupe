@@ -1781,7 +1781,7 @@
       state.memberFocus = nextIndex;
       state.memberPage = nextIndex;
       renderMembers(current);
-      $("memberPagination").scrollIntoView({ block: "start", behavior: "smooth" });
+      $("memberPagination").scrollIntoView({ block: "start", behavior: "instant" });
       return;
     }
     if (!current || !isPagedIndependentReview(current)) return;
@@ -1797,7 +1797,7 @@
     renderMembers(current);
     // Jump to the top pager so the next page of results is immediately visible.
     const topPager = $("memberPagination");
-    if (topPager) topPager.scrollIntoView({ block: "start", behavior: "smooth" });
+    if (topPager) topPager.scrollIntoView({ block: "start", behavior: "instant" });
   }
 
   document.querySelectorAll(".member-prev").forEach((btn) => {
