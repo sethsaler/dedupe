@@ -524,6 +524,12 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
     assert "aspect-ratio: var(--preview-aspect-ratio);" in stylesheet
     assert "aspect-ratio: 16 / 10;" not in stylesheet
+    assert ".triage-card .thumb-wrap" in stylesheet
+    assert "aspect-ratio: 1 / 1;" in stylesheet
+    # Triage cards must not inherit content-visibility: auto, or off-screen
+    # square previews lose their layout box and the grid reflows on scroll.
+    triage_card_rule = stylesheet.split(".triage-card {", 1)[1].split("}", 1)[0]
+    assert "content-visibility: visible;" in triage_card_rule
 
 
 def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
