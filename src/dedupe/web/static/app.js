@@ -2045,8 +2045,11 @@
     });
   });
   $("btnClearFilters").addEventListener("click", () => {
-    for (const id of LIVE_FILTER_IDS.filter((value) => value !== "resultSearch")) $(id).value = "";
+    for (const id of LIVE_FILTER_IDS) $(id).value = "";
+    $("selectionFilter").value = "all";
     $("filterFaces").value = "any";
+    $("issuesOnly").checked = false;
+    $("hideCompleted").checked = false;
     resetGroupListWindow();
     renderGroupList();
   });

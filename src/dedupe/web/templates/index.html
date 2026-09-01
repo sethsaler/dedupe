@@ -202,25 +202,35 @@
           <button class="tab" data-kind="faces" type="button">Faces <span class="tab-count" id="countFaces">0</span></button>
         </div>
         <div class="result-controls" aria-label="Find and organize results">
-          <label for="resultSearch">Search files</label>
-          <input id="resultSearch" type="search" placeholder="Path or file name" autocomplete="off" />
-          <div class="result-control-row">
-            <label for="resultSort">Sort</label>
-            <select id="resultSort">
-              <option value="reclaimable">Reclaimable bytes</option>
-              <option value="size">Group size</option>
-              <option value="date">Newest date</option>
-              <option value="media">Media type</option>
-            </select>
+          <div class="result-controls-heading">
+            <span>Results</span>
+            <button class="btn text-button" id="btnClearFilters" type="button">Clear filters</button>
           </div>
-          <div class="result-control-row">
-            <label for="selectionFilter">Selection</label>
-            <select id="selectionFilter">
-              <option value="all">Any</option><option value="selected">Selected</option><option value="unselected">Unselected</option>
-            </select>
+          <label class="search-field" for="resultSearch">
+            <span class="sr-only">Search files</span>
+            <input id="resultSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
+          </label>
+          <div class="result-control-grid">
+            <label class="control-field" for="resultSort">
+              <span>Sort</span>
+              <select id="resultSort">
+                <option value="reclaimable">Reclaimable bytes</option>
+                <option value="size">Group size</option>
+                <option value="date">Newest date</option>
+                <option value="media">Media type</option>
+              </select>
+            </label>
+            <label class="control-field" for="selectionFilter">
+              <span>Selection</span>
+              <select id="selectionFilter">
+                <option value="all">Any</option><option value="selected">Selected</option><option value="unselected">Unselected</option>
+              </select>
+            </label>
           </div>
-          <label class="inline-check"><input id="issuesOnly" type="checkbox" /> Needs attention</label>
-          <label class="inline-check"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
+          <div class="display-toggles" aria-label="Result display options">
+            <label class="toggle-option"><input id="issuesOnly" type="checkbox" /> Needs attention</label>
+            <label class="toggle-option"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
+          </div>
           <details class="sidebar-panel" id="advancedFilters">
             <summary>Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></summary>
             <div class="result-control-row">
@@ -251,7 +261,6 @@
               </select>
             </div>
             <span class="thresh-hint">A group matches when any of its files match. Path accepts a substring or a glob. Face filters only apply to files scanned with Count faces.</span>
-            <button class="btn ghost" id="btnClearFilters" type="button">Clear advanced filters</button>
           </details>
           <details class="sidebar-panel" id="bulkPanel">
             <summary>Bulk selection</summary>

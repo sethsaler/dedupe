@@ -83,10 +83,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .advanced-options summary { cursor: pointer; }
 .advanced-options .thresh { margin-top: 8px; }
 
-.result-controls { padding: 12px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; font-size: .78rem; }
+.result-controls { padding: 12px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; font-size: .78rem; }
 .result-controls > input, .result-controls select { width: 100%; min-width: 0; }
 .result-control-row { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; }
 .inline-check { display: flex; align-items: center; gap: 7px; }
+.result-controls-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text); font-size: .82rem; font-weight: 650; }
+.text-button { padding: 0; min-height: auto; border: 0; color: var(--accent); font-size: .75rem; }
+.text-button:hover { background: transparent; color: var(--text); }
+.search-field input { width: 100%; }
+.result-control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.control-field { display: grid; gap: 4px; color: var(--muted); font-size: .72rem; }
+.control-field select { min-height: 32px; }
+.display-toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.toggle-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid var(--border-soft); border-radius: 7px; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
+.toggle-option:hover { border-color: var(--border); color: var(--text); }
+.toggle-option:has(input:checked) { border-color: var(--accent); background: rgba(91, 157, 255, .2); box-shadow: inset 0 0 0 1px rgba(91, 157, 255, .25); color: var(--text); }
+.toggle-option input { margin: 0; accent-color: var(--accent); }
 .non-human-banner {
   margin-bottom: 12px;
   padding: 12px 14px;
@@ -1976,6 +1988,8 @@ kbd {
   .topbar { flex-direction: column; align-items: flex-start; }
   .session-status { flex-direction: column; align-items: flex-start; }
   .range-pair { grid-template-columns: 1fr; }
+  .result-control-grid { grid-template-columns: 1fr; }
+  .display-toggles { display: grid; grid-template-columns: 1fr; }
   .result-control-row { grid-template-columns: 1fr; }
   .bulk-row .btn { flex: 1 1 100%; }
   .actionbar { flex-direction: column; align-items: stretch; }

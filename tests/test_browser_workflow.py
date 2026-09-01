@@ -165,14 +165,18 @@ def test_bulk_selection_and_advanced_filters(
     page.locator(".group-item").first.click()
     page.locator("#members .card").first.wait_for(state="visible")
 
-    # A path glob narrows the sidebar and clearing it restores the full list.
+    # A path glob narrows the sidebar and Clear filters resets every result-display filter.
     page.locator("#advancedFilters summary").click()
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     assert page.locator(".group-item").count() == 0
     page.locator("#filterPathPattern").fill("*keeper*")
     assert page.locator(".group-item").count() == 3
+    page.locator("#resultSearch").fill("keeper")
+    page.locator("#issuesOnly").check()
     page.locator("#btnClearFilters").click()
     assert page.locator(".group-item").count() == 3
+    assert page.locator("#resultSearch").input_value() == ""
+    assert not page.locator("#issuesOnly").is_checked()
 
     page.locator('.tab[data-kind="exact"]').click()
     expect(page.locator(".group-item")).to_have_count(1)
