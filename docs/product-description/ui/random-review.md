@@ -37,7 +37,7 @@ The first arrow-key decision persists: the decision is applied server-side, vali
 
 **Keeps are deliberately forgetful.** Unlike low-resolution candidates, a kept random candidate writes no durable decision — the keep-decisions sync applies only to the low-resolution category. Keeping a file in Random 50 means "not this one, today"; the next scan's sample does not remember.
 
-**Acting.** Deleted candidates accumulate as selections. In a Trash action, random-review selections follow the review-category rule: they are quarantined into `_Dedupe Quarantine` beside the scan root rather than sent to the system Trash, and the [Action sheet](action-sheet.md) preview reports the split.
+**Acting.** Deleted candidates accumulate as selections until the action bar's **Delete All Selected Low-res + Random** button (shared with the [low-resolution review](low-res-review.md)) carries them into a confirmed action. Random-review selections follow the review-category rule: they are quarantined into `_Dedupe Quarantine` beside the scan root rather than sent to the system Trash, and the [Action sheet](action-sheet.md) preview reports the split.
 
 ### Complete
 

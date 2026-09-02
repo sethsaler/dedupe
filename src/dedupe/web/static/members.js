@@ -104,7 +104,7 @@ function updateDetailMeta(g) {
     const selected = new Set(g.selected_for_removal || []);
     const remaining = Math.max(0, g.member_count - reviewed.size);
     $("detailMeta").textContent =
-      `${reviewed.size} reviewed · ${selected.size} marked Delete · ${remaining} remaining · decisions are staged until you confirm a file action`;
+      `${reviewed.size} reviewed · ${selected.size} marked Delete · ${remaining} remaining · staged deletions confirm with the Low-res + Random button below`;
     return;
   }
 

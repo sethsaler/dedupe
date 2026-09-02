@@ -144,11 +144,28 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     expect(page.locator("#detailMeta")).to_contain_text("0 marked Delete")
     assert "2 reviewed" in page.locator("#detailMeta").inner_text()
 
-    # A Low-res decision does not become eligible for either bottom action.
+    # A Low-res decision does not become eligible for the duplicate actions,
+    # but it does enable the Low-res + Random review action.
     page.keyboard.press("ArrowLeft")
     expect(page.locator("#detailMeta")).to_contain_text("1 marked Delete")
     expect(page.locator("#btnTrashExact")).to_be_disabled()
     expect(page.locator("#btnTrashSimilar")).to_be_disabled()
+    expect(page.locator("#btnTrashReview")).to_be_enabled()
+
+    # The review action previews the quarantine split without moving anything.
+    page.locator("#btnTrashReview").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalTitle")).to_have_text(
+        "Delete all selected Low-res + Random review files?"
+    )
+    expect(page.locator("#modalBody")).to_contain_text("_Dedupe Quarantine")
+    expect(page.locator("#modalConfirm")).to_have_text("Move to Quarantine")
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
 
 
 @pytest.mark.e2e
@@ -248,6 +265,9 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
         )
         expect(page.locator("#btnTrashSimilar")).to_have_text(
             "Delete All Selected Similar Matches"
+        )
+        expect(page.locator("#btnTrashReview")).to_have_text(
+            "Delete All Selected Low-res + Random"
         )
         page.locator('.tab[data-kind="similar"]').click()
         page.locator(".group-item").click()

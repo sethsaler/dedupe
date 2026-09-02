@@ -2,11 +2,11 @@
 
 ## Summary
 
-The action sheet is the last gate between selections and consequences: the user asks to delete the selected exact matches or the selected similar matches, the sheet previews exactly what will move and where, counts down while that preview stays trustworthy, and only then executes — revalidating every file one final time as it moves. It is opened from the action bar under the [group list](group-list.md) (the two **Delete All Selected…** buttons, or `a` for the exact-match sheet), and it is the only place destructive actions begin in the UI. The UI's action is always Trash; Quarantine and Isolate exist only on the command line ([`scan`](../cli/scan.md), [`isolate`](../cli/isolate.md)). The safety layers the sheet orchestrates are owned by [Actions and undo](../foundations/actions-and-undo.md).
+The action sheet is the last gate between selections and consequences: the user asks to delete the selected exact matches, the selected similar matches, or the staged low-res/random review deletions; the sheet previews exactly what will move and where, counts down while that preview stays trustworthy, and only then executes — revalidating every file one final time as it moves. It is opened from the action bar under the [group list](group-list.md) (the three **Delete All Selected…** buttons, or `a` for the exact-match sheet), and it is the only place destructive actions begin in the UI. The UI's action is always Trash; Quarantine and Isolate exist only on the command line ([`scan`](../cli/scan.md), [`isolate`](../cli/isolate.md)). The safety layers the sheet orchestrates are owned by [Actions and undo](../foundations/actions-and-undo.md).
 
 ## The simple case
 
-The user has selections in some groups and presses **Delete All Selected Exact Matches** (or `a`). A dry run computes the effective selection — vetoes applied, keepers protected — and the sheet lists what will happen: how many files, the total bytes, and any files that failed verification. If the selection includes low-resolution or random-review files, the first thing the sheet says is that those files move to a `_Dedupe Quarantine` folder beside the scan instead of the system Trash, and how many. A line under the numbers reads "Verified against the current selection · preview valid for 10:00" and counts down. The user confirms with the Confirm button; the files move, the result is reported on a toast, moved files disappear from their groups, and a receipt is written.
+The user has selections in some groups and presses **Delete All Selected Exact Matches** (or `a`). A dry run computes the effective selection — vetoes applied, keepers protected — and the sheet lists what will happen: how many files, the total bytes, and any files that failed verification. The **Delete All Selected Low-res + Random** button covers the staged [low-resolution](low-res-review.md) and [random-review](random-review.md) deletions instead, and its sheet leads with the different destination: those files move to a `_Dedupe Quarantine` folder beside the scan, not the system Trash, and the Confirm button reads **Move to Quarantine**. A line under the numbers reads "Verified against the current selection · preview valid for 10:00" and counts down. The user confirms with the Confirm button; the files move, the result is reported on a toast, moved files disappear from their groups, and a receipt is written.
 
 ## The interaction, event by event
 
@@ -23,7 +23,7 @@ stateDiagram-v2
 
 ### Start
 
-Each of the two action-bar buttons is scoped: one covers exact-match selections, the other similar-match selections, and each is disabled with an explanatory tooltip while its scope has no selections. Pressing one starts a dry run of the Trash action against the current selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
+Each of the three action-bar buttons is scoped: one covers exact-match selections, one similar-match selections, and one the staged low-resolution and random-review selections; each is disabled with an explanatory tooltip while its scope has no selections. Pressing one starts a dry run of the Trash action against the current selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
 
 While the dry run and any execute are in flight, the action bar is disabled and a status note ("Verifying the selection against the files on disk…", then "Moving files to Trash…") says what is happening; there is no silent wait.
 
@@ -49,13 +49,13 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 - Moved files are dropped from their groups in the displayed results; groups below their minimum size dissolve. A keeper that somehow moved (it cannot in a duplicate group, but a similar group's keeper is a recomputation) is re-picked from the survivors.
 - The updated result is persisted to the review session.
-- The Trash split: selections from the *low-resolution and random review* categories do not go to the system Trash — they are quarantined into a `_Dedupe Quarantine` folder beside the scanned source. Everything else goes to the macOS Trash. The two parts write separate receipts.
+- The Trash split: selections from the *low-resolution and random review* categories do not go to the system Trash — they are quarantined into a `_Dedupe Quarantine` folder beside the scanned source, and the Low-res + Random sheet's Confirm button says **Move to Quarantine** to make that plain. Exact and similar selections go to the macOS Trash. (The server still supports a single Trash request spanning both destinations and writes two receipts for it, but the UI's scoped buttons never mix scopes in one sheet.)
 
 ## Modifiers
 
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
-| Button choice (Exact / Similar) | Selects which selections the Trash action covers. | Fixed per sheet; the other scope needs its own preview. |
+| Button choice (Exact / Similar / Low-res + Random) | Selects which selections the Trash action covers; the review scope's sheet leads with the `_Dedupe Quarantine` destination. | Fixed per sheet; another scope needs its own preview. |
 | Selection state | Defines the preview's numbers. | Any change invalidates the token; re-preview on Confirm. |
 
 ## Cancel and interrupt
@@ -89,7 +89,7 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 ## Edge cases
 
-- Confirming a preview of zero eligible files is allowed and reports nothing moved — useful as a sanity check, harmless. (Both buttons are disabled while their scope has no selections at all.)
+- Confirming a preview of zero eligible files is allowed and reports nothing moved — useful as a sanity check, harmless. (Every button is disabled while its scope has no selections at all.)
 - The two-part Trash action (system trash + review quarantine) can partially fail: one part's receipt exists, the other's files stayed. The result reports per-file outcomes.
 - A preview taken during a scan cannot happen — actions refuse while scanning — so the token's scan id is always the live one.
 
@@ -97,6 +97,6 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 - The automatic re-preview on a stale token is read from the client's stale-response handling; the visible sequence (sheet numbers refresh without closing) should be confirmed by hand.
 - The countdown's behavior when the tab is backgrounded (timer throttling) is unexamined; the server-side expiry is authoritative regardless.
-- The review-quarantine split leads the preview whenever it applies (restored after a regression in the "simplify duplicate deletion actions" change dropped the note); confirm the wording by hand on a scan with low-res candidates.
+- The review-quarantine split leads the Low-res + Random preview (restored after the "simplify duplicate deletion actions" change dropped the scope from the action bar entirely — see [bug-triage](../bug-triage.md) B-06); confirm the wording by hand on a scan with low-res candidates.
 
 Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).

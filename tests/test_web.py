@@ -133,6 +133,8 @@ def test_bulk_action_ui_separates_exact_matches_from_similars(tmp_path: Path) ->
     assert "Delete All Selected Exact Matches" in page
     assert 'id="btnTrashSimilar"' in page
     assert "Delete All Selected Similar Matches" in page
+    assert 'id="btnTrashReview"' in page
+    assert "Delete All Selected Low-res + Random" in page
     assert 'id="actionScope"' not in page
 
 

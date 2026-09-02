@@ -10,11 +10,24 @@ import { state } from "./state.js";
 import { refreshStatus } from "./status.js";
 import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
+const SCOPE_KINDS = {
+  exact: ["exact"],
+  similar: ["similar"],
+  review_suggestions: ["low_resolution", "random_review"],
+};
+
+function scopeKinds(scope) {
+  return SCOPE_KINDS[scope] || [scope];
+}
+
 function scopeLabelFor(scope) {
-  return scope === "exact" ? "Exact matches" : "Similar matches";
+  if (scope === "exact") return "Exact matches";
+  if (scope === "similar") return "Similar matches";
+  return "Low-res + Random review files";
 }
 
 function effectiveSelection(scope) {
+  const kinds = scopeKinds(scope);
   const source = state.allGroups.length ? state.allGroups : state.groups;
   const protectedPaths = new Set();
   for (const g of source) {
@@ -26,7 +39,7 @@ function effectiveSelection(scope) {
   }
   const selected = new Map();
   for (const g of source) {
-    if (g.kind !== scope) continue;
+    if (!kinds.includes(g.kind)) continue;
     const sel = new Set(g.selected_for_removal || []);
     const reviewed = new Set(g.reviewed_paths || []);
     for (const m of g.members || []) {
@@ -40,7 +53,7 @@ function effectiveSelection(scope) {
     }
   }
   for (const g of source) {
-    if (g.kind !== scope) continue;
+    if (!kinds.includes(g.kind)) continue;
     if (isIndependentReview(g) || !(g.members || []).length) continue;
     if (g.members.every((m) => selected.has(m.path))) {
       selected.delete(g.suggested_keep || g.members[0].path);
@@ -50,7 +63,11 @@ function effectiveSelection(scope) {
 }
 
 function updateSelectionSummary() {
-  for (const [id, scope] of [["btnTrashExact", "exact"], ["btnTrashSimilar", "similar"]]) {
+  for (const [id, scope] of [
+    ["btnTrashExact", "exact"],
+    ["btnTrashSimilar", "similar"],
+    ["btnTrashReview", "review_suggestions"],
+  ]) {
       const button = $(id);
       const count = effectiveSelection(scope).length;
       button.disabled = state.actionBusy || count === 0;
@@ -334,10 +351,21 @@ async function runDelete(scope, options = {}) {
   const reviewQuarantineNote = reviewQuarantineCount
     ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
     : "";
+  const reviewScope = scope === "review_suggestions";
+  const titleScope = scope === "exact"
+    ? "exact matches"
+    : scope === "similar"
+      ? "similar matches"
+      : "Low-res + Random review files";
+  // Duplicate groups always retain a keeper; independent review candidates
+  // can all be selected, and they quarantine instead of going to system Trash.
+  const destinationNote = reviewScope
+    ? "<p>Every selected file moves to the quarantine folder named above — not the system Trash. The saved receipt can restore them.</p>"
+    : "<p>At least one file is always kept in every duplicate group. Selected files go to system Trash and can be restored there.</p>";
   const ok = await confirmModal({
-    title: `Delete all selected ${scope === "exact" ? "exact" : "similar"} matches?`,
-    body: `<div class="review-sheet">${previewNoticeHtml(notice)}${reviewQuarantineNote}<p><strong>${preview.success_count} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>At least one file is always kept in every duplicate group. Selected files go to system Trash and can be restored there.</p>${heuristicWarning}</div>`,
-    confirmLabel: "Move to Trash",
+    title: `Delete all selected ${titleScope}?`,
+    body: `<div class="review-sheet">${previewNoticeHtml(notice)}${reviewQuarantineNote}<p><strong>${preview.success_count} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}${destinationNote}${heuristicWarning}</div>`,
+    confirmLabel: reviewScope ? "Move to Quarantine" : "Move to Trash",
     danger: true,
     validitySeconds: Number(preview.preview_expires_in) || null,
   });
@@ -406,5 +434,6 @@ async function runDelete(scope, options = {}) {
 
 $("btnTrashExact").addEventListener("click", () => runDelete("exact"));
 $("btnTrashSimilar").addEventListener("click", () => runDelete("similar"));
+$("btnTrashReview").addEventListener("click", () => runDelete("review_suggestions"));
 
 export { updateSelectionSummary, applyRuleToCurrentGroup, runDelete };

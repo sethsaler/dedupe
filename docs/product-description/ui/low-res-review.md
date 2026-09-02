@@ -39,7 +39,7 @@ The first arrow-key decision makes the review consequential: the decision is sen
 
 **Overlapping groups.** The decision is written through *every* group the file belongs to: in other independent branches it becomes reviewed with the same selection state, and a Keep additionally removes the file from any duplicate group's selection — an explicit Keep vetoes automatic deletion everywhere, per the [effective-selection rules](../foundations/duplicate-group.md#what-actually-acts-the-effective-selection). The newest arrow-key decision wins wherever the file appears.
 
-**Acting.** Deleted candidates stay selected until a confirmed action moves them. A low-resolution selection has a different destination than most: in a Trash action, review-category selections (low-res and random) are quarantined into `_Dedupe Quarantine` beside the scan root rather than sent to the system Trash — the [Action sheet](action-sheet.md) says so in its preview.
+**Acting.** Deleted candidates stay selected until a confirmed action moves them. The entry point is the action bar's **Delete All Selected Low-res + Random** button (shared with the [random review](random-review.md)); the detail pane's summary line points at it while deletions are staged. A low-resolution selection has a different destination than most: review-category selections (low-res and random) are quarantined into `_Dedupe Quarantine` beside the scan root rather than sent to the system Trash — the [Action sheet](action-sheet.md) says so in its preview, and its Confirm button reads **Move to Quarantine**.
 
 ### Complete
 
