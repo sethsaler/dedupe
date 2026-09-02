@@ -1044,11 +1044,17 @@ def run_scans_parallel(
             progress(done)
         return result
 
-    n_streams = min(len(resolved_roots), resolve_workers(max_streams))
+    # Every folder is scanned (nothing is dropped); max_streams only throttles
+    # how many run at once. The worker budget is divided across the folders
+    # sharing it — not across the CPU-derived throttle — so per-stream counts
+    # never depend on machine core count.
+    n_streams = len(resolved_roots)
+    max_concurrent = min(n_streams, resolve_workers(max_streams))
+    budget_streams = max_concurrent if max_streams is not None else n_streams
     # Divide the worker budget across streams (rounding up, floor of 2): each
     # stream splits its budget again between concurrent CPU stages, and a
     # double division down to 1 worker serializes image hashing/face counting.
-    per_stream_workers = max(2, -(-resolve_workers(workers) // n_streams))
+    per_stream_workers = max(2, -(-resolve_workers(workers) // budget_streams))
 
     started = time.monotonic()
     lock = threading.RLock()
@@ -1134,7 +1140,7 @@ def run_scans_parallel(
         )
 
     interrupted = False
-    with ThreadPoolExecutor(max_workers=n_streams) as ex:
+    with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
         futures = {
             ex.submit(scan_one, i, root): (i, root)
             for i, root in enumerate(resolved_roots)
