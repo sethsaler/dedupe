@@ -379,42 +379,13 @@
       </main>
     </section>
 
-    <footer class="actionbar" id="actionBar" hidden>
-      <div class="action-info">
-        <span class="selection-dot" aria-hidden="true"></span>
-        <span id="selectionSummary">0 files selected</span>
-        <label class="scope-field">
-          Bulk action
-          <select id="actionScope">
-            <option value="exact" selected>Exact matches</option>
-            <option value="similar">Similar images &amp; videos</option>
-            <option value="all">All selected categories</option>
-            <option value="review_suggestions">Low-res + Random review</option>
-            <option value="low_resolution">Low resolution</option>
-            <option value="random_review">Random review</option>
-            <option value="no_humans">Non-Human</option>
-            <option value="faces">Faces</option>
-          </select>
-        </label>
-      </div>
-      <div class="action-controls">
-        <label class="quarantine-field">
-          Quarantine folder
-          <input id="quarantineDir" type="text" placeholder="~/Duplicates" spellcheck="false" />
-        </label>
-        <div class="btn-group">
-          <button class="btn ghost" id="btnDryTrash" type="button" title="Preview what would go to Trash or review quarantine">Preview trash</button>
-          <button class="btn danger" id="btnTrash" type="button">Trash / review quarantine</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn ghost" id="btnDryQuarantine" type="button">Preview quarantine</button>
-          <button class="btn warn" id="btnQuarantine" type="button">Quarantine</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn ghost" id="btnDryIsolate" type="button" title="Copy groups into _Dedupe Review inside source">Preview isolate</button>
-          <button class="btn secondary" id="btnIsolate" type="button">Isolate copies</button>
-        </div>
-      </div>
+    <footer class="actionbar" id="actionBar" hidden aria-label="Delete selected matches">
+      <button class="btn danger" id="btnTrashExact" type="button">
+        Delete All Selected Exact Matches
+      </button>
+      <button class="btn danger" id="btnTrashSimilar" type="button">
+        Delete All Selected Similar Matches
+      </button>
     </footer>
   </div>
 
@@ -479,7 +450,6 @@
         <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
         <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
-        <div><dt><kbd>a</kbd></dt><dd>Open the action review sheet (preview trash)</dd></div>
         <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card</dd></div>
         <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human or Faces file to Trash (one click, undo from the toast)</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>

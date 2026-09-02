@@ -2,7 +2,6 @@
   const $ = (id) => document.getElementById(id);
 
   const RECENT_KEY = "dedupe.recentPaths";
-  const QUAR_KEY = "dedupe.quarantineDir";
   const WORKERS_KEY = "dedupe.workers";
   const SETTINGS_KEY = "dedupe.scanSettings.v1";
   const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
@@ -410,21 +409,6 @@
       });
     });
   }
-
-  // restore quarantine
-  try {
-    const q = localStorage.getItem(QUAR_KEY);
-    if (q) $("quarantineDir").value = q;
-  } catch {
-    /* ignore */
-  }
-  $("quarantineDir").addEventListener("change", () => {
-    try {
-      localStorage.setItem(QUAR_KEY, $("quarantineDir").value.trim());
-    } catch {
-      /* ignore */
-    }
-  });
 
   // —— Native folder/file pick (the local server can return absolute paths) ——
   function appendPickedPaths(paths) {
@@ -1797,33 +1781,12 @@
     if (current) renderMembers(current);
   });
 
-  function currentScope() {
-    const el = $("actionScope");
-    return el ? el.value : "all";
-  }
-
   function scopeLabelFor(scope) {
-    return (
-      {
-        all: "All selected categories",
-        review_suggestions: "Low-res + Random review",
-        exact: "Exact matches",
-        similar: "Similar images & videos",
-        low_resolution: "Low resolution",
-        random_review: "Random review",
-        no_humans: "Non-Human",
-        faces: "Faces",
-      }[scope] ||
-      "All selected categories"
-    );
+    return scope === "exact" ? "Exact matches" : "Similar matches";
   }
 
-  function effectiveSelection(scope = currentScope()) {
+  function effectiveSelection(scope) {
     const source = state.allGroups.length ? state.allGroups : state.groups;
-    const inScope = (g) =>
-      scope === "all" ||
-      g.kind === scope ||
-      (scope === "review_suggestions" && ["low_resolution", "random_review"].includes(g.kind));
     const protectedPaths = new Set();
     for (const g of source) {
       if (!isIndependentReview(g)) continue;
@@ -1834,7 +1797,7 @@
     }
     const selected = new Map();
     for (const g of source) {
-      if (!inScope(g)) continue;
+      if (g.kind !== scope) continue;
       const sel = new Set(g.selected_for_removal || []);
       const reviewed = new Set(g.reviewed_paths || []);
       for (const m of g.members || []) {
@@ -1848,7 +1811,7 @@
       }
     }
     for (const g of source) {
-      if (!inScope(g)) continue;
+      if (g.kind !== scope) continue;
       if (isIndependentReview(g) || !(g.members || []).length) continue;
       if (g.members.every((m) => selected.has(m.path))) {
         selected.delete(g.suggested_keep || g.members[0].path);
@@ -1858,12 +1821,14 @@
   }
 
   function updateSelectionSummary() {
-    const scope = currentScope();
-    const selected = effectiveSelection(scope);
-    const count = selected.length;
-    const bytes = selected.reduce((total, member) => total + (member.size || 0), 0);
-    const prefix = scope === "all" ? "" : `${scopeLabelFor(scope)} · `;
-    $("selectionSummary").textContent = `${prefix}${count} unique file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
+    for (const [id, scope] of [["btnTrashExact", "exact"], ["btnTrashSimilar", "similar"]]) {
+      const button = $(id);
+      const count = effectiveSelection(scope).length;
+      button.disabled = count === 0;
+      button.title = count
+        ? `${count} selected ${scopeLabelFor(scope).toLowerCase()}`
+        : `No ${scopeLabelFor(scope).toLowerCase()} selected`;
+    }
   }
 
   // —— Scan ——
@@ -1986,7 +1951,6 @@
       document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
       state.kind = tab.dataset.kind;
-      $("actionScope").value = state.kind;
       updateSelectionSummary();
       resetGroupListWindow();
       await loadGroups();
@@ -2236,121 +2200,81 @@
     return notice ? `<p class="preview-notice">${escapeHtml(notice)}</p>` : "";
   }
 
-  async function runAction(action, dryRun, options = {}) {
+  async function runDelete(scope, options = {}) {
     const { attempt = 0, notice = "" } = options;
-    let previewToken = null;
-    let previewValidity = null;
-    const quarantine_dir = $("quarantineDir").value.trim() || null;
-    if (action === "quarantine" && !dryRun && !quarantine_dir) {
-      toast("Set a quarantine folder first");
-      $("quarantineDir").focus();
-      return;
-    }
-
-    // selection check (scoped to the chosen category)
-    const scope = currentScope();
-    const scopeLabel = scope === "all" ? "" : `${scopeLabelFor(scope)} `;
+    const scopeLabel = scopeLabelFor(scope);
     const count = effectiveSelection(scope).length;
-    if (action !== "isolate" && count === 0 && !dryRun) {
-      toast(`No ${scopeLabel}files selected for removal`);
+    if (count === 0) {
+      toast(`No ${scopeLabel.toLowerCase()} selected for removal`);
       return;
     }
 
-    if (!dryRun) {
-      let preview;
-      try {
-        preview = await api("/api/action", {
-          method: "POST",
-          body: JSON.stringify({
-            action,
-            dry_run: true,
-            quarantine_dir,
-            scan_id: state.scanId,
-            kinds: scope,
-            ...(action === "isolate" ? { isolate_mode: "copy", isolate_kinds: scope } : {}),
-          }),
-        });
-        previewToken = preview.preview_token;
-        previewValidity = Number(preview.preview_expires_in) || null;
-      } catch (error) {
-        toast(`Could not verify selection: ${error.message}`, "error");
-        return;
-      }
-
-      if (action !== "isolate" && preview.success_count === 0) {
-        toast(`No verified ${scopeLabel}files are eligible for this action`);
-        await loadGroups();
-        return;
-      }
-
-      const eligibleCount = preview.success_count;
-      const verifiedCount = action === "isolate" ? count : eligibleCount;
-      const counts = preview.selection_counts || {};
-      const selectedMembers = effectiveSelection(scope);
-      const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
-      const facesBreakdown = counts.faces ? ` · ${counts.faces} Faces` : "";
-      const duplicateBreakdown = `${counts.exact || 0} Exact · ${counts.similar || 0} Similar · ${counts.low_resolution || 0} Low-res · ${counts.random_review || 0} Random · ${counts.no_humans || 0} Non-Human${facesBreakdown}`;
-      const skippedWarning = (action !== "isolate" && preview.fail_count)
-        ? `<p><strong>${eligibleCount} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
-        : "";
-      const reviewQuarantineCount = preview.review_quarantine_count || 0;
-      const reviewQuarantineNote = reviewQuarantineCount
-        ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
-        : "";
-      const labels = {
-        trash: `Move selected ${scopeLabel}files to Trash?`,
-        quarantine: `Move selected ${scopeLabel}files to quarantine?`,
-        isolate: `Copy ${scope === "all" ? "all groups" : `${scopeLabelFor(scope)} groups`} into a _Dedupe Review folder inside the scan root?`,
-      };
-      const bodies = {
-        trash: `<div class="review-sheet">${previewNoticeHtml(notice)}${reviewQuarantineNote}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Other selected files go to system Trash and can be restored there.</p>${(counts.similar || counts.no_humans || counts.faces) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching, Non-Human detection, and face counting are heuristic, not guarantees.</p>' : ""}</div>`,
-        quarantine: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${verifiedCount} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>${duplicateBreakdown}</p><p>At least one file is always kept in every duplicate group. Files move to <code>${escapeHtml(quarantine_dir)}</code>; undo is a manual move back.</p>${(counts.similar || counts.no_humans || counts.faces) ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching, Non-Human detection, and face counting are heuristic, not guarantees.</p>' : ""}</div>`,
-        isolate: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>Non-destructive review copy</strong></p><p>${scope === "all" ? "Every source" : `Every ${scopeLabelFor(scope)} source`} will be revalidated and copied into a timestamped _Dedupe Review folder. Originals stay put.</p></div>`,
-      };
-      const ok = await confirmModal({
-        title: labels[action] || "Confirm",
-        body: bodies[action] || "",
-        confirmLabel: action === "trash" ? "Move to Trash" : action === "quarantine" ? "Quarantine" : "Isolate",
-        danger: action === "trash",
-        validitySeconds: previewToken ? previewValidity : null,
+    let preview;
+    try {
+      preview = await api("/api/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "trash",
+          dry_run: true,
+          quarantine_dir: null,
+          scan_id: state.scanId,
+          kinds: scope,
+        }),
       });
-      if (ok === "expired") {
-        // The token lapsed while the sheet was open: re-verify, then re-confirm.
-        if (attempt >= MAX_PREVIEW_REFRESHES) {
-          toast("Preview keeps expiring — try again when you are ready to confirm", "error");
-          return;
-        }
-        toast("Preview expired — re-checking the current selection…");
-        return runAction(action, dryRun, {
-          attempt: attempt + 1,
-          notice: "The previous preview expired. These numbers were just re-verified — confirm them again.",
-        });
-      }
-      if (!ok) return;
+    } catch (error) {
+      toast(`Could not verify selection: ${error.message}`, "error");
+      return;
     }
+
+    if (preview.success_count === 0) {
+      toast(`No verified ${scopeLabel.toLowerCase()} are eligible for deletion`);
+      await loadGroups();
+      return;
+    }
+
+    const selectedMembers = effectiveSelection(scope);
+    const totalBytes = selectedMembers.reduce((sum, member) => sum + (member.size || 0), 0);
+    const skippedWarning = preview.fail_count
+      ? `<p><strong>${preview.success_count} eligible</strong> · ${preview.fail_count} skipped (stale/unavailable)</p>`
+      : "";
+    const heuristicWarning = scope === "similar"
+      ? '<p class="heuristic-warning"><strong>Review carefully:</strong> Similar matching is heuristic, not a guarantee.</p>'
+      : "";
+    const ok = await confirmModal({
+      title: `Delete all selected ${scope === "exact" ? "exact" : "similar"} matches?`,
+      body: `<div class="review-sheet">${previewNoticeHtml(notice)}<p><strong>${preview.success_count} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}<p>At least one file is always kept in every duplicate group. Selected files go to system Trash and can be restored there.</p>${heuristicWarning}</div>`,
+      confirmLabel: "Move to Trash",
+      danger: true,
+      validitySeconds: Number(preview.preview_expires_in) || null,
+    });
+    if (ok === "expired") {
+      if (attempt >= MAX_PREVIEW_REFRESHES) {
+        toast("Preview keeps expiring — try again when you are ready to confirm", "error");
+        return;
+      }
+      toast("Preview expired — re-checking the current selection…");
+      return runDelete(scope, {
+        attempt: attempt + 1,
+        notice: "The previous preview expired. These numbers were just re-verified — confirm them again.",
+      });
+    }
+    if (!ok) return;
 
     try {
-      const payload = {
-        action,
-        dry_run: dryRun,
-        quarantine_dir,
-        scan_id: state.scanId,
-        kinds: scope,
-        preview_token: previewToken,
-      };
-      if (action === "isolate") {
-        payload.isolate_mode = "copy";
-        payload.isolate_kinds = scope;
-      }
       const res = await api("/api/action", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          action: "trash",
+          dry_run: false,
+          quarantine_dir: null,
+          scan_id: state.scanId,
+          kinds: scope,
+          preview_token: preview.preview_token,
+        }),
       });
-      const mode = dryRun ? "Preview" : "Done";
-      let msg = (!dryRun && res.fail_count > 0)
+      let msg = res.fail_count > 0
         ? `Done: ${res.success_count} ok, ${res.fail_count} skipped`
-        : `${mode}: ${res.success_count} ok, ${res.fail_count} failed`;
-      if (res.review_root) msg += ` · ${res.review_root}`;
+        : `Done: ${res.success_count} ok, ${res.fail_count} failed`;
       if (res.log_path) msg += ` · receipt saved`;
       if (res.fail_count) {
         const failed = res.items?.find((item) => item.error);
@@ -2359,30 +2283,15 @@
         }
       }
       toast(msg, res.fail_count ? "" : "ok");
-      if (!dryRun) {
-        await loadGroups();
-        await refreshStatus();
-        if (action === "isolate" && res.review_root) {
-          try {
-            await api(`/api/reveal?path=${encodeURIComponent(res.review_root)}&open=1`);
-          } catch {
-            /* optional */
-          }
-        }
-      } else if (res.items?.length) {
-        const sample = res.items
-          .slice(0, 3)
-          .map((i) => basename(i.path))
-          .join(", ");
-        if (sample) toast(`${msg} — e.g. ${sample}`);
-      }
+      await loadGroups();
+      await refreshStatus();
     } catch (e) {
       const stale = e.data?.preview_stale
         || /preview expired|selection changed|fresh preview/i.test(e.message);
       if (stale && attempt < MAX_PREVIEW_REFRESHES) {
         // Never execute on a stale token: re-run the dry run and re-confirm.
         toast(`${e.message} — re-checking now…`);
-        return runAction(action, dryRun, {
+        return runDelete(scope, {
           attempt: attempt + 1,
           notice: `${e.message.charAt(0).toUpperCase()}${e.message.slice(1)}. These numbers were just re-verified — confirm them again.`,
         });
@@ -2391,13 +2300,8 @@
     }
   }
 
-  $("btnDryTrash").addEventListener("click", () => runAction("trash", true));
-  $("btnTrash").addEventListener("click", () => runAction("trash", false));
-  $("btnDryQuarantine").addEventListener("click", () => runAction("quarantine", true));
-  $("btnQuarantine").addEventListener("click", () => runAction("quarantine", false));
-  $("btnDryIsolate").addEventListener("click", () => runAction("isolate", true));
-  $("btnIsolate").addEventListener("click", () => runAction("isolate", false));
-  $("actionScope").addEventListener("change", updateSelectionSummary);
+  $("btnTrashExact").addEventListener("click", () => runDelete("exact"));
+  $("btnTrashSimilar").addEventListener("click", () => runDelete("similar"));
 
   // —— Lightbox ——
   function openLightbox(index) {
@@ -2580,10 +2484,6 @@
       e.preventDefault();
     } else if (e.key === "s" && state.currentId) {
       $("btnSmartGroup").click();
-      e.preventDefault();
-    } else if (e.key === "a") {
-      if ($("actionBar").hidden) return;
-      $("btnTrash").click();
       e.preventDefault();
     } else if (e.key === "Enter" && state.currentId) {
       const focused = document.querySelector("#members .card.focused .thumb-wrap");

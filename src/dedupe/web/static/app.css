@@ -27,7 +27,7 @@
   --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --shadow-panel: 0 12px 40px rgba(0, 0, 0, 0.35);
-  --actionbar-h: 126px;
+  --actionbar-h: 72px;
 }
 
 * { box-sizing: border-box; }
@@ -309,8 +309,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 }
 
 .field-row > label,
-.opt-label,
-.quarantine-field {
+.opt-label {
   color: var(--muted);
   font-size: 0.78rem;
   font-weight: 550;
@@ -1606,73 +1605,17 @@ kbd {
   backdrop-filter: blur(16px) saturate(1.2);
   -webkit-backdrop-filter: blur(16px) saturate(1.2);
   border-top: 1px solid var(--border);
-  padding: 12px 22px 14px;
+  padding: 14px 22px;
   display: flex;
-  justify-content: flex-start;
-  align-items: flex-end;
-  gap: 10px;
-  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
   z-index: 20;
   animation: slide-up 0.3s var(--ease-out) both;
 }
 
-.action-info {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 0.9rem;
-  font-weight: 550;
-}
-
-.selection-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--danger);
-  box-shadow: 0 0 0 3px var(--danger-soft);
-}
-
-.scope-field {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 4px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border);
-  font-size: 0.8rem;
-  font-weight: 500;
-  opacity: 0.85;
-}
-
-.scope-field select {
-  padding: 5px 8px;
-  font-size: 0.8rem;
-}
-
-.action-controls {
-  width: 100%;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: flex-end;
-  justify-content: flex-end;
-}
-
-.quarantine-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.quarantine-field input {
-  min-width: 220px;
-  padding: 8px 10px;
-  font-size: 0.85rem;
-}
-
-.action-controls .btn-group .btn {
-  min-width: 112px;
+.actionbar .btn {
+  min-width: 280px;
 }
 
 /* —— Toast —— */
@@ -1978,7 +1921,7 @@ kbd {
     background: var(--panel);
     align-items: stretch;
   }
-  .action-controls { flex: 1; justify-content: flex-start; }
+  .actionbar .btn { flex: 1; min-width: 0; }
   .lightbox { grid-template-columns: 1fr; padding: 56px 12px 20px; }
   .lb-nav { display: none; }
 }
@@ -2008,14 +1951,4 @@ kbd {
   .candidate-key-guide { width: 100%; }
   .candidate-key-guide > span { flex: 1; text-align: center; }
   .candidate-actions { grid-template-columns: 1fr; }
-  .action-controls {
-    flex: none;
-    width: 100%;
-    display: grid;
-    grid-template-columns: 1fr;
-  }
-  .quarantine-field { width: 100%; }
-  .quarantine-field input { width: 100%; min-width: 0; }
-  .btn-group { display: flex; width: 100%; }
-  .btn-group .btn { flex: 1; }
 }

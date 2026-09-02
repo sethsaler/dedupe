@@ -129,9 +129,11 @@ def test_status_transports_diagnostics_and_completed_elapsed(tmp_path: Path) -> 
 def test_bulk_action_ui_separates_exact_matches_from_similars(tmp_path: Path) -> None:
     page = create_app(_result(tmp_path)).test_client().get("/").get_data(as_text=True)
 
-    assert '<option value="exact" selected>Exact matches</option>' in page
-    assert '<option value="similar">Similar images &amp; videos</option>' in page
-    assert '<option value="duplicates">Exact + Similar</option>' not in page
+    assert 'id="btnTrashExact"' in page
+    assert "Delete All Selected Exact Matches" in page
+    assert 'id="btnTrashSimilar"' in page
+    assert "Delete All Selected Similar Matches" in page
+    assert 'id="actionScope"' not in page
 
 
 def test_similar_group_payload_reports_image_and_video_fingerprint_agreement(
@@ -529,9 +531,11 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="btnSelectSuggested"' in html
     assert 'id="btnClearGroup"' in html
     assert "Apply to this group" in html
-    assert "Preview trash" in html
-    assert "Preview quarantine" in html
-    assert "Preview isolate" in html
+    assert "Delete All Selected Exact Matches" in html
+    assert "Delete All Selected Similar Matches" in html
+    assert 'id="actionScope"' not in html
+    assert "Preview quarantine" not in html
+    assert "Preview isolate" not in html
     assert 'id="memberPagination"' in html
     assert 'id="memberPaginationBottom"' in html
     assert 'class="btn ghost member-prev"' in html

@@ -99,9 +99,12 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     expect(page.locator(".group-item")).to_have_count(1)
     assert page.locator(".group-item").count() == 1
 
-    # Dry-run traverses the action endpoint but cannot move either fixture to Trash.
-    page.locator("#btnDryTrash").click()
-    page.locator("#toast").filter(has_text="Preview: 1 ok, 0 failed").wait_for()
+    # Opening the exact-match action verifies the selection but cannot move either fixture
+    # unless the user confirms.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
     assert sorted(path.name for path in duplicate_images.iterdir()) == [
         "duplicate.png",
         "keeper.png",
@@ -140,15 +143,11 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     expect(page.locator("#detailMeta")).to_contain_text("0 marked Delete")
     assert "2 reviewed" in page.locator("#detailMeta").inner_text()
 
-    # Review shortcuts are inert while the final confirmation sheet is open.
+    # A Low-res decision does not become eligible for either bottom action.
     page.keyboard.press("ArrowLeft")
     expect(page.locator("#detailMeta")).to_contain_text("1 marked Delete")
-    before_modal = page.locator("#detailMeta").inner_text()
-    page.locator("#btnTrash").click()
-    page.locator("#modalBackdrop").wait_for(state="visible")
-    page.keyboard.press("ArrowLeft")
-    assert page.locator("#detailMeta").inner_text() == before_modal
-    page.locator("#modalCancel").click()
+    expect(page.locator("#btnTrashExact")).to_be_disabled()
+    expect(page.locator("#btnTrashSimilar")).to_be_disabled()
 
 
 @pytest.mark.e2e
@@ -193,7 +192,7 @@ def test_bulk_selection_and_advanced_filters(
     assert page.locator("#members .card.keep").count() == 1
 
     # The review sheet states how long its server-issued preview stays valid.
-    page.locator("#btnTrash").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
     assert "preview valid for" in page.locator("#modalValidity").inner_text()
     page.locator("#modalCancel").click()
@@ -242,20 +241,24 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
         page.goto(url, wait_until="domcontentloaded")
         page.locator("#results").wait_for(state="visible", timeout=10_000)
 
-        scope = page.locator("#actionScope")
-        expect(scope).to_have_value("exact")
-        assert scope.locator("option").all_text_contents()[:2] == [
-            "Exact matches",
-            "Similar images & videos",
-        ]
+        expect(page.locator("#btnTrashExact")).to_have_text(
+            "Delete All Selected Exact Matches"
+        )
+        expect(page.locator("#btnTrashSimilar")).to_have_text(
+            "Delete All Selected Similar Matches"
+        )
         page.locator('.tab[data-kind="similar"]').click()
-        expect(scope).to_have_value("similar")
         page.locator(".group-item").click()
         expect(page.locator("#members .evidence")).to_contain_text([
             "100% Similar",
             "99.8% Similar",
         ])
         expect(page.locator("#members .evidence").last).to_contain_text("not a probability")
+        page.locator("#btnTrashSimilar").click()
+        expect(page.locator("#modalTitle")).to_have_text(
+            "Delete all selected similar matches?"
+        )
+        page.locator("#modalCancel").click()
 
 
 @contextmanager
