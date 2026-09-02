@@ -11,12 +11,15 @@ import pytest
 from PIL import Image
 
 from dedupe.human_detection import (
+    DETECT_MAX_SIDE,
+    HUMAN_VIDEO_EXTRACT_CHUNK,
     PHOTON_DETECT_TARGETS,
     YUNET_PRESENCE_SCORE_THRESHOLD,
     _EnsemblePersonDetector,
     _media_person_evidence,
     _OpenCVPersonDetector,
     _person_sample_timestamps,
+    _pil_frames,
     create_person_detector,
     find_no_human_files,
     human_detection_signature,
@@ -31,6 +34,7 @@ def test_detector_signature_pins_recall_settings() -> None:
     assert "face-confidence=0.35" in signature
     assert "face-flip=1" in signature
     assert "face-tiles=2x2" in signature
+    assert "frame-decode=v2" in signature
 
 
 def test_blank_landscape_is_review_candidate(tmp_path: Path) -> None:
@@ -188,6 +192,26 @@ def test_opencv_face_flip_fallback_keeps_mirrored_faces() -> None:
     assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(0.80)
 
 
+def _ppm_bytes() -> bytes:
+    image = Image.new("RGB", (64, 36), "white")
+    encoded = BytesIO()
+    image.save(encoded, format="PPM")
+    return encoded.getvalue()
+
+
+def _stub_batched_video_frames(monkeypatch, calls: list[list[float]]) -> None:
+    """Fake the chunked extractor; each call yields one PPM per timestamp."""
+
+    def fake_batched(_path, timestamps, **_kwargs):
+        calls.append(list(timestamps))
+        return [_ppm_bytes() for _ in timestamps]
+
+    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.human_detection._extract_seek_frames_ppm", fake_batched
+    )
+
+
 def test_video_person_detection_seeks_and_stops_after_positive(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -198,39 +222,142 @@ def test_video_person_detection_seeks_and_stops_after_positive(
         media_type=MediaType.VIDEO,
         extension=".mp4",
     )
-    calls: list[float] = []
+    chunks: list[list[float]] = []
 
     class FakeDetector:
         backend = "test"
 
+        def __init__(self):
+            self.scored = 0
+
         def score(self, _frame):
-            return 0.8 if len(calls) == 2 else 0.0
+            self.scored += 1
+            return 0.8 if self.scored == 2 else 0.0
 
         def close(self):
             return None
 
-    image = Image.new("RGB", (64, 36), "white")
-    encoded = BytesIO()
-    image.save(encoded, format="PPM")
+    def fail_per_frame(*_args, **_kwargs):
+        raise AssertionError("per-seek fallback must not run after a full chunk")
 
-    def fake_seek(_path, timestamp, **_kwargs):
-        calls.append(timestamp)
-        return encoded.getvalue()
-
-    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    _stub_batched_video_frames(monkeypatch, chunks)
     monkeypatch.setattr("dedupe.human_detection.probe_video", lambda _path: (30.0, 640, 360))
-    monkeypatch.setattr("dedupe.human_detection._extract_seek_frame_ppm", fake_seek)
+    monkeypatch.setattr("dedupe.human_detection._extract_seek_frame_ppm", fail_per_frame)
 
     assert _media_person_evidence(record, FakeDetector()) == (True, 2, 0.8)
-    assert len(calls) == 2
+    # One ffmpeg process decoded the first chunk; the positive frame stopped
+    # all later chunks.
+    assert len(chunks) == 1
+    assert len(chunks[0]) == HUMAN_VIDEO_EXTRACT_CHUNK
     assert (record.duration, record.width, record.height) == (30.0, 640, 360)
 
 
-def test_video_person_samples_prioritize_middle_then_endpoints() -> None:
-    timestamps = _person_sample_timestamps(60.0)
+def test_video_person_detection_uses_chunked_extraction_and_scans_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = FileRecord(
+        path=str(tmp_path / "video.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=60.0,
+    )
+    chunks: list[list[float]] = []
 
-    assert timestamps[:3] == [30.0, 0.0, 56.25]
-    assert sorted(timestamps) == [index * 3.75 for index in range(16)]
+    class NegativeDetector:
+        backend = "test"
+
+        def score(self, _frame):
+            return 0.0
+
+        def close(self):
+            return None
+
+    _stub_batched_video_frames(monkeypatch, chunks)
+    monkeypatch.setattr(
+        "dedupe.human_detection._extract_seek_frame_ppm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("per-seek fallback must not run after a full chunk")
+        ),
+    )
+
+    assert _media_person_evidence(record, NegativeDetector()) == (False, 16, 0.0)
+    # 16 frames in chunks of 4 → 4 ffmpeg processes instead of 16.
+    assert len(chunks) == -(-16 // HUMAN_VIDEO_EXTRACT_CHUNK)
+    assert [len(chunk) for chunk in chunks] == [4, 4, 4, 4]
+
+
+def test_video_person_detection_stops_after_positive_chunk(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = FileRecord(
+        path=str(tmp_path / "video.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=60.0,
+    )
+    chunks: list[list[float]] = []
+
+    class PositiveOnFifthFrame:
+        backend = "test"
+
+        def __init__(self):
+            self.scored = 0
+
+        def score(self, _frame):
+            self.scored += 1
+            return 0.9 if self.scored == 5 else 0.0
+
+        def close(self):
+            return None
+
+    _stub_batched_video_frames(monkeypatch, chunks)
+
+    detector = PositiveOnFifthFrame()
+    assert _media_person_evidence(record, detector) == (True, 5, 0.9)
+    # The first frame of chunk 2 was positive; chunks 3 and 4 never decoded.
+    assert len(chunks) == 2
+
+
+def test_video_person_detection_falls_back_to_per_seek_when_chunk_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = FileRecord(
+        path=str(tmp_path / "video.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=60.0,
+    )
+    seek_calls: list[float] = []
+
+    class NegativeDetector:
+        backend = "test"
+
+        def score(self, _frame):
+            return 0.0
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.human_detection._extract_seek_frames_ppm",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def fake_seek(_path, timestamp, **_kwargs):
+        seek_calls.append(timestamp)
+        return _ppm_bytes()
+
+    monkeypatch.setattr("dedupe.human_detection._extract_seek_frame_ppm", fake_seek)
+
+    assert _media_person_evidence(record, NegativeDetector()) == (False, 16, 0.0)
+    assert len(seek_calls) == 16
 
 
 def test_video_person_detection_fails_closed_on_incomplete_seek(
@@ -256,10 +383,21 @@ def test_video_person_detection_fails_closed_on_incomplete_seek(
 
     monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
     monkeypatch.setattr(
+        "dedupe.human_detection._extract_seek_frames_ppm",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
         "dedupe.human_detection._extract_seek_frame_ppm", lambda *_args, **_kwargs: None
     )
 
     assert _media_person_evidence(record, FakeDetector()) == (None, 0, 0.0)
+
+
+def test_video_person_samples_prioritize_middle_then_endpoints() -> None:
+    timestamps = _person_sample_timestamps(60.0)
+
+    assert timestamps[:3] == [30.0, 0.0, 56.25]
+    assert sorted(timestamps) == [index * 3.75 for index in range(16)]
 
 
 def test_cached_person_decisions_skip_detector_and_keep_only_non_human(
@@ -507,3 +645,38 @@ def test_ensemble_short_circuits_photon_after_opencv_positive() -> None:
     assert detector.score(np.zeros((8, 8, 3), dtype=np.uint8)) == 0.75
     assert opencv.calls == 1
     assert photon.calls == 0
+
+
+def test_pil_frames_uses_draft_mode_for_jpeg(tmp_path: Path, monkeypatch) -> None:
+    from PIL import JpegImagePlugin
+
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (1200, 900), "white").save(path)
+    draft_calls: list[tuple[str, tuple[int, int]]] = []
+    original_draft = JpegImagePlugin.JpegImageFile.draft
+
+    def spy_draft(self, mode, size):
+        draft_calls.append((mode, size))
+        return original_draft(self, mode, size)
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", spy_draft)
+
+    frames = list(_pil_frames(path))
+
+    assert draft_calls == [("RGB", (DETECT_MAX_SIDE, DETECT_MAX_SIDE))]
+    assert len(frames) == 1
+    # 1200×900 fit into DETECT_MAX_SIDE by the existing thumbnail step.
+    assert frames[0].shape == (720, 960, 3)
+
+
+def test_pil_frames_applies_exif_orientation_after_draft(tmp_path: Path) -> None:
+    path = tmp_path / "rotated.jpg"
+    image = Image.new("RGB", (200, 100), "white")
+    exif = image.getexif()
+    exif[0x0112] = 6  # Orientation: stored rotated, swap width/height on view
+    image.save(path, exif=exif)
+
+    frames = list(_pil_frames(path))
+
+    assert len(frames) == 1
+    assert frames[0].shape == (200, 100, 3)

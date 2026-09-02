@@ -7,6 +7,7 @@ model so files can be filtered by male/female face counts.
 from __future__ import annotations
 
 import hashlib
+import math
 import tempfile
 import threading
 from collections.abc import Callable
@@ -28,6 +29,7 @@ from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
+    _extract_seek_frames_ppm,
     _sample_timestamps,
     ffmpeg_available,
     probe_video,
@@ -35,11 +37,16 @@ from .similar_video import (
 
 ProgressCb = Callable[[str, int, int], None]
 
-FACE_COUNT_CACHE_VERSION = "face-count-v2"
+# v3: sampled frames come from one batched multi-seek ffmpeg pass, whose
+# decode-order output can differ subtly from per-frame exact seeks.
+FACE_COUNT_CACHE_VERSION = "face-count-v3"
 # Face counting has no early exit (the count is the busiest sampled frame), so
 # videos get a bounded sample of frames rather than a full decode.
 FACE_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
 FACE_VIDEO_MAX_FRAMES = 16
+FACE_VIDEO_MIN_FRAMES = 4
+# One sampled frame per ~5s of video, clamped to the 4–16 range above.
+FACE_VIDEO_SECONDS_PER_FRAME = 5
 # Sample video frames wide enough for YuNet's full-size detection pass.
 FACE_VIDEO_FRAME_WIDTH = DETECT_MAX_SIDE
 
@@ -130,8 +137,16 @@ class _YuNetFaceCounter:
         """
         best_faces = None
         best_candidate = bgr_frame
+        height, width = bgr_frame.shape[:2]
+        # The 480px pass exists for close-up faces. When the short side is
+        # already ≤480, that pass only upscales and re-detects the same
+        # faces, so skip it. (Deferred: also skipping it when the first pass
+        # found faces would need a benchmark corpus we do not have here.)
+        skip_second_pass = min(width, height) <= YUNET_SECOND_PASS_MAX_SIDE
         checked_sizes: set[tuple[int, int]] = set()
         for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
+            if max_side == YUNET_SECOND_PASS_MAX_SIDE and skip_second_pass:
+                continue
             height, width = bgr_frame.shape[:2]
             longest = max(width, height)
             if longest > max_side:
@@ -201,6 +216,19 @@ class _YuNetFaceCounter:
         return (len(faces), males, females)
 
 
+def _face_video_max_frames(duration: float | None) -> int:
+    """Scale the video sample budget with duration, clamped to 4–16 frames."""
+    if duration is None or duration <= 0:
+        return FACE_VIDEO_MAX_FRAMES
+    return min(
+        FACE_VIDEO_MAX_FRAMES,
+        max(
+            FACE_VIDEO_MIN_FRAMES,
+            math.ceil(duration / FACE_VIDEO_SECONDS_PER_FRAME),
+        ),
+    )
+
+
 def _video_face_frames(
     record: FileRecord, counter: _YuNetFaceCounter
 ) -> list[tuple[int, int, int]]:
@@ -229,12 +257,22 @@ def _video_face_frames(
             frames.append(counter.analyze_frame(np.asarray(image.convert("RGB"))))
 
     if duration is not None and duration > 0:
-        for timestamp in _sample_timestamps(duration, FACE_VIDEO_MAX_FRAMES):
-            ppm = _extract_seek_frame_ppm(
-                record.path, timestamp, frame_width=FACE_VIDEO_FRAME_WIDTH
-            )
-            if ppm is None:
-                raise RuntimeError(f"frame decode failed at {timestamp:.2f}s")
+        timestamps = _sample_timestamps(duration, _face_video_max_frames(duration))
+        # One ffmpeg process for all sampled frames instead of one per frame.
+        ppms = _extract_seek_frames_ppm(
+            record.path, timestamps, frame_width=FACE_VIDEO_FRAME_WIDTH
+        )
+        if len(ppms) != len(timestamps):
+            # Per-frame fallback for inputs the batched pass cannot satisfy.
+            ppms = []
+            for timestamp in timestamps:
+                ppm = _extract_seek_frame_ppm(
+                    record.path, timestamp, frame_width=FACE_VIDEO_FRAME_WIDTH
+                )
+                if ppm is None:
+                    raise RuntimeError(f"frame decode failed at {timestamp:.2f}s")
+                ppms.append(ppm)
+        for ppm in ppms:
             analyze_ppm(ppm)
         return frames
 

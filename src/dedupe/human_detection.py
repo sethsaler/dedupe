@@ -21,6 +21,7 @@ from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
+    _extract_seek_frames_ppm,
     _sample_timestamps,
     ffmpeg_available,
     probe_video,
@@ -53,6 +54,11 @@ YUNET_MODEL_PATH = (
 YUNET_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
 HUMAN_VIDEO_MAX_FRAMES = 16
 HUMAN_VIDEO_FRAME_WIDTH = 640
+# Frames are extracted in chunks of this many timestamps per ffmpeg process:
+# one process per frame costs up to 16 startups, but a single 16-frame pass
+# would decode frames past a positive hit — this stage early-exits on the
+# first person found, so chunks bound the wasted decode work.
+HUMAN_VIDEO_EXTRACT_CHUNK = 4
 
 
 class PersonDetector(Protocol):
@@ -326,6 +332,11 @@ def human_detection_signature(
     """Identify detector inputs that must match before a result can be reused."""
     normalized = backend.strip().lower()
     parts = [HUMAN_DETECTION_CACHE_VERSION, normalized]
+    # Frame extraction changed (chunked ffmpeg seeks, draft-mode JPEG decode)
+    # and can shift results marginally; pin it so prior cached decisions are
+    # re-analyzed. Appended here so the version-prefix check in human_policy
+    # still recognizes these decisions.
+    parts.append("frame-decode=v2")
     if normalized in {"opencv", "ensemble"}:
         parts.append(f"confidence={max(0.0, float(confidence)):g}")
         parts.append(f"yunet={YUNET_MODEL_SHA256[:12]}")
@@ -335,11 +346,6 @@ def human_detection_signature(
     if normalized in {"photon", "ensemble"}:
         parts.append(f"model={photon_model.strip() or DEFAULT_PHOTON_MODEL}")
     return "|".join(parts)
-
-
-def _create_detector(confidence: float) -> PersonDetector:
-    """Backward-compatible factory for the original OpenCV-only path."""
-    return create_person_detector("opencv", confidence=confidence)
 
 
 def _pil_frames(path: Path):
@@ -355,6 +361,11 @@ def _pil_frames(path: Path):
         pass
 
     with Image.open(path) as image:
+        # JPEG decodes straight at a reduced DCT scale with draft() — much
+        # faster on high-resolution photos, and detection resizes to
+        # ≤DETECT_MAX_SIDE anyway. Other formats ignore the hint. EXIF
+        # orientation is still applied afterwards, below.
+        image.draft("RGB", (DETECT_MAX_SIDE, DETECT_MAX_SIDE))
         frame_count = int(getattr(image, "n_frames", 1))
         indexes = sorted({0, frame_count // 2, max(0, frame_count - 1)})
         for index in indexes:
@@ -406,25 +417,44 @@ def _media_person_evidence(
                 record.height = height or record.height
 
             if duration is not None and duration > 0:
-                # Seek and score incrementally. A positive frame stops all later
-                # decodes; a no-person decision still requires every requested
-                # frame to decode successfully.
-                for timestamp in _person_sample_timestamps(duration):
-                    ppm = _extract_seek_frame_ppm(
+                # Seek and score incrementally. A positive frame stops all
+                # later decodes; a no-person decision still requires every
+                # requested frame to decode successfully. Frames decode in
+                # chunks of HUMAN_VIDEO_EXTRACT_CHUNK per ffmpeg process, so
+                # a positive chunk still skips the remaining processes.
+                # Note: unlike face counting, the frame budget stays flat at
+                # HUMAN_VIDEO_MAX_FRAMES regardless of duration — presence is
+                # recall-first and early-exits on positives, so sparse
+                # short-clip sampling would only add miss risk.
+                timestamps = _person_sample_timestamps(duration)
+                for start in range(0, len(timestamps), HUMAN_VIDEO_EXTRACT_CHUNK):
+                    chunk = timestamps[start : start + HUMAN_VIDEO_EXTRACT_CHUNK]
+                    ppms = _extract_seek_frames_ppm(
                         record.path,
-                        timestamp,
+                        chunk,
                         frame_width=HUMAN_VIDEO_FRAME_WIDTH,
                     )
-                    if ppm is None:
-                        return None, frames_analyzed, max_confidence
-                    with Image.open(BytesIO(ppm)) as image:
-                        frames_analyzed += 1
-                        max_confidence = max(
-                            max_confidence,
-                            detector.score(np.asarray(image.convert("RGB"))),
-                        )
-                    if max_confidence > 0:
-                        return True, frames_analyzed, max_confidence
+                    if len(ppms) != len(chunk):
+                        # Per-seek fallback when the batched pass fails.
+                        ppms = []
+                        for timestamp in chunk:
+                            ppm = _extract_seek_frame_ppm(
+                                record.path,
+                                timestamp,
+                                frame_width=HUMAN_VIDEO_FRAME_WIDTH,
+                            )
+                            if ppm is None:
+                                return None, frames_analyzed, max_confidence
+                            ppms.append(ppm)
+                    for ppm in ppms:
+                        with Image.open(BytesIO(ppm)) as image:
+                            frames_analyzed += 1
+                            max_confidence = max(
+                                max_confidence,
+                                detector.score(np.asarray(image.convert("RGB"))),
+                            )
+                        if max_confidence > 0:
+                            return True, frames_analyzed, max_confidence
                 return False, frames_analyzed, max_confidence
 
             # Rare fallback for containers without a probeable duration.

@@ -25,6 +25,9 @@ from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
 ProgressCb = Callable[[str, int, int, str | None], None]
 
 DEFAULT_THRESHOLD = 8  # Hamming on combined 64-bit fingerprint
+
+# Error-kind prefix; engine diagnostics classify on it.
+ERROR_VIDEO_FINGERPRINT_FAILED = "video fingerprint failed"
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
 FRAME_WIDTH = 320
 HASH_FRAME_SIZE = 32
@@ -112,11 +115,6 @@ def probe_video(path: str | Path) -> tuple[float | None, int | None, int | None]
 def probe_duration(path: str | Path) -> float | None:
     dur, _, _ = probe_video(path)
     return dur
-
-
-def probe_dimensions(path: str | Path) -> tuple[int | None, int | None]:
-    _, w, h = probe_video(path)
-    return w, h
 
 
 def _extract_frames(
@@ -338,6 +336,76 @@ def _extract_seek_frame_ppm_once(
     return result.stdout
 
 
+def _extract_seek_frames_ppm(
+    path: str | Path, timestamps: list[float], *, frame_width: int
+) -> list[bytes]:
+    """Fast-seek every timestamp in a single ffmpeg process; PPM per frame.
+
+    Same multi-input ``-ss`` pattern as :func:`_extract_hash_frames`: the file
+    is opened once per timestamp so each output keeps the exact input-side
+    seek of :func:`_extract_seek_frame_ppm`, with one process spawn instead of
+    one per frame. Tries hardware decode when available, falling back to
+    software decode. Returns ``[]`` when the pass is incomplete so the caller
+    can fall back to per-frame seeks.
+    """
+    if not timestamps:
+        return []
+    hwaccel = _hwaccel_args()
+    frames = _extract_seek_frames_ppm_once(
+        path, timestamps, hwaccel, frame_width=frame_width
+    )
+    if not frames and hwaccel:
+        frames = _extract_seek_frames_ppm_once(
+            path, timestamps, (), frame_width=frame_width
+        )
+    return frames
+
+
+def _extract_seek_frames_ppm_once(
+    path: str | Path,
+    timestamps: list[float],
+    hwaccel: tuple[str, ...],
+    *,
+    frame_width: int,
+) -> list[bytes]:
+    scale = f"scale={max(1, int(frame_width))}:-2"
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    for timestamp in timestamps:
+        cmd += [*hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
+    with tempfile.TemporaryDirectory(prefix="dedupe-vidppm-") as tmp:
+        targets = [Path(tmp) / f"frame_{index:03d}.ppm" for index in range(len(timestamps))]
+        for index, target in enumerate(targets):
+            cmd += [
+                "-map",
+                f"{index}:v",
+                "-an",
+                "-sn",
+                "-vf",
+                scale,
+                "-frames:v",
+                "1",
+                "-c:v",
+                "ppm",
+                "-f",
+                "image2",
+                "-y",
+                str(target),
+            ]
+        result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        if result.returncode != 0:
+            return []
+        frames: list[bytes] = []
+        for target in targets:
+            try:
+                ppm = target.read_bytes()
+            except OSError:
+                return []
+            if not ppm.startswith(b"P6"):
+                return []
+            frames.append(ppm)
+        return frames
+
+
 def compute_video_fingerprint(
     path: str | Path,
     *,
@@ -400,6 +468,24 @@ def compute_video_fingerprint(
         return "v3:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
 
 
+def aligned_position_indexes(
+    left_len: int, right_len: int
+) -> tuple[list[int], list[int]]:
+    """Aligned sample positions for two fingerprint sequences of any length.
+
+    Shared by video grouping, action revalidation, and the UI's similarity
+    percentages so every comparison aligns frames the same way.
+    """
+    count = min(left_len, right_len)
+    if count == 0:
+        return [], []
+    if count == 1:
+        return [0], [0]
+    left_indexes = [round(i * (left_len - 1) / (count - 1)) for i in range(count)]
+    right_indexes = [round(i * (right_len - 1) / (count - 1)) for i in range(count)]
+    return left_indexes, right_indexes
+
+
 def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
     """Compare ordered frame hashes at normalized positions."""
     import imagehash
@@ -414,12 +500,7 @@ def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
     right = parse(b)
     if not left or not right:
         return None
-    count = min(len(left), len(right))
-    if count == 1:
-        left_indexes = right_indexes = [0]
-    else:
-        left_indexes = [round(i * (len(left) - 1) / (count - 1)) for i in range(count)]
-        right_indexes = [round(i * (len(right) - 1) / (count - 1)) for i in range(count)]
+    left_indexes, right_indexes = aligned_position_indexes(len(left), len(right))
     return [
         int(
             imagehash.hex_to_hash(left[left_index])
@@ -444,7 +525,7 @@ def _video_fingerprint_job(
         fp, w, h, dur = compute_video_fingerprint(path, on_frame=on_frame)
         return path, fp, w, h, dur, None
     except Exception as exc:
-        return path, None, None, None, None, f"video fingerprint failed: {exc}"
+        return path, None, None, None, None, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: {exc}"
 
 
 def find_similar_video_groups(
@@ -577,18 +658,9 @@ def find_similar_video_groups(
                 or (left[-1] ^ right[-1]).bit_count() > max_frame_distance
             ):
                 continue
-            count = min(len(left), len(right))
-            if count == 1:
-                left_indexes = right_indexes = [0]
-            else:
-                left_indexes = [
-                    round(k * (len(left) - 1) / (count - 1))
-                    for k in range(count)
-                ]
-                right_indexes = [
-                    round(k * (len(right) - 1) / (count - 1))
-                    for k in range(count)
-                ]
+            left_indexes, right_indexes = aligned_position_indexes(
+                len(left), len(right)
+            )
             distances = [
                 (left[li] ^ right[ri]).bit_count()
                 for li, ri in zip(left_indexes, right_indexes, strict=True)

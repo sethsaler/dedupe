@@ -4,6 +4,15 @@ Ideas for making the Count Faces pipeline (YuNet detection + InsightFace
 genderage) faster. Ordered roughly by expected impact. Each entry notes effort
 and risk so we can pick what's worth doing.
 
+> **Status 2026-09:** items 1–3 landed (single-pass video frame extraction —
+> extended to person detection with chunked 4-frame passes — plus PIL draft
+> decode and the duration-scaled 4–16 frame budget). Item 4 landed in its safe
+> half only (the second YuNet pass is skipped when the image is already at or
+> below its 480 px scale); the "skip when pass 1 found faces" variant still
+> needs a real-corpus benchmark. Item 5 remains unbenchmarked. Items 6–8 stay
+> parked. The cache signatures moved to `face-count-v3` and
+> `human-presence-…|frame-decode=v2`, so stale counts/decisions invalidate.
+
 ## Current cost profile (facts, not guesses)
 
 - Detection runs **two YuNet passes per frame**: full-size capped at

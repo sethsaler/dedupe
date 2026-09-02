@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from PIL import Image
 
 from dedupe.face_detection import (
     FACE_COUNT_CACHE_VERSION,
+    _face_video_max_frames,
+    _YuNetFaceCounter,
     analyze_face_count,
     count_faces_in_files,
     face_detection_signature,
@@ -170,8 +174,8 @@ def _stub_video_frames(monkeypatch, timestamps: list[float]) -> None:
         lambda duration, max_frames: list(timestamps),
     )
     monkeypatch.setattr(
-        "dedupe.face_detection._extract_seek_frame_ppm",
-        lambda path, timestamp, frame_width: _ppm_bytes(),
+        "dedupe.face_detection._extract_seek_frames_ppm",
+        lambda path, ts, frame_width: [_ppm_bytes() for _ in ts],
     )
 
 
@@ -203,6 +207,11 @@ def test_video_frame_decode_failure_clears_count(tmp_path: Path, monkeypatch) ->
         "dedupe.face_detection._sample_timestamps",
         lambda duration, max_frames: [0.0, 2.0],
     )
+    # The batched pass fails, then the per-frame fallback hits a bad frame.
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frames_ppm",
+        lambda path, ts, frame_width: [],
+    )
     decoded = iter([_ppm_bytes(), None])
     monkeypatch.setattr(
         "dedupe.face_detection._extract_seek_frame_ppm",
@@ -216,6 +225,130 @@ def test_video_frame_decode_failure_clears_count(tmp_path: Path, monkeypatch) ->
     assert record.face_count is None
     assert record.face_detection_signature is None
     assert "face counting failed" in (record.error or "")
+
+
+def test_video_face_count_extracts_all_frames_in_one_ffmpeg_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 30.0
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: True)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        targets = [cmd[index + 1] for index, arg in enumerate(cmd) if arg == "-y"]
+        for target in targets:
+            Path(target).write_bytes(_ppm_bytes())
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", fake_run)
+
+    def fail_per_frame(*_args, **_kwargs):
+        raise AssertionError("per-frame extraction must not run after a full batch")
+
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frame_ppm", fail_per_frame
+    )
+    counter = _StubCounter([(1, 0, 1)] * 16)
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 1
+    assert len(calls) == 1
+    # 30s at ~1 frame per 5s → 6 sampled frames, all in one ffmpeg process.
+    seeks = [
+        float(calls[0][index + 1])
+        for index, arg in enumerate(calls[0])
+        if arg == "-ss"
+    ]
+    assert len(seeks) == 6
+    assert counter.calls == 6
+
+
+def test_video_face_count_falls_back_to_per_frame_seeks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 10.0
+    monkeypatch.setattr("dedupe.face_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        "dedupe.face_detection._sample_timestamps",
+        lambda duration, max_frames: [0.0, 5.0],
+    )
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frames_ppm",
+        lambda path, ts, frame_width: [],
+    )
+    per_frame_calls: list[float] = []
+
+    def fake_seek(_path, timestamp, frame_width):
+        per_frame_calls.append(timestamp)
+        return _ppm_bytes()
+
+    monkeypatch.setattr(
+        "dedupe.face_detection._extract_seek_frame_ppm", fake_seek
+    )
+    counter = _StubCounter([(0, 0, 0), (2, 1, 1)])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 2
+    assert per_frame_calls == [0.0, 5.0]
+
+
+def test_face_video_frame_budget_scales_with_duration() -> None:
+    assert _face_video_max_frames(3.0) == 4
+    assert _face_video_max_frames(60.0) == 12
+    assert _face_video_max_frames(600.0) == 16  # capped
+    assert _face_video_max_frames(None) == 16
+    assert _face_video_max_frames(0) == 16
+
+
+class _FakeFaceDetector:
+    def __init__(self) -> None:
+        self.detect_calls: list[tuple[int, int]] = []
+
+    def setInputSize(self, _size) -> None:
+        return None
+
+    def detect(self, frame):
+        height, width = frame.shape[:2]
+        self.detect_calls.append((width, height))
+        return 1, None
+
+
+class _FakeCV2:
+    INTER_AREA = 1
+
+    @staticmethod
+    def resize(frame, size, interpolation=None):
+        return np.zeros((size[1], size[0], 3), dtype=np.uint8)
+
+
+def _fake_counter() -> tuple[_YuNetFaceCounter, _FakeFaceDetector]:
+    counter = _YuNetFaceCounter.__new__(_YuNetFaceCounter)
+    counter.cv2 = _FakeCV2()
+    counter.face = _FakeFaceDetector()
+    return counter, counter.face
+
+
+def test_detect_best_skips_second_pass_when_short_side_is_small() -> None:
+    counter, face = _fake_counter()
+
+    faces, _candidate = counter._detect_best(np.zeros((240, 320, 3), dtype=np.uint8))
+
+    assert faces is None
+    # Short side 240 ≤ 480: the 480px pass would only upscale the same faces.
+    assert face.detect_calls == [(320, 240)]
+
+
+def test_detect_best_still_runs_second_pass_on_large_images() -> None:
+    counter, face = _fake_counter()
+
+    counter._detect_best(np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+    assert face.detect_calls == [(960, 540), (480, 270)]
 
 
 def test_video_face_count_requires_ffmpeg(tmp_path: Path, monkeypatch) -> None:
