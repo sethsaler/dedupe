@@ -91,11 +91,12 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.locator("#lightbox").wait_for(state="hidden")
 
     # Search and category filtering both update the browser-rendered group list.
+    # (Search input is debounced; to_have_count auto-retries until it applies.)
     page.locator("#resultSearch").fill("does-not-exist")
-    assert page.locator(".group-item").count() == 0
+    expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#resultSearch").fill("duplicate.png")
-    assert page.locator(".group-item").count() == 3
-    page.get_by_role("button", name="Exact 1").click()
+    expect(page.locator(".group-item")).to_have_count(3)
+    page.get_by_role("tab", name="Exact 1").click()
     expect(page.locator(".group-item")).to_have_count(1)
     assert page.locator(".group-item").count() == 1
 
@@ -165,15 +166,16 @@ def test_bulk_selection_and_advanced_filters(
     page.locator("#members .card").first.wait_for(state="visible")
 
     # A path glob narrows the sidebar and Clear filters resets every result-display filter.
+    # (Text filters are debounced; to_have_count auto-retries until they apply.)
     page.locator("#advancedFilters summary").click()
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
-    assert page.locator(".group-item").count() == 0
+    expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#filterPathPattern").fill("*keeper*")
-    assert page.locator(".group-item").count() == 3
+    expect(page.locator(".group-item")).to_have_count(3)
     page.locator("#resultSearch").fill("keeper")
     page.locator("#issuesOnly").check()
     page.locator("#btnClearFilters").click()
-    assert page.locator(".group-item").count() == 3
+    expect(page.locator(".group-item")).to_have_count(3)
     assert page.locator("#resultSearch").input_value() == ""
     assert not page.locator("#issuesOnly").is_checked()
 
@@ -362,3 +364,62 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         page.locator("#toast").filter(has_text="Moved").wait_for()
         expect(page.locator("#members .card")).to_have_count(2)
         expect(page.locator("#members .card.deleted")).to_have_count(1)
+
+
+@pytest.mark.e2e
+def test_a_shortcut_opens_action_sheet_and_enter_respects_focus(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+
+    # `a` opens the same Trash preview sheet as the primary action-bar button.
+    page.keyboard.press("a")
+    page.locator("#modalBackdrop").wait_for(state="visible")
+
+    # The sheet opens with focus on Cancel (the safe default), so a stray Enter
+    # cancels instead of confirming — nothing moves.
+    assert page.evaluate("document.activeElement.id") == "modalCancel"
+    page.keyboard.press("Enter")
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    page.wait_for_timeout(500)
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+
+    # Enter confirms only when the Confirm button itself has focus.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    page.locator("#modalConfirm").focus()
+    assert page.evaluate("document.activeElement.id") == "modalConfirm"
+    page.keyboard.press("Enter")
+    # "1 ok" is the execute result, not the earlier "Done — …" scan-complete toast.
+    page.locator("#toast").filter(has_text="1 ok").wait_for(state="visible")
+    assert len(list(duplicate_images.iterdir())) == 1
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_keyboard_help_lists_a_shortcut(page, live_dedupe_server: str) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.keyboard.press("?")
+    page.locator("#helpBackdrop").wait_for(state="visible")
+    expect(
+        page.locator("#helpBackdrop .shortcuts dt").get_by_text("a", exact=True)
+    ).to_be_visible()
+    expect(page.locator("#helpBackdrop .shortcuts")).to_contain_text("Preview Trash")
+    page.keyboard.press("Escape")
+    page.locator("#helpBackdrop").wait_for(state="hidden")
+    assert page_errors == []

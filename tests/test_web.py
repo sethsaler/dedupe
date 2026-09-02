@@ -567,7 +567,11 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="lbOpacity"' in html
     assert 'id="lbFlicker"' in html
 
-    script = app.test_client().get("/static/app.js").get_data(as_text=True)
+    # The frontend is split into ES modules; assert across all of them.
+    static_dir = Path(web_app.__file__).parent / "static"
+    script = "\n".join(
+        path.read_text() for path in sorted(static_dir.glob("*.js"))
+    )
     assert 'class="hover-video"' in script
     assert 'class="thumb-image ${m.media_type === "gif" ? "hover-gif"' in script
     assert 'data-preview-width="${mediaWidth}"' in script

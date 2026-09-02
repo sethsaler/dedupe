@@ -35,6 +35,19 @@
 /* Author display rules must not override the semantic hidden state. */
 [hidden] { display: none !important; }
 
+/* Visually hidden but available to assistive technology. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -203,7 +216,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .lb-image-stack { position: relative; display: grid; place-items: center; min-width: 0; max-height: calc(100vh - 170px); }
 .lb-image-stack img { grid-area: 1 / 1; }
 .lb-keeper-image { z-index: 2; }
-.lb-compare-tools { display: flex; align-items: center; flex-wrap: wrap; justify-content: center; gap: 10px; color: var(--muted); font-size: .8rem; }
+.lb-compare-tools { display: flex; align-items: center; flex-wrap: wrap; justify-content: center; gap: 10px; color: #8b96ab; font-size: .8rem; } /* dark surface in both themes */
 
 /* —— Layout —— */
 .app {
@@ -1722,14 +1735,14 @@ kbd {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  color: var(--muted);
+  color: #8b96ab; /* dark surface in both themes */
   font-size: 0.78rem;
 }
 
 .lb-video-tools[hidden] { display: none; }
 
 .lb-video-tools label {
-  color: var(--text);
+  color: #e9eef7;
   font-weight: 600;
 }
 
@@ -1738,9 +1751,20 @@ kbd {
   padding: 4px 28px 4px 9px;
 }
 
+.lb-counter {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #aab4c6; /* the lightbox surface is always dark, in both themes */
+  text-align: center;
+  min-height: 1em;
+}
+
+.lb-counter:empty { margin: 0; }
+
 .lb-meta {
   font-size: 0.82rem;
-  color: var(--muted);
+  color: #8b96ab; /* dark surface in both themes */
   font-family: var(--mono);
   text-align: center;
   max-width: 90%;
@@ -1758,7 +1782,7 @@ kbd {
 .lb-actions[hidden] { display: none; }
 
 .lb-action-hint {
-  color: var(--muted);
+  color: #8b96ab; /* dark surface in both themes */
   font-size: 0.78rem;
 }
 
@@ -1769,23 +1793,23 @@ kbd {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--text);
+  border: 1px solid #263044;
+  background: #141922; /* dark surface in both themes */
+  color: #e9eef7;
   cursor: pointer;
   font-size: 1rem;
 }
 
-.lb-close:hover { background: var(--panel-2); }
+.lb-close:hover { background: #1a2130; }
 .lb-close:active { transform: scale(0.95); }
 
 .lb-nav {
   width: 44px;
   height: 44px;
   border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--text);
+  border: 1px solid #263044;
+  background: #141922; /* dark surface in both themes */
+  color: #e9eef7;
   font-size: 1.5rem;
   cursor: pointer;
   line-height: 1;
@@ -1794,7 +1818,7 @@ kbd {
   justify-self: center;
 }
 
-.lb-nav:hover { background: var(--panel-2); }
+.lb-nav:hover { background: #1a2130; }
 .lb-nav:active { transform: scale(0.95); }
 .lb-nav:disabled { opacity: 0.3; cursor: default; }
 
@@ -1951,4 +1975,72 @@ kbd {
   .candidate-key-guide { width: 100%; }
   .candidate-key-guide > span { flex: 1; text-align: center; }
   .candidate-actions { grid-template-columns: 1fr; }
+}
+
+/* —— Light theme —— */
+/* The app follows the OS appearance. Colors overlaid on media (thumb badges,
+   lightbox, video) stay dark in both themes by design. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f3f5f9;
+    --bg-elev: #ffffff;
+    --panel: #ffffff;
+    --panel-2: #edf0f6;
+    --panel-hover: #e4e9f2;
+    --border: #d3dae6;
+    --border-soft: #e2e7f0;
+    --text: #1a2230;
+    --muted: #5a6577;
+    --faint: #8a94a6;
+    --accent: #2f6fe0;
+    --accent-2: #1f5cc9;
+    --accent-soft: rgba(47, 111, 224, 0.12);
+    --danger: #d33d3d;
+    --danger-2: #b62f2f;
+    --danger-soft: rgba(211, 61, 61, 0.10);
+    --warn: #a8760f;
+    --warn-2: #8f660c;
+    --ok: #1e9e6a;
+    --ok-soft: rgba(30, 158, 106, 0.10);
+    --keep: #1f7a54;
+    --shadow-panel: 0 12px 40px rgba(30, 40, 60, 0.12);
+  }
+
+  body {
+    background:
+      radial-gradient(1100px 520px at 8% -12%, #e3ecfc 0%, transparent 55%),
+      radial-gradient(900px 480px at 100% -5%, #e0f0e8 0%, transparent 50%),
+      var(--bg);
+  }
+
+  .quality-warning, .heuristic-warning { color: #7a5b12; }
+  .session-status.warn { color: #7a5b12; }
+  .session-status.warn .session-flag { color: #7a5b12; }
+  .modal-validity.expiring { color: #7a5b12; }
+  .triage-guide .delete-key, .candidate-key-guide .delete-key { color: #b62f2f; }
+  .triage-guide .keep-key { color: #1f5cc9; }
+  .candidate-key-guide .keep-key { color: #1f7a54; }
+  .btn.primary { color: #ffffff; }
+  .btn.warn { color: #fff8ec; }
+  .btn.primary-soft { color: #1f5cc9; }
+  .path-input-wrap.drag-over input { background: #eef3fc; }
+  .recent-chip:hover { border-color: #b8c4d8; }
+  .btn:hover { border-color: #b8c4d8; }
+  .group-item.active { background: #dfe8f6; }
+  .badge { background: #e6ebf3; }
+  .badge.exact { background: #dce8fb; color: #1f5cc9; }
+  .badge.similar { background: #d9efe2; color: #1f7a54; }
+  .badge.no_humans { background: #f6ead0; color: #8f660c; }
+  .badge.low_resolution { background: #f7dede; color: #b62f2f; }
+  .badge.random_review { background: #dde9f7; color: #2a5aa8; }
+  .badge.faces { background: #ece0f7; color: #7a4bb3; }
+  .detail-tools > .btn { color: #3c465a; border-color: #c3cddd; background: #eef1f7; }
+  .detail-tools > .btn:hover { border-color: #aebbcf; background: #e4e9f2; }
+  .actionbar { background: rgba(243, 245, 249, 0.9); }
+  .card:hover { border-color: #b8c4d8; }
+  .selection-control:hover { border-color: #b8c4d8; }
+  .toast { background: #ffffff; }
+  .toast.error { background: #fdf1f1; }
+  .toast.ok { background: #ecf8f2; }
+  .toast-action { color: #1f5cc9; }
 }
