@@ -291,27 +291,6 @@
       .replace(/"/g, "&quot;");
   }
 
-  function hexDistance(left, right) {
-    if (!left || !right || left.length !== right.length || !/^[0-9a-f]+$/i.test(left + right)) return null;
-    let distance = 0;
-    for (let i = 0; i < left.length; i += 1) {
-      let bits = parseInt(left[i], 16) ^ parseInt(right[i], 16);
-      while (bits) { distance += bits & 1; bits >>>= 1; }
-    }
-    return distance;
-  }
-
-  function similarityExplanation(member, keeper) {
-    const parts = [];
-    const phash = hexDistance(member.phash, keeper.phash);
-    const dhash = hexDistance(member.dhash, keeper.dhash);
-    if (phash !== null) parts.push(`pHash distance ${phash}`);
-    if (dhash !== null) parts.push(`dHash distance ${dhash}`);
-    if (member.tile_phashes && keeper.tile_phashes) parts.push("tile fingerprints compared");
-    if (member.video_fingerprint && keeper.video_fingerprint) parts.push("video fingerprints compared");
-    return parts.join(" · ");
-  }
-
   async function api(path, opts = {}) {
     const res = await fetch(path, {
       headers: {
@@ -1380,12 +1359,14 @@
           : isKeep
             ? `<span class="thumb-badge keep">Keep</span>`
             : "";
-        const keeper = allMembers.find((candidate) => candidate.path === g.suggested_keep);
-        const distanceParts = g.kind === "similar" && keeper ? similarityExplanation(m, keeper) : "";
+        const similarity = m.similarity_percent == null ? null : Number(m.similarity_percent);
+        const similarityEvidence = Number.isFinite(similarity)
+          ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper · fingerprint agreement, not a probability`
+          : "Perceptual match to suggested keeper · similarity score unavailable";
         const evidence = g.kind === "exact"
           ? "Byte-identical SHA-256 match"
           : g.kind === "similar"
-            ? `Perceptual match to suggested keeper${distanceParts ? ` · ${distanceParts}` : ""} (explanation only, not a probability)`
+            ? similarityEvidence
             : g.kind === "low_resolution"
               ? `${dims} · ${((m.width || 0) * (m.height || 0) / 1_000_000).toFixed(2)} megapixels · below the 1 MP review threshold`
               : g.kind === "random_review"
@@ -1825,10 +1806,9 @@
     return (
       {
         all: "All selected categories",
-        duplicates: "Exact + Similar",
         review_suggestions: "Low-res + Random review",
-        exact: "Exact",
-        similar: "Similar",
+        exact: "Exact matches",
+        similar: "Similar images & videos",
         low_resolution: "Low resolution",
         random_review: "Random review",
         no_humans: "Non-Human",
@@ -1843,7 +1823,6 @@
     const inScope = (g) =>
       scope === "all" ||
       g.kind === scope ||
-      (scope === "duplicates" && (g.kind === "exact" || g.kind === "similar")) ||
       (scope === "review_suggestions" && ["low_resolution", "random_review"].includes(g.kind));
     const protectedPaths = new Set();
     for (const g of source) {
@@ -1878,30 +1857,13 @@
     return [...selected.values()];
   }
 
-  function duplicateSelectionCounts() {
-    const combined = new Set(effectiveSelection("duplicates").map((member) => member.path));
-    const exact = new Set(
-      effectiveSelection("exact")
-        .map((member) => member.path)
-        .filter((path) => combined.has(path)),
-    );
-    const similar = effectiveSelection("similar")
-      .filter((member) => combined.has(member.path) && !exact.has(member.path))
-      .length;
-    return { exact: exact.size, similar, uniqueTotal: combined.size };
-  }
-
   function updateSelectionSummary() {
     const scope = currentScope();
     const selected = effectiveSelection(scope);
     const count = selected.length;
     const bytes = selected.reduce((total, member) => total + (member.size || 0), 0);
     const prefix = scope === "all" ? "" : `${scopeLabelFor(scope)} · `;
-    const duplicateCounts = scope === "duplicates" ? duplicateSelectionCounts() : null;
-    const breakdown = duplicateCounts
-      ? ` (${duplicateCounts.exact} Exact + ${duplicateCounts.similar} Similar)`
-      : "";
-    $("selectionSummary").textContent = `${prefix}${count} unique file${count === 1 ? "" : "s"} selected${breakdown} · ${formatBytes(bytes)}`;
+    $("selectionSummary").textContent = `${prefix}${count} unique file${count === 1 ? "" : "s"} selected · ${formatBytes(bytes)}`;
   }
 
   // —— Scan ——
@@ -2024,6 +1986,8 @@
       document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
       state.kind = tab.dataset.kind;
+      $("actionScope").value = state.kind;
+      updateSelectionSummary();
       resetGroupListWindow();
       await loadGroups();
     });

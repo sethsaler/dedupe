@@ -126,6 +126,64 @@ def test_status_transports_diagnostics_and_completed_elapsed(tmp_path: Path) -> 
     assert status["summary"]["diagnostics"] == result.diagnostics.to_dict()
 
 
+def test_bulk_action_ui_separates_exact_matches_from_similars(tmp_path: Path) -> None:
+    page = create_app(_result(tmp_path)).test_client().get("/").get_data(as_text=True)
+
+    assert '<option value="exact" selected>Exact matches</option>' in page
+    assert '<option value="similar">Similar images &amp; videos</option>' in page
+    assert '<option value="duplicates">Exact + Similar</option>' not in page
+
+
+def test_similar_group_payload_reports_image_and_video_fingerprint_agreement(
+    tmp_path: Path,
+) -> None:
+    records = []
+    specifications = (
+        ("image-keeper.jpg", MediaType.IMAGE, {
+            "phash": "0000000000000000",
+            "dhash": "0000000000000000",
+            "tile_phashes": "t2:" + ",".join(["0000000000000000"] * 5),
+        }),
+        ("image-copy.jpg", MediaType.IMAGE, {
+            "phash": "0000000000000001",
+            "dhash": "0000000000000000",
+            "tile_phashes": "t2:" + ",".join(["0000000000000000"] * 5),
+        }),
+        ("video-keeper.mp4", MediaType.VIDEO, {
+            "video_fingerprint": "v3:0000000000000000,0000000000000000",
+        }),
+        ("video-copy.mp4", MediaType.VIDEO, {
+            "video_fingerprint": "v3:0000000000000001,0000000000000000",
+        }),
+    )
+    for name, media_type, fingerprints in specifications:
+        path = tmp_path / name
+        path.write_bytes(b"media")
+        records.append(FileRecord(
+            path=str(path),
+            size=5,
+            mtime=1,
+            media_type=media_type,
+            extension=path.suffix,
+            **fingerprints,
+        ))
+    groups = build_groups([], [[records[0], records[1]], [records[2], records[3]]])
+    for group, keeper in zip(groups, (records[0], records[2]), strict=True):
+        group.suggested_keep = keeper.path
+    result = ScanResult(roots=[str(tmp_path)], files=records, groups=groups)
+
+    payloads = create_app(result).test_client().get("/api/groups?kind=similar").get_json()[
+        "groups"
+    ]
+    image_members = {member["path"]: member for member in payloads[0]["members"]}
+    video_members = {member["path"]: member for member in payloads[1]["members"]}
+
+    assert image_members[records[0].path]["similarity_percent"] == 100.0
+    assert image_members[records[1].path]["similarity_percent"] == 99.8
+    assert video_members[records[2].path]["similarity_percent"] == 100.0
+    assert video_members[records[3].path]["similarity_percent"] == 99.2
+
+
 def test_mutating_api_rejects_cross_origin_and_plain_text(tmp_path: Path) -> None:
     app = create_app(_result(tmp_path))
     client = app.test_client()

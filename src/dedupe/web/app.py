@@ -49,7 +49,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 16
+WEB_API_VERSION = 17
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Independent review flows whose cards support direct per-file Trash + undo.
@@ -85,6 +85,62 @@ def stale_preview_payload(reason: str) -> dict:
 
 
 BULK_SELECT_OPERATIONS = {"select_all", "select_none", "invert", "criteria"}
+
+
+def _hash_difference(left: str | None, right: str | None) -> tuple[int, int] | None:
+    """Return differing and total bits for two same-sized hexadecimal hashes."""
+    if not left or not right or len(left) != len(right):
+        return None
+    try:
+        difference = (int(left, 16) ^ int(right, 16)).bit_count()
+    except ValueError:
+        return None
+    return difference, len(left) * 4
+
+
+def _stored_hashes(value: str | None, versions: tuple[str, ...]) -> list[str]:
+    if not value or not value.startswith(tuple(f"{version}:" for version in versions)):
+        return []
+    return [part for part in value.split(":", 1)[1].split(",") if part]
+
+
+def similarity_percent(member, keeper) -> float | None:
+    """Return perceptual-fingerprint bit agreement with a group's keeper."""
+    comparisons: list[tuple[int, int]] = []
+    if member.media_type.value == "video":
+        left = _stored_hashes(member.video_fingerprint, ("v2", "v3"))
+        right = _stored_hashes(keeper.video_fingerprint, ("v2", "v3"))
+        count = min(len(left), len(right))
+        if count:
+            if count == 1:
+                left_indexes = right_indexes = [0]
+            else:
+                left_indexes = [round(i * (len(left) - 1) / (count - 1)) for i in range(count)]
+                right_indexes = [round(i * (len(right) - 1) / (count - 1)) for i in range(count)]
+            comparisons.extend(
+                result
+                for left_index, right_index in zip(left_indexes, right_indexes, strict=True)
+                if (result := _hash_difference(left[left_index], right[right_index])) is not None
+            )
+    else:
+        for left, right in ((member.phash, keeper.phash), (member.dhash, keeper.dhash)):
+            result = _hash_difference(left, right)
+            if result is not None:
+                comparisons.append(result)
+        left_tiles = _stored_hashes(member.tile_phashes, ("t2",))
+        right_tiles = _stored_hashes(keeper.tile_phashes, ("t2",))
+        if len(left_tiles) == len(right_tiles):
+            comparisons.extend(
+                result
+                for left, right in zip(left_tiles, right_tiles, strict=True)
+                if (result := _hash_difference(left, right)) is not None
+            )
+
+    differing_bits = sum(difference for difference, _total in comparisons)
+    total_bits = sum(total for _difference, total in comparisons)
+    if not total_bits:
+        return None
+    return round(100 * (1 - differing_bits / total_bits), 1)
 
 
 def review_quarantine_dir(roots: list[str], selected_paths: set[str]) -> Path:
@@ -293,6 +349,16 @@ def create_app(
 
     def group_payload(group) -> dict:
         payload = group.to_dict()
+        if group.kind == GroupKind.SIMILAR:
+            keeper = next(
+                (member for member in group.members if member.path == group.suggested_keep),
+                None,
+            )
+            if keeper is not None:
+                for member, member_payload in zip(
+                    group.members, payload["members"], strict=True
+                ):
+                    member_payload["similarity_percent"] = similarity_percent(member, keeper)
         deleted = state["deleted_files"]
         payload["deleted_paths"] = [
             member.path for member in group.members if member.path in deleted

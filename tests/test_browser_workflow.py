@@ -13,7 +13,7 @@ from PIL import Image
 from playwright.sync_api import expect
 from werkzeug.serving import make_server
 
-from dedupe.grouping import build_no_human_groups
+from dedupe.grouping import build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import FileRecord, MediaType, ScanResult
 from dedupe.web.app import create_app
@@ -203,6 +203,59 @@ def test_bulk_selection_and_advanced_filters(
         "keeper.png",
     ]
     assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
+    page, tmp_path: Path
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for name, phash in (
+        ("keeper.png", "0000000000000000"),
+        ("similar.png", "0000000000000001"),
+    ):
+        path = media / name
+        Image.new("RGB", (48, 32), (25, 100, 180)).save(path)
+        stat = path.stat()
+        records.append(FileRecord(
+            path=str(path),
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=".png",
+            width=48,
+            height=32,
+            phash=phash,
+            dhash="0000000000000000",
+            tile_phashes="t2:" + ",".join(["0000000000000000"] * 5),
+        ))
+    groups = build_groups([], [records])
+    groups[0].suggested_keep = records[0].path
+    app = create_app(
+        ScanResult(roots=[str(media)], files=records, groups=groups),
+        review_session_path=tmp_path / "review.json",
+    )
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+
+        scope = page.locator("#actionScope")
+        expect(scope).to_have_value("exact")
+        assert scope.locator("option").all_text_contents()[:2] == [
+            "Exact matches",
+            "Similar images & videos",
+        ]
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(scope).to_have_value("similar")
+        page.locator(".group-item").click()
+        expect(page.locator("#members .evidence")).to_contain_text([
+            "100% Similar",
+            "99.8% Similar",
+        ])
+        expect(page.locator("#members .evidence").last).to_contain_text("not a probability")
 
 
 @contextmanager
