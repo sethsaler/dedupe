@@ -52,7 +52,7 @@ The rule behind all four: a bulk-deletable view must never be built from files t
 
 **Bulk selection by face count.** The bulk criteria include a minimum face count: select every shown candidate with at least N faces (minimum 1). A file with no recorded count never matches, for the same reason as the filter.
 
-**Per-candidate Trash and undo.** Each card's Trash control runs the same one-click flow as the [no-person review](no-person-review.md#while-extended): the server preflights the file, refuses it when it is not safely eligible, and otherwise moves it to the macOS Trash in the same request. There is no confirmation sheet. A toast offers Undo; showing deleted cards restores the per-candidate control. Face counts remain heuristic. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it (after which the file is still recoverable from the Trash by hand).
+**Per-candidate Trash and undo.** Each card's Trash control runs the same one-click flow as the [no-person review](no-person-review.md#while-extended): the server preflights the file, refuses it when it is not safely eligible, and otherwise moves it to the macOS Trash in the same request. There is no confirmation sheet. A toast offers Undo and stays until another message replaces it; showing deleted cards restores the per-candidate control. Face counts remain heuristic. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it (after which the file is still recoverable from the Trash by hand).
 
 ### Complete
 
@@ -91,11 +91,11 @@ The category is consumed like any other: reviewed-and-selected candidates flow i
 
 **Optional dependencies.** Face counting needs OpenCV (YuNet + genderage models bundled); video frame sampling uses ffmpeg. Degraded behavior per dependency is collected in [Optional dependencies](../cross-cutting/optional-dependencies.md).
 
-**Concurrency and resource limits.** Counting runs on the scan's worker budget (OpenCV detection capped at 4 concurrent detector instances); videos sample at most 16 frames each, so long videos cost no more than short ones. Reviewing is light; thumbnails are cached server-side.
+**Concurrency and resource limits.** Counting runs on the scan's worker budget (OpenCV detection capped at 4 concurrent detector instances); videos sample a duration-scaled 4–16 frames each (about one frame per five seconds), so long videos cost no more than 16 frames and short clips no fewer than 4. Reviewing is light; thumbnails are cached server-side.
 
 **macOS specifics.** Trash and manual recovery go through the macOS Trash; HEIC/TIFF thumbnails are transcoded on demand.
 
-**Configuration and defaults.** Face counting is off until enabled at scan time; the per-video sampling cap is 16 frames; the minimum-face bulk criterion accepts values of 1 or more. The Faces filter positions are fixed.
+**Configuration and defaults.** Face counting is off until enabled at scan time; video sampling scales with duration between 4 and 16 frames; the minimum-face bulk criterion accepts values of 1 or more. The Faces filter positions are fixed.
 
 ## Edge cases
 
@@ -113,4 +113,4 @@ The category is consumed like any other: reviewed-and-selected candidates flow i
 - The scan-time behavior when face counting is enabled but OpenCV is unavailable (error vs empty category) was not confirmed.
 - The per-candidate undo's new-scan behavior (trash map cleared with the superseded session) is the same as the [no-person review](no-person-review.md#open-questions-and-verification); one triage entry covered both.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).

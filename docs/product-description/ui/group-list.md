@@ -98,7 +98,7 @@ The list itself does not "complete"; the session does, when the user opens the [
 - Invert on a group whose keeper is unselected selects everything else; on a fully selected group it deselects everything except what the server's keeper rule restores.
 - A group hidden by filters keeps its selection, and bulk operations do not reach it — bulk applies to shown groups only, by design.
 - Bulk criteria never select files without a trusted face count when a minimum-face rule is used; unanalyzed media is skipped rather than guessed at.
-- Pressing `a` with no selection still opens the preview — it reports zero files, which is the honest answer.
+- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for the similar-matches button.
 
 ## Open questions and verification
 

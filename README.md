@@ -14,11 +14,11 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Face counts** — optional OpenCV pass counts faces in images and GIFs; every file card shows its count, files with detected faces get their own Faces review tab (busiest shots first), and a bulk rule ("at least … faces") selects group-photo shots in one click
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
-- **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media
+- **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media, hydrated in batched queries so large libraries start fast
 - **Thumbnail cache** — previews are kept on disk under `~/.cache/dedupe/thumbnails/` and pruned least-recently-used against a size budget
 - **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
-- **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, overlay/flicker comparison, keyboard navigation, native picker, and isolate
+- **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, overlay/flicker comparison with wrap-around and neighbor prefetching, keyboard navigation, native picker, light and dark themes (follows the OS), and isolate
 - **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
 - **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
 

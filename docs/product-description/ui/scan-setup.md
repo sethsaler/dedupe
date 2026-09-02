@@ -23,11 +23,11 @@ stateDiagram-v2
 
 ### Start
 
-The page loads with whatever the server already holds: nothing (the setup form prominent), a completed result (the group list, with the setup form collapsed above it), or a resumed session (same, plus the [resumed-session banner](session-resume.md)). The path field accepts one or more paths, one per line; `~` is expanded by the server. Around it:
+The page loads with whatever the server already holds: nothing (the setup form prominent), a completed result (the group list, with the setup form collapsed above it), or a resumed session (same, plus the [resumed-session banner](session-resume.md)). The path field accepts one or more paths, comma-separated (a drag-and-drop or the native picker appends to the list); `~` is expanded by the server. Around it:
 
 - **Choose…** opens the native folder picker; **Choose files…** opens a file picker for scanning specific files. Picked paths are appended to the field. Dragging folders from Finder onto the field inserts their paths.
 - **Recent folders** appear as chips below the field; clicking one fills the path field. Recent paths are remembered in the browser's local storage.
-- **Exclusions** — glob patterns, one per line — remove matching paths from the scan.
+- **Exclusions** — glob patterns, comma-separated — remove matching paths from the scan.
 - **Scan options** (collapsible): exact and similar detection on/off; no-person review, which reveals a person-detector dropdown (`opencv`, `photon`, `ensemble`); faces counting; low-resolution review with per-type pixel bounds; random review count; images/GIFs/videos toggles; hidden files; similarity thresholds (image default 6, video default 8); worker count; cache on/off. Scan option values are remembered in the browser's local storage and restored on the next visit.
 
 Pressing Scan with an empty path list does nothing server-side: the request is rejected with "paths required".
@@ -69,7 +69,7 @@ The progress line becomes the final summary; the result — files, groups, diagn
 | The user does something else mid-way | Editing paths/options is the normal state. | Browsing streamed groups works; selection and action requests are refused until the scan ends. Starting another scan is refused. |
 | A clean complete happens elsewhere | No effect. | No effect — there is exactly one scan at a time. |
 | The environment fails | A Photos.app library root is refused with an export message; a missing folder is reported and skipped ([Scan pipeline](../foundations/scan-pipeline.md)). | Corrupt media files never abort the scan; they appear in the diagnostics. If the whole scan raises, the error is shown, previous results restored, and preview tokens voided. |
-| The page or process goes away | No effect. | The scan runs server-side and continues through a browser reload — the page re-attaches to the running scan via its status poll. Closing the last tab schedules server shutdown (1.5 s grace); a reload in time cancels it. Killing the server process loses the in-progress scan and whatever groups had streamed. |
+| The page or process goes away | No effect. | The scan runs server-side and continues through a browser reload — the page re-attaches to the running scan via its event stream (a server-sent-events channel, with a 350 ms status poll as fallback). Closing the last tab schedules server shutdown (1.5 s grace); a reload in time cancels it. Killing the server process loses the in-progress scan and whatever groups had streamed. |
 | Something else changes the target | No effect until files are read. | Files are read as the scan reaches them; changes after reading are not noticed until revalidation at action time ([Actions and undo](../foundations/actions-and-undo.md#the-safety-model)). |
 | The input channel changes | No effect. | No effect. |
 | A resumed review supersedes | A resume is what the page shows instead of blank setup; starting a scan replaces it. | Resume/discard requests are locked out while scanning. |
@@ -100,7 +100,7 @@ The progress line becomes the final summary; the result — files, groups, diagn
 
 ## Open questions and verification
 
-- The exact behavior of the workers slider at the cap (label text, enforcement) was read from `updateWorkersUI` in `app.js`, not watched by hand.
+- The exact behavior of the workers slider at the cap (label text, enforcement) was read from `updateWorkersUI` in `settings.js`, not watched by hand.
 - Whether local-storage scan settings survive across browsers/profiles obviously they do not — but a user running the UI from another browser gets defaults silently; may be worth a note in the UI itself.
 
 Verified against dedupe commit `2a6cede`.

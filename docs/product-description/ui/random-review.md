@@ -90,7 +90,7 @@ The sample drains as decisions are made; deleted files leave when an action exec
 
 ## Open questions and verification
 
-- The forgetful-Keep behavior is verified in code (the keep-decisions sync skips non-low-resolution groups); whether the UI should say "keeps here are not remembered" is a product question.
-- The exact tab label ("Random 50" vs a count-dependent label) when the count is configured to another number was not confirmed.
+- The forgetful-Keep behavior is verified in code (the keep-decisions sync skips non-low-resolution groups), and the review banner now says so: "Keep decisions here are not remembered between scans."
+- The tab label reads "Random" regardless of the configured count; the count badge beside it shows the sample size. Confirmed in `index.html`.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).

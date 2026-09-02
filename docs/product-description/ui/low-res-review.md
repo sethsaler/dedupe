@@ -94,6 +94,6 @@ The category drains as decisions accumulate: kept files vanish from future scans
 
 - The keep-decisions write failure being silently swallowed ("the durable store is a convenience") is explicit in the code; whether the UI should ever say so is a product question.
 - The exact summary-line wording for this category was read from the shared member-summary renderer; confirm visually.
-- Whether advancing past the last candidate wraps, stops, or focuses the action bar was not confirmed from `reviewCandidate` in `app.js`.
+- Advancing past the last candidate stays on the pile; the decision that completes it raises a "Review complete — every file in this group has a decision" toast. Confirmed in `reviewCandidate` (`members.js`).
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).

@@ -56,7 +56,7 @@ Item 5 matters most. Asking the same interrupt questions of every feature is how
 
 For each document:
 
-1. Read where the behavior lives: `src/dedupe/engine.py` orchestrates scans, `src/dedupe/web/app.py` and `static/app.js` own the UI state, `src/dedupe/review_session.py` owns persistence, `src/dedupe/actions.py` owns trash/quarantine/isolate and receipts, `src/dedupe/cli.py` defines every command and flag.
+1. Read where the behavior lives: `src/dedupe/engine.py` orchestrates scans, `src/dedupe/web/app.py` and the ES modules under `static/` (entry `static/main.js`: `state.js`, `groups.js`, `members.js`, `actions.js`, `status.js`, …) own the UI state, `src/dedupe/review_session.py` owns persistence, `src/dedupe/actions.py` owns trash/quarantine/isolate and receipts, `src/dedupe/cli.py` defines every command and flag.
 2. Read the matching tests in `tests/`. `test_engine.py`, `test_actions.py`, `test_review_session.py`, `test_grouping.py`, `test_web.py`, and `test_browser_workflow.py` read as executable specifications of the edge cases.
 3. Draft the document.
 4. Try anything ambiguous on the running product: `.venv/bin/dedupe ui` → `http://127.0.0.1:8765` in the source repo, or `.venv/bin/dedupe {subcommand}`. Tests settle "what happens"; the running product settles how it feels, what is visible while the interaction is in progress, and what the timing is like.
@@ -85,7 +85,7 @@ Progress is tracked in the [coverage table](#coverage) below.
 - **Photon model internals out of scope.** Only what the user sees of the opt-in Photon backend (a download, engine choices, frame counts) is described; model weights and inference mechanics are not.
 - **Interaction shape.** The units of interaction are the CLI *invocation* (phases: invoke / exit immediately / begin running / while running / finish) and the UI *task* (phases: start / end without changing anything / become extended / while extended / complete). The interrupt list and the order of cross-cutting concerns are fixed as written in the document template above and do not change without revisiting every document.
 - **Numbered rules.** These are prose documents, not numbered specifications. Stable heading anchors are enough for cross-references.
-- **Re-pin.** The set was drafted against commit `e8969e4` and re-pinned to `2a6cede` after the triaged fixes ([bug-triage.md](bug-triage.md) B-01 to B-04) landed; documents describe the post-fix behavior throughout.
+- **Re-pin.** The set was drafted against commit `e8969e4` and re-pinned to `2a6cede` after the triaged fixes ([bug-triage.md](bug-triage.md) B-01 to B-04) landed; documents describe the post-fix behavior throughout. After the 2026-09 improvement phases (correctness, performance, UX) landed, the affected documents were updated in place to describe the improved behavior and re-verified in code; their verification footers read "post-improvement working tree". A full re-pin with a fresh commit hash follows the next release commit.
 
 ## Structure
 
@@ -165,10 +165,10 @@ Status is one of `not started`, `drafted`, or `verified`.
 
 ## Reference
 
-The source of truth is the Dedupe repository at `/Users/sethsaler/Documents/GitHub/dedupe`, pinned at commit `2a6cede`. The relevant locations are:
+The source of truth is the Dedupe repository at `/Users/sethsaler/Documents/GitHub/dedupe`. The set was pinned at commit `2a6cede`; documents touched by the 2026-09 improvement phases describe that later working tree and say so in their verification footers. The relevant locations are:
 
 - `src/dedupe/cli.py`: every command, flag, and default; the entry point for the CLI surface.
-- `src/dedupe/web/app.py`, `src/dedupe/web/static/app.js`, `templates/index.html`: the UI surface and its state.
+- `src/dedupe/web/app.py`, `src/dedupe/web/static/*.js` (ES modules, entry `main.js`), `templates/index.html`: the UI surface and its state.
 - `src/dedupe/engine.py`: scan orchestration — the stage order and what each stage produces.
 - `src/dedupe/exact.py`, `similar_image.py`, `similar_video.py`, `human_detection.py`, `face_detection.py`: the detectors and their thresholds.
 - `src/dedupe/grouping.py`, `keep_decisions.py`: ranking, smart select, and remembered Keep decisions.
