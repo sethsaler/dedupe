@@ -176,3 +176,79 @@ def test_store_all_batches_writes(tmp_path: Path, monkeypatch) -> None:
     assert reloaded.phash == "0" * 16
     assert reloaded.tile_phashes == "t2:0,1,2,3,4"
     cache.close()
+
+
+def test_hydrate_batches_reads(tmp_path: Path, monkeypatch) -> None:
+    """Hydration uses chunked IN queries, not one round trip per record."""
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    records = []
+    for index in range(1000):
+        record = _record(tmp_path / f"photo{index}.jpg", inode=index)
+        record.tile_phashes = "t2:0,1,2,3,4"
+        records.append(record)
+    cache.store_all(records)
+
+    selects: list[str] = []
+    connection = cache._conn
+
+    class CountingConnection:
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().upper().startswith("SELECT"):
+                selects.append(sql)
+            return connection.execute(sql, *args)
+
+    monkeypatch.setattr(cache, "_conn", CountingConnection())
+
+    fresh = []
+    for index in range(1000):
+        record = _record(tmp_path / f"photo{index}.jpg", inode=index)
+        record.phash = None
+        record.tile_phashes = None
+        fresh.append(record)
+
+    assert cache.hydrate(fresh) == 1000
+    assert all(record.tile_phashes == "t2:0,1,2,3,4" for record in fresh)
+    # 1000 paths / 400 per batch = 3 path queries; no misses, so no fallback.
+    assert len(selects) == 3
+    cache.close()
+
+
+def test_hydrate_batches_identity_fallback(tmp_path: Path, monkeypatch) -> None:
+    """Renamed files reuse hashes via one batched device/inode query pass."""
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    originals = []
+    for index in range(20):
+        original = _record(tmp_path / "before" / f"photo{index}.jpg", inode=index)
+        original.tile_phashes = "t2:0,1,2,3,4"
+        originals.append(original)
+    cache.store_all(originals)
+
+    selects: list[str] = []
+    connection = cache._conn
+
+    class CountingConnection:
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().upper().startswith("SELECT"):
+                selects.append(sql)
+            return connection.execute(sql, *args)
+
+    monkeypatch.setattr(cache, "_conn", CountingConnection())
+
+    moved = []
+    for index in range(20):
+        record = _record(tmp_path / "after" / f"renamed{index}.jpg", inode=index)
+        record.phash = None
+        record.tile_phashes = None
+        moved.append(record)
+
+    assert cache.hydrate(moved) == 20
+    assert all(record.phash == "0" * 16 for record in moved)
+    # 1 path batch (misses) + 1 identity fallback batch.
+    assert len(selects) == 2
+    cache.close()

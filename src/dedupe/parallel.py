@@ -59,13 +59,17 @@ def split_cpu_budget(total: int, stages: int) -> int:
 
     Image hashing, OpenCV person detection, and face counting are all
     image-decode + CPU work. When more than one runs at the same time, each
-    gets an equal share of the overall budget (at least 1) so the combined
-    thread count stays within the machine-wide budget instead of every stage
-    claiming its full private cap.
+    gets an equal share of the overall budget so the combined thread count
+    stays within the machine-wide budget instead of every stage claiming its
+    full private cap. A stage never drops below 2 workers (when the total
+    budget allows): multi-folder scans divide the budget per stream first, and
+    a second division down to 1 worker would serialize a CPU-bound stage.
     """
     if stages <= 1:
         return max(1, int(total))
-    return max(1, int(total) // stages)
+    if total < 2:
+        return 1
+    return max(2, int(total) // stages)
 
 
 def map_parallel(
@@ -113,19 +117,19 @@ def map_parallel(
     next_i = 0
     inflight: dict = {}
 
-    with Executor(max_workers=workers) as ex:
-        def _submit_more() -> None:
-            nonlocal next_i
-            while next_i < n and len(inflight) < window:
-                fut = ex.submit(fn, items[next_i])
-                inflight[fut] = next_i
-                next_i += 1
+    ex = Executor(max_workers=workers)
 
+    def _submit_more() -> None:
+        nonlocal next_i
+        while next_i < n and len(inflight) < window:
+            fut = ex.submit(fn, items[next_i])
+            inflight[fut] = next_i
+            next_i += 1
+
+    try:
         _submit_more()
         while inflight:
             if cancelled and cancelled():
-                for future in inflight:
-                    future.cancel()
                 raise InterruptedError("scan cancelled")
             finished, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)
             for fut in finished:
@@ -135,5 +139,15 @@ def map_parallel(
                 if progress and (done % every == 0 or done == n):
                     progress(done, n)
             _submit_more()
+    except BaseException:
+        # Cancel/error path: drop queued work and return promptly instead of
+        # blocking on shutdown(wait=True) — a running work item (e.g. an
+        # ffmpeg extract with a 60–180s timeout) would otherwise make cancel
+        # hang. Running items finish (or time out) in the background; their
+        # subprocesses carry their own timeouts so none are orphaned forever.
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        ex.shutdown(wait=True)
 
     return ordered  # type: ignore[return-value]

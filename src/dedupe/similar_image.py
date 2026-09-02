@@ -22,6 +22,9 @@ ProgressCb = Callable[[str, int, int], None]
 
 # Near-identical default (strict). Hamming distance on 64-bit pHash.
 DEFAULT_THRESHOLD = 6
+
+# Error-kind prefix; engine diagnostics classify on it.
+ERROR_IMAGE_HASH_FAILED = "image hash failed"
 # dHash is secondary; slightly looser than pHash.
 DHASH_THRESHOLD = 10
 # Regional tiles: same-image/different-res pairs score ~0–2; pose changes ~12–22.
@@ -182,7 +185,7 @@ def _image_hash_job(
         ph, dh, w, h, tiles = compute_image_hashes_with_tiles(path)
         return path, ph, dh, w, h, tiles, None
     except Exception as exc:
-        return path, None, None, None, None, None, f"image hash failed: {exc}"
+        return path, None, None, None, None, None, f"{ERROR_IMAGE_HASH_FAILED}: {exc}"
 
 
 def _tile_phashes_from_image(img) -> list:

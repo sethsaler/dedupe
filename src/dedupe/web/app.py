@@ -44,12 +44,13 @@ from ..review_session import (
     load_review_session,
     save_review_session,
 )
+from ..similar_video import aligned_position_indexes
 from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 17
+WEB_API_VERSION = 18
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Independent review flows whose cards support direct per-file Trash + undo.
@@ -59,6 +60,11 @@ REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 # How long after the last tab closes before the server exits. Long enough for a
 # page reload to come back and cancel the shutdown, short enough to feel prompt.
 SHUTDOWN_GRACE_SECONDS = 1.5
+
+# Selection-change persistence is synchronous below this many groups and
+# debounced (PERSIST_DEBOUNCE_SECONDS) above it.
+PERSIST_DEBOUNCE_MIN_GROUPS = 2000
+PERSIST_DEBOUNCE_SECONDS = 0.3
 
 # Why an execute was refused, phrased so the UI can tell the user what happens next.
 PREVIEW_STALE_MESSAGES = {
@@ -110,18 +116,12 @@ def similarity_percent(member, keeper) -> float | None:
     if member.media_type.value == "video":
         left = _stored_hashes(member.video_fingerprint, ("v2", "v3"))
         right = _stored_hashes(keeper.video_fingerprint, ("v2", "v3"))
-        count = min(len(left), len(right))
-        if count:
-            if count == 1:
-                left_indexes = right_indexes = [0]
-            else:
-                left_indexes = [round(i * (len(left) - 1) / (count - 1)) for i in range(count)]
-                right_indexes = [round(i * (len(right) - 1) / (count - 1)) for i in range(count)]
-            comparisons.extend(
-                result
-                for left_index, right_index in zip(left_indexes, right_indexes, strict=True)
-                if (result := _hash_difference(left[left_index], right[right_index])) is not None
-            )
+        left_indexes, right_indexes = aligned_position_indexes(len(left), len(right))
+        comparisons.extend(
+            result
+            for left_index, right_index in zip(left_indexes, right_indexes, strict=True)
+            if (result := _hash_difference(left[left_index], right[right_index])) is not None
+        )
     else:
         for left, right in ((member.phash, keeper.phash), (member.dhash, keeper.dhash)):
             result = _hash_difference(left, right)
@@ -291,12 +291,31 @@ def create_app(
         "review_session": loaded,
         "preview_tokens": {},
         "shutdown_timer": None,
+        # Number of effectively-selected paths; maintained alongside
+        # result.recompute_stats() so /api/status need not recompute per poll.
+        "selected_count": 0,
+        # Bumped on every in-place membership change (group streamed, members
+        # removed) so the allowed-path set used by media routes can be cached.
+        "paths_version": 0,
+        "allowed_paths_cache": None,  # ((id(result), paths_version), frozenset)
+        # Ids of groups streamed by the active scan, for O(1) replace checks.
+        "streamed_group_index": {},
+        # Debounced review-session persistence for large results.
+        "persist_dirty": False,
+        "persist_timer": None,
+        # Wakes SSE generators when groups/progress/scan state change.
+        "events": threading.Condition(lock),
     }
     app.extensions["dedupe_state"] = state
 
     def persist_result() -> bool:
         """Persist the active completed result, recording errors for status APIs."""
         with lock:
+            state["persist_dirty"] = False
+            timer = state.get("persist_timer")
+            if timer is not None:
+                timer.cancel()
+                state["persist_timer"] = None
             result = state["result"]
             if result is None:
                 return False
@@ -315,6 +334,35 @@ def create_app(
                 report.error = str(exc)
                 state["last_error"] = f"Could not save review: {exc}"
                 return False
+
+    def _flush_persist() -> None:
+        with lock:
+            state["persist_timer"] = None
+            if not state["persist_dirty"]:
+                return
+        persist_result()
+
+    def schedule_persist() -> None:
+        """Persist small results synchronously; debounce multi-MB session writes.
+
+        A selection toggle persists the whole result as JSON, which costs
+        milliseconds for typical reviews but megabytes of churn per click on
+        very large ones. Above the threshold, writes coalesce over a short
+        window; actions, shutdown, and scan completion still flush eagerly.
+        """
+        with lock:
+            result = state["result"]
+            if result is None:
+                return
+            if len(result.groups) < PERSIST_DEBOUNCE_MIN_GROUPS:
+                persist_result()
+                return
+            state["persist_dirty"] = True
+            if state.get("persist_timer") is None:
+                timer = threading.Timer(PERSIST_DEBOUNCE_SECONDS, _flush_persist)
+                timer.daemon = True
+                state["persist_timer"] = timer
+                timer.start()
 
     def normalized_destination(action: str, destination) -> str | None:
         if action != "quarantine" or not destination:
@@ -365,15 +413,70 @@ def create_app(
         ]
         return payload
 
+    def allowed_paths_locked() -> frozenset:
+        """Paths media routes may serve, cached per result/paths_version.
+
+        Rebuilding this set used to cost O(all files + all members) under the
+        global lock on every thumbnail/media request; membership only changes
+        when paths_version bumps or the result object is replaced.
+        """
+        result: ScanResult | None = state["result"]
+        key = (id(result), state["paths_version"])
+        cached = state["allowed_paths_cache"]
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        allowed: set[str] = set()
+        if result is not None:
+            allowed.update(file.path for file in result.files)
+            for group in result.groups:
+                allowed.update(member.path for member in group.members)
+        frozen = frozenset(allowed)
+        state["allowed_paths_cache"] = (key, frozen)
+        return frozen
+
     def is_scanned_file(path: Path, raw_path: str) -> bool:
         """Return whether a file belongs to the active local review session."""
         with lock:
-            result: ScanResult | None = state["result"]
-            allowed = {file.path for file in result.files} if result else set()
-            if result:
-                for group in result.groups:
-                    allowed.update(member.path for member in group.members)
+            allowed = allowed_paths_locked()
         return raw_path in allowed or str(path.resolve()) in allowed
+
+    def note_group_streamed_locked(group) -> None:
+        """Fold one streamed group into the served stats (lock held).
+
+        Selections are locked while a scan runs and fresh groups carry no
+        review decisions, so per-group contributions are independent and the
+        old per-group recompute_stats() (O(all members) per group, O(n^2) per
+        scan) is unnecessary. Exact and similar groups never share member
+        paths, and independent review groups start with empty selections, so
+        per-group effective selections cannot double-count here. Post-scan
+        mutations still recompute in full.
+        """
+        result: ScanResult | None = state["result"]
+        if result is None:
+            return
+        if group.kind == GroupKind.EXACT:
+            result.exact_groups += 1
+        elif group.kind == GroupKind.SIMILAR:
+            result.similar_groups += 1
+        elif group.kind == GroupKind.NO_HUMANS:
+            result.no_human_files += len(group.members)
+        elif group.kind == GroupKind.LOW_RESOLUTION:
+            result.low_resolution_files += len(group.members)
+        elif group.kind == GroupKind.RANDOM_REVIEW:
+            result.random_review_files += len(group.members)
+        elif group.kind == GroupKind.FACES:
+            result.faces_files += len(group.members)
+        selected = effective_selected_paths([group])
+        sizes = {member.path: member.size for member in group.members}
+        result.reclaimable_bytes += sum(sizes.get(path, 0) for path in selected)
+        state["selected_count"] += len(selected)
+
+    def refresh_selected_count_locked() -> None:
+        """Full refresh after post-scan selection/membership mutations."""
+        result: ScanResult | None = state["result"]
+        state["selected_count"] = (
+            len(effective_selected_paths(result.groups)) if result is not None else 0
+        )
 
     @app.before_request
     def cancel_pending_shutdown():
@@ -429,6 +532,7 @@ def create_app(
     if initial_result is not None:
         with lock:
             state["result"] = initial_result
+            initial_result.recompute_stats()
             state["progress"] = ScanProgress(
                 phase="done",
                 done=True,
@@ -437,10 +541,12 @@ def create_app(
                 message="Loaded previous scan",
                 elapsed_seconds=initial_result.diagnostics.total_duration_seconds,
             )
+            refresh_selected_count_locked()
         persist_result()
     elif loaded.result is not None:
         with lock:
             state["result"] = loaded.result
+            loaded.result.recompute_stats()
             state["deleted_files"] = dict(loaded.deleted_files)
             state["scan_id"] = secrets.token_hex(12)
             state["progress"] = ScanProgress(
@@ -451,6 +557,7 @@ def create_app(
                 message="Resumed saved review",
                 elapsed_seconds=loaded.result.diagnostics.total_duration_seconds,
             )
+            refresh_selected_count_locked()
 
     @app.get("/")
     def index():
@@ -468,52 +575,159 @@ def create_app(
         )
         return Response(svg, mimetype="image/svg+xml")
 
-    @app.get("/api/status")
-    def api_status():
-        import os
+    def status_payload_locked() -> dict:
+        """Build the /api/status payload (lock held; shared with the SSE stream).
 
+        Stats fields are maintained incrementally while groups stream in and
+        recomputed at every post-scan mutation site, so serving a poll is O(1)
+        in result size instead of rewalking every group and member per call.
+        """
         from ..parallel import DEFAULT_WORKERS_CAP, resolve_workers
 
-        with lock:
-            prog = state["progress"]
-            result: ScanResult | None = state["result"]
-            cpu = os.cpu_count() or 1
-            payload = {
-                "scanning": state["scanning"],
-                "acting": state["acting"],
-                "progress": prog.to_dict(),
-                "has_result": result is not None,
-                "web_api_version": WEB_API_VERSION,
-                "groups_version": state["groups_version"],
-                "scan_id": state["scan_id"],
-                "error": state["last_error"],
-                "streams": [dict(stream) for stream in state["streams"]],
-                "review_session": state["review_session"].metadata(),
-                "system": {
-                    "cpu_count": cpu,
-                    "auto_workers": resolve_workers(None),
-                    "max_workers": max(cpu, DEFAULT_WORKERS_CAP),
-                    "workers_cap": DEFAULT_WORKERS_CAP,
-                },
+        prog = state["progress"]
+        result: ScanResult | None = state["result"]
+        cpu = os.cpu_count() or 1
+        payload = {
+            "scanning": state["scanning"],
+            "acting": state["acting"],
+            "progress": prog.to_dict(),
+            "has_result": result is not None,
+            "web_api_version": WEB_API_VERSION,
+            "groups_version": state["groups_version"],
+            "scan_id": state["scan_id"],
+            "error": state["last_error"],
+            "streams": [dict(stream) for stream in state["streams"]],
+            "review_session": state["review_session"].metadata(),
+            "system": {
+                "cpu_count": cpu,
+                "auto_workers": resolve_workers(None),
+                "max_workers": max(cpu, DEFAULT_WORKERS_CAP),
+                "workers_cap": DEFAULT_WORKERS_CAP,
+            },
+        }
+        if result is not None:
+            payload["summary"] = {
+                "roots": result.roots,
+                "file_count": len(result.files),
+                "group_count": len(result.groups),
+                "exact_groups": result.exact_groups,
+                "similar_groups": result.similar_groups,
+                "no_human_files": result.no_human_files,
+                "low_resolution_files": result.low_resolution_files,
+                "random_review_files": result.random_review_files,
+                "faces_files": result.faces_files,
+                "reclaimable_bytes": result.reclaimable_bytes,
+                "reclaimable_human": format_bytes(result.reclaimable_bytes),
+                "selected_count": state["selected_count"],
+                "errors": list(result.errors[:20]),
+                "diagnostics": result.diagnostics.to_dict(),
             }
-            if result is not None:
-                result.recompute_stats()
-                payload["summary"] = {
-                    "roots": result.roots,
-                    "file_count": len(result.files),
-                    "group_count": len(result.groups),
-                    "exact_groups": result.exact_groups,
-                    "similar_groups": result.similar_groups,
-                    "no_human_files": result.no_human_files,
-                    "low_resolution_files": result.low_resolution_files,
-                    "random_review_files": result.random_review_files,
-                    "reclaimable_bytes": result.reclaimable_bytes,
-                    "reclaimable_human": format_bytes(result.reclaimable_bytes),
-                    "selected_count": len(effective_selected_paths(result.groups)),
-                    "errors": list(result.errors[:20]),
-                    "diagnostics": result.diagnostics.to_dict(),
-                }
-            return jsonify(payload)
+        return payload
+
+    @app.get("/api/status")
+    def api_status():
+        with lock:
+            return jsonify(status_payload_locked())
+
+    @app.get("/api/events")
+    def api_events():
+        """Server-sent events: scan status, streamed groups, and resync hints.
+
+        Replaces client-side polling during scans. Events:
+          - ``status``: the /api/status payload (throttled while scanning,
+            immediate on state transitions)
+          - ``group``: one streamed group payload, in discovery order
+          - ``reset``: the group list was replaced (scan finished, new scan,
+            resume/discard); the client should refetch /api/groups
+        A comment heartbeat keeps idle connections alive.
+        """
+        import json as _json
+
+        def stream():
+            result_token = None
+            sent_groups = 0
+            seen_groups_version = -1
+            last_snapshot = None
+            last_status_emit = 0.0
+            last_any_emit = 0.0
+            while True:
+                events: list[tuple[str, dict]] = []
+                with lock:
+                    result: ScanResult | None = state["result"]
+                    # id() ints are safe identity tokens here: a replaced
+                    # result stays referenced by the review session, so its
+                    # id cannot be recycled while a connection tracks it.
+                    token = id(result) if result is not None else None
+                    if token != result_token:
+                        # Result object replaced (new scan, completion, resume,
+                        # discard): per-connection append tracking is invalid.
+                        result_token = token
+                        sent_groups = 0
+                        events.append(
+                            (
+                                "reset",
+                                {
+                                    "groups_version": state["groups_version"],
+                                    "scan_id": state["scan_id"],
+                                },
+                            )
+                        )
+                        if not state["scanning"]:
+                            # Completion/resume/discard: the client refetches
+                            # the authoritative list on reset, so skip deltas.
+                            seen_groups_version = state["groups_version"]
+                        # While scanning, leave the seen version stale: groups
+                        # appended since the replacement stream as deltas below.
+                    if (
+                        result is not None
+                        and state["groups_version"] != seen_groups_version
+                    ):
+                        for group in result.groups[sent_groups:]:
+                            events.append(("group", group_payload(group)))
+                        sent_groups = len(result.groups)
+                        seen_groups_version = state["groups_version"]
+
+                    prog = state["progress"]
+                    snapshot = (
+                        state["scanning"],
+                        state["acting"],
+                        prog.phase,
+                        prog.done,
+                        prog.files_processed,
+                        prog.groups_found,
+                        state["last_error"],
+                        state["groups_version"],
+                        state["selected_count"],
+                    )
+                    now = time.monotonic()
+                    transitioned = snapshot != last_snapshot
+                    due = state["scanning"] and now - last_status_emit >= 0.25
+                    if transitioned or due:
+                        events.append(("status", status_payload_locked()))
+                        last_snapshot = snapshot
+                        last_status_emit = now
+                    scanning = state["scanning"]
+
+                if events:
+                    lines = []
+                    for name, payload in events:
+                        lines.append(
+                            f"event: {name}\ndata: {_json.dumps(payload)}\n\n"
+                        )
+                    last_any_emit = time.monotonic()
+                    yield "".join(lines)
+                elif time.monotonic() - last_any_emit >= 30.0:
+                    last_any_emit = time.monotonic()
+                    yield ": heartbeat\n\n"
+
+                with lock:
+                    # Coalesce per-file progress notifications into one wakeup
+                    # cadence while scanning; sleep until notified when idle.
+                    state["events"].wait(timeout=0.25 if scanning else 30.0)
+
+        response = Response(stream(), mimetype="text/event-stream")
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
 
     @app.get("/api/review-session")
     def api_review_session():
@@ -533,6 +747,8 @@ def create_app(
             state["scan_id"] = secrets.token_hex(12)
             state["deleted_files"] = dict(report.deleted_files)
             state["groups_version"] += 1
+            state["paths_version"] += 1
+            refresh_selected_count_locked()
             state["progress"] = ScanProgress(
                 phase="done",
                 done=True,
@@ -559,6 +775,8 @@ def create_app(
             state["deleted_files"] = {}
             state["scan_id"] = secrets.token_hex(12)
             state["groups_version"] += 1
+            state["paths_version"] += 1
+            state["selected_count"] = 0
             state["progress"] = ScanProgress()
         return jsonify({"ok": True, "discarded": removed})
 
@@ -663,6 +881,9 @@ def create_app(
             state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
             state["preview_tokens"] = {}
             state["groups_version"] = state.get("groups_version", 0) + 1
+            state["paths_version"] += 1
+            state["selected_count"] = 0
+            state["streamed_group_index"] = {}
             # Default to parallel per-folder streams when more than one folder is
             # given; each folder becomes its own concurrent scan (no cross-folder dedup).
             parallel_default = len(resolved_roots) > 1
@@ -692,28 +913,34 @@ def create_app(
                     with lock:
                         if state["scan_id"] == scan_id:
                             state["progress"] = prog
+                            state["events"].notify_all()
 
                 def on_group(group) -> None:
                     with lock:
                         result: ScanResult | None = state["result"]
                         if result is None or state["scan_id"] != scan_id:
                             return
-                        # Replace if same id already streamed (shouldn't happen), else append
-                        existing = next(
-                            (i for i, g in enumerate(result.groups) if g.id == group.id),
-                            None,
-                        )
+                        # Append in discovery order and bump the version; the
+                        # per-group full sort + recompute_stats this replaced
+                        # cost O(groups^2 log n) per scan. The client keeps its
+                        # own sorted view, and the final result (which replaces
+                        # this one at completion) is sorted by the engine.
+                        index = state["streamed_group_index"]
+                        existing = index.get(group.id)
                         if existing is not None:
+                            # Shouldn't happen; fall back to a full recompute.
                             result.groups[existing] = group
+                            result.recompute_stats()
+                            refresh_selected_count_locked()
                         else:
+                            index[group.id] = len(result.groups)
                             result.groups.append(group)
-                        result.groups.sort(
-                            key=lambda g: g.reclaimable_bytes, reverse=True
-                        )
-                        result.recompute_stats()
+                            note_group_streamed_locked(group)
                         state["groups_version"] = state.get("groups_version", 0) + 1
+                        state["paths_version"] += 1
                         prog = state["progress"]
                         prog.groups_found = len(result.groups)
+                        state["events"].notify_all()
 
                 def on_stream_progress(prog: ScanProgress) -> None:
                     with lock:
@@ -733,6 +960,7 @@ def create_app(
                             "groups_found": prog.groups_found,
                             "done": prog.done,
                         }
+                        state["events"].notify_all()
 
                 raw_workers = data.get("workers", None)
                 if raw_workers in ("", None):
@@ -803,6 +1031,9 @@ def create_app(
                         raise RuntimeError("; ".join(result.errors))
                     state["result"] = result
                     state["groups_version"] = state.get("groups_version", 0) + 1
+                    state["paths_version"] += 1
+                    state["streamed_group_index"] = {}
+                    refresh_selected_count_locked()
                     state["progress"] = replace(
                         state["progress"],
                         phase="done",
@@ -822,6 +1053,7 @@ def create_app(
                     persist_result()
                     state["scanning"] = False
                     state["cancel_event"] = None
+                    state["events"].notify_all()
             except Exception as exc:
                 with lock:
                     if state["scan_id"] != scan_id:
@@ -831,6 +1063,9 @@ def create_app(
                     state["deleted_files"] = previous_deleted
                     state["scan_id"] = secrets.token_hex(12)
                     state["groups_version"] += 1
+                    state["paths_version"] += 1
+                    state["streamed_group_index"] = {}
+                    refresh_selected_count_locked()
                     state["preview_tokens"] = {}
                     state["scanning"] = False
                     state["cancel_event"] = None
@@ -841,7 +1076,10 @@ def create_app(
                         error=None if was_cancelled else str(exc),
                         message="Scan cancelled" if was_cancelled else str(exc),
                     )
+                    state["events"].notify_all()
 
+        with lock:
+            state["events"].notify_all()  # wake SSE clients: scanning=True
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({"ok": True, "scan_id": scan_id})
 
@@ -883,8 +1121,10 @@ def create_app(
                 for g in result.groups:
                     if g.id == group_id:
                         apply_smart_select(g, rule)
+                        result.recompute_stats()
+                        refresh_selected_count_locked()
                         payload = group_payload(g)
-                        persist_result()
+                        schedule_persist()
                         return jsonify(payload)
                 return jsonify({"error": "not found"}), 404
             if group_ids is None:
@@ -894,7 +1134,8 @@ def create_app(
                 scoped = [g for g in result.groups if g.id in wanted]
             apply_smart_select_all(scoped, rule)
             result.recompute_stats()
-            persist_result()
+            refresh_selected_count_locked()
+            schedule_persist()
             return jsonify({"ok": True, "group_count": len(scoped)})
 
     @app.post("/api/selection")
@@ -956,9 +1197,10 @@ def create_app(
                                     if path != decision_path
                                 ]
                         result.recompute_stats()
+                        refresh_selected_count_locked()
                         sync_low_resolution_keeps(result, {decision_path})
                         payload = group_payload(g)
-                        persist_result()
+                        schedule_persist()
                         return jsonify(payload)
                     picks = [p for p in selected if p in member_paths]
                     # Duplicate groups retain one file; independent review candidates may remove all.
@@ -982,8 +1224,10 @@ def create_app(
                         ]
                     if g.kind == GroupKind.LOW_RESOLUTION:
                         sync_low_resolution_keeps(result, member_paths)
+                    result.recompute_stats()
+                    refresh_selected_count_locked()
                     payload = group_payload(g)
-                    persist_result()
+                    schedule_persist()
                     return jsonify(payload)
         return jsonify({"error": "not found"}), 404
 
@@ -1039,15 +1283,16 @@ def create_app(
                     touched_low_res_paths.update(member.path for member in group.members)
                 changed += 1
             result.recompute_stats()
+            refresh_selected_count_locked()
             if touched_low_res_paths:
                 sync_low_resolution_keeps(result, touched_low_res_paths)
-            persist_result()
+            schedule_persist()
             return jsonify({
                 "ok": True,
                 "operation": operation,
                 "group_count": len(scoped),
                 "changed_count": changed,
-                "selected_count": len(effective_selected_paths(result.groups)),
+                "selected_count": state["selected_count"],
             })
 
     @app.post("/api/review-candidate/delete")
@@ -1146,6 +1391,9 @@ def create_app(
                     selected for selected in original_selected if selected != path
                 ]
                 group.reviewed_paths = list(dict.fromkeys([*original_reviewed, path]))
+                if result is not None:
+                    result.recompute_stats()
+                    refresh_selected_count_locked()
                 payload = group_payload(group)
                 persist_result()
                 return jsonify(payload)
@@ -1221,6 +1469,9 @@ def create_app(
                 group.selected_for_removal = [
                     selected for selected in group.selected_for_removal if selected != path
                 ]
+                if result is not None:
+                    result.recompute_stats()
+                    refresh_selected_count_locked()
                 persist_result()
                 return jsonify(group_payload(group))
         except OSError as exc:
@@ -1291,7 +1542,9 @@ def create_app(
                     ]
                 result.groups = [group for group in result.groups if group.members]
                 result.recompute_stats()
+                refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
+                state["paths_version"] += 1
             persist_result()
             return jsonify({"ok": True, "marked_count": len(records)})
         except Exception as exc:
@@ -1337,7 +1590,9 @@ def create_app(
             with lock:
                 result.groups = [candidate for candidate in result.groups if candidate.id != group_id]
                 result.recompute_stats()
+                refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
+                state["paths_version"] += 1
             persist_result()
             return jsonify({"ok": True, "pair_count": pair_count})
         except Exception as exc:
@@ -1573,6 +1828,8 @@ def create_app(
                             file for file in result.files if file.path not in removed
                         ]
                         result.recompute_stats()
+                        refresh_selected_count_locked()
+                        state["paths_version"] += 1
                 if removed:
                     persist_result()
 
@@ -1629,10 +1886,14 @@ def create_app(
         if not is_scanned_file(p, path):
             return jsonify({"error": "not in scan"}), 403
 
-        # ?full=1 → lightbox preview at Quick Look fidelity. Browsers render
-        # these formats natively, so serve the untouched original; only
-        # formats like HEIC/TIFF need the cached full-resolution transcode.
-        variant = "full" if request.args.get("full") == "1" else "thumb"
+        # Variants: "thumb" (grid cards), "preview" (lightbox, ≤2560px, cached),
+        # "full" (original-resolution transcode for formats browsers cannot
+        # render; browser-safe originals are served untouched as before).
+        variant_arg = request.args.get("variant")
+        if variant_arg in ("thumb", "preview", "full"):
+            variant = variant_arg
+        else:
+            variant = "full" if request.args.get("full") == "1" else "thumb"
         if variant == "full" and not is_video(p) and is_browser_safe_image(p):
             return send_file(p, mimetype=media_mimetype(p), conditional=True)
         cached = cached_thumbnail(p, variant=variant)
@@ -1703,6 +1964,8 @@ def create_app(
         """
 
         def stop() -> None:
+            # Flush any debounced review-session write before the process exits.
+            _flush_persist()
             server = app.extensions.get("dedupe_server")
             if server is not None:
                 # Unblocks serve_forever() in run_app, so the process exits

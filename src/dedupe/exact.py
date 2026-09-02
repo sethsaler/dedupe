@@ -15,6 +15,10 @@ ProgressCb = Callable[[str, int, int], None]
 PARTIAL_SIZE = 64 * 1024
 CHUNK_SIZE = 1024 * 1024
 
+# Error-kind prefixes; engine diagnostics classify on these.
+ERROR_PARTIAL_HASH_FAILED = "partial hash failed"
+ERROR_SHA256_FAILED = "sha256 failed"
+
 
 def file_partial_hash(path: str | Path, nbytes: int = PARTIAL_SIZE) -> str:
     h = hashlib.sha256()
@@ -39,7 +43,7 @@ def _partial_job(path: str) -> tuple[str, str | None, str | None]:
     try:
         return path, file_partial_hash(path), None
     except OSError as exc:
-        return path, None, f"partial hash failed: {exc}"
+        return path, None, f"{ERROR_PARTIAL_HASH_FAILED}: {exc}"
 
 
 def _sha256_job(path: str) -> tuple[str, str | None, str | None]:
@@ -47,7 +51,7 @@ def _sha256_job(path: str) -> tuple[str, str | None, str | None]:
     try:
         return path, file_sha256(path), None
     except OSError as exc:
-        return path, None, f"sha256 failed: {exc}"
+        return path, None, f"{ERROR_SHA256_FAILED}: {exc}"
 
 
 def find_exact_groups(
@@ -114,7 +118,7 @@ def find_exact_groups(
                 try:
                     rec.partial_hash = partial_fn(rec.path)
                 except OSError as exc:
-                    rec.error = f"partial hash failed: {exc}"
+                    rec.error = f"{ERROR_PARTIAL_HASH_FAILED}: {exc}"
                 if progress and ((i + 1) % 20 == 0 or i + 1 == len(partial_targets)):
                     progress("exact-partial", i + 1, max(total_candidates, 1))
 
@@ -168,7 +172,7 @@ def find_exact_groups(
                 try:
                     rec.sha256 = hash_fn(rec.path)
                 except OSError as exc:
-                    rec.error = f"sha256 failed: {exc}"
+                    rec.error = f"{ERROR_SHA256_FAILED}: {exc}"
                 if progress and ((i + 1) % 10 == 0 or i + 1 == len(full_targets)):
                     progress("exact-full", i + 1, max(full_total, 1))
 

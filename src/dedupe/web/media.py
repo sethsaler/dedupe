@@ -20,10 +20,19 @@ VIDEO_EXTENSIONS = {
 
 BROWSER_SAFE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
 
-THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v5"
+THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v6"
 DEFAULT_THUMBNAIL_BUDGET_BYTES = 512 * 1024 * 1024
 PRUNE_MIN_INTERVAL_SECONDS = 120.0
 PRUNE_EVERY_N_WRITES = 32
+
+# Bound concurrent thumbnail generation: a page of video posters can otherwise
+# spawn dozens of ffmpeg processes (and full-res HEIC decodes spike RAM).
+GENERATE_WORKERS_CAP = 4
+_generate_semaphore = threading.BoundedSemaphore(GENERATE_WORKERS_CAP)
+# In-flight dedup: concurrent requests for the same uncached key share one
+# generation instead of each decoding/encoding their own copy.
+_inflight_lock = threading.Lock()
+_inflight: dict[str, threading.Event] = {}
 
 _prune_lock = threading.Lock()
 _prune_state = {"writes": 0, "last_run": 0.0}
@@ -43,7 +52,32 @@ def media_mimetype(path: Path) -> str:
     return mime or "application/octet-stream"
 
 
-def image_thumbnail_bytes(path: Path, *, full: bool = False) -> bytes:
+def _flatten_to_rgb(img):
+    """Composite alpha onto white; a plain convert("RGB") turns transparent
+    pixels black, which makes transparent PNG/GIF thumbs look wrong."""
+    from PIL import Image
+
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+    if not has_alpha:
+        return img.convert("RGB")
+    rgba = img.convert("RGBA")
+    background = Image.new("RGB", rgba.size, (255, 255, 255))
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
+
+
+# Card thumbs render up to ~800 CSS px wide (~1600 physical px on Retina);
+# the lightbox preview variant targets large displays at 2560 px, which is
+# dramatically lighter than serving multi-MP originals; "full" keeps the
+# original resolution for Quick Look-exact transcodes of formats browsers
+# cannot render natively (HEIC, TIFF, …).
+VARIANT_MAX_SIDE = {"thumb": 1600, "preview": 2560, "full": None}
+VARIANT_QUALITY = {"thumb": 85, "preview": 88, "full": 95}
+
+
+def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
     from PIL import Image, ImageOps
 
     try:
@@ -53,21 +87,17 @@ def image_thumbnail_bytes(path: Path, *, full: bool = False) -> bytes:
     except Exception:
         pass
 
-    # Card thumbs are sized for Retina (2x) displays: decision cards render up
-    # to ~800 CSS px wide (~1600 physical px), so anything smaller gets
-    # upscaled by the browser and looks soft next to Finder's previews. The
-    # full (lightbox) variant is only used for formats browsers cannot render
-    # natively (HEIC, TIFF, …) and keeps the original resolution for
-    # Quick Look-exact fidelity; browser-safe originals are served as-is by
-    # the /api/thumbnail route.
+    max_side = VARIANT_MAX_SIDE.get(variant, VARIANT_MAX_SIDE["thumb"])
+    quality = VARIANT_QUALITY.get(variant, VARIANT_QUALITY["thumb"])
     with Image.open(path) as img:
+        if max_side is not None:
+            # Decode JPEGs at a reduced DCT scale instead of full resolution;
+            # PIL ignores draft() for formats that do not support it.
+            img.draft("RGB", (max_side, max_side))
         img = ImageOps.exif_transpose(img)
-        img = img.convert("RGB")
-        if full:
-            quality = 95
-        else:
-            quality = 85
-            img.thumbnail((1600, 1600), Image.Resampling.LANCZOS, reducing_gap=3.0)
+        img = _flatten_to_rgb(img)
+        if max_side is not None:
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS, reducing_gap=3.0)
         output = BytesIO()
         img.save(output, format="JPEG", quality=quality)
         return output.getvalue()
@@ -141,7 +171,7 @@ def generate_thumbnail_bytes(path: Path, *, variant: str) -> bytes | None:
     if is_video(path):
         return video_thumbnail_bytes(path)
     try:
-        return image_thumbnail_bytes(path, full=variant == "full")
+        return image_thumbnail_bytes(path, variant=variant)
     except Exception:
         return None
 
@@ -162,30 +192,68 @@ def store_thumbnail(destination: Path, data: bytes) -> None:
         raise
 
 
-def cached_thumbnail(
-    path: Path, *, variant: str = "thumb", cache_dir: Path | None = None
-) -> tuple[Path, str] | None:
-    """Return the cached thumbnail file and its key, generating it when missing."""
-    try:
-        key = thumbnail_cache_key(path, variant=variant)
-    except OSError:
-        return None
-    destination = thumbnail_cache_file(key, cache_dir=cache_dir)
+def _stored_thumbnail(destination: Path, key: str) -> tuple[Path, str] | None:
     if destination.is_file():
         try:
             os.utime(destination, None)
         except OSError:
             pass
         return destination, key
-    data = generate_thumbnail_bytes(path, variant=variant)
-    if not data:
-        return None
+    return None
+
+
+def cached_thumbnail(
+    path: Path, *, variant: str = "thumb", cache_dir: Path | None = None
+) -> tuple[Path, str] | None:
+    """Return the cached thumbnail file and its key, generating it when missing.
+
+    Generation is bounded (GENERATE_WORKERS_CAP) and deduplicated: concurrent
+    requests for the same uncached thumbnail wait on the in-flight one rather
+    than each spawning their own decode/ffmpeg job.
+    """
     try:
-        store_thumbnail(destination, data)
+        key = thumbnail_cache_key(path, variant=variant)
     except OSError:
         return None
-    maybe_prune_thumbnail_cache(cache_dir=cache_dir)
-    return destination, key
+    destination = thumbnail_cache_file(key, cache_dir=cache_dir)
+    cached = _stored_thumbnail(destination, key)
+    if cached is not None:
+        return cached
+
+    with _inflight_lock:
+        event = _inflight.get(key)
+        if event is None:
+            event = threading.Event()
+            _inflight[key] = event
+            leader = True
+        else:
+            leader = False
+
+    if not leader:
+        # Another request is generating this thumbnail; use its result.
+        event.wait(timeout=120)
+        return _stored_thumbnail(destination, key)
+
+    try:
+        # Re-check after winning leadership: a just-finished generation may
+        # have produced the file while we were registering.
+        cached = _stored_thumbnail(destination, key)
+        if cached is not None:
+            return cached
+        with _generate_semaphore:
+            data = generate_thumbnail_bytes(path, variant=variant)
+        if not data:
+            return None
+        try:
+            store_thumbnail(destination, data)
+        except OSError:
+            return None
+        maybe_prune_thumbnail_cache(cache_dir=cache_dir)
+        return destination, key
+    finally:
+        with _inflight_lock:
+            _inflight.pop(key, None)
+            event.set()
 
 
 def prune_thumbnail_cache(

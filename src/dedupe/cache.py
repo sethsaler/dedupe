@@ -12,6 +12,9 @@ from .models import FileRecord, MediaType
 CACHE_ALGORITHM_VERSION = "dedupe-hashes-v2"
 # Rows per executemany batch when persisting a scan.
 STORE_BATCH_SIZE = 1000
+# Records per hydration query batch; each path/device+inode pair is one bind
+# variable and SQLite's default variable limit is 999.
+HYDRATE_BATCH_SIZE = 400
 
 _UPSERT_SQL = """
     INSERT INTO hashes (
@@ -189,6 +192,24 @@ class HashCache:
         except Exception:
             pass
 
+    @staticmethod
+    def _validate_row(rec: FileRecord, row) -> dict | None:
+        """Check a candidate cache row against the record's current identity."""
+        cached = dict(row)
+        if cached.get("size") is not None and int(cached["size"]) != rec.size:
+            return None
+        if rec.mtime_ns is not None and cached.get("mtime_ns") is not None:
+            if int(cached["mtime_ns"]) != int(rec.mtime_ns):
+                return None
+        elif abs(float(cached["mtime"]) - rec.mtime) >= 0.001:
+            return None
+        for key in ("device", "inode"):
+            current = getattr(rec, key)
+            prior = cached.get(key)
+            if current is not None and prior is not None and int(current) != int(prior):
+                return None
+        return cached
+
     def get(self, rec: FileRecord) -> dict | None:
         row = self._conn.execute(
             "SELECT * FROM hashes WHERE path = ? AND size = ? AND algorithm_version = ?",
@@ -216,21 +237,7 @@ class HashCache:
             ).fetchone()
         if not row:
             return None
-        cached = dict(row)
-        if rec.mtime_ns is not None and cached.get("mtime_ns") is not None:
-            if int(cached["mtime_ns"]) != int(rec.mtime_ns):
-                return None
-        elif abs(float(cached["mtime"]) - rec.mtime) >= 0.001:
-            return None
-        for key in ("device", "inode"):
-            current = getattr(rec, key)
-            prior = cached.get(key)
-            if current is not None and prior is not None and int(current) != int(prior):
-                return None
-        return cached
-
-    def put(self, rec: FileRecord) -> None:
-        self._conn.execute(_UPSERT_SQL, _upsert_row(rec))
+        return self._validate_row(rec, row)
 
     def commit(self) -> None:
         self._conn.commit()
@@ -289,52 +296,109 @@ class HashCache:
                 pairs.add((left.path, right.path))
         return pairs
 
+    @staticmethod
+    def _apply_row(rec: FileRecord, row: dict) -> None:
+        rec.width = row["width"] if row["width"] is not None else rec.width
+        rec.height = row["height"] if row["height"] is not None else rec.height
+        rec.sha256 = row["sha256"] or rec.sha256
+        rec.partial_hash = row["partial_hash"] or rec.partial_hash
+        rec.phash = row["phash"] or rec.phash
+        rec.dhash = row["dhash"] or rec.dhash
+        rec.tile_phashes = row["tile_phashes"] or rec.tile_phashes
+        rec.video_fingerprint = row["video_fingerprint"] or rec.video_fingerprint
+        rec.duration = row["duration"] if row["duration"] is not None else rec.duration
+        rec.human_detection_status = (
+            row["human_detection_status"] or rec.human_detection_status
+        )
+        rec.human_detector = row["human_detector"] or rec.human_detector
+        rec.human_detection_signature = (
+            row["human_detection_signature"] or rec.human_detection_signature
+        )
+        rec.human_frames_analyzed = (
+            row["human_frames_analyzed"]
+            if row["human_frames_analyzed"] is not None
+            else rec.human_frames_analyzed
+        )
+        rec.human_max_confidence = (
+            row["human_max_confidence"]
+            if row["human_max_confidence"] is not None
+            else rec.human_max_confidence
+        )
+        rec.face_count = (
+            row["face_count"] if row["face_count"] is not None else rec.face_count
+        )
+        rec.face_detector = row["face_detector"] or rec.face_detector
+        rec.face_detection_signature = (
+            row["face_detection_signature"] or rec.face_detection_signature
+        )
+        if row["media_type"]:
+            try:
+                rec.media_type = MediaType(row["media_type"])
+            except ValueError:
+                pass
+
     def hydrate(self, records: list[FileRecord]) -> int:
-        """Fill records from cache. Returns number of cache hits."""
+        """Fill records from cache. Returns number of cache hits.
+
+        Batched: one chunked ``IN`` query per ~400 paths (plus one batched
+        device/inode fallback pass for path misses) instead of 1–2 round trips
+        per record, which dominates scan startup on 10k+ file libraries.
+        """
+        rows_by_path: dict[str, dict] = {}
+        paths = [rec.path for rec in records]
+        for start in range(0, len(paths), HYDRATE_BATCH_SIZE):
+            chunk = paths[start : start + HYDRATE_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self._conn.execute(
+                f"SELECT * FROM hashes WHERE algorithm_version = ? "
+                f"AND path IN ({placeholders})",
+                (CACHE_ALGORITHM_VERSION, *chunk),
+            ):
+                rows_by_path[row["path"]] = row
+
         hits = 0
+        misses: list[FileRecord] = []
         for rec in records:
-            row = self.get(rec)
-            if not row:
+            row = rows_by_path.get(rec.path)
+            cached = self._validate_row(rec, row) if row is not None else None
+            if cached is None:
+                misses.append(rec)
                 continue
             hits += 1
-            rec.width = row["width"] if row["width"] is not None else rec.width
-            rec.height = row["height"] if row["height"] is not None else rec.height
-            rec.sha256 = row["sha256"] or rec.sha256
-            rec.partial_hash = row["partial_hash"] or rec.partial_hash
-            rec.phash = row["phash"] or rec.phash
-            rec.dhash = row["dhash"] or rec.dhash
-            rec.tile_phashes = row["tile_phashes"] or rec.tile_phashes
-            rec.video_fingerprint = row["video_fingerprint"] or rec.video_fingerprint
-            rec.duration = row["duration"] if row["duration"] is not None else rec.duration
-            rec.human_detection_status = (
-                row["human_detection_status"] or rec.human_detection_status
-            )
-            rec.human_detector = row["human_detector"] or rec.human_detector
-            rec.human_detection_signature = (
-                row["human_detection_signature"] or rec.human_detection_signature
-            )
-            rec.human_frames_analyzed = (
-                row["human_frames_analyzed"]
-                if row["human_frames_analyzed"] is not None
-                else rec.human_frames_analyzed
-            )
-            rec.human_max_confidence = (
-                row["human_max_confidence"]
-                if row["human_max_confidence"] is not None
-                else rec.human_max_confidence
-            )
-            rec.face_count = (
-                row["face_count"] if row["face_count"] is not None else rec.face_count
-            )
-            rec.face_detector = row["face_detector"] or rec.face_detector
-            rec.face_detection_signature = (
-                row["face_detection_signature"] or rec.face_detection_signature
-            )
-            if row["media_type"]:
-                try:
-                    rec.media_type = MediaType(row["media_type"])
-                except ValueError:
-                    pass
+            self._apply_row(rec, cached)
+
+        # Identity fallback for path misses: reuse hashes after a rename/move
+        # on the same filesystem (same device+inode, same size and media type).
+        fallback_candidates = [
+            rec for rec in misses if rec.device is not None and rec.inode is not None
+        ]
+        if fallback_candidates:
+            identities: dict[tuple, list[dict]] = {}
+            for start in range(0, len(fallback_candidates), HYDRATE_BATCH_SIZE):
+                chunk = fallback_candidates[start : start + HYDRATE_BATCH_SIZE]
+                pairs = ",".join("(?,?)" for _ in chunk)
+                params: list = [CACHE_ALGORITHM_VERSION]
+                for rec in chunk:
+                    params.extend((rec.device, rec.inode))
+                for row in self._conn.execute(
+                    f"SELECT * FROM hashes WHERE algorithm_version = ? "
+                    f"AND (device, inode) IN ({pairs}) ORDER BY path",
+                    params,
+                ):
+                    identities.setdefault((row["device"], row["inode"]), []).append(
+                        dict(row)
+                    )
+            for rec in fallback_candidates:
+                candidates = identities.get((rec.device, rec.inode), [])
+                for row in candidates:
+                    if row["media_type"] != rec.media_type.value:
+                        continue
+                    cached = self._validate_row(rec, row)
+                    if cached is None:
+                        continue
+                    hits += 1
+                    self._apply_row(rec, cached)
+                    break
         return hits
 
     def store_all(self, records: list[FileRecord]) -> None:

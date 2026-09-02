@@ -834,3 +834,30 @@ def test_run_scan_without_count_faces_publishes_no_faces_group(
 
     assert result.faces_files == 0
     assert all(g.kind != GroupKind.FACES for g in result.groups)
+
+
+def test_parallel_streams_floor_per_stream_workers(tmp_path: Path, monkeypatch) -> None:
+    """Multi-folder scans must not double-divide CPU stages down to 1 worker."""
+    import dedupe.engine as engine_module
+
+    seen_workers: list[int] = []
+
+    def fake_run_scan(paths, **kwargs):
+        seen_workers.append(kwargs["workers"])
+        return ScanResult(
+            roots=[str(path) for path in paths], files=[], groups=[]
+        )
+
+    monkeypatch.setattr(engine_module, "run_scan", fake_run_scan)
+    roots = []
+    for name in ("a", "b", "c"):
+        root = tmp_path / name
+        root.mkdir()
+        roots.append(root)
+
+    run_scans_parallel(roots, workers=8, use_cache=False)
+    assert seen_workers == [3, 3, 3]  # ceil(8/3), not floor-to-2 then split again
+
+    seen_workers.clear()
+    run_scans_parallel(roots, workers=1, use_cache=False)
+    assert seen_workers == [2, 2, 2]  # floor of 2 keeps CPU stages concurrent

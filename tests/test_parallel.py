@@ -79,6 +79,43 @@ def test_split_cpu_budget_divides_between_concurrent_cpu_stages() -> None:
     # Never below one worker.
     assert split_cpu_budget(1, 3) == 1
     assert split_cpu_budget(0, 2) == 1
+    # Small budgets floor at 2 per stage: parallel scan streams divide the
+    # budget first, and a second division to 1 would serialize a CPU stage.
+    assert split_cpu_budget(2, 2) == 2
+    assert split_cpu_budget(3, 2) == 2
+
+
+def test_map_parallel_cancel_returns_promptly() -> None:
+    """Cancel must not block on shutdown(wait=True) behind a slow work item."""
+    import threading
+    import time
+
+    import pytest
+
+    started = threading.Event()
+    cancel = threading.Event()
+
+    def slow(x: int) -> int:
+        started.set()
+        # Far longer than the test is willing to wait; queued items are
+        # cancelled, running ones finish in the background.
+        deadline = time.monotonic() + 30
+        while not cancel.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return x
+
+    cancel_at = time.monotonic()
+    try:
+        with pytest.raises(InterruptedError):
+            map_parallel(
+                slow,
+                list(range(6)),
+                workers=2,
+                cancelled=lambda: started.is_set(),
+            )
+    finally:
+        cancel.set()  # let the abandoned workers exit
+    assert time.monotonic() - cancel_at < 5
 
 
 def test_map_parallel_preserves_order() -> None:

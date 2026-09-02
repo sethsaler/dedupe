@@ -1578,8 +1578,8 @@ def test_thumbnail_is_generated_once_and_served_from_disk(tmp_path: Path, monkey
     scanned = Path(result.files[0].path)
     calls = []
 
-    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
-        calls.append((str(path), full))
+    def fake_thumbnail(path: Path, *, variant: str = "thumb") -> bytes:
+        calls.append((str(path), variant))
         return b"jpeg-bytes"
 
     monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
@@ -1621,7 +1621,7 @@ def test_thumbnail_cache_key_changes_when_source_file_changes(
     scanned = Path(result.files[0].path)
     calls = []
 
-    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
+    def fake_thumbnail(path: Path, *, variant: str = "thumb") -> bytes:
         calls.append(str(path))
         return b"jpeg-%d" % len(calls)
 
@@ -1645,8 +1645,8 @@ def test_full_thumbnail_serves_original_for_browser_safe_images(
     scanned = Path(result.files[0].path)
     calls = []
 
-    def fake_thumbnail(path: Path, *, full: bool = False) -> bytes:
-        calls.append(full)
+    def fake_thumbnail(path: Path, *, variant: str = "thumb") -> bytes:
+        calls.append(variant)
         return b"jpeg-bytes"
 
     monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
@@ -1678,8 +1678,8 @@ def test_full_thumbnail_transcodes_formats_browsers_cannot_render(
     client = create_app(result).test_client()
     calls = []
 
-    def fake_thumbnail(source: Path, *, full: bool = False) -> bytes:
-        calls.append(full)
+    def fake_thumbnail(source: Path, *, variant: str = "thumb") -> bytes:
+        calls.append(variant)
         return b"transcoded-jpeg"
 
     monkeypatch.setattr(web_media, "image_thumbnail_bytes", fake_thumbnail)
@@ -1688,7 +1688,7 @@ def test_full_thumbnail_transcodes_formats_browsers_cannot_render(
 
     assert response.status_code == 200
     assert response.data == b"transcoded-jpeg"
-    assert calls == [True]
+    assert calls == ["full"]
 
 
 def test_thumbnail_rejects_paths_outside_the_scan(tmp_path: Path) -> None:
@@ -2064,3 +2064,417 @@ def test_bulk_min_faces_rule_only_selects_analyzed_multi_face_files(tmp_path: Pa
         parse_bulk_criteria({"min_faces": 0})
     with pytest.raises(ValueError):
         parse_bulk_criteria({"min_faces": "not-a-number"})
+
+
+def _two_exact_groups(tmp_path: Path):
+    """Two exact-duplicate groups (four real files) for streaming tests."""
+    records = []
+    member_lists = []
+    for label in ("one", "two"):
+        data = f"identical-payload-{label}".encode()
+        pair = []
+        for suffix in ("a", "b"):
+            path = tmp_path / f"{label}-{suffix}.jpg"
+            path.write_bytes(data)
+            stat = path.stat()
+            pair.append(
+                FileRecord(
+                    path=str(path),
+                    size=stat.st_size,
+                    mtime=stat.st_mtime,
+                    media_type=MediaType.IMAGE,
+                    extension=".jpg",
+                    device=stat.st_dev,
+                    inode=stat.st_ino,
+                    mtime_ns=stat.st_mtime_ns,
+                )
+            )
+        member_lists.append(pair)
+        records.extend(pair)
+    return records, build_groups(member_lists, [])
+
+
+def test_status_summary_includes_faces_files(tmp_path: Path) -> None:
+    status = create_app(_faces_result(tmp_path)).test_client().get("/api/status").get_json()
+    assert status["summary"]["faces_files"] == 1
+
+
+def test_status_poll_does_not_recompute_stats(tmp_path: Path, monkeypatch) -> None:
+    """Serving a poll is O(1): stats are maintained where mutations happen."""
+    calls = 0
+    original = ScanResult.recompute_stats
+
+    def counting(self):
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    monkeypatch.setattr(ScanResult, "recompute_stats", counting)
+    app = create_app(_result(tmp_path))
+    after_init = calls
+    client = app.test_client()
+    first = client.get("/api/status").get_json()
+    second = client.get("/api/status").get_json()
+    assert calls == after_init
+    assert first["summary"]["selected_count"] == second["summary"]["selected_count"] == 1
+
+
+def test_streamed_groups_update_stats_incrementally(tmp_path: Path, monkeypatch) -> None:
+    """Mid-scan /api/status reflects streamed groups without a full recompute."""
+    records, groups = _two_exact_groups(tmp_path)
+    gate = threading.Event()
+    streamed = threading.Event()
+
+    def fake_run_scan(paths, **kwargs):
+        on_group = kwargs["on_group"]
+        on_group(groups[0])
+        streamed.set()
+        gate.wait(15)
+        on_group(groups[1])
+        result = ScanResult(roots=[str(tmp_path)], files=records, groups=list(groups))
+        result.recompute_stats()
+        return result
+
+    monkeypatch.setattr(web_app, "run_scan", fake_run_scan)
+    app = create_app()
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "cache.sqlite3")
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+
+    started = client.post(
+        "/api/scan",
+        json={"paths": [str(tmp_path)], "parallel_streams": False, "use_cache": False},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert started.status_code == 200
+    assert streamed.wait(10)
+
+    status = {}
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if status.get("summary", {}).get("group_count") == 1:
+            break
+        time.sleep(0.02)
+    # One streamed group: auto smart select picks one member for removal.
+    assert status["scanning"] is True
+    assert status["summary"]["exact_groups"] == 1
+    assert status["summary"]["selected_count"] == 1
+    assert status["summary"]["reclaimable_bytes"] > 0
+
+    gate.set()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if not status["scanning"]:
+            break
+        time.sleep(0.02)
+    assert status["scanning"] is False
+    assert status["summary"]["group_count"] == 2
+    assert status["summary"]["selected_count"] == 2
+
+
+def test_events_stream_delivers_groups_status_and_reset(tmp_path: Path, monkeypatch) -> None:
+    records, groups = _two_exact_groups(tmp_path)
+    gate = threading.Event()
+
+    def fake_run_scan(paths, **kwargs):
+        on_group = kwargs["on_group"]
+        on_group(groups[0])
+        gate.wait(15)
+        on_group(groups[1])
+        result = ScanResult(roots=[str(tmp_path)], files=records, groups=list(groups))
+        result.recompute_stats()
+        return result
+
+    monkeypatch.setattr(web_app, "run_scan", fake_run_scan)
+    app = create_app()
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "cache.sqlite3")
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+
+    response = client.get("/api/events", buffered=False)
+    chunks: list[str] = []
+    stop_reading = threading.Event()
+
+    def reader() -> None:
+        try:
+            for chunk in response.response:
+                chunks.append(
+                    chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                )
+                if stop_reading.is_set():
+                    break
+        except Exception:
+            pass
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    deadline = time.monotonic() + 15
+    while not chunks and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert chunks  # stream is live before the scan starts
+
+    started = client.post(
+        "/api/scan",
+        json={"paths": [str(tmp_path)], "parallel_streams": False, "use_cache": False},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert started.status_code == 200
+
+    def seen(needle: str) -> bool:
+        return any(needle in chunk for chunk in chunks)
+
+    while not seen(groups[0].id) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert seen("event: group") and seen(groups[0].id)
+
+    gate.set()
+    while not (seen('"done": true') and seen("event: reset")) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert seen('"done": true')
+    # The completed result replaced the streaming one: a reset tells clients
+    # to refetch instead of trusting per-connection append tracking. Group
+    # deltas are best-effort mid-scan; the reset is authoritative, so g2 (which
+    # landed in the same wakeup as completion) is covered by the refetch.
+    assert seen("event: reset")
+    final = client.get("/api/groups?kind=all").get_json()
+    assert {g["id"] for g in final["groups"]} == {groups[0].id, groups[1].id}
+    stop_reading.set()
+    # Do not response.close(): the reader thread can be blocked inside the
+    # generator's idle wait, and closing then raises "generator already
+    # executing". The daemon reader and GC reclaim it at test end.
+
+
+def test_selection_persist_debounced_for_large_results(tmp_path: Path, monkeypatch) -> None:
+    """Above the group threshold, selection toggles coalesce session writes."""
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_MIN_GROUPS", 0)
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_SECONDS", 0.05)
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    state = app.extensions["dedupe_state"]
+
+    group = client.get("/api/groups").get_json()["groups"][0]
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    state["persist_dirty"] = False  # drain the startup persist
+
+    response = client.post(
+        "/api/selection",
+        json={
+            "group_id": group["id"],
+            "selected": [group["members"][0]["path"]],
+            "scan_id": scan_id,
+        },
+        headers={"X-Dedupe-Token": token},
+    )
+    assert response.status_code == 200
+    assert state["persist_dirty"] is True  # debounced, not yet on disk
+
+    deadline = time.monotonic() + 5
+    while state["persist_dirty"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert state["persist_dirty"] is False
+    assert state["review_session"].saved_at is not None
+
+
+def test_transparent_image_thumbnail_composites_on_white(tmp_path: Path) -> None:
+    """Transparent pixels must not turn black in thumbnails."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    source = tmp_path / "transparent.png"
+    image = Image.new("RGBA", (8, 8), (200, 0, 0, 0))
+    image.save(source, format="PNG")
+
+    data = web_media.image_thumbnail_bytes(source)
+    with Image.open(BytesIO(data)) as thumb:
+        pixel = thumb.convert("RGB").getpixel((0, 0))
+    assert all(channel > 200 for channel in pixel)
+
+
+def test_concurrent_thumbnail_generation_is_deduplicated(tmp_path: Path, monkeypatch) -> None:
+    """Parallel requests for one uncached thumbnail share a single generation."""
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"not really a jpeg; generation is faked")
+
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fake_generate(path: Path, *, variant: str) -> bytes:
+        nonlocal calls
+        time.sleep(0.05)
+        with calls_lock:
+            calls += 1
+        return b"fake-jpeg-bytes"
+
+    monkeypatch.setattr(web_media, "generate_thumbnail_bytes", fake_generate)
+    cache_dir = tmp_path / "thumbs"
+
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                web_media.cached_thumbnail(source, cache_dir=cache_dir)
+            )
+        )
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert calls == 1
+    assert all(result is not None for result in results)
+    assert len(results) == 8
+
+
+def test_preview_variant_downscales_browser_safe_images(tmp_path: Path) -> None:
+    """The lightbox preview variant is a cached ≤2560px JPEG, not the original."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    path = tmp_path / "big.jpg"
+    Image.new("RGB", (4000, 3000), (24, 48, 96)).save(path, quality=90)
+    stat = path.stat()
+    record = FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[record], groups=[])
+    client = create_app(result).test_client()
+
+    response = client.get(
+        "/api/thumbnail", query_string={"path": str(path), "variant": "preview"}
+    )
+
+    assert response.status_code == 200
+    assert "immutable" in response.headers["Cache-Control"]
+    with Image.open(BytesIO(response.data)) as preview:
+        assert max(preview.size) <= 2560
+        assert preview.format == "JPEG"
+    assert len(list((tmp_path / "thumbs").rglob("*.jpg"))) == 1
+
+
+def test_reveal_returns_scanned_path_and_rejects_outside(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    scanned = result.files[0].path
+
+    ok = client.get("/api/reveal", query_string={"path": scanned})
+    assert ok.status_code == 200
+    assert ok.get_json() == {"path": scanned, "exists": True}
+
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"nope")
+    forbidden = client.get("/api/reveal", query_string={"path": str(outside)})
+    assert forbidden.status_code == 403
+
+
+def test_reveal_open_requires_token_and_invokes_finder(tmp_path: Path, monkeypatch) -> None:
+    result = _result(tmp_path)
+    app = create_app(result)
+    client = app.test_client()
+    scanned = result.files[0].path
+
+    # open=1 has a side effect: the mutating-token rule applies even to GET.
+    no_token = client.get("/api/reveal", query_string={"path": scanned, "open": "1"})
+    assert no_token.status_code == 403
+
+    opened = []
+    import subprocess as subprocess_module
+
+    class FakePopen:
+        def __init__(self, command):
+            opened.append(command)
+
+    monkeypatch.setattr(subprocess_module, "Popen", FakePopen)
+    ok = client.get(
+        "/api/reveal",
+        query_string={"path": scanned, "open": "1"},
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+    assert ok.status_code == 200
+    assert opened == [["open", "-R", scanned]]
+
+
+def test_shutdown_stops_server_after_grace_and_new_request_cancels(
+    tmp_path: Path,
+) -> None:
+    class FakeServer:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    # Cancellation: a request during the grace period keeps the server alive.
+    app = create_app()
+    fake = FakeServer()
+    app.extensions["dedupe_server"] = fake
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+
+    response = client.post("/api/shutdown", json={}, headers={"X-Dedupe-Token": token})
+    assert response.status_code == 200
+    client.get("/api/status")  # a reloaded page cancels the pending shutdown
+    time.sleep(2.0)
+    assert fake.shutdown_calls == 0
+
+    # Uninterrupted: the grace timer fires and stops the server.
+    response = client.post("/api/shutdown", json={}, headers={"X-Dedupe-Token": token})
+    assert response.status_code == 200
+    deadline = time.monotonic() + 5
+    while not fake.shutdown_calls and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert fake.shutdown_calls == 1
+
+
+def test_review_session_resume_and_discard_endpoints(tmp_path: Path) -> None:
+    from dedupe.review_session import save_review_session
+
+    session_path = tmp_path / "state" / "review-session.json"
+    result = _result(tmp_path)
+
+    # The app starts empty (nothing auto-loaded without a result), then resume
+    # revalidates against disk and installs the saved review. The session is
+    # written after create_app because an initial_result is persisted at boot.
+    app = create_app(initial_result=ScanResult(roots=[], files=[], groups=[]),
+                     review_session_path=session_path)
+    save_review_session(result, session_path)
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    assert client.get("/api/groups").get_json()["groups"] == []
+
+    resumed = client.post(
+        "/api/review-session/resume", json={}, headers={"X-Dedupe-Token": token}
+    )
+    assert resumed.status_code == 200
+    groups = client.get("/api/groups").get_json()["groups"]
+    assert len(groups) == len(result.groups)
+
+    discarded = client.delete(
+        "/api/review-session",
+        # The browser client always sends a JSON content type, even body-less.
+        content_type="application/json",
+        headers={"X-Dedupe-Token": token},
+    )
+    assert discarded.status_code == 200
+    assert client.get("/api/groups").get_json()["groups"] == []
+    assert not session_path.exists()
+
+    # Resuming with nothing on disk is a clean 404.
+    missing = client.post(
+        "/api/review-session/resume", json={}, headers={"X-Dedupe-Token": token}
+    )
+    assert missing.status_code == 404

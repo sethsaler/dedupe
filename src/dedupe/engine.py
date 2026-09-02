@@ -9,7 +9,11 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .cache import HashCache
-from .exact import find_exact_groups
+from .exact import (
+    ERROR_PARTIAL_HASH_FAILED,
+    ERROR_SHA256_FAILED,
+    find_exact_groups,
+)
 from .face_detection import FACE_MEDIA_TYPES, count_faces_in_files
 from .grouping import (
     DEFAULT_RANDOM_REVIEW_COUNT,
@@ -37,16 +41,28 @@ from .models import (
     ScanResult,
     StageDiagnostics,
 )
-from .parallel import resolve_workers, split_cpu_budget
+from .parallel import map_parallel, resolve_workers, split_cpu_budget
 from .scanner import inventory, is_in_photos_library
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
-from .similar_image import find_similar_image_groups, probe_image_dimensions
+from .similar_image import (
+    ERROR_IMAGE_HASH_FAILED,
+    find_similar_image_groups,
+    probe_image_dimensions,
+)
 from .similar_video import DEFAULT_THRESHOLD as VID_THRESHOLD
-from .similar_video import ffmpeg_available, find_similar_video_groups, probe_video
+from .similar_video import (
+    ERROR_VIDEO_FINGERPRINT_FAILED,
+    ffmpeg_available,
+    find_similar_video_groups,
+    probe_video,
+)
 
 ProgressCb = Callable[[ScanProgress], None]
 GroupCb = Callable[[DuplicateGroup], None]
 StreamProgressCb = Callable[[ScanProgress], None]
+
+# Minimum seconds between mid-stage progress callback invocations.
+PROGRESS_CALLBACK_MIN_INTERVAL = 0.1
 
 
 def _low_resolution_bounds(
@@ -106,17 +122,16 @@ def _populate_missing_dimensions(
         except Exception as exc:
             return f"resolution probe failed for {record.path}: {exc}"
 
-    errors: list[str] = []
-    with ThreadPoolExecutor(
-        max_workers=max(1, min(workers, len(missing))),
-        thread_name_prefix="media-dimensions",
-    ) as pool:
-        for done, error in enumerate(pool.map(probe, missing), start=1):
-            if error:
-                errors.append(error)
-            if progress:
-                progress(done, len(missing))
-    return errors
+    # map_parallel keeps only ~2x workers futures in flight; a raw
+    # ThreadPoolExecutor.map would allocate one future per missing record.
+    results = map_parallel(
+        probe,
+        missing,
+        workers=max(1, min(workers, len(missing))),
+        progress=progress,
+        cancelled=cancelled,
+    )
+    return [error for error in results if error]
 
 
 def run_scan(
@@ -191,10 +206,17 @@ def run_scan(
     }
     cache_hits = 0
 
+    # Per-file progress arrives from every concurrent stage; invoking the
+    # caller's callback for each one means hundreds of thousands of lock
+    # acquisitions on a big library. Throttle mid-stage callbacks and always
+    # deliver phase changes, milestones, and stage completions.
+    last_callback = {"t": 0.0}
+
     def emit(phase: str, processed: int = 0, total: int = 0, message: str = "") -> None:
         nonlocal phase_started, previous_phase
         now = time.monotonic()
-        if phase != previous_phase:
+        phase_changed = phase != previous_phase
+        if phase_changed:
             phase_started = now
             previous_phase = phase
         prog.phase = phase
@@ -212,7 +234,16 @@ def run_scan(
         else:
             prog.eta_seconds = None
         if progress:
-            progress(prog)
+            milestone = bool(message) and (not total or processed >= total)
+            stage_finished = bool(total) and processed >= total
+            if (
+                phase_changed
+                or milestone
+                or stage_finished
+                or now - last_callback["t"] >= PROGRESS_CALLBACK_MIN_INTERVAL
+            ):
+                last_callback["t"] = now
+                progress(prog)
 
     def check_cancelled() -> None:
         if cancelled and cancelled():
@@ -713,7 +744,9 @@ def run_scan(
                 record.error
                 for record in records
                 if record.error
-                and record.error.startswith(("partial hash failed", "sha256 failed"))
+                and record.error.startswith(
+                    (ERROR_PARTIAL_HASH_FAILED, ERROR_SHA256_FAILED)
+                )
             ]
         if run_similar:
             stage_durations["similar_image"] = stage_results["image"]
@@ -721,12 +754,12 @@ def run_scan(
             stage_errors["similar_image"] = [
                 record.error
                 for record in records
-                if record.error and record.error.startswith("image hash failed")
+                if record.error and record.error.startswith(ERROR_IMAGE_HASH_FAILED)
             ]
             stage_errors["similar_video"] = [
                 record.error
                 for record in records
-                if record.error and record.error.startswith("video fingerprint failed")
+                if record.error and record.error.startswith(ERROR_VIDEO_FINGERPRINT_FAILED)
             ]
         if run_dimensions:
             stage_durations["low_resolution"] = stage_results["dims"]
@@ -1012,7 +1045,10 @@ def run_scans_parallel(
         return result
 
     n_streams = min(len(resolved_roots), resolve_workers(max_streams))
-    per_stream_workers = max(1, resolve_workers(workers) // n_streams)
+    # Divide the worker budget across streams (rounding up, floor of 2): each
+    # stream splits its budget again between concurrent CPU stages, and a
+    # double division down to 1 worker serializes image hashing/face counting.
+    per_stream_workers = max(2, -(-resolve_workers(workers) // n_streams))
 
     started = time.monotonic()
     lock = threading.RLock()

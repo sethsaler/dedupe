@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -150,17 +151,28 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
     records = list(result.files) + [
         member for group in result.groups for member in group.members
     ]
-    for record in records:
+    keep_without_stat = {
         # Trashed review candidates are absent from their original path on
         # purpose; keep them so the per-candidate undo survives a restart.
-        if record.path in report.deleted_files:
-            valid_paths.add(record.path)
-            continue
-        error = validate_file_record(record, result.roots)
-        if error is None:
-            valid_paths.add(record.path)
-        else:
-            invalid.setdefault(record.path, error)
+        record.path
+        for record in records
+        if record.path in report.deleted_files
+    }
+    valid_paths |= keep_without_stat
+    to_validate = [record for record in records if record.path not in keep_without_stat]
+
+    def _validate(record):
+        return record.path, validate_file_record(record, result.roots)
+
+    # One lstat per file, parallelized: resume validation is the slowest part
+    # of UI startup on a large saved review when run serially.
+    workers = min(8, max(1, (os.cpu_count() or 2) - 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="review-revalidate") as pool:
+        for validated_path, error in pool.map(_validate, to_validate):
+            if error is None:
+                valid_paths.add(validated_path)
+            else:
+                invalid.setdefault(validated_path, error)
     for valid_path in valid_paths:
         invalid.pop(valid_path, None)
     result.files = [record for record in result.files if record.path in valid_paths]
