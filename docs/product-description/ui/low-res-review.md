@@ -33,7 +33,7 @@ The first arrow-key decision makes the review consequential: the decision is sen
 
 ### While extended
 
-**Deciding.** The focused candidate is decided with `←` (Delete) or `→` (Keep); the detail pane advances. Each decision does two things: it marks the candidate *reviewed*, and it sets or clears its selection. A Delete selects; a Keep deselects. The member summary line reports "{N} of {count} reviewed · {M} selected for removal".
+**Deciding.** The focused candidate is decided with `←` (Delete) or `→` (Keep); the detail pane advances, and each advance re-centers the candidate's media in the viewport so the full image or video stays on screen while arrowing through the pile. Each decision does two things: it marks the candidate *reviewed*, and it sets or clears its selection. A Delete selects; a Keep deselects. The member summary line reports "{N} of {count} reviewed · {M} selected for removal".
 
 **What a Keep commits.** A reviewed, unselected low-resolution candidate is an explicit keep: the decision is written to the keep-decisions file, keyed to the file's identity. Future scans stop surfacing the file — the decision outlives this session, this scan, and this browser. If the file later changes, the identity no longer matches and the decision stops applying; the file can resurface. Withdrawing a Keep — selecting the candidate again — clears the stored decision.
 

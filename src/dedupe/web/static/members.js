@@ -499,6 +499,16 @@ function renderMembers(g) {
       card.classList.add("focused");
     });
   });
+
+  if (decisionReview) {
+    // Keep the candidate's media pinned to the vertical center of the screen:
+    // each ← / → decision re-renders the card, and without this the scroll
+    // position drifts until part of the image sits off-screen. The wrap's
+    // aspect ratio is already set from the scan dimensions, so centering is
+    // correct even before the thumbnail finishes loading.
+    box.querySelector(".decision-card .thumb-wrap")
+      ?.scrollIntoView({ block: "center", behavior: "instant" });
+  }
 }
 
 async function reviewCandidate(group, path, remove) {
@@ -712,8 +722,9 @@ function changeMemberPage(delta) {
     if (nextIndex === state.memberFocus) return;
     state.memberFocus = nextIndex;
     state.memberPage = nextIndex;
+    // renderMembers centers the candidate's media; no pager scroll here, or
+    // it would yank the view back to the top of the pane.
     renderMembers(current);
-    $("memberPagination").scrollIntoView({ block: "start", behavior: "instant" });
     return;
   }
   if (!current || !isPagedIndependentReview(current)) return;

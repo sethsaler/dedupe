@@ -588,8 +588,11 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert "low_resolution_gif_max_pixels: lowResolutionBounds.gifs" in script
     assert "low_resolution_video_max_pixels: lowResolutionBounds.videos" in script
     assert 'await reviewCandidate(current, member.path, e.key === "ArrowLeft")' in script
-    assert script.count('scrollIntoView({ block: "start", behavior: "instant" })') == 2
+    assert script.count('scrollIntoView({ block: "start", behavior: "instant" })') == 1
     assert 'scrollIntoView({ block: "start", behavior: "smooth" })' not in script
+    # Decision reviews (← Delete / → Keep) re-center the candidate's media on
+    # every render so the full image stays on screen while arrowing through.
+    assert 'scrollIntoView({ block: "center", behavior: "instant" })' in script
 
     stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
     assert "aspect-ratio: var(--preview-aspect-ratio);" in stylesheet
