@@ -11,6 +11,7 @@ import os
 import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -576,6 +577,22 @@ def cmd_ui(args: argparse.Namespace) -> int:
         data = json.loads(Path(args.load).read_text(encoding="utf-8"))
         initial = ScanResult.from_dict(data)
     app = create_app(initial_result=initial)
+    # Probe the port first: on a busy port werkzeug prints its own two-liner
+    # and raises SystemExit, which read as a crash. A plain bind (with the
+    # same SO_REUSEADDR werkzeug uses) lets us say it cleanly.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", args.port))
+    except OSError as exc:
+        print(
+            f"error: port {args.port} is not available ({exc.strerror or exc}) — "
+            "is another Dedupe UI already running?",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        probe.close()
     run_app(app, port=args.port, open_browser=not args.no_browser)
     return 0
 
@@ -608,6 +625,9 @@ def cmd_isolate(args: argparse.Namespace) -> int:
         f"{mode} isolate: {action_result.success_count} ok, "
         f"{action_result.fail_count} failed"
     )
+    for item in action_result.items:
+        if not item.ok:
+            print(f"  failed: {item.path}: {item.error}")
     print(f"Review root: {action_result.review_root}")
     print(f"Group folders: {len(action_result.group_dirs)}")
     for d in action_result.group_dirs[:20]:

@@ -2205,14 +2205,16 @@ def run_app(
     from werkzeug.serving import make_server
 
     url = f"http://{host}:{port}/"
-    print(f"Dedupe UI: {url}")
-    if open_browser:
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    # make_server (rather than app.run) so /api/shutdown can stop the loop via
-    # server.shutdown() and let the process exit cleanly when the tab closes.
+    # Bind before announcing anything: on a genuinely busy port make_server
+    # raises OSError, and the URL line must never print for a server that did
+    # not start. (make_server rather than app.run so /api/shutdown can stop
+    # the loop via server.shutdown() when the tab closes.)
     server = make_server(host, port, app, threaded=True)
     app.extensions["dedupe_server"] = server
-    print("Press CTRL+C to quit (closing the browser tab also stops the server)")
+    print(f"Dedupe UI: {url}", flush=True)
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    print("Press CTRL+C to quit (closing the browser tab also stops the server)", flush=True)
     try:
         server.serve_forever()
     finally:

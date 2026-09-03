@@ -183,6 +183,42 @@ def test_scan_second_sigint_interrupts_immediately(
     assert signal_mod.getsignal(signal_mod.SIGINT) is previous
 
 
+def test_isolate_prints_per_item_failure_reasons(tmp_path: Path, capsys) -> None:
+    pair = tmp_path / "pair"
+    pair.mkdir()
+    (pair / "a.jpg").write_bytes(b"same-bytes")
+    (pair / "b.jpg").write_bytes(b"same-bytes")
+    out_json = tmp_path / "results.json"
+    assert cli.main(["scan", str(pair), "--no-similar", "--json", str(out_json)]) == 0
+    capsys.readouterr()
+
+    # A file that changed since the scan cancels the whole execute, and the
+    # user must see why without opening the receipt.
+    (pair / "a.jpg").write_bytes(b"changed after the scan")
+    assert cli.main(["isolate", str(out_json), "--execute"]) == 1
+
+    out = capsys.readouterr().out
+    assert "failed:" in out
+    assert "changed since scan" in out
+    assert "isolate cancelled because another file failed preflight" in out
+
+
+def test_ui_on_a_busy_port_exits_cleanly(capsys) -> None:
+    import socket
+
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    port = blocker.getsockname()[1]
+    try:
+        assert cli.main(["ui", "--no-browser", "--port", str(port)]) == 2
+    finally:
+        blocker.close()
+    err = capsys.readouterr().err
+    assert f"port {port}" in err
+    assert "Traceback" not in err
+
+
 def test_receipts_list_warns_about_unreadable_receipts(tmp_path: Path, capsys) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()
