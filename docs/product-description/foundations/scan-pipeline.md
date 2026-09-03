@@ -8,9 +8,11 @@ A scan is one full pass over a set of folders: it finds every media file, finger
 
 A scan walks the given folders recursively and picks up three kinds of media by file extension:
 
-- **Images:** `.jpg`, `.jpeg`, `.png`, `.heic`, `.heif`, `.webp`, `.tif`, `.tiff`, `.bmp`, `.raw`, `.cr2`, `.nef`, `.arw`, `.dng`
+- **Images:** `.jpg`, `.jpeg`, `.png`, `.heic`, `.heif`, `.webp`, `.avif`, `.tif`, `.tiff`, `.bmp`, `.raw`, `.cr2`, `.nef`, `.arw`, `.dng`
 - **GIFs:** `.gif`
-- **Videos:** `.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.webm`, `.mts`, `.m2ts`, `.wmv`, `.flv`, `.3gp`
+- **Videos:** `.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.webm`, `.mts`, `.m2ts`, `.wmv`, `.flv`, `.3gp`, `.mpg`, `.mpeg`, `.ts`, `.vob`
+
+AVIF files render natively in the browser, so they need no transcode anywhere. Like the other formats browsers cannot play natively (`.avi`, `.mkv`, `.wmv`, `.flv`, `.mts`, `.m2ts`), the MPEG-1/2 containers (`.mpg`, `.mpeg`, `.ts`, `.vob`) fingerprint and thumbnail normally but the lightbox's video player may not play them; their cards still show a poster frame.
 
 Everything else is ignored silently. Hidden files are skipped unless the scan is told to include them. Each kind can be turned off for a scan (`include_images`, `include_gifs`, `include_videos`), and exclusion globs remove matching paths before anything is read.
 

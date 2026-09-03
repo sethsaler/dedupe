@@ -13,10 +13,10 @@ import time
 from io import BytesIO
 from pathlib import Path
 
-VIDEO_EXTENSIONS = {
-    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mts", ".m2ts",
-    ".wmv", ".flv", ".3gp",
-}
+# One extension table: the scanner's. A second copy here rotted (`.avif` was
+# already listed as browser-safe below while the scanner never inventoried
+# the format), so thumbnails follow whatever the scan considers video.
+from ..models import VIDEO_EXTS as VIDEO_EXTENSIONS
 
 BROWSER_SAFE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
 

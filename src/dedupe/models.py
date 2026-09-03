@@ -51,6 +51,7 @@ IMAGE_EXTS = {
     ".heic",
     ".heif",
     ".webp",
+    ".avif",
     ".tif",
     ".tiff",
     ".bmp",
@@ -73,6 +74,10 @@ VIDEO_EXTS = {
     ".wmv",
     ".flv",
     ".3gp",
+    ".mpg",
+    ".mpeg",
+    ".ts",
+    ".vob",
 }
 
 
