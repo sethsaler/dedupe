@@ -10,8 +10,10 @@ import math
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from . import __version__
@@ -404,6 +406,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if prog.done:
             print()
 
+    # First Ctrl+C asks the engine to stop at its next checkpoint (the same
+    # cooperative cancel the web UI's Cancel button uses); a second one
+    # interrupts immediately with the plain KeyboardInterrupt path in main().
+    cancel_event = threading.Event()
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(signum, frame) -> None:
+        if cancel_event.is_set():
+            raise KeyboardInterrupt
+        cancel_event.set()
+        print(
+            "\nCancelling after the current work item… (Ctrl+C again to stop now)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     scan_kwargs = {
         "exact": not args.no_exact,
         "similar": not args.no_similar,
@@ -435,15 +455,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "workers": args.workers,
         "exclusions": args.exclude,
         "progress": on_progress,
+        "cancelled": cancel_event.is_set,
     }
-    if args.parallel:
-        result = run_scans_parallel(
-            args.paths,
-            max_streams=args.max_streams or None,
-            **scan_kwargs,
-        )
-    else:
-        result = run_scan(args.paths, **scan_kwargs)
+    try:
+        if args.parallel:
+            result = run_scans_parallel(
+                args.paths,
+                max_streams=args.max_streams or None,
+                **scan_kwargs,
+            )
+        else:
+            result = run_scan(args.paths, **scan_kwargs)
+    except InterruptedError:
+        # The cooperative cancel landed at a checkpoint; in-flight stage work
+        # is discarded, but every cache write the engine completed stands.
+        print("\nscan cancelled", file=sys.stderr)
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
 
     apply_smart_select_all(result.groups, SmartRule(args.smart))
     print(summarize_scan(result))

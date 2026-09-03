@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 from dedupe.engine import run_scan, run_scans_parallel
@@ -49,6 +51,34 @@ def test_run_scan_finds_exact_and_similar(tmp_path: Path) -> None:
     assert len(result.files) == 5
     # At least one group overall
     assert len(result.groups) >= 1
+
+
+def test_run_scan_cancel_midway_raises_promptly(tmp_path: Path) -> None:
+    """Cancelling while stages overlap must not deadlock the stage pool.
+
+    Regression: the dimensions stage set its done-event in a ``finally`` that
+    did not cover its own cancel check, so a cancel raised there left the
+    review stage waiting on the event forever.
+    """
+    for index in range(40):
+        _save(tmp_path / f"img{index:02}.jpg", (index * 6 % 255, 60, 90), quality=90)
+    cancel_after = {"n": 0}
+
+    def cancelled() -> bool:
+        cancel_after["n"] += 1
+        return cancel_after["n"] > 3
+
+    started = time.monotonic()
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        run_scan(
+            [tmp_path],
+            exact=True,
+            similar=True,
+            include_videos=False,
+            use_cache=False,
+            cancelled=cancelled,
+        )
+    assert time.monotonic() - started < 30
 
 
 def test_run_scan_streams_groups_via_on_group(tmp_path: Path) -> None:

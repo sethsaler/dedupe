@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dedupe import cli
 from dedupe.models import ScanResult
 
@@ -131,6 +133,54 @@ def test_main_reports_keyboard_interrupt_cleanly(monkeypatch, capsys) -> None:
     assert cli.main(["scan", "/tmp"]) == 130
     captured = capsys.readouterr()
     assert "cancelled" in captured.err
+
+
+def test_scan_sigint_cancels_cooperatively(tmp_path: Path, monkeypatch, capsys) -> None:
+    import signal as signal_mod
+
+    def fake_run_scan(paths, **kwargs):
+        cancelled = kwargs["cancelled"]
+        assert not cancelled()
+        handler = signal_mod.getsignal(signal_mod.SIGINT)
+        # First Ctrl+C: ask the engine to stop at its next checkpoint.
+        handler(signal_mod.SIGINT, None)
+        assert cancelled()
+        # Second Ctrl+C: hard interrupt.
+        with pytest.raises(KeyboardInterrupt):
+            handler(signal_mod.SIGINT, None)
+        raise InterruptedError("scan cancelled")
+
+    monkeypatch.setattr(cli, "run_scan", fake_run_scan)
+    previous = signal_mod.getsignal(signal_mod.SIGINT)
+
+    assert cli.main(["scan", str(tmp_path)]) == 130
+
+    captured = capsys.readouterr()
+    assert "Cancelling after the current work item" in captured.err
+    assert "scan cancelled" in captured.err
+    # The process-wide handler is restored after the scan either way.
+    assert signal_mod.getsignal(signal_mod.SIGINT) is previous
+
+
+def test_scan_second_sigint_interrupts_immediately(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import signal as signal_mod
+
+    def fake_run_scan(paths, **kwargs):
+        handler = signal_mod.getsignal(signal_mod.SIGINT)
+        handler(signal_mod.SIGINT, None)
+        handler(signal_mod.SIGINT, None)  # raises KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_scan", fake_run_scan)
+    previous = signal_mod.getsignal(signal_mod.SIGINT)
+
+    assert cli.main(["scan", str(tmp_path)]) == 130
+
+    captured = capsys.readouterr()
+    assert "Cancelling after the current work item" in captured.err
+    assert "cancelled" in captured.err
+    assert signal_mod.getsignal(signal_mod.SIGINT) is previous
 
 
 def test_receipts_list_warns_about_unreadable_receipts(tmp_path: Path, capsys) -> None:

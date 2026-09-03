@@ -71,7 +71,7 @@ Selections in the CLI are made by the `--smart` rule alone — there is no inter
 
 | Event | Before running | While running |
 | --- | --- | --- |
-| The user aborts explicitly (Ctrl+C) | Nothing started. | The scan stops and prints `cancelled` on stderr, exiting 130 — the interrupt is caught at the top level; the cooperative, checkpoint-respecting cancel the web UI uses is not wired to the CLI, so the stop is immediate. Safe throughout scanning: only cache writes may have happened. During an `--execute` action, Ctrl+C interrupts mid-batch: files already moved stay moved, and the receipt may be incomplete. |
+| The user aborts explicitly (Ctrl+C) | Nothing started. | The first Ctrl+C asks the engine to stop at its next checkpoint — the same cooperative cancel the web UI's Cancel button uses: it prints "Cancelling after the current work item… (Ctrl+C again to stop now)", stops at the next work-item boundary, prints `scan cancelled` on stderr, and exits 130. A second Ctrl+C stops immediately (plain `cancelled`, also 130). Safe throughout scanning: only cache writes may have happened. During an `--execute` action, Ctrl+C interrupts mid-batch: files already moved stay moved, and the receipt may be incomplete. |
 | The user does something else mid-way | Not applicable; the invocation owns the terminal. | Not applicable. |
 | A clean complete happens elsewhere | Not applicable. | Another `dedupe` run in another terminal is independent; the hash cache tolerates concurrent readers via its connection handling, but two scans writing the same cache concurrently is not a supported pattern. |
 | The environment fails | A bad low-res bound exits 2 before scanning. | Corrupt files never abort the scan ([Scan pipeline](../foundations/scan-pipeline.md#cancellation-and-failure)); per-stage failures land in the diagnostics block. |
@@ -106,7 +106,7 @@ Selections in the CLI are made by the `--smart` rule alone — there is no inter
 
 ## Open questions and verification
 
-- The CLI's Ctrl+C is immediate rather than the web UI's checkpoint-respecting cancel; a user interrupting mid-stage loses that stage's in-flight work even though the scan could have stopped at the next item. Whether to wire the cooperative cancel to SIGINT is a product question.
+- (Resolved 2026-09-03.) The CLI's Ctrl+C now uses the engine's cooperative cancel: the first press stops at the next checkpoint ("Cancelling after the current work item…"), a second press interrupts immediately. The fix also closed a stage-pool deadlock where a cancelled dimensions stage never released the review stage, hanging the process — the web UI's Cancel had the same exposure.
 - The summary format comes from `summarize_scan` in `actions.py`; its exact lines were not reproduced here verbatim.
 - `--ui` after an executed action serves the post-action result; the interplay with the review session save on UI startup was not exercised.
 

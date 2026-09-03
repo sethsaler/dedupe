@@ -555,11 +555,11 @@ def run_scan(
             # Image/video hashing fills most dimensions as a side effect, so
             # probe only the leftovers once those stages are done. The waits
             # are excluded from the recorded duration.
-            image_done.wait()
-            video_done.wait()
-            check_cancelled()
-            started_at = time.monotonic()
             try:
+                image_done.wait()
+                video_done.wait()
+                check_cancelled()
+                started_at = time.monotonic()
 
                 def resolution_progress(processed: int, total: int) -> None:
                     _stage_progress(
