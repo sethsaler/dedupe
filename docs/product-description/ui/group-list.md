@@ -27,7 +27,7 @@ The list controls above it: a text search over member paths; a selection filter 
 
 ### End without changing anything
 
-Browsing without changing selections records nothing beyond what was already saved. Leaving the page and returning restores the same list; the focused group is not remembered across reloads.
+Browsing without changing selections records nothing beyond what was already saved. Leaving the page and returning restores the same list, and the user's place in it: the focused group is remembered in the browser's session storage and re-selected after a reload when it still exists in the list; if it is gone, the first group is selected as before. Starting a new scan or discarding the saved review clears the memory.
 
 ### Become extended
 
@@ -35,13 +35,13 @@ Reviewing becomes consequential the first time a selection changes: the change i
 
 ### While extended
 
-**Navigating.** `j`/`↓` and `k`/`↑` move the focus through the *shown* list (filters respected); `[` and `]` jump between the shown groups that need attention, wrapping around, with a toast when none do. Focusing a group scrolls its card into view and loads its members.
+**Navigating.** `j`/`↓` and `k`/`↑` move the focus through the *shown* list (filters respected); `[` and `]` jump between the shown groups that need attention, wrapping around, with a toast when none do. Focusing a group scrolls its card into view and loads its members — and moves real keyboard focus: the selected group's sidebar item is a focused button carrying `aria-current="true"`, so screen readers announce the group itself. One exception: while a decision review (Low-res or Random 50) is open, `↑`/`↓` step between that review's candidates instead — `j`/`k` still change groups. The category tabs above the list are a tab strip: only the active tab sits in the Tab order, `←`/`→`/`Home`/`End` move between the tabs and activate each one on arrival, and the global arrow-key meanings do not fire while focus is on the tab strip.
 
-**Selecting in duplicate groups.** Each member card carries a checkbox; toggling it posts the group's new selection to the server, which enforces the last-survivor rule: a keep-one group cannot have every member selected — the keeper is restored to the selection set automatically. The suggested keeper's card is marked in green.
+**Selecting in duplicate groups.** Each member card carries a checkbox; toggling it posts the group's new selection to the server, which enforces the last-survivor rule: a keep-one group cannot have every member selected — the keeper is restored to the selection set automatically. The suggested keeper's card is marked in green. The selection summary above the cards reads "Suggested selection — N of M selected for removal · adjust freely" for a keep-one group the user has not yet modified; the first selection change of any kind — a card checkbox, a selection rule, smart select, a bulk operation, or the lightbox's Mark for removal toggle — flips it for the rest of the session to the plain "N of M selected for removal". Starting a new scan or discarding the saved review resets every group to the suggested framing.
 
 **Reviewing in independent categories.** In Low-res and Random 50 the detail pane is a one-item-at-a-time decision review: `←` means Delete this candidate, `→` means Keep it, applied to the focused member and advancing. A Keep is both a review and a veto; a Delete marks the candidate reviewed and selected. In Non-Human and Faces the list is paged with independent cards; decisions apply per candidate the same way, and candidates can additionally be trashed and restored one at a time from their cards (see their documents).
 
-**Rules.** `u` applies the suggested (automatic) selection to the focused group; `s` opens the rule chooser for it (newest, oldest, largest, smallest, shortest path, deselect all — and select candidates in independent groups). `Space` toggles the focused member card's checkbox.
+**Rules.** `u` applies the suggested (automatic) selection to the focused group; `s` opens the rule chooser for it (newest, oldest, largest, smallest, shortest path, deselect all — and select candidates in independent groups). `Space` toggles the focused member card's checkbox. Outside a decision review, `←`/`→` move the focused member card, and the card's preview button takes real keyboard focus so a screen reader announces it; `Space` and `Enter` keep their meanings there — toggle removal and open the [lightbox](lightbox.md). `Enter`/`Space` on any other focused button simply activate that button; the global meanings do not also fire.
 
 **Bulk selection.** The bulk controls apply one operation — select all, select none, invert, or a rule (smaller than keeper, larger/smaller than N MB, path contains, at least N faces) — to every group currently shown. The operation is re-derived on the server from its own state: keepers are never selected and at least one member of every duplicate group survives, whatever the browser asked. In independent groups, bulk-selecting candidates also marks them reviewed.
 
@@ -49,9 +49,11 @@ Reviewing becomes consequential the first time a selection changes: the change i
 
 **Live update.** While a scan streams, groups appear and re-sort as they arrive; selection controls stay locked until the scan finishes.
 
+**Toasts.** Result and error messages from every flow on this screen appear as toasts. Ordinary ones vanish after about 3.4 s; error toasts and toasts carrying an action (Undo) are sticky — they stay until dismissed, and every toast has a ✕ button for that. While a sticky toast is up, further toasts queue behind it instead of replacing it: a repeat of the same message is dropped, and the queue is capped at four — a fifth drops the oldest queued one.
+
 ### Complete
 
-The list itself does not "complete"; the session does, when the user opens the [Action sheet](action-sheet.md) (`a` is the shortcut to preview Trash). After an executed action, moved files vanish from their groups; groups that shrink below their minimum size (two members for duplicates, one for independent categories) dissolve from the list entirely.
+The list itself does not "complete"; the session does, when the user opens the [Action sheet](action-sheet.md) (`a` previews Trash for the exact selections, `A` for the similar ones). After an executed action, moved files vanish from their groups; groups that shrink below their minimum size (two members for duplicates, one for independent categories) dissolve from the list entirely.
 
 ## Modifiers
 
@@ -71,7 +73,7 @@ The list itself does not "complete"; the session does, when the user opens the [
 | The user does something else mid-way | No effect. | Switching tabs, filters, or groups keeps all selections; they follow their groups, not the view. Opening the lightbox or the action sheet leaves the list state untouched. |
 | A clean complete happens elsewhere | No effect. | An executed action removes the moved files and may dissolve groups; a smart-select rule applied in bulk re-selects whatever it touched. |
 | The environment fails | A stale scan id (from a superseded scan or resume) makes selection requests fail with "stale scan session; refresh results" — the page reloads its groups. | Same; the change that failed was not applied, and the UI's refreshed state comes from the server. |
-| The page or process goes away | Reload restores the list from the server's result. | Selections are saved server-side on every change, so a reload loses nothing committed; a browser crash between a checkbox toggle and its request losing that one change is the worst case. Server death loses the in-memory result; the review session file holds the last save. |
+| The page or process goes away | Reload restores the list from the server's result and re-selects the previously focused group when it still exists. | Selections are saved server-side on every change, so a reload loses nothing committed; a browser crash between a checkbox toggle and its request losing that one change is the worst case. Server death loses the in-memory result; the review session file holds the last save. |
 | Something else changes the target | Invisible here; the list shows scan-time snapshots. | Caught at action time, not here ([Actions and undo](../foundations/actions-and-undo.md#the-safety-model)). |
 | The input channel changes | No effect. | No effect. |
 | A resumed review supersedes | That is one way the list is populated. | Resume is locked out while an action runs; otherwise it replaces the whole list and its selections with the session's pruned state. |
@@ -86,7 +88,7 @@ The list itself does not "complete"; the session does, when the user opens the [
 
 **Optional dependencies.** Faces filters and face counts exist only when faces counting ran (OpenCV); Non-Human exists only when person detection ran.
 
-**Concurrency and resource limits.** Member cards paginate at 50 per page; very large independent groups never render thousands of cards at once.
+**Concurrency and resource limits.** Member cards paginate at 50 per page; very large independent groups never render thousands of cards at once. The sidebar likewise renders a sliding window of rows rather than the whole list: scrolling near the bottom grows or slides the window down one 60-row chunk at a time, scrolling back to the top while earlier rows exist slides it up the same way with the scroll position held stable, and the **Show N more** / **Show N earlier** buttons move the window by hand.
 
 **macOS specifics.** Thumbnails for HEIC/TIFF are transcoded server-side on demand; natively-rendered formats serve untouched.
 
@@ -98,12 +100,12 @@ The list itself does not "complete"; the session does, when the user opens the [
 - Invert on a group whose keeper is unselected selects everything else; on a fully selected group it deselects everything except what the server's keeper rule restores.
 - A group hidden by filters keeps its selection, and bulk operations do not reach it — bulk applies to shown groups only, by design.
 - Bulk criteria never select files without a trusted face count when a minimum-face rule is used; unanalyzed media is skipped rather than guessed at.
-- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for the similar-matches button.
+- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button.
+- A filter that hides every group leaves the sidebar showing a plain "No groups in this filter." message — plain text, not a status announcement.
 
 ## Open questions and verification
 
-- The focused-group restoration behavior after a reload (none, per code) is worth confirming by hand — users may expect the list to remember their place.
 - Toast wording for "No shown groups need attention" observed in code only.
 - Whether the Similar videos tab is a separate sidebar entry or merged under Similar images depends on `kind` handling in the tab rendering; to confirm visually.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

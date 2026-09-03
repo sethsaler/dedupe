@@ -19,6 +19,22 @@ from .models import (
 ProgressCb = Callable[[str, int, int], None]
 CancelCb = Callable[[], bool]
 
+#: Common junk / system folders and our own review output, always skipped.
+BUILTIN_EXCLUSIONS = {
+    ".git",
+    ".dedupe",
+    "*.photoslibrary",
+    "node_modules",
+    ".trash",
+    ".ds_store",
+    "__macosx",
+    "for deletion",
+    "_dedupe review",
+    "dedupe review",
+    "_dedupe quarantine",
+    "dedupe quarantine",
+}
+
 
 def is_in_photos_library(path: str | Path) -> bool:
     """Return whether a path is a Photos-managed package or one of its descendants."""
@@ -60,20 +76,7 @@ def inventory(
 
     exclusion_patterns = {e.strip().lower() for e in (exclusions or []) if e.strip()}
     # Always skip common junk / system folders + our own review output
-    exclusion_patterns |= {
-        ".git",
-        ".dedupe",
-        "*.photoslibrary",
-        "node_modules",
-        ".trash",
-        ".ds_store",
-        "__macosx",
-        "for deletion",
-        "_dedupe review",
-        "dedupe review",
-        "_dedupe quarantine",
-        "dedupe quarantine",
-    }
+    exclusion_patterns |= BUILTIN_EXCLUSIONS
 
     records: list[FileRecord] = []
     seen_inodes: set[tuple[int, int]] = set()
@@ -187,6 +190,94 @@ def inventory(
     if progress:
         progress("inventory", found, found)
     return records
+
+
+def preview_exclusions(
+    roots: Iterable[str | Path],
+    exclusions: Iterable[str],
+    *,
+    max_visits: int = 100_000,
+    max_matches: int = 1_000,
+) -> dict:
+    """Count what each user exclusion pattern would match under ``roots``.
+
+    Walks the tree with the same rules as a real scan (hidden files skipped,
+    excluded dirs pruned, built-in patterns always applied) so a pattern that
+    matches nothing — usually a typo — is visible before the scan starts.
+    Bounded by ``max_visits`` entries; ``truncated`` reports when the cap hit.
+    """
+    user_patterns = [e.strip().lower() for e in exclusions if e.strip()]
+    all_patterns = set(user_patterns) | BUILTIN_EXCLUSIONS
+    counts = {pattern: 0 for pattern in user_patterns}
+    examples: dict[str, list[str]] = {pattern: [] for pattern in user_patterns}
+    visited = 0
+    truncated = False
+
+    def note(name: str, relative: Path, root_path: Path) -> None:
+        name_lower = name.lower()
+        rel_lower = relative.as_posix().lower()
+        for pattern in user_patterns:
+            if fnmatch(name_lower, pattern) or fnmatch(rel_lower, pattern):
+                if counts[pattern] < max_matches:
+                    counts[pattern] += 1
+                if len(examples[pattern]) < 3:
+                    examples[pattern].append(str(root_path / relative))
+
+    def excluded(name: str, relative: Path) -> bool:
+        name_lower = name.lower()
+        rel_lower = relative.as_posix().lower()
+        return any(
+            fnmatch(name_lower, pattern) or fnmatch(rel_lower, pattern)
+            for pattern in all_patterns
+        )
+
+    for root in roots:
+        if truncated:
+            break
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.exists() or is_in_photos_library(root_path):
+            continue
+        if root_path.is_file():
+            note(root_path.name, Path(root_path.name), root_path.parent)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            pruned: list[str] = []
+            for d in dirnames:
+                if d.startswith("."):
+                    continue
+                candidate = Path(dirpath) / d
+                try:
+                    relative = candidate.relative_to(root_path)
+                except ValueError:
+                    continue
+                note(d, relative, root_path)
+                visited += 1
+                if excluded(d, relative) or candidate.is_symlink():
+                    continue
+                pruned.append(d)
+            dirnames[:] = pruned
+            for name in filenames:
+                if name.startswith("."):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    relative = path.relative_to(root_path)
+                except ValueError:
+                    continue
+                note(name, relative, root_path)
+                visited += 1
+            if visited >= max_visits:
+                truncated = True
+                break
+
+    return {
+        "patterns": [
+            {"pattern": pattern, "matches": counts[pattern], "examples": examples[pattern]}
+            for pattern in user_patterns
+        ],
+        "visited": visited,
+        "truncated": truncated,
+    }
 
 
 def _record_for_file(

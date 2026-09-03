@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { renderMembers, selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
-import { currentGroup, isIndependentReview, isPagedIndependentReview } from "./model.js";
+import { currentGroup, isIndependentReview, isPagedIndependentReview, markGroupTouched } from "./model.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
 import { refreshStatus } from "./status.js";
@@ -92,6 +92,7 @@ async function applyRuleToCurrentGroup(rule, successMessage) {
     if (idx >= 0) state.groups[idx] = g;
     const aidx = state.allGroups.findIndex((x) => x.id === g.id);
     if (aidx >= 0) state.allGroups[aidx] = g;
+    markGroupTouched(g.id);
     renderMembers(g);
     if (selectionFiltersActive() || !updateGroupListItem(g)) {
       scheduleRender({ groupList: true });
@@ -132,6 +133,7 @@ $("btnSmartAll").addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ rule: $("smartRule").value, scan_id: state.scanId }),
     });
+    state.allGroups.forEach((group) => markGroupTouched(group.id));
     await loadGroups();
     toast("Smart select applied to all groups", "ok");
   } catch (e) {
@@ -163,6 +165,7 @@ async function runBulkSelection(operation, criteria = null, label = "") {
         scan_id: state.scanId,
       }),
     });
+    groupIds.forEach(markGroupTouched);
     await loadGroups({ preserveSelection: true });
     if (state.currentId) await selectGroup(state.currentId, { silent: true });
     scheduleRender({ groupList: true, selection: true });

@@ -552,6 +552,9 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="btnDiscardSession"' in html
     assert 'id="nonHumanBanner"' in html
     assert 'id="candidateReviewBanner"' in html
+    assert 'id="scanCollapse"' in html
+    assert 'aria-controls="scanMain"' in html
+    assert "<kbd>↑</kbd> Back" in html
     assert 'id="optLowResolution"' in html
     assert 'id="optLowResolutionImages"' in html
     assert 'id="optLowResolutionGifs"' in html
@@ -593,11 +596,18 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     # Decision reviews (← Delete / → Keep) re-center the candidate's media on
     # every render so the full image stays on screen while arrowing through.
     assert 'scrollIntoView({ block: "center", behavior: "instant" })' in script
+    # In a decision review, ↑ / ↓ step between candidates without deciding.
+    assert 'e.key === "ArrowUp" && isDecisionReview(currentGroup())' in script
+    assert 'e.key === "ArrowDown" && isDecisionReview(currentGroup())' in script
+    # The scan setup form collapses into a slim bar once a scan starts (or
+    # when results are already loaded) so results get the screen.
+    assert "collapseScanPanel" in script
 
     stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
     assert "aspect-ratio: var(--preview-aspect-ratio);" in stylesheet
     assert "aspect-ratio: 16 / 10;" not in stylesheet
     assert ".triage-card .thumb-wrap" in stylesheet
+    assert ".scan-panel.collapsed .scan-main" in stylesheet
     assert "aspect-ratio: 1 / 1;" in stylesheet
     # Triage cards must not inherit content-visibility: auto, or off-screen
     # square previews lose their layout box and the grid reflows on scroll.
@@ -2483,3 +2493,124 @@ def test_review_session_resume_and_discard_endpoints(tmp_path: Path) -> None:
         "/api/review-session/resume", json={}, headers={"X-Dedupe-Token": token}
     )
     assert missing.status_code == 404
+
+
+def test_status_reports_capabilities_and_review_health(tmp_path: Path) -> None:
+    status = create_app(_result(tmp_path)).test_client().get("/api/status").get_json()
+    capabilities = status["capabilities"]
+    assert set(capabilities) == {"opencv", "yunet_model", "photon", "ffmpeg", "ffprobe"}
+    assert all(isinstance(value, bool) for value in capabilities.values())
+    assert status["keep_decisions_error"] is None
+    assert status["trash_undo_cleared"] == 0
+    assert status["summary"]["errors_total"] == len(status["summary"]["errors"])
+
+
+def test_check_exclusions_counts_matches_per_glob(tmp_path: Path) -> None:
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    (exports / "a.jpg").write_bytes(b"x")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "b.jpg").write_bytes(b"x")
+    (tmp_path / "keep.jpg").write_bytes(b"x")
+    app = create_app()
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    response = client.post(
+        "/api/scan/check-exclusions",
+        json={
+            "paths": [str(tmp_path)],
+            "exclusions": ["exports", "cache/**", "nope-*"],
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    patterns = {entry["pattern"]: entry for entry in response.get_json()["patterns"]}
+    assert patterns["exports"]["matches"] >= 1
+    assert patterns["cache/**"]["matches"] >= 1
+    assert patterns["nope-*"]["matches"] == 0
+
+
+def test_check_exclusions_requires_paths_and_globs(tmp_path: Path) -> None:
+    app = create_app()
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    no_paths = client.post(
+        "/api/scan/check-exclusions",
+        json={"exclusions": ["exports"]},
+        headers=headers,
+    )
+    no_globs = client.post(
+        "/api/scan/check-exclusions",
+        json={"paths": [str(tmp_path)]},
+        headers=headers,
+    )
+    assert no_paths.status_code == 400
+    assert no_globs.status_code == 400
+
+
+def test_scan_start_reports_cleared_trash_undo_map(tmp_path: Path) -> None:
+    app = create_app(_non_human_result(tmp_path))
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "cache.sqlite3")
+    trashed = str(tmp_path / "landscape.jpg")
+    app.extensions["dedupe_state"]["deleted_files"] = {trashed: trashed}
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    started = client.post(
+        "/api/scan",
+        json={
+            "paths": [str(tmp_path)],
+            "similar": False,
+            "include_videos": False,
+            "use_cache": False,
+        },
+        headers=headers,
+    )
+    assert started.status_code == 200
+
+    status = client.get("/api/status").get_json()
+    assert status["trash_undo_cleared"] == 1
+
+    deadline = time.monotonic() + 15
+    while status["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = client.get("/api/status").get_json()
+    assert not status["scanning"]
+
+
+def test_keep_decisions_write_failure_is_surfaced_in_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = _result(tmp_path)
+    for record in result.files:
+        record.width = 320
+        record.height = 240
+    low_resolution = build_low_resolution_groups(result.files)[0]
+    result.groups = [result.groups[0], low_resolution]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    def broken_keeps(*, keep, clear):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(web_app, "update_keep_decisions", broken_keeps)
+    target = low_resolution.members[0].path
+    decision = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "decision_path": target,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert decision.status_code == 200
+
+    status = client.get("/api/status").get_json()
+    assert status["keep_decisions_error"] == "disk full"

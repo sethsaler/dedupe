@@ -39,4 +39,10 @@ function groupNeedsAttention(g) {
   return (g.members || []).some((member) => member.error) || (g.deleted_paths || []).length > 0 || !groupComplete(g);
 }
 
-export { isDecisionReview, isIndependentReview, isPagedIndependentReview, currentGroup, patchGroup, groupSelectedCount, groupComplete, groupNeedsAttention };
+// Groups the user has actively re-selected in; until then their selection is
+// the smart-select suggestion and the UI labels it as such.
+function markGroupTouched(id) {
+  if (id) state.touchedGroups.add(id);
+}
+
+export { isDecisionReview, isIndependentReview, isPagedIndependentReview, currentGroup, patchGroup, groupSelectedCount, groupComplete, groupNeedsAttention, markGroupTouched };

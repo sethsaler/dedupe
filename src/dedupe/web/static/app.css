@@ -189,6 +189,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .session-status.warn .session-flag { background: rgba(224,160,58,.2); color: #f4c97d; }
 .session-pruned { flex: 1 1 100%; }
 .session-pruned summary { cursor: pointer; color: var(--text); }
+.session-pruned .btn { margin-top: 8px; }
+.session-dismiss { margin-left: auto; align-self: flex-start; }
 .pruned-list { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 4px; max-height: 220px; overflow: auto; }
 .pruned-list li { display: flex; flex-wrap: wrap; gap: 4px 10px; }
 .pruned-path { color: var(--text); font-family: var(--mono); font-size: .75rem; }
@@ -216,6 +218,57 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .lb-image-stack { position: relative; display: grid; place-items: center; min-width: 0; max-height: calc(100vh - 170px); }
 .lb-image-stack img { grid-area: 1 / 1; }
 .lb-keeper-image { z-index: 2; }
+
+/* Zoomed: the stack becomes a scrollable full-resolution viewport; drag pans. */
+.lb-image-stack.zoomed {
+  display: block;
+  overflow: auto;
+  width: 100%;
+  max-width: 100%;
+  text-align: center;
+  cursor: grab;
+  touch-action: none;
+}
+
+.lb-image-stack.zoomed:active { cursor: grabbing; }
+
+.lb-image-stack.zoomed img#lbImage {
+  display: inline-block;
+  max-width: none;
+  max-height: none;
+  animation: none;
+}
+
+.lb-stage-tools {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.lb-stage-tools[hidden] { display: none; }
+
+.lb-details {
+  font-size: 0.78rem;
+  color: #aab4c6; /* the lightbox surface is always dark, in both themes */
+  text-align: center;
+  min-height: 1em;
+}
+
+.lb-details:empty { display: none; }
+
+.lb-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.lb-select[hidden] { display: none; }
+
+.lb-select .btn[aria-pressed="true"] {
+  border-color: rgba(239, 90, 90, 0.5);
+}
 .lb-compare-tools { display: flex; align-items: center; flex-wrap: wrap; justify-content: center; gap: 10px; color: #8b96ab; font-size: .8rem; } /* dark surface in both themes */
 
 /* —— Layout —— */
@@ -314,6 +367,49 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 }
 
 .scan-main { display: flex; flex-direction: column; gap: 12px; }
+
+.scan-panel.collapsed .scan-main { display: none; }
+
+/* Slim bar the scan panel folds into once a scan starts, so results get the
+   screen. Mirrors .opts-toggle; the paths summary only shows when collapsed. */
+.scan-collapse {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 550;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 4px 10px;
+  text-align: left;
+}
+
+.scan-panel.collapsed .scan-collapse { padding-bottom: 2px; }
+.scan-collapse:hover { color: var(--text); }
+.scan-collapse .chev {
+  display: inline-block;
+  transition: transform 0.18s var(--ease-out);
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+.scan-collapse[aria-expanded="true"] .chev { transform: rotate(90deg); }
+
+.scan-collapse-paths {
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.scan-panel.collapsed .scan-collapse-paths:not(:empty) { display: inline; }
 
 .field-row {
   display: flex;
@@ -475,6 +571,37 @@ input[type="text"]:focus, select:focus {
 }
 
 .chip-check:active span { transform: scale(0.97); }
+
+.chip-check:has(input:disabled) { cursor: not-allowed; }
+
+.chip-check input:disabled + span {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.cross-folder-hint {
+  margin: 6px 0 0;
+  color: var(--warn, #e0a34a);
+}
+
+.exclude-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.exclusions-check-result {
+  display: block;
+  max-width: 520px;
+  line-height: 1.5;
+}
+
+.settings-note {
+  margin: 4px 0 0;
+  font-style: italic;
+}
 
 .low-resolution-bounds {
   display: flex;
@@ -1568,9 +1695,21 @@ kbd {
 
 .card:hover .thumb-delete,
 .card.focused .thumb-delete,
+.thumb-stack:focus-within .thumb-delete,
 .thumb-delete:focus-visible {
   opacity: 1;
   transform: translateY(0);
+}
+
+/* Touch devices have no hover: keep the delete control visible and drop the
+   "Hover to play" badge (a tap opens the lightbox instead). */
+@media (hover: none) {
+  .thumb-delete {
+    opacity: 1;
+    transform: none;
+  }
+
+  .video-preview-badge { display: none; }
 }
 
 .thumb-delete:hover {
@@ -1656,7 +1795,8 @@ kbd {
   pointer-events: none;
 }
 
-.toast.has-action { pointer-events: auto; }
+/* Always interactive: every toast carries a dismiss button now. */
+.toast.show { pointer-events: auto; }
 
 .toast-action {
   appearance: none;
@@ -1673,6 +1813,24 @@ kbd {
 }
 
 .toast-action:hover { background: rgba(91, 157, 255, 0.24); }
+
+.toast-dismiss {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.6;
+  font: inherit;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 4px;
+  margin: -4px -6px -4px 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 6px;
+}
+
+.toast-dismiss:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
 
 .toast.show {
   opacity: 1;

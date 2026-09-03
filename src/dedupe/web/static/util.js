@@ -3,12 +3,26 @@
 const $ = (id) => document.getElementById(id);
 
 // —— Toast ——
+// One visible slot plus a small queue. Error toasts and action toasts (Undo)
+// are sticky: they stay until dismissed or acted on, so a failure — or a
+// reversible action — never becomes unavailable because a timer elapsed
+// (WCAG 2.2.1). A new toast never destroys a sticky one; it queues behind it.
+const toastQueue = [];
+const TOAST_QUEUE_MAX = 4;
+let toastStickyVisible = false;
+let toastCurrentKey = "";
+
 function hideToast() {
   const el = $("toast");
   el.classList.remove("show");
-  clearTimeout(el._t);
-  el._t = setTimeout(() => {
+  clearTimeout(el._hideTimer);
+  clearTimeout(el._fadeTimer);
+  el._fadeTimer = setTimeout(() => {
     el.hidden = true;
+    toastStickyVisible = false;
+    toastCurrentKey = "";
+    // Flush the queue only after the fade, so toasts don't overlap visually.
+    if (toastQueue.length) showToast(toastQueue.shift());
   }, 220);
 }
 
@@ -40,10 +54,11 @@ function trapTabKey(container, e) {
   return false;
 }
 
-function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
+function showToast({ msg, kind, actionLabel, onAction, duration }) {
   const el = $("toast");
   const message = $("toastMessage") || el;
   const action = $("toastAction");
+  const dismiss = $("toastDismiss");
   message.textContent = msg;
   el.className = "toast" + (kind ? ` ${kind}` : "");
   if (action) {
@@ -57,16 +72,34 @@ function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
       : null;
     el.classList.toggle("has-action", Boolean(actionLabel));
   }
+  if (dismiss) dismiss.hidden = false;
   el.hidden = false;
   void el.offsetWidth;
   el.classList.add("show");
-  clearTimeout(el._t);
-  // Action toasts (e.g. Undo) never time out on their own: a reversible action
-  // must not become unavailable because a timer elapsed (WCAG 2.2.1). The next
-  // toast simply replaces it. Pass an explicit duration to override.
-  const ms = duration ?? (actionLabel ? 0 : 3400);
-  if (ms > 0) el._t = setTimeout(hideToast, ms);
+  clearTimeout(el._hideTimer);
+  toastStickyVisible = duration === undefined && Boolean(actionLabel || kind === "error");
+  toastCurrentKey = `${kind}|${msg}`;
+  const ms = duration ?? (toastStickyVisible ? 0 : 3400);
+  if (ms > 0) el._hideTimer = setTimeout(hideToast, ms);
 }
+
+function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
+  const item = { msg, kind, actionLabel, onAction, duration };
+  const key = `${kind}|${msg}`;
+  // A sticky toast (error / Undo) must survive until the user deals with it:
+  // queue anything that arrives while one is up. Identical messages collapse.
+  if (toastStickyVisible && !$("toast").hidden) {
+    if (key === toastCurrentKey || toastQueue.some((queued) => `${queued.kind}|${queued.msg}` === key)) {
+      return;
+    }
+    if (toastQueue.length >= TOAST_QUEUE_MAX) toastQueue.shift();
+    toastQueue.push(item);
+    return;
+  }
+  showToast(item);
+}
+
+$("toastDismiss")?.addEventListener("click", hideToast);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

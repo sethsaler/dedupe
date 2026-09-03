@@ -43,7 +43,7 @@ The review becomes consequential at the first persisted decision: toggling a can
 
 **Per-candidate undo.** The restore control moves the file back from the Trash to its original path. It refuses if the original path is now occupied and reports "there is no deleted file to undo" when there is nothing to restore.
 
-> Technical note: the restore reads the trashed candidate's destination from the review session, where the trash map is saved on every change. It therefore survives server restarts and resumes; only an entirely new scan clears it, after which recovery falls back to the macOS Trash.
+> Technical note: the restore reads the trashed candidate's destination from the review session, where the trash map is saved on every change. It therefore survives server restarts and resumes; only an entirely new scan clears it — announced at scan start by the one-time toast described in [Session resume](session-resume.md) — after which recovery falls back to the macOS Trash.
 
 **Mark all remaining as human.** The detail header's button asks, with the count, "Mark N remaining files as containing humans? They will not appear in future Non-Human scans unless the files change." Confirming records a manual-review decision for every candidate not already trashed this session, persists it through the hash cache, and removes those files from the category immediately. Manual decisions outrank detector versions — the detector signature is cleared — but the cache's file-identity check still applies: change the file, and the decision no longer matches it, so it can be re-analyzed and resurface. If the cache write fails, the in-memory markings are rolled back and the request reports the error; nothing half-persists.
 
@@ -101,8 +101,8 @@ The category is consumed two ways: selections that are both reviewed and selecte
 
 - The exact card copy and layout for the analyzed-frame count were not verified against the UI modules (`members.js`) in this session; the source README states the UI shows how many frames were analyzed.
 - The per-candidate trash goes through the same action plumbing that writes receipts for other actions; whether a receipt lands in `~/.cache/dedupe/logs/` for a single-candidate trash should be confirmed by hand.
-- The per-candidate undo survives restarts but not a new scan, which clears the trash map along with the rest of the superseded session; whether that deserves a longer memory is a product question.
+- The per-candidate undo survives restarts but not a new scan, which clears the trash map along with the rest of the superseded session; the user is told at scan start by the one-time toast described in [Session resume](session-resume.md).
 - The source README mentions a scan-time "Mark reviewed + select non-human" affordance; it is not described here and belongs to `cli/scan.md` when written.
 - Ensemble's division of labor (which frames escalate to Photon) is a scan-time detail owned by the scan pipeline; its user-visible effect beyond the frame count was not confirmed.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

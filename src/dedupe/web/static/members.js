@@ -1,9 +1,9 @@
 // The detail pane: member cards, review flows, per-candidate trash/undo.
 
 import { api } from "./api.js";
-import { applyResultControls, ensureGroupVisible, markGroupListActive, selectionFiltersActive, updateGroupListItem } from "./groups.js";
+import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
-import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, patchGroup } from "./model.js";
+import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, markGroupTouched, patchGroup } from "./model.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast } from "./util.js";
@@ -54,9 +54,34 @@ function updateGroupSelectionText(g) {
   const reviewedPaths = new Set(g.reviewed_paths || []);
   const sourceMembers = g.members || [];
   const reviewedCount = sourceMembers.filter((member) => reviewedPaths.has(member.path)).length;
-  $("groupSelectionSummary").textContent = isIndependentReview(g)
-    ? `${selected.size} selected · ${reviewedCount} of ${sourceMembers.length} reviewed`
-    : `${selected.size} of ${sourceMembers.length} selected for removal`;
+  if (isIndependentReview(g)) {
+    $("groupSelectionSummary").textContent =
+      `${selected.size} selected · ${reviewedCount} of ${sourceMembers.length} reviewed`;
+    return;
+  }
+  const base = `${selected.size} of ${sourceMembers.length} selected for removal`;
+  // Groups arrive pre-selected by the smart-select suggestion; until the user
+  // changes anything, label it as a suggestion rather than a done decision.
+  $("groupSelectionSummary").textContent =
+    selected.size > 0 && !state.touchedGroups.has(g.id)
+      ? `Suggested selection — ${base} · adjust freely`
+      : base;
+}
+
+// Full lightbox item for one member: the lightbox shows metadata and selection
+// state, so it needs more than the path.
+function lightboxItemFor(member, group) {
+  return {
+    path: member.path,
+    mediaType: member.media_type,
+    keeper: group.suggested_keep,
+    kind: group.kind,
+    size: member.size,
+    width: member.width,
+    height: member.height,
+    mtime: member.mtime,
+    similarityPercent: member.similarity_percent,
+  };
 }
 
 // Sync one card's selection affordances (badge, classes, copy, checkbox) after
@@ -119,6 +144,7 @@ function updateDetailMeta(g) {
 async function selectGroup(id, { silent = false } = {}) {
   const myToken = ++state.selectToken;
   state.currentId = id;
+  rememberFocusedGroup(id);
   state.memberFocus = 0;
   state.memberPage = 0;
   state.trashedInPlace.clear();
@@ -178,9 +204,13 @@ async function selectGroup(id, { silent = false } = {}) {
   $("btnSelectSuggested").textContent =
     isIndependentReview(g) ? "Select reviewed candidates" : "Use suggested";
   renderMembers(g);
-  // keep list item in view
+  // keep list item in view; explicit (non-silent) selection moves focus too,
+  // so j/k navigation gives screen readers the group's announcement
   const active = document.querySelector(`.group-item[data-id="${id}"]`);
-  if (active && !silent) active.scrollIntoView({ block: "nearest" });
+  if (active && !silent) {
+    active.scrollIntoView({ block: "nearest" });
+    active.focus({ preventScroll: true });
+  }
 }
 
 function renderMembers(g) {
@@ -238,7 +268,7 @@ function renderMembers(g) {
   }
   state.lightboxItems = members
     .filter((member) => !deletedPaths.has(member.path))
-    .map((member) => ({ path: member.path, mediaType: member.media_type, keeper: g.suggested_keep, kind: g.kind }));
+    .map((member) => lightboxItemFor(member, g));
   updateDetailMeta(g);
   updateGroupSelectionText(g);
   if (triage && !members.length) {
@@ -415,6 +445,7 @@ function renderMembers(g) {
             scan_id: state.scanId,
           }),
         });
+        markGroupTouched(g.id);
         const idx = state.groups.findIndex((x) => x.id === g.id);
         if (idx >= 0) state.groups[idx] = updated;
         const aidx = state.allGroups.findIndex((x) => x.id === g.id);
@@ -668,8 +699,11 @@ async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) 
     renderMembers(previous);
     scheduleRender({ groupList: true, selection: true });
     if (fromLightbox && !$("lightbox").hidden) {
+      const failedMember = (previous.members || []).find((member) => member.path === path);
       state.lightboxItems = [
-        { path, mediaType: (previous.members || []).find((member) => member.path === path)?.media_type, keeper: previous.suggested_keep, kind: previous.kind },
+        failedMember
+          ? lightboxItemFor(failedMember, previous)
+          : { path, mediaType: undefined, keeper: previous.suggested_keep, kind: previous.kind },
         ...state.lightboxItems,
       ];
       updateLightbox();
@@ -697,12 +731,7 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
     if (fromLightbox) {
       const member = (updated.members || []).find((item) => item.path === path);
       if (member && !state.lightboxItems.some((item) => item.path === path)) {
-        state.lightboxItems.splice(state.lightboxIndex, 0, {
-          path,
-          mediaType: member.media_type,
-          keeper: updated.suggested_keep,
-          kind: updated.kind,
-        });
+        state.lightboxItems.splice(state.lightboxIndex, 0, lightboxItemFor(member, updated));
         updateLightbox();
       }
     }
@@ -710,6 +739,38 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+// Toggle one member's removal selection from outside the card grid (the
+// lightbox). Keeper retention runs server-side and may flip a neighbor, so
+// every visible card resyncs from the response.
+async function setMemberSelected(group, path, wantSelected) {
+  if (!group || isIndependentReview(group)) return null;
+  const selected = new Set(group.selected_for_removal || []);
+  if (wantSelected) selected.add(path);
+  else selected.delete(path);
+  const updated = await api("/api/selection", {
+    method: "POST",
+    body: JSON.stringify({
+      group_id: group.id,
+      selected: [...selected],
+      scan_id: state.scanId,
+    }),
+  });
+  markGroupTouched(group.id);
+  patchGroup(updated);
+  const box = $("members");
+  box.querySelectorAll(".card[data-path]").forEach((card) => {
+    syncCardSelection(card, updated, card.dataset.path);
+  });
+  updateGroupSelectionText(updated);
+  if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+    scheduleRender({ groupList: true });
+  } else {
+    applyResultControls();
+  }
+  scheduleRender({ selection: true });
+  return updated;
 }
 
 function changeMemberPage(delta) {
@@ -758,4 +819,4 @@ $("memberSort")?.addEventListener("change", (event) => {
   if (current) renderMembers(current);
 });
 
-export { selectGroup, renderMembers, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage };
+export { selectGroup, renderMembers, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage, setMemberSelected };

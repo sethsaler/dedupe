@@ -2,7 +2,7 @@
 
 ## Summary
 
-The action sheet is the last gate between selections and consequences: the user asks to delete the selected exact matches, the selected similar matches, or the staged low-res/random review deletions; the sheet previews exactly what will move and where, counts down while that preview stays trustworthy, and only then executes — revalidating every file one final time as it moves. It is opened from the action bar under the [group list](group-list.md) (the three **Delete All Selected…** buttons, or `a` for the exact-match sheet), and it is the only place destructive actions begin in the UI. The UI's action is always Trash; Quarantine and Isolate exist only on the command line ([`scan`](../cli/scan.md), [`isolate`](../cli/isolate.md)). The safety layers the sheet orchestrates are owned by [Actions and undo](../foundations/actions-and-undo.md).
+The action sheet is the last gate between selections and consequences: the user asks to delete the selected exact matches, the selected similar matches, or the staged low-res/random review deletions; the sheet previews exactly what will move and where, counts down while that preview stays trustworthy, and only then executes — revalidating every file one final time as it moves. It is opened from the action bar under the [group list](group-list.md) (the three **Delete All Selected…** buttons, `a` for the exact-match sheet, or `A` — Shift+`a` — for the similar-match one), and it is the only place destructive actions begin in the UI. The UI's action is always Trash; Quarantine and Isolate exist only on the command line ([`scan`](../cli/scan.md), [`isolate`](../cli/isolate.md)). The safety layers the sheet orchestrates are owned by [Actions and undo](../foundations/actions-and-undo.md).
 
 ## The simple case
 
@@ -23,7 +23,7 @@ stateDiagram-v2
 
 ### Start
 
-Each of the three action-bar buttons is scoped: one covers exact-match selections, one similar-match selections, and one the staged low-resolution and random-review selections; each is disabled with an explanatory tooltip while its scope has no selections. Pressing one starts a dry run of the Trash action against the current selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
+Each of the three action-bar buttons is scoped: one covers exact-match selections, one similar-match selections, and one the staged low-resolution and random-review selections; each is disabled with an explanatory tooltip while its scope has no selections. Two of the scopes have keyboard shortcuts: `a` previews the exact matches, `A` (Shift+`a`) the similar matches, and the `?` help sheet lists them together — "a / A — Preview Trash for selected exact / similar matches"; the Low-res + Random scope remains button-only. Pressing one starts a dry run of the Trash action against the current selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
 
 While the dry run and any execute are in flight, the action bar is disabled and a status note ("Verifying the selection against the files on disk…", then "Moving files to Trash…") says what is happening; there is no silent wait.
 
@@ -45,7 +45,7 @@ The countdown ticks each second. If the user changes the selection elsewhere whi
 
 ### Complete
 
-Executing consumes the token and runs the action with per-file immediate revalidation. A toast reports the result — how many moved, how many were skipped or failed with the first reason, and whether a receipt was written. When review-category files were part of the action, the toast notes how many landed in `_Dedupe Quarantine`. Then:
+Executing consumes the token and runs the action with per-file immediate revalidation. A toast reports the result — how many moved, how many were skipped or failed with the first reason, and whether a receipt was written. When review-category files were part of the action, the toast notes how many landed in `_Dedupe Quarantine`. The sheet's failure paths — the dry run refusing ("Could not verify selection…"), the preview refusing to settle, an execute error — raise sticky error toasts: they stay until dismissed with their ✕ button, and further toasts queue behind them rather than replacing them (the toast rules are owned by the [group list](group-list.md)). Then:
 
 - Moved files are dropped from their groups in the displayed results; groups below their minimum size dissolve. A keeper that somehow moved (it cannot in a duplicate group, but a similar group's keeper is a recomputation) is re-picked from the survivors.
 - The updated result is persisted to the review session.
@@ -55,7 +55,7 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
-| Button choice (Exact / Similar / Low-res + Random) | Selects which selections the Trash action covers; the review scope's sheet leads with the `_Dedupe Quarantine` destination. | Fixed per sheet; another scope needs its own preview. |
+| Button choice (Exact / Similar / Low-res + Random) | Selects which selections the Trash action covers; the review scope's sheet leads with the `_Dedupe Quarantine` destination. `a` / `A` open the exact / similar sheets from the keyboard; the review scope is button-only. | Fixed per sheet; another scope needs its own preview. |
 | Selection state | Defines the preview's numbers. | Any change invalidates the token; re-preview on Confirm. |
 
 ## Cancel and interrupt
@@ -99,4 +99,4 @@ Executing consumes the token and runs the action with per-file immediate revalid
 - The countdown's behavior when the tab is backgrounded (timer throttling) is unexamined; the server-side expiry is authoritative regardless.
 - The review-quarantine split leads the Low-res + Random preview (restored after the "simplify duplicate deletion actions" change dropped the scope from the action bar entirely — see [bug-triage](../bug-triage.md) B-06); confirm the wording by hand on a scan with low-res candidates.
 
-Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

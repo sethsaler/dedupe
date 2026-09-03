@@ -18,7 +18,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Thumbnail cache** — previews are kept on disk under `~/.cache/dedupe/thumbnails/` and pruned least-recently-used against a size budget
 - **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
-- **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, overlay/flicker comparison with wrap-around and neighbor prefetching, keyboard navigation, native picker, light and dark themes (follows the OS), and isolate
+- **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, a lightbox with metadata, keeper overlay/flicker comparison, full-resolution zoom, and in-place selection, keyboard navigation, native picker, dependency-gated scan options, light and dark themes (follows the OS), and isolate
 - **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
 - **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
 
@@ -118,12 +118,15 @@ Keyboard:
 | `j` / `↓` | Next group |
 | `k` / `↑` | Previous group |
 | `[` / `]` | Previous / next group needing attention |
+| `←` / `→` on tabs | Switch result category (tabs also take `Home` / `End`) |
 | `u` | Use the suggested selection for this group |
 | `s` | Apply the selection rule to this group |
-| `a` | Open the action review sheet (preview trash) |
-| `Space` | Toggle remove on the focused card |
+| `a` / `A` | Open the action review sheet (preview trash) for exact / similar selections |
+| `Space` | Toggle remove on the focused card; in the lightbox, toggle removal for exact/similar files |
 | `Enter` | Open the lightbox |
 | `←` / `→` | Delete / Keep in Low-res and Random 50 review; otherwise focus previous / next card or navigate the lightbox |
+| `d` | Trash the focused Non-Human/Faces file; in an exact/similar lightbox, toggle removal |
+| `z` | Full-resolution zoom in the lightbox (drag pans) |
 | `Esc` | Close the lightbox, help, or overlay |
 | `?` | Shortcut help |
 

@@ -2,11 +2,11 @@
 
 import { api } from "./api.js";
 import { updateSelectionSummary } from "./actions.js";
-import { loadGroups, renderGroupList, resetGroupListWindow } from "./groups.js";
+import { loadGroups, renderGroupList, rememberFocusedGroup, resetGroupListWindow } from "./groups.js";
 import { selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
 import { groupNeedsAttention } from "./model.js";
-import { lowResolutionMaxPixels, saveRecent } from "./settings.js";
+import { collapseScanPanel, lowResolutionMaxPixels, saveRecent } from "./settings.js";
 import { state } from "./state.js";
 import { refreshStatus, renderSession, startStatusPolling } from "./status.js";
 import { $, toast } from "./util.js";
@@ -55,6 +55,7 @@ async function startScan() {
   try {
     $("progressWrap").hidden = false;
     $("progressFill").style.width = "5%";
+    $("progressBar").setAttribute("aria-valuenow", "5");
     $("progressMsg").textContent = "Starting…";
     $("emptyState").hidden = true;
     $("results").hidden = false;
@@ -62,7 +63,7 @@ async function startScan() {
     $("detailBody").hidden = true;
     $("detailEmpty").hidden = false;
       $("groupList").innerHTML =
-        `<div class="group-empty" role="presentation">Scanning — matches will appear here as they are found…</div>`;
+        `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
       $("groupMore").innerHTML = "";
     $("countAll").textContent = "0";
     $("countExact").textContent = "0";
@@ -75,6 +76,8 @@ async function startScan() {
     state.allGroups = [];
     state.currentId = null;
     state.groupsVersion = -1;
+    state.touchedGroups.clear();
+    rememberFocusedGroup(null);
     resetGroupListWindow();
     const workersRaw = Number($("workers").value);
     const started = await api("/api/scan", {
@@ -106,6 +109,9 @@ async function startScan() {
     });
     state.scanId = started.scan_id || state.scanId;
     state.scanning = true;
+    // Fold the setup form into its slim bar so the streaming results get
+    // the screen; the bar shows the scanned paths and re-opens on click.
+    collapseScanPanel(raw);
     // SSE status/group events drive the UI from here; polling is the
     // fallback and stands down as soon as the stream delivers.
     startStatusPolling();
@@ -116,23 +122,44 @@ async function startScan() {
   }
 }
 
-document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", async () => {
-    document.querySelectorAll(".tab").forEach((t) => {
-      t.classList.remove("active");
-      t.setAttribute("aria-selected", "false");
-    });
-    tab.classList.add("active");
-    tab.setAttribute("aria-selected", "true");
-    state.kind = tab.dataset.kind;
-    updateSelectionSummary();
-    resetGroupListWindow();
-    try {
-      await loadGroups();
-    } catch (e) {
-      toast(e.message || String(e), "error");
-    }
+const tabButtons = [...document.querySelectorAll(".tab")];
+
+async function activateTab(tab) {
+  tabButtons.forEach((t) => {
+    const active = t === tab;
+    t.classList.toggle("active", active);
+    t.setAttribute("aria-selected", active ? "true" : "false");
+    // Roving tabindex: only the active tab is in the Tab order; arrows move.
+    t.tabIndex = active ? 0 : -1;
   });
+  state.kind = tab.dataset.kind;
+  updateSelectionSummary();
+  resetGroupListWindow();
+  try {
+    await loadGroups();
+  } catch (e) {
+    toast(e.message || String(e), "error");
+  }
+}
+
+tabButtons.forEach((tab) => {
+  tab.addEventListener("click", () => activateTab(tab));
+});
+
+// WAI tablist: ←/→/Home/End move between tabs and activate on move.
+document.querySelector(".filter-tabs").addEventListener("keydown", (e) => {
+  const current = tabButtons.indexOf(document.activeElement);
+  if (current < 0) return;
+  let next = null;
+  if (e.key === "ArrowRight") next = (current + 1) % tabButtons.length;
+  else if (e.key === "ArrowLeft") next = (current - 1 + tabButtons.length) % tabButtons.length;
+  else if (e.key === "Home") next = 0;
+  else if (e.key === "End") next = tabButtons.length - 1;
+  if (next === null) return;
+  e.preventDefault();
+  e.stopPropagation(); // keep the global arrow handlers (cards/groups) out of this
+  tabButtons[next].focus();
+  activateTab(tabButtons[next]);
 });
 
 const LIVE_FILTER_IDS = [
@@ -180,6 +207,17 @@ $("btnNextReview").addEventListener("click", () => {
     .catch((e) => toast(e.message || String(e), "error"));
 });
 
+// Rescanning the saved review's folders is the only way to bring pruned
+// files back; the banner offers it directly.
+$("btnRescanSession").addEventListener("click", () => {
+  const roots = state.reviewSession?.roots || [];
+  if (!roots.length) return toast("No saved folders to rescan", "error");
+  $("paths").value = roots.join(", ");
+  $("scanPanel").classList.remove("collapsed");
+  $("scanCollapse").setAttribute("aria-expanded", "true");
+  startScan();
+});
+
 $("btnDiscardSession").addEventListener("click", async () => {
   const ok = await confirmModal({
     title: "Discard saved review?",
@@ -190,6 +228,8 @@ $("btnDiscardSession").addEventListener("click", async () => {
   try {
     await api("/api/review-session", { method: "DELETE" });
     state.groups = []; state.allGroups = []; state.currentId = null;
+    state.touchedGroups.clear();
+    rememberFocusedGroup(null);
     renderSession(null); renderGroupList(); await refreshStatus();
     toast("Saved review discarded", "ok");
   } catch (error) { toast(error.message, "error"); }

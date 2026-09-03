@@ -52,7 +52,7 @@ The rule behind all four: a bulk-deletable view must never be built from files t
 
 **Bulk selection by face count.** The bulk criteria include a minimum face count: select every shown candidate with at least N faces (minimum 1). A file with no recorded count never matches, for the same reason as the filter.
 
-**Per-candidate Trash and undo.** Each card's Trash control runs the same one-click flow as the [no-person review](no-person-review.md#while-extended): the server preflights the file, refuses it when it is not safely eligible, and otherwise moves it to the macOS Trash in the same request. There is no confirmation sheet. A toast offers Undo and stays until another message replaces it; showing deleted cards restores the per-candidate control. Face counts remain heuristic. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it (after which the file is still recoverable from the Trash by hand).
+**Per-candidate Trash and undo.** Each card's Trash control runs the same one-click flow as the [no-person review](no-person-review.md#while-extended): the server preflights the file, refuses it when it is not safely eligible, and otherwise moves it to the macOS Trash in the same request. There is no confirmation sheet. A toast offers Undo and stays until another message replaces it; showing deleted cards restores the per-candidate control. Face counts remain heuristic. The restore persists in the review session exactly like the no-person flow's: it survives restarts and resumes, and only an entirely new scan clears it — announced at scan start by the one-time toast described in [Session resume](session-resume.md) — after which the file is still recoverable from the Trash by hand.
 
 ### Complete
 
@@ -111,6 +111,6 @@ The category is consumed like any other: reviewed-and-selected candidates flow i
 - The exact card layout of the count badges was read from the client's rendering code, not watched in a browser.
 - Whether face-count decisions hydrate from the hash cache across scans is suggested by the detector signature on each record; confirm in [Files Dedupe writes](../cross-cutting/caches-and-files.md)'s terms.
 - The scan-time behavior when face counting is enabled but OpenCV is unavailable (error vs empty category) was not confirmed.
-- The per-candidate undo's new-scan behavior (trash map cleared with the superseded session) is the same as the [no-person review](no-person-review.md#open-questions-and-verification); one triage entry covered both.
+- The per-candidate undo's new-scan behavior (trash map cleared with the superseded session, announced by the one-time toast in [Session resume](session-resume.md)) is the same as the [no-person review](no-person-review.md#open-questions-and-verification); one triage entry covered both.
 
-Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

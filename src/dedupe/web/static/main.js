@@ -8,14 +8,20 @@ import "./lightbox.js";
 import "./members.js";
 import "./modal.js";
 import "./scan.js";
-import { renderRecent } from "./settings.js";
+import { collapseScanPanel, renderRecent } from "./settings.js";
 import { CSRF_TOKEN } from "./state.js";
 import { openEventStream, refreshStatus } from "./status.js";
 
 // —— Init ——
 renderRecent();
 openEventStream();
-refreshStatus().catch(() => {});
+refreshStatus()
+  .then((s) => {
+    // With a scan running or results already loaded, the setup form folds
+    // away so the results get the screen; fresh pages keep it prominent.
+    if (s?.scanning || s?.summary) collapseScanPanel();
+  })
+  .catch(() => {});
 
 // Shut down the server when the tab is closed so the Terminal/.command window closes too.
 // sendBeacon cannot carry the X-Dedupe-Token header, so use fetch with keepalive,

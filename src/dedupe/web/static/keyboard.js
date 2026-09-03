@@ -2,7 +2,7 @@
 
 import { openHelp, closeHelp } from "./help.js";
 import { closeLightbox, openLightbox } from "./lightbox.js";
-import { reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
+import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
 import { currentGroup, groupNeedsAttention, isDecisionReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
 import { $, toast, trapTabKey } from "./util.js";
@@ -45,14 +45,24 @@ document.addEventListener("keydown", async (e) => {
         return;
       }
       if (typing || e.target === $("lbVideo")) return;
+    // A focused button handles Space/Enter natively (e.g. hold-to-flicker).
+    const onButton = e.target?.tagName === "BUTTON";
     if (e.key === "ArrowLeft") {
       $("lbPrev").click();
       e.preventDefault();
     } else if (e.key === "ArrowRight") {
       $("lbNext").click();
       e.preventDefault();
+    } else if (e.key === "z" || e.key === "Z") {
+      if (!$("lbStageTools").hidden) $("lbZoom").click();
+      e.preventDefault();
+    } else if (e.key === " " && !onButton) {
+      if (!$("lbSelectWrap").hidden) $("lbSelect").click();
+      e.preventDefault();
     } else if (["d", "Delete", "Backspace"].includes(e.key)) {
-      $("lbDelete").click();
+      // Triage reviews trash in one click; duplicate groups toggle removal.
+      if (!$("lbActions").hidden) $("lbDelete").click();
+      else if (!$("lbSelectWrap").hidden) $("lbSelect").click();
       e.preventDefault();
     }
     return;
@@ -62,11 +72,27 @@ document.addEventListener("keydown", async (e) => {
 
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+  // Enter/Space on a focused button activate it natively; don't also run the
+  // global meaning. Member thumbnails are the exception: Space/Enter there
+  // mean toggle-remove / open-lightbox and are handled (preventDefault) below.
+  const onMemberThumb = Boolean(e.target?.closest?.("#members .thumb-wrap"));
+  if (
+    (e.key === " " || e.key === "Enter")
+    && e.target?.tagName === "BUTTON"
+    && !onMemberThumb
+  ) return;
+
   if (e.key === "j" || e.key === "ArrowDown") {
-    navGroup(1);
+    // In a decision review, ↓ steps to the next candidate without deciding;
+    // j always moves between groups.
+    if (e.key === "ArrowDown" && isDecisionReview(currentGroup())) changeMemberPage(1);
+    else navGroup(1);
     e.preventDefault();
   } else if (e.key === "k" || e.key === "ArrowUp") {
-    navGroup(-1);
+    // ↑ goes back to the previous candidate in a decision review (its
+    // decision stays as made; the opposite arrow key revises it).
+    if (e.key === "ArrowUp" && isDecisionReview(currentGroup())) changeMemberPage(-1);
+    else navGroup(-1);
     e.preventDefault();
   } else if (e.key === "]") {
     navAttention(1);
@@ -82,6 +108,9 @@ document.addEventListener("keydown", async (e) => {
     e.preventDefault();
   } else if (e.key === "a") {
     $("btnTrashExact").click();
+    e.preventDefault();
+  } else if (e.key === "A") {
+    $("btnTrashSimilar").click();
     e.preventDefault();
   } else if (e.key === "Enter" && state.currentId) {
     const focused = document.querySelector("#members .card.focused .thumb-wrap");
@@ -123,6 +152,11 @@ document.addEventListener("keydown", async (e) => {
     cards.forEach((c) => c.classList.remove("focused"));
     cards[state.memberFocus].classList.add("focused");
     cards[state.memberFocus].scrollIntoView({ block: "nearest" });
+    // Focus follows the card: screen readers announce it, and Space/Enter keep
+    // working through the thumb button's handlers.
+    cards[state.memberFocus]
+      .querySelector(".thumb-wrap")
+      ?.focus({ preventScroll: true });
     e.preventDefault();
   }
 });

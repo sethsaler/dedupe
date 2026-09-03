@@ -33,7 +33,7 @@ The first arrow-key decision makes the review consequential: the decision is sen
 
 ### While extended
 
-**Deciding.** The focused candidate is decided with `←` (Delete) or `→` (Keep); the detail pane advances, and each advance re-centers the candidate's media in the viewport so the full image or video stays on screen while arrowing through the pile. Each decision does two things: it marks the candidate *reviewed*, and it sets or clears its selection. A Delete selects; a Keep deselects. The member summary line reports "{N} of {count} reviewed · {M} selected for removal".
+**Deciding.** The focused candidate is decided with `←` (Delete) or `→` (Keep); the detail pane advances, and each advance re-centers the candidate's media in the viewport so the full image or video stays on screen while arrowing through the pile. `↑` steps back to the previous candidate without touching its decision (and `↓` steps forward again) — revisiting a reviewed candidate shows the decision already made, and the opposite arrow key revises it. Each decision does two things: it marks the candidate *reviewed*, and it sets or clears its selection. A Delete selects; a Keep deselects. The member summary line reports "{N} of {count} reviewed · {M} selected for removal".
 
 **What a Keep commits.** A reviewed, unselected low-resolution candidate is an explicit keep: the decision is written to the keep-decisions file, keyed to the file's identity. Future scans stop surfacing the file — the decision outlives this session, this scan, and this browser. If the file later changes, the identity no longer matches and the decision stops applying; the file can resurface. Withdrawing a Keep — selecting the candidate again — clears the stored decision.
 
@@ -61,7 +61,7 @@ The category drains as decisions accumulate: kept files vanish from future scans
 | The user aborts explicitly | No effect. | There is no cancel; the opposite arrow key is the undo. A Keep after a Delete withdraws the selection and clears the stored decision. |
 | The user does something else mid-way | No effect. | Switching tabs keeps all decisions; selections follow the files. |
 | A clean complete happens elsewhere | No effect. | An executed action removes deleted candidates from the category; bulk selections rewrite what they touch. |
-| The environment fails | Dimension-probe failures exclude files from candidacy and appear in scan diagnostics; a keep-decisions write failure is swallowed — the selection still applies, the durable memory does not. | A decision request that fails validation (stale scan id) leaves the server state unchanged and the page refreshes from it. |
+| The environment fails | Dimension-probe failures exclude files from candidacy and appear in scan diagnostics; a keep-decisions write failure no longer passes silently — a sticky error toast reports "Could not remember Keep decisions (…) — these files may resurface in future scans", once per distinct error, while the selection itself still applies (the durable store is a convenience). | A decision request that fails validation (stale scan id) leaves the server state unchanged and the page refreshes from it. |
 | The page or process goes away | Reload restores from the server. | Decisions persist as made; at worst the one in flight is lost. |
 | Something else changes the target | Invisible until action time. | Kept files that changed no longer match their decision; deleted files that changed fail the action's revalidation and stay put. |
 | The input channel changes | No effect. | No effect. |
@@ -92,8 +92,7 @@ The category drains as decisions accumulate: kept files vanish from future scans
 
 ## Open questions and verification
 
-- The keep-decisions write failure being silently swallowed ("the durable store is a convenience") is explicit in the code; whether the UI should ever say so is a product question.
 - The exact summary-line wording for this category was read from the shared member-summary renderer; confirm visually.
 - Advancing past the last candidate stays on the pile; the decision that completes it raises a "Review complete — every file in this group has a decision" toast. Confirmed in `reviewCandidate` (`members.js`).
 
-Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

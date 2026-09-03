@@ -41,7 +41,7 @@ Resuming becomes active reviewing with the first interaction with the resumed gr
 
 ### While extended
 
-The banner stays as a record of what pruning did; it does not block reviewing. Selections made now persist through the normal save path. One asymmetry to know: files pruned at startup are gone from this review for good — they were not deleted from disk, but they are no longer in the result, and nothing in the UI brings a pruned file back short of rescanning.
+The banner stays as a record of what pruning did; it does not block reviewing, and it is dismissible: its ✕ hides it for the rest of the page session. The dismissal is keyed to the session's identity — availability, corruption, saved-at time, pruned count, error — so a session that changes (a fresh save, new pruning at the next start) re-shows the banner even after a dismissal, and a plain reload brings it back too. Selections made now persist through the normal save path. One asymmetry to know: files pruned at startup are gone from this review for good — they were not deleted from disk, but they are no longer in the result. The **What was dropped?** panel says so itself — "Dropped files only return through a fresh scan of the same folders." — and offers the one way back: **Rescan these folders** fills the path field from the saved review's roots (the session metadata now carries them), expands the scan setup, and starts the scan immediately.
 
 ### Complete
 
@@ -73,7 +73,7 @@ The resumed session "completes" the ways any review does: an executed action con
 
 **Files on disk.** One file: the review session JSON (private permissions, atomic writes). Discard deletes it; startup pruning rewrites it; completed scans overwrite it. Details in [Files Dedupe writes](../cross-cutting/caches-and-files.md).
 
-**Safety and undo.** Resume itself never moves or deletes user files — pruning removes entries from the *review*, not from disk.
+**Safety and undo.** Resume itself never moves or deletes user files — pruning removes entries from the *review*, not from disk. Starting a new scan still clears the per-candidate Trash undo map kept for the [no-person](no-person-review.md) and [faces](faces-review.md) reviews, but the loss no longer passes silently: the scan starts with a one-time toast — "N files trashed earlier can still be restored from the Trash — the new scan ends in-app undo for them" — and Finder's Trash remains the restore path for those files. If the new scan is cancelled or fails, the previous result is restored with its undo map intact and the cleared count is withdrawn.
 
 **Review sessions.** (This document; the mechanics live in [The review session](../foundations/review-session.md).)
 
@@ -89,14 +89,14 @@ The resumed session "completes" the ways any review does: an executed action con
 
 - The banner reports up to 20 example files; a session that pruned thousands shows the per-reason totals and a sample, not the full list.
 - The same file pruned from several groups counts once.
-- A session whose every group pruned away loads as an empty result — the page shows a resumed review with no groups rather than starting clean.
+- A session whose every group pruned away loads as an empty result — the page shows a resumed review with no groups rather than starting clean, and a one-time toast explains it: "The saved review's files all changed or moved — nothing is left to review. Scan again for a fresh look."
 - Discard during an active scan or action is refused with the lock message; it succeeds once the work ends.
 - After a failed scan restores previous results, the session file still holds the last *completed* scan — restart then resumes that older state, not the failed attempt.
 
 ## Open questions and verification
 
-- The banner's exact layout and wording (the "What was dropped?" disclosure control, whether reason labels are pluralized with counts) was read from the rendering functions' names and the metadata shape, not confirmed by hand against the running UI.
+- The banner's exact layout and wording (the "What was dropped?" disclosure control, whether reason labels are pluralized with counts, the placement of the dismiss ✕ and **Rescan these folders**) was read from the rendering functions' names and the metadata shape, not confirmed by hand against the running UI.
 - Whether a corrupt session surfaces its error text visibly in the banner or only through the status API should be checked in the product — the metadata carries both `corrupt` and `error`.
 - The order of precedence when a scan was started from the CLI with a result handed to the app (`initial_result`) — which saves over the session file first — is exercised only by the launcher flow and was not reproduced here.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

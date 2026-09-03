@@ -2,7 +2,7 @@
 
 import { api } from "./api.js";
 import { addStreamedGroup, loadGroups } from "./groups.js";
-import { updateWorkersUI, workersEl } from "./settings.js";
+import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatDuration, toast } from "./util.js";
 
@@ -62,12 +62,25 @@ function renderDiagnostics(summary) {
     for (const warning of stage.warnings || []) warnings.push(`${name.replaceAll("_", " ")}: ${warning}`);
   }
   $("scanQualitySummary").textContent = `· ${formatDuration(diagnostics.total_duration_seconds)} · ${diagnostics.cache_hits || 0} cache hits`;
-  $("scanQualityGrid").innerHTML = stages.map(([name, stage]) => `
+  $("scanQualityGrid").innerHTML = stages.map(([name, stage]) => {
+    // Stage warnings are capped server-side; say so instead of implying the
+    // shown list is complete.
+    const capped = (stage.failed || 0) > (stage.warnings || []).length;
+    return `
     <div class="quality-stage">
       <strong>${escapeHtml(name.replaceAll("_", " "))}</strong><span>${formatDuration(stage.duration_seconds)}</span>
-      <small>${stage.attempted || 0} attempted · ${stage.succeeded || 0} succeeded · ${stage.failed || 0} failed · ${stage.skipped || 0} skipped ${escapeHtml(stage.unit || "files")}</small>
-    </div>`).join("");
-  $("scanQualityWarnings").innerHTML = warnings.slice(0, 20).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+      <small>${stage.attempted || 0} attempted · ${stage.succeeded || 0} succeeded · ${stage.failed || 0} failed · ${stage.skipped || 0} skipped ${escapeHtml(stage.unit || "files")}${capped ? " · first warnings shown" : ""}</small>
+    </div>`;
+  }).join("");
+  const shown = warnings.slice(0, 20);
+  const errorsTotal = Number(summary.errors_total) || (summary.errors || []).length;
+  const hiddenErrors = Math.max(0, errorsTotal - (summary.errors || []).length);
+  const hiddenWarnings = Math.max(0, warnings.length - shown.length);
+  const hiddenNote = hiddenErrors + hiddenWarnings > 0
+    ? `<li class="muted">+ ${hiddenErrors + hiddenWarnings} more warning${hiddenErrors + hiddenWarnings === 1 ? "" : "s"} not shown</li>`
+    : "";
+  $("scanQualityWarnings").innerHTML =
+    shown.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("") + hiddenNote;
   const incomplete = failed > 0 || warnings.length > 0;
   $("scanQualityWarning").hidden = !incomplete;
   $("scanQualityWarning").textContent = incomplete
@@ -110,11 +123,26 @@ function renderPrunedDetail(metadata) {
     : "";
 }
 
+// Identity of the banner the user dismissed; a changed session re-shows it.
+function sessionBannerKey(metadata) {
+  if (!metadata) return "";
+  return [
+    metadata.available,
+    metadata.corrupt,
+    metadata.saved_at,
+    metadata.pruned_files,
+    metadata.error,
+  ].join("|");
+}
+
 function renderSession(metadata, resumed = false) {
   state.reviewSession = metadata || null;
   const available = !!metadata?.available;
   const corrupt = !!metadata?.corrupt;
-  $("sessionStatus").hidden = !available && !corrupt;
+  const dismissed = sessionBannerKey(metadata) === state.dismissedSessionKey
+    && state.dismissedSessionKey !== "";
+  $("sessionStatus").hidden = (!available && !corrupt) || dismissed;
+  if (dismissed) return;
   $("sessionStatus").classList.toggle("warn", corrupt);
   if (!available && !corrupt) return;
   if (corrupt) {
@@ -133,6 +161,11 @@ function renderSession(metadata, resumed = false) {
   renderPrunedDetail(metadata);
 }
 
+$("btnDismissSession").addEventListener("click", () => {
+  state.dismissedSessionKey = sessionBannerKey(state.reviewSession);
+  $("sessionStatus").hidden = true;
+});
+
 async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   // With no payload this is the polling path; SSE status events pass theirs
   // in and stream groups separately (group/reset events) instead of refetching.
@@ -144,6 +177,17 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   const top = $("topStats");
   const scanCompleted = state.scanning && !s.scanning && s.progress?.done;
 
+  // A new scan ends in-app undo for files trashed from the earlier review;
+  // say so once instead of letting the restore control silently vanish.
+  if (s.scanning && !state.trashUndoClearedNotified && (s.trash_undo_cleared || 0) > 0) {
+    state.trashUndoClearedNotified = true;
+    const count = s.trash_undo_cleared;
+    toast(
+      `${count} file${count === 1 ? "" : "s"} trashed earlier can still be restored from the Trash — the new scan ends in-app undo for ${count === 1 ? "it" : "them"}`,
+    );
+  }
+  if (!s.scanning && !(s.trash_undo_cleared > 0)) state.trashUndoClearedNotified = false;
+
   state.scanning = !!s.scanning;
   state.acting = !!s.acting;
   state.scanId = s.scan_id || state.scanId;
@@ -151,6 +195,22 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
     element.disabled = state.scanning || state.acting;
   });
+
+  // Gate dependency-bound scan options (OpenCV/Photon/ffmpeg) once known.
+  if (s.capabilities && s.capabilities !== state.capabilities) {
+    state.capabilities = s.capabilities;
+    applyCapabilities(s.capabilities);
+  }
+
+  // A durable keep-decisions write failure must not pass silently: surface it
+  // once per distinct error instead of swallowing it server-side.
+  if (s.keep_decisions_error && s.keep_decisions_error !== state.keepDecisionsError) {
+    toast(
+      `Could not remember Keep decisions (${s.keep_decisions_error}) — these files may resurface in future scans`,
+      "error",
+    );
+  }
+  state.keepDecisionsError = s.keep_decisions_error || null;
 
   // Configure workers slider from server CPU info (once)
   if (s.system) {
@@ -179,7 +239,9 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     // Soft progress while hashing; bump near-complete as groups stream in
     let pct = total ? Math.min(95, Math.round((done / total) * 100)) : 12;
     if (groupsSoFar > 0) pct = Math.max(pct, Math.min(98, 20 + groupsSoFar * 3));
-    fill.style.width = `${p.done ? 100 : Math.max(pct, 5)}%`;
+    const shownPct = p.done ? 100 : Math.max(pct, 5);
+    fill.style.width = `${shownPct}%`;
+    $("progressBar").setAttribute("aria-valuenow", String(shownPct));
     const baseMsg = p.message || p.phase || "";
     const parts = [
       total > 0 ? `${done}/${total}` : "",
@@ -196,6 +258,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     $("btnScan").querySelector(".btn-label").textContent = "Scan";
     if (s.progress?.done) {
       fill.style.width = "100%";
+      $("progressBar").setAttribute("aria-valuenow", "100");
       msg.textContent = s.progress.message || "Done";
       statusEl.textContent = s.error ? `Error` : "Ready";
       if (s.error) statusEl.classList.add("error");
@@ -258,6 +321,21 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (scanCompleted) {
     if (s.error) toast(s.error, "error");
     else toast(s.progress.message || "Scan complete", "ok");
+  }
+  // A resumed session whose files all pruned away loads as a baffling empty
+  // review; explain it once and point at a fresh scan.
+  if (
+    !state.emptyResumeNotified
+    && !s.scanning
+    && s.review_session?.available
+    && s.summary
+    && Number(s.summary.group_count) === 0
+    && s.progress?.message === "Resumed saved review"
+  ) {
+    state.emptyResumeNotified = true;
+    toast(
+      "The saved review's files all changed or moved — nothing is left to review. Scan again for a fresh look.",
+    );
   }
   return s;
 }

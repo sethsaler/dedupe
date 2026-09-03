@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import threading
 import urllib.request
@@ -69,6 +70,10 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     # Start the actual scanner through the UI, without opening a native picker.
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
+    # The setup form folds into its slim bar so the results get the screen.
+    expect(page.locator("#scanPanel")).to_have_class("scan-panel collapsed")
+    assert page.locator("#scanCollapse").get_attribute("aria-expanded") == "false"
+    assert page.locator("#scanCollapsePaths").inner_text() == str(duplicate_images)
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
     page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     page.locator(".group-item").first.click()
@@ -137,6 +142,14 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     expect(page.locator("#detailMeta")).to_contain_text("2 reviewed")
     assert "1 marked Delete" in page.locator("#detailMeta").inner_text()
     assert "0 remaining" in page.locator("#detailMeta").inner_text()
+
+    # ↑ steps back to the previous candidate without changing any decision,
+    # and ↓ steps forward again.
+    page.keyboard.press("ArrowUp")
+    expect(page.locator("#memberPagination .member-page-summary")).to_have_text("1 of 2")
+    expect(page.locator("#detailMeta")).to_contain_text("2 reviewed")
+    page.keyboard.press("ArrowDown")
+    expect(page.locator("#memberPagination .member-page-summary")).to_have_text("2 of 2")
 
     # Revisit and correct the first decision without clearing the whole review.
     page.locator("#memberPagination .member-prev").click()
@@ -443,3 +456,180 @@ def test_keyboard_help_lists_a_shortcut(page, live_dedupe_server: str) -> None:
     page.keyboard.press("Escape")
     page.locator("#helpBackdrop").wait_for(state="hidden")
     assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_lightbox_shows_metadata_and_toggles_selection(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    assert page.locator("#members .card.selected").count() == 1
+
+    # Open the lightbox on the selected (marked-for-removal) card.
+    selected_name = page.locator("#members .card.selected .name").inner_text()
+    page.locator("#members .card.selected .thumb-wrap").click()
+    page.locator("#lightbox").wait_for(state="visible")
+
+    # The lightbox shows the file's metadata, not just its path.
+    expect(page.locator("#lbMeta")).to_contain_text(selected_name)
+    expect(page.locator("#lbDetails")).to_contain_text("48×32")
+    expect(page.locator("#lbDetails")).to_contain_text("B")
+
+    # The removal toggle reflects and changes the group selection.
+    const_select = page.locator("#lbSelect")
+    expect(const_select).to_be_visible()
+    expect(const_select).to_have_attribute("aria-pressed", "true")
+    expect(const_select).to_have_text("Marked for removal")
+    const_select.click()
+    expect(const_select).to_have_attribute("aria-pressed", "false")
+    expect(page.locator("#members .card.selected")).to_have_count(0)
+
+    # `d` toggles removal for duplicate groups (it is not a no-op here).
+    page.keyboard.press("d")
+    expect(const_select).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#members .card.selected")).to_have_count(1)
+    # The group always keeps one file; the keeper card is never selected away.
+    expect(page.locator("#members .card.keep")).to_have_count(1)
+
+    page.keyboard.press("Escape")
+    page.locator("#lightbox").wait_for(state="hidden")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_lightbox_zoom_swaps_to_full_resolution(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card .thumb-wrap").first.click()
+    page.locator("#lightbox").wait_for(state="visible")
+
+    expect(page.locator("#lbZoom")).to_be_visible()
+    page.keyboard.press("z")
+    expect(page.locator("#lbImageStack")).to_have_class("lb-image-stack zoomed")
+    expect(page.locator("#lbZoom")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#lbImage")).to_have_attribute("src", re.compile(r"variant=full"))
+
+    page.keyboard.press("z")
+    expect(page.locator("#lbImageStack")).not_to_have_class("lb-image-stack zoomed")
+    page.keyboard.press("Escape")
+    page.locator("#lightbox").wait_for(state="hidden")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_error_toasts_persist_until_dismissed(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+
+    page.route(
+        "**/api/selection",
+        lambda route: route.fulfill(
+            status=500, content_type="application/json", body='{"error": "boom"}'
+        ),
+    )
+    page.locator("#members .sel-cb").first.click()
+    page.locator("#toast").filter(has_text="boom").wait_for(state="visible")
+    # An error must not vanish on a timer (plain toasts dismiss in ~3.4 s).
+    page.wait_for_timeout(4200)
+    expect(page.locator("#toast").filter(has_text="boom")).to_be_visible()
+    page.locator("#toastDismiss").click()
+    page.locator("#toast").wait_for(state="hidden")
+
+
+@pytest.mark.e2e
+def test_tabs_and_group_list_are_keyboard_navigable(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    # Arrow keys move between tabs (roving tabindex, activate on move).
+    # Each switch reloads the list asynchronously; the filtered-count text is
+    # written synchronously inside that reload, so it is the settle signal.
+    page.locator('.tab[data-kind="all"]').focus()
+    page.keyboard.press("ArrowRight")
+    assert page.evaluate("document.activeElement.dataset.kind") == "exact"
+    expect(page.locator('.tab[data-kind="exact"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#filteredCount")).to_have_text("1 of 3 groups shown")
+    page.keyboard.press("ArrowRight")
+    assert page.evaluate("document.activeElement.dataset.kind") == "similar"
+    expect(page.locator("#filteredCount")).to_have_text("0 of 3 groups shown")
+    page.keyboard.press("Home")
+    assert page.evaluate("document.activeElement.dataset.kind") == "all"
+    expect(page.locator("#filteredCount")).to_have_text("3 of 3 groups shown")
+    # The auto-select marks its group item active synchronously at start; once
+    # it exists, a j-initiated selection supersedes it and lands the focus.
+    page.locator(".group-item.active").wait_for(state="attached")
+
+    # j/k navigation moves real focus onto the group items (selection is
+    # async — poll until focus lands). wait_for_function's string predicate
+    # needs eval, which the app's CSP forbids; page.evaluate is unaffected.
+    page.keyboard.press("j")
+    focused = False
+    for _ in range(50):
+        focused = page.evaluate("document.activeElement?.classList?.contains('group-item')")
+        if focused:
+            break
+        page.wait_for_timeout(100)
+    assert focused
+    assert page.evaluate(
+        "document.activeElement.getAttribute('aria-current')"
+    ) == "true"
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_scan_setup_hints_and_exclusion_check(
+    page, live_dedupe_server: str, tmp_path: Path
+) -> None:
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    Image.new("RGB", (48, 32), (25, 100, 180)).save(folder_a / "a.png")
+    Image.new("RGB", (48, 32), (25, 100, 180)).save(folder_b / "b.png")
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    # Two folders with parallel streams (the default) surface the
+    # no-cross-folder-dedup hint; turning streams off hides it again.
+    expect(page.locator("#crossFolderHint")).to_be_hidden()
+    page.locator("#paths").fill(f"{folder_a}, {folder_b}")
+    expect(page.locator("#crossFolderHint")).to_be_visible()
+    page.locator("#optsToggle").click()
+    # Chip checkboxes are visually hidden behind their label; force the toggle.
+    page.locator("#optParallel").uncheck(force=True)
+    expect(page.locator("#crossFolderHint")).to_be_hidden()
+
+    # The exclusion check reports what each glob matches, flagging dead ones.
+    page.locator("#exclusions").fill("a*, zzz-*")
+    page.locator("#btnCheckExclusions").click()
+    expect(page.locator("#exclusionsCheckResult")).to_contain_text("✓ a*")
+    expect(page.locator("#exclusionsCheckResult")).to_contain_text("zzz-* — matches nothing")

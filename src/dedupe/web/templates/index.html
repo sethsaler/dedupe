@@ -29,7 +29,12 @@
     </header>
 
     <section class="scan-panel" id="scanPanel" tabindex="-1">
-      <div class="scan-main">
+      <button type="button" class="scan-collapse" id="scanCollapse" aria-expanded="true" aria-controls="scanMain">
+        <span class="chev" aria-hidden="true">▸</span>
+        <span class="scan-collapse-label">Scan setup</span>
+        <span class="scan-collapse-paths" id="scanCollapsePaths"></span>
+      </button>
+      <div class="scan-main" id="scanMain">
         <div class="field-row path-row">
           <label for="paths">Folders or files to scan</label>
           <div class="path-input-wrap">
@@ -48,6 +53,10 @@
             </button>
           </div>
           <div class="recent-paths" id="recentPaths" hidden></div>
+          <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
+            Multiple folders scan as parallel streams: duplicates <em>across</em> folders are not found.
+            Scan their common parent folder — or turn off Parallel streams in Options — to catch those.
+          </p>
         </div>
 
         <div class="scan-meta-row">
@@ -56,7 +65,7 @@
             Options
           </button>
           <div class="actions-row">
-            <span id="scanStatus" class="status muted">Ready</span>
+            <span id="scanStatus" class="status muted" aria-live="polite">Ready</span>
             <button id="btnCancelScan" class="btn ghost" type="button" hidden>Cancel</button>
             <button id="btnScan" class="btn primary" type="button">
               <span class="btn-label">Scan</span>
@@ -67,10 +76,11 @@
         <div class="options" id="optionsPanel" hidden>
           <div class="opt-group">
             <span class="opt-label">Detect</span>
-            <label class="chip-check"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
-            <label class="chip-check"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
-            <label class="chip-check"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
-            <label class="chip-check"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
+            <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
+            <label class="chip-check" id="optSimilarWrap"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
+            <label class="chip-check" id="optNoHumansWrap"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
+            <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
+            <span class="thresh-hint" id="depHint" hidden></span>
           </div>
           <label class="preset-field" id="humanBackendField" hidden>
             <span class="opt-label">Person detector</span>
@@ -116,6 +126,7 @@
               <option value="3">Very strict</option>
               <option value="6" selected>Balanced</option>
               <option value="10">Broader</option>
+              <option value="" disabled>Custom (raw slider)</option>
             </select>
             <span class="thresh-hint">Start strict; broader results need closer review.</span>
           </label>
@@ -136,14 +147,19 @@
           </label>
           <label class="exclude-field">
             <span class="opt-label">Exclude</span>
-            <input id="exclusions" type="text" placeholder="*.tmp, exports/**, cache" spellcheck="false" />
+            <span class="exclude-input-row">
+              <input id="exclusions" type="text" placeholder="*.tmp, exports/**, cache" spellcheck="false" />
+              <button class="btn ghost" id="btnCheckExclusions" type="button" title="Check what each glob matches under the scan folders">Check</button>
+            </span>
             <span class="thresh-hint">comma-separated globs</span>
+            <span class="thresh-hint exclusions-check-result" id="exclusionsCheckResult" hidden></span>
           </label>
+          <p class="thresh-hint settings-note">Scan settings and recent folders are remembered in this browser only.</p>
         </div>
       </div>
 
       <div class="progress-wrap" id="progressWrap" hidden>
-        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-bar" id="progressBar" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="progressFill"></div></div>
         <div class="progress-msg" id="progressMsg"></div>
         <div class="stream-progress" id="streamProgress" hidden></div>
       </div>
@@ -156,8 +172,11 @@
           <summary id="sessionPrunedSummary">What was dropped?</summary>
           <ul class="pruned-list" id="sessionPrunedList"></ul>
           <p class="muted small" id="sessionPrunedMore" hidden></p>
+          <p class="muted small">Dropped files only return through a fresh scan of the same folders.</p>
+          <button class="btn ghost" id="btnRescanSession" type="button">Rescan these folders</button>
         </details>
         <button class="linkish" id="btnDiscardSession" type="button">Discard saved review</button>
+        <button class="linkish session-dismiss" id="btnDismissSession" type="button" title="Dismiss this banner" aria-label="Dismiss this banner">✕</button>
       </div>
       <details class="scan-quality" id="scanQuality" hidden>
         <summary>Scan quality <span id="scanQualitySummary"></span></summary>
@@ -184,7 +203,7 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>d</kbd> Trash Non-Human · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>↑</kbd> back · <kbd>d</kbd> Trash Non-Human · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
@@ -192,13 +211,13 @@
     <section class="results" id="results" hidden>
       <aside class="sidebar">
         <div class="filter-tabs" role="tablist" aria-label="Result categories">
-          <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true">All <span class="tab-count" id="countAll">0</span></button>
-          <button class="tab" data-kind="exact" type="button" role="tab" aria-selected="false">Exact <span class="tab-count" id="countExact">0</span></button>
-          <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false">Similar <span class="tab-count" id="countSimilar">0</span></button>
-          <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
-          <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false">Random <span class="tab-count" id="countRandomReview">0</span></button>
-          <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
-          <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false">Faces <span class="tab-count" id="countFaces">0</span></button>
+          <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
+          <button class="tab" data-kind="exact" type="button" role="tab" aria-selected="false" tabindex="-1">Exact <span class="tab-count" id="countExact">0</span></button>
+          <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
+          <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false" tabindex="-1">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
+          <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
+          <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
+          <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
         </div>
         <div class="result-controls" aria-label="Find and organize results">
           <div class="result-controls-heading">
@@ -290,7 +309,7 @@
           <span class="muted small" id="filteredCount" aria-live="polite"></span>
         </div>
         <div class="group-more-slot" id="groupEarlier"></div>
-        <div class="group-list" id="groupList" role="listbox" aria-label="Duplicate groups"></div>
+        <div class="group-list" id="groupList" aria-label="Duplicate groups"></div>
         <div class="group-more-slot" id="groupMore"></div>
       </aside>
 
@@ -330,6 +349,7 @@
             </div>
             <div class="candidate-key-guide" aria-label="Review shortcuts">
               <span class="delete-key"><kbd>←</kbd> Delete</span>
+              <span><kbd>↑</kbd> Back</span>
               <span class="keep-key">Keep <kbd>→</kbd></span>
             </div>
           </div>
@@ -403,6 +423,9 @@
         <img id="lbImage" alt="Current file preview" />
         <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
       </div>
+      <div class="lb-stage-tools" id="lbStageTools" hidden>
+        <button class="btn ghost" id="lbZoom" type="button" aria-pressed="false" title="Full-resolution zoom (z)">Zoom</button>
+      </div>
       <div class="lb-compare-tools" id="lbCompareTools" hidden>
         <label for="lbOpacity">Keeper overlay</label>
         <input id="lbOpacity" type="range" min="0" max="100" value="50" />
@@ -419,10 +442,15 @@
           <option value="3">3×</option>
           <option value="4">4×</option>
         </select>
-        <span>Use the video timeline to scrub quickly</span>
+        <span>Scrub with the timeline, or click the video and use <kbd>←</kbd>/<kbd>→</kbd> · click outside the video to navigate between files</span>
       </div>
       <div class="lb-counter" id="lbCounter" aria-live="polite"></div>
       <div class="lb-meta" id="lbMeta"></div>
+      <div class="lb-details" id="lbDetails"></div>
+      <div class="lb-select" id="lbSelectWrap" hidden>
+        <button class="btn" id="lbSelect" type="button" aria-pressed="false">Mark for removal</button>
+        <span class="lb-action-hint"><kbd>d</kbd> or <kbd>Space</kbd> toggles · a group's suggested keeper is always protected</span>
+      </div>
       <div class="lb-actions" id="lbActions" hidden>
         <button class="btn danger" id="lbDelete" type="button">Move to Trash</button>
         <span class="lb-action-hint">One click · recoverable from Trash · <kbd>d</kbd> or <kbd>⌫</kbd></span>
@@ -449,16 +477,17 @@
     <div class="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
       <h3 id="helpTitle">Keyboard shortcuts</h3>
       <dl class="shortcuts">
-        <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group</dd></div>
-        <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group</dd></div>
+        <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group · in Low-res and Random review, ↓ steps to the next candidate without deciding</dd></div>
+        <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group · in Low-res and Random review, ↑ goes back to the previous candidate</dd></div>
         <div><dt><kbd>[</kbd> / <kbd>]</kbd></dt><dd>Previous / next group needing attention</dd></div>
         <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card</dd></div>
         <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
         <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
-        <div><dt><kbd>a</kbd></dt><dd>Preview Trash for the selected files</dd></div>
-        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card</dd></div>
-        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human or Faces file to Trash (one click, undo from the toast)</dd></div>
+        <div><dt><kbd>a</kbd> / <kbd>A</kbd></dt><dd>Preview Trash for selected exact / similar matches</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card · navigate in the lightbox</dd></div>
+        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human or Faces file to Trash (one click, undo from the toast) · in the lightbox, toggles removal for exact/similar files</dd></div>
+        <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>
@@ -471,6 +500,7 @@
   <div class="toast" id="toast" role="status" aria-live="polite" hidden>
     <span id="toastMessage"></span>
     <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>
+    <button class="toast-dismiss" id="toastDismiss" type="button" aria-label="Dismiss notification">✕</button>
   </div>
   <script type="module" src="/static/main.js"></script>
 </body>

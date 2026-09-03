@@ -2,11 +2,11 @@
 
 ## Summary
 
-The lightbox is the full-screen overlay for looking at one member of the focused group at full fidelity — comparing candidates before deciding what stays and what goes. It opens from the [group list](group-list.md) with Enter on a member card (or the equivalent click), shows that member large, and steps through the group's members with the arrow keys or the on-screen previous/next buttons. In Non-Human and Faces review it also offers one-click Trash (`d` / `Delete` / `Backspace`, or the on-screen button), then advances to the next remaining file. Elsewhere it is a viewing tool: nothing about the selection changes while it is open. Esc returns to the group list exactly as it was.
+The lightbox is the full-screen overlay for looking at one member of the focused group at full fidelity — comparing candidates before deciding what stays and what goes. It opens from the [group list](group-list.md) with Enter on a member card (or the equivalent click), shows that member large with a details line (dimensions, size, modified date) under its full path, and steps through the group's members with the arrow keys or the on-screen previous/next buttons. In Non-Human and Faces review it also offers one-click Trash (`d` / `Delete` / `Backspace`, or the on-screen button), then advances to the next remaining file. In exact and similar duplicate groups the same keys — or `Space`, or the on-screen Mark for removal button — toggle the member's removal selection instead, with the group's suggested keeper always protected, and images can be zoomed to full resolution and panned. Esc returns to the group list with focus exactly as it was.
 
 ## The simple case
 
-The user is on a group with several members, presses Enter (or clicks a member's preview), and the lightbox opens on that member at full preview quality. `←` and `→` — or the previous/next buttons — step through the group's members one at a time; the current member shows at full fidelity while the browser can natively display it, and videos play inline with native seeking. A flicker control, where present, alternates the two views rapidly so small differences between similar images jump out. Esc closes the overlay and the user is back on the same group with the same focus and selection. Stepping past the last member wraps around to the first (and vice versa), and a position indicator shows where the current member sits in the set (for example, `3 / 8`).
+The user is on a group with several members, presses Enter (or clicks a member's preview), and the lightbox opens on that member at full preview quality. `←` and `→` — or the previous/next buttons — step through the group's members one at a time; the current member shows at full fidelity while the browser can natively display it, and videos play inline with native seeking. Under the full path, a details line lists the member's dimensions, file size, and modified date — and, in Similar groups, how similar the member is to the keeper. A flicker control, where present, alternates the two views rapidly so small differences between similar images jump out; a Mark for removal button, where present, mirrors the member card's selection checkbox; and `z` (or a double-click) zooms an image to full resolution. Esc closes the overlay and the user is back on the same group with the same focus. Stepping past the last member wraps around to the first (and vice versa), and a position indicator shows where the current member sits in the set (for example, `3 / 8`).
 
 ## The interaction, event by event
 
@@ -16,12 +16,17 @@ stateDiagram-v2
     closed --> open : Enter / click on a member
     open --> open : ← / → / prev / next (change member)
     open --> open : Trash in Non-Human / Faces (advance)
+    open --> open : d / Space / Mark for removal (toggle selection, exact/similar)
+    open --> zoomed : Zoom / z / double-click (images only)
+    zoomed --> open : Zoom out / z / navigate (zoom resets)
     open --> closed : Esc / Trash of last remaining candidate
 ```
 
 ### Start
 
 The lightbox opens on one member of the focused group: the member whose card has focus (Enter uses the current member focus, defaulting to the first card) or the member clicked. The image is requested as a large (up to 2560 px) cached preview from the media preview endpoints; the group context — which members exist and in what order — is the focused group's member list as shown in the detail pane.
+
+Below the preview sit the full path and a details line: dimensions (`W×H`), file size, and modified date, joined by middots. In Similar groups the line adds the member's similarity to the suggested keeper (`82.5% similar to keeper`, or `similarity score unavailable` when the scan recorded none). Each part appears only when known, so the line is empty when nothing applies. When the member belongs to an exact or similar duplicate group, a Mark for removal toggle appears under the details line.
 
 Opening the lightbox does not pause, lock, or snapshot anything else: a scan keeps streaming behind it, and selection requests remain possible from other tabs of the same page (they are refused during scans exactly as without the lightbox).
 
@@ -38,14 +43,16 @@ The lightbox has no threshold between short and long use — it is "extended" fo
 ### While extended
 
 - **Navigation.** `←` / `→` and the previous/next buttons move through the group's members, wrapping around at both ends; the position indicator under the preview reads `current / total`. While the lightbox is open these keys navigate it and nothing else: the group-list bindings for the same keys (member focus, low-res/random Delete-Keep decisions) do not fire.
-- **Videos.** A video member plays in place with the browser's native controls and seeking; while the video itself has keyboard focus, the arrow keys go to the player, not the lightbox navigation.
+- **Videos.** A video member plays in place with the browser's native controls and seeking. The hint under the player reads "Scrub with the timeline, or click the video and use ←/→ · click outside the video to navigate between files": while the video itself has keyboard focus, the arrow keys go to the player, not the lightbox navigation.
 - **Flicker compare.** A dedicated control alternates the views being compared so subtle differences become visible; it can be held with the pointer and is also operable from the keyboard (Space / Enter on the control).
-- **One-click Trash (Non-Human and Faces).** A Trash button and the `d` / `Delete` / `Backspace` keys move the current file to the system Trash immediately, then show the next remaining member. Undo is offered on the toast, and that toast stays until another message replaces it — a reversible action never times out. The same Undo is also available later on the candidate's card via "N in Trash · Show". Duplicate-group lightboxes do not offer this control.
+- **Mark for removal (exact and similar groups).** The Mark for removal toggle reflects and changes the same selection as the member card's checkbox — the same request to the server, with the same server-side keeper protection, so marking every member still leaves the suggested keeper unselected. The button announces its state with `aria-pressed` and switches to "Marked for removal" styling when on, and the card grid, sidebar row, and action-bar counts update live. `d` / `Delete` / `Backspace` and `Space` toggle it from the keyboard, except that `Space` on a focused control button keeps that button's native activation. Covered by the browser test `test_lightbox_shows_metadata_and_toggles_selection`.
+- **Full-resolution zoom (images only).** The Zoom button — or `z`, or double-clicking the image — swaps the 2560 px preview for the full-resolution variant (the original file when the browser can display it, a full-size transcode otherwise) once it finishes loading; the preview stays on screen until then. The stage turns into a scrollable viewport, the view starts centered, and dragging pans with the pointer. Zooming hides the keeper overlay and the compare tools, it is unavailable for videos, and it resets when navigating to another member or closing the lightbox. Covered by the browser test `test_lightbox_zoom_swaps_to_full_resolution`.
+- **One-click Trash (Non-Human and Faces).** A Trash button and the `d` / `Delete` / `Backspace` keys move the current file to the system Trash immediately, then show the next remaining member. Undo is offered on the toast, and that toast is sticky: error and Undo toasts stay until dismissed with the toast's ✕ button, and new toasts queue behind a sticky one instead of replacing it — a reversible action never times out. The same Undo is also available later on the candidate's card via "N in Trash · Show". Duplicate-group lightboxes do not offer this control; there the same keys toggle the removal selection instead.
 - **Everything else keeps running.** The scan's progress, other browser tabs, and server state are unaffected by the overlay being open.
 
 ### Complete
 
-The lightbox does not commit; it ends. Esc closes it, returning to the group list with focus and selection unchanged. There is no "apply" step — decisions are made back in the detail pane.
+The lightbox has no apply step; it ends. Esc closes it, returning to the group list with focus unchanged and the selection as it was last set — any removal toggles made inside took effect immediately, member by member.
 
 ## Modifiers
 
@@ -55,13 +62,14 @@ The lightbox does not commit; it ends. Esc closes it, returning to the group lis
 | Media kind (image / GIF / video) | Decides what renders: still previews for images and GIFs, an inline player for videos. | No effect — navigation treats every member the same. |
 | Format needing transcode (HEIC/TIFF) | Full preview is served from a cached transcode; first view of a large HEIC may take a moment. | No effect after caching. |
 | Scan streaming in background | Previews resolve only for members already in the session. | Newly streamed groups are not part of the open lightbox until it is reopened. |
+| Full-resolution zoom (images only) | Off at open; the Zoom button, `z`, or a double-click turns it on and swaps in the full-resolution image. | Drag pans while it is on; any navigation — or closing — resets it. Videos have no Zoom control. |
 
 ## Cancel and interrupt
 
 | Event | Before opening | While open |
 | --- | --- | --- |
 | The user aborts explicitly | Nothing to abort. | Esc closes the lightbox at once; nothing is committed. |
-| The user does something else mid-way | No effect. | Other keyboard shortcuts are suspended for the keys the lightbox owns (arrows); opening help or a modal is not offered from inside the overlay. Switching browser tabs leaves it open. |
+| The user does something else mid-way | No effect. | Other keyboard shortcuts are suspended for the keys the lightbox owns (arrows, `d` / `Delete` / `Backspace`, `Space`, `z`); opening help or a modal is not offered from inside the overlay. Switching browser tabs leaves it open. |
 | A clean complete happens elsewhere | No effect. | An executed action from another tab removes members; the lightbox's member list is refreshed on the next group load, and a removed member can no longer be previewed (its request would return not found). |
 | The environment fails | Preview requests for unreadable or evicted files return an error; the lightbox shows that member as having no preview rather than failing the overlay. | Same per member; navigation still works. |
 | The page or process goes away | No effect. | A reload closes the lightbox (overlay state is not persisted); the group list reloads from the server. Server death ends previews; the page shows its disconnected state. |
@@ -73,7 +81,7 @@ The lightbox does not commit; it ends. Esc closes it, returning to the group lis
 
 **Files on disk.** The lightbox writes nothing; preview transcodes are cached server-side (immutable, keyed by file identity) and are described in [Files Dedupe writes](../cross-cutting/caches-and-files.md).
 
-**Safety and undo.** Viewing never moves files. In Non-Human and Faces review the overlay's Trash control is the same one-click per-candidate trash as the card, with the same restore path.
+**Safety and undo.** Viewing never moves files. In exact and similar groups the overlay's Mark for removal toggle changes only the selection — the same one the member card's checkbox writes — so nothing lands on disk until an action is confirmed. In Non-Human and Faces review the overlay's Trash control is the same one-click per-candidate trash as the card, with the same restore path.
 
 **Review sessions.** None directly; the members it shows belong to the current result, whether scanned fresh or [resumed](session-resume.md).
 
@@ -92,6 +100,8 @@ The lightbox does not commit; it ends. Esc closes it, returning to the group lis
 - Esc closes the lightbox before any other overlay: it is checked first in the keyboard handling, so an open lightbox always takes the Escape.
 - Members deleted by an executed action elsewhere stop resolving; their preview requests fail with not found.
 - A group paginated at 50 members per page in the detail pane navigates in the lightbox over the members as loaded.
+- Marking every member of a duplicate group for removal still leaves the suggested keeper unselected: keeper retention runs server-side on every selection change, so the toggle cannot strip a group down to zero keeps.
+- Zoom disables swipe navigation: while zoomed, horizontal drags — touch or pointer — pan the image instead of stepping to the next member.
 
 ## Open questions and verification
 
@@ -100,4 +110,4 @@ The lightbox does not commit; it ends. Esc closes it, returning to the group lis
 
 Navigation wraps at both ends, neighboring previews are prefetched after every navigation, and a `current / total` position indicator sits under the preview — all three confirmed in `lightbox.js` (the wrap arithmetic, `prefetchLightboxNeighbors`, and the counter element) and covered by the browser workflow tests.
 
-Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).
+Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

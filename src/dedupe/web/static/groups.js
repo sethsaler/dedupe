@@ -61,6 +61,26 @@ function renderTabCounts() {
   $("countFaces").textContent = memberCount("faces");
 }
 
+// The focused group survives a page reload: remembered in sessionStorage and
+// restored on the first group-list load, if it still exists after the scan.
+const FOCUS_KEY = "dedupe.focusedGroupId";
+let focusRestorePending = (() => {
+  try {
+    return sessionStorage.getItem(FOCUS_KEY) || null;
+  } catch {
+    return null;
+  }
+})();
+
+function rememberFocusedGroup(id) {
+  try {
+    if (id) sessionStorage.setItem(FOCUS_KEY, id);
+    else sessionStorage.removeItem(FOCUS_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function loadGroups({ preserveSelection = false } = {}) {
   const token = ++state.groupsLoadToken;
   const all = await fetchAllGroups(token);
@@ -89,9 +109,16 @@ async function loadGroups({ preserveSelection = false } = {}) {
       $("detailEmpty").hidden = false;
     }
   } else if (state.groups.length && !$("results").hidden) {
-    // Auto-select first when nothing selected (including first group mid-scan)
+    // Auto-select when nothing is selected: the group the user was looking at
+    // before a reload, if it still exists, otherwise the first group.
     if (!$("detailEmpty").hidden) {
-      await selectGroup(state.groups[0].id, { silent: true });
+      let targetId = state.groups[0].id;
+      if (focusRestorePending) {
+        const wanted = focusRestorePending;
+        focusRestorePending = null;
+        if (state.groups.some((g) => g.id === wanted)) targetId = wanted;
+      }
+      await selectGroup(targetId, { silent: true });
     }
   }
 }
@@ -237,7 +264,7 @@ function groupItemHtml(g) {
   const stateLabel = attention ? "Needs review" : "Reviewed";
   const stateGlyph = attention ? "●" : "✔";
   return `
-        <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" role="option" aria-selected="${active ? "true" : "false"}">
+        <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" aria-current="${active ? "true" : "false"}">
           <div class="g-top">
             <span>${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
             <span class="badge ${g.kind}">${badgeLabel}</span>
@@ -287,6 +314,9 @@ function wireGroupList() {
     });
     list.addEventListener("scroll", () => {
       if (list.scrollTop + list.clientHeight >= list.scrollHeight - 240) growGroupList();
+      // Scrolling back up slides the window too; otherwise a long list hits a
+      // hard edge and only the "Show earlier" button could rescue it.
+      if (list.scrollTop <= 120 && state.groupListStart > 0) shrinkGroupListWindow();
     });
     const more = $("groupMore");
     more.dataset.wired = "1";
@@ -356,7 +386,7 @@ function renderGroupList() {
   const list = wireGroupList();
   if (!state.groups.length) {
     state.groupListStart = 0;
-    list.innerHTML = `<div class="group-empty" role="presentation">No groups in this filter.</div>`;
+    list.innerHTML = `<div class="group-empty">No groups in this filter.</div>`;
     $("groupMore").innerHTML = "";
     syncEarlierSlot();
     return;
@@ -390,7 +420,7 @@ function updateGroupListItem(g) {
   const fresh = holder.firstElementChild;
   if (!fresh) return false;
   node.className = fresh.className;
-  node.setAttribute("aria-selected", fresh.getAttribute("aria-selected"));
+  node.setAttribute("aria-current", fresh.getAttribute("aria-current"));
   node.innerHTML = fresh.innerHTML;
   return true;
 }
@@ -407,15 +437,12 @@ function markGroupListActive(id) {
   const list = $("groupList");
   list.querySelectorAll(".group-item.active").forEach((node) => {
     node.classList.remove("active");
-    node.setAttribute("aria-selected", "false");
+    node.setAttribute("aria-current", "false");
   });
   const node = list.querySelector(`.group-item[data-id="${id}"]`);
   if (node) {
     node.classList.add("active");
-    node.setAttribute("aria-selected", "true");
-    list.setAttribute("aria-activedescendant", `gopt-${id}`);
-  } else {
-    list.removeAttribute("aria-activedescendant");
+    node.setAttribute("aria-current", "true");
   }
   return node;
 }
@@ -440,4 +467,4 @@ function ensureGroupVisible(id) {
   renderGroupList();
 }
 
-export { loadGroups, addStreamedGroup, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts };
+export { loadGroups, addStreamedGroup, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, rememberFocusedGroup };

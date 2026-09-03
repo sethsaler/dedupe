@@ -50,7 +50,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 18
+WEB_API_VERSION = 19
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Independent review flows whose cards support direct per-file Trash + undo.
@@ -230,12 +230,16 @@ def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
     return picks
 
 
-def sync_low_resolution_keeps(result: ScanResult, paths: set[str]) -> None:
+def sync_low_resolution_keeps(result: ScanResult, paths: set[str]) -> str | None:
     """Persist keep decisions for low-resolution candidates among ``paths``.
 
     A candidate that has been reviewed and left unselected was explicitly kept;
     that decision is stored durably so future scans stop resurfacing the file.
     Any other state (selected for removal, or review withdrawn) clears it.
+
+    Returns None on success, otherwise the error message. The durable store is
+    a convenience, so a write failure never fails the selection request — but
+    the caller surfaces it instead of swallowing it silently.
     """
     keep = []
     clear = []
@@ -253,9 +257,34 @@ def sync_low_resolution_keeps(result: ScanResult, paths: set[str]) -> None:
                 clear.append(member.path)
     try:
         update_keep_decisions(keep=keep, clear=clear)
-    except OSError:
-        # The durable store is a convenience; never fail the selection request.
-        pass
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def detect_capabilities() -> dict:
+    """Probe optional dependencies once; the UI gates scan options on this."""
+    from ..human_detection import YUNET_MODEL_PATH
+
+    try:
+        import cv2  # noqa: F401
+
+        opencv = True
+    except Exception:
+        opencv = False
+    try:
+        import moondream  # noqa: F401
+
+        photon = True
+    except Exception:
+        photon = False
+    return {
+        "opencv": opencv,
+        "yunet_model": YUNET_MODEL_PATH.is_file(),
+        "photon": photon,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffprobe": shutil.which("ffprobe") is not None,
+    }
 
 
 def create_app(
@@ -272,6 +301,7 @@ def create_app(
     app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
     app.config["DEDUPE_CACHE_PATH"] = None
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
+    capabilities = detect_capabilities()
     lock = threading.RLock()
     loaded = ReviewSessionLoad(path=Path(review_session_path) if review_session_path else None)
     if initial_result is None:
@@ -303,6 +333,12 @@ def create_app(
         # Debounced review-session persistence for large results.
         "persist_dirty": False,
         "persist_timer": None,
+        # Last durable keep-decisions write failure (None when healthy). The
+        # write must never fail a selection request, but it must be visible.
+        "keep_decisions_error": None,
+        # Per-candidate Trash undo entries dropped by the latest scan start;
+        # surfaced once so the user knows in-app undo has ended for them.
+        "trash_undo_cleared": 0,
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -598,6 +634,9 @@ def create_app(
             "error": state["last_error"],
             "streams": [dict(stream) for stream in state["streams"]],
             "review_session": state["review_session"].metadata(),
+            "capabilities": capabilities,
+            "keep_decisions_error": state["keep_decisions_error"],
+            "trash_undo_cleared": state["trash_undo_cleared"],
             "system": {
                 "cpu_count": cpu,
                 "auto_workers": resolve_workers(None),
@@ -620,6 +659,7 @@ def create_app(
                 "reclaimable_human": format_bytes(result.reclaimable_bytes),
                 "selected_count": state["selected_count"],
                 "errors": list(result.errors[:20]),
+                "errors_total": len(result.errors),
                 "diagnostics": result.diagnostics.to_dict(),
             }
         return payload
@@ -876,6 +916,9 @@ def create_app(
             state["cancel_event"] = cancel_event
             state["last_error"] = None
             state["deleted_files"] = {}
+            # A new scan ends in-app undo for anything trashed earlier; the
+            # status payload reports this once so it is not a silent loss.
+            state["trash_undo_cleared"] = len(previous_deleted)
             state["progress"] = ScanProgress(phase="starting", message="Starting…")
             # Empty result so the UI can stream groups as they appear.
             state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
@@ -1061,6 +1104,7 @@ def create_app(
                     was_cancelled = isinstance(exc, InterruptedError)
                     state["result"] = previous_result
                     state["deleted_files"] = previous_deleted
+                    state["trash_undo_cleared"] = 0  # the undo map survived after all
                     state["scan_id"] = secrets.token_hex(12)
                     state["groups_version"] += 1
                     state["paths_version"] += 1
@@ -1095,6 +1139,30 @@ def create_app(
             event.set()
             state["progress"].message = "Cancelling after current work item…"
         return jsonify({"ok": True})
+
+    @app.post("/api/scan/check-exclusions")
+    def api_scan_check_exclusions():
+        """Report what each exclusion glob would match under the given roots.
+
+        A glob that matches nothing is usually a typo; the scan would silently
+        treat it as dead weight. The walk is bounded and read-only.
+        """
+        data = request.get_json(silent=True) or {}
+        paths = data.get("paths") or []
+        if isinstance(paths, str):
+            paths = [paths]
+        paths = [str(p) for p in paths if p and str(p).strip()]
+        if not paths:
+            return jsonify({"error": "paths required"}), 400
+        raw_exclusions = data.get("exclusions") or []
+        if isinstance(raw_exclusions, str):
+            raw_exclusions = raw_exclusions.split(",")
+        exclusions = [str(p).strip() for p in raw_exclusions if str(p).strip()]
+        if not exclusions:
+            return jsonify({"error": "exclusions required"}), 400
+        from ..scanner import preview_exclusions
+
+        return jsonify(preview_exclusions(paths, exclusions))
 
     @app.post("/api/smart-select")
     def api_smart_select():
@@ -1198,7 +1266,9 @@ def create_app(
                                 ]
                         result.recompute_stats()
                         refresh_selected_count_locked()
-                        sync_low_resolution_keeps(result, {decision_path})
+                        state["keep_decisions_error"] = sync_low_resolution_keeps(
+                            result, {decision_path}
+                        )
                         payload = group_payload(g)
                         schedule_persist()
                         return jsonify(payload)
@@ -1223,7 +1293,9 @@ def create_app(
                             path for path in reviewed if path in member_paths
                         ]
                     if g.kind == GroupKind.LOW_RESOLUTION:
-                        sync_low_resolution_keeps(result, member_paths)
+                        state["keep_decisions_error"] = sync_low_resolution_keeps(
+                            result, member_paths
+                        )
                     result.recompute_stats()
                     refresh_selected_count_locked()
                     payload = group_payload(g)

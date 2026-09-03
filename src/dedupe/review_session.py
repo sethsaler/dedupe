@@ -68,6 +68,7 @@ class ReviewSessionLoad:
             "path": str(self.path) if self.path else None,
             "available": self.available,
             "saved_at": self.saved_at,
+            "roots": list(self.result.roots) if self.result else [],
             "pruned_files": self.pruned_files,
             "pruned_reasons": dict(self.pruned_reasons),
             "pruned_reason_labels": {

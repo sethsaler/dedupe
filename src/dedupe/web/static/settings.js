@@ -16,6 +16,9 @@ thresh.addEventListener("input", () => {
   preset.value = [...preset.options].some((option) => option.value === thresh.value) ? thresh.value : "";
 });
 $("similarityPreset").addEventListener("change", () => {
+  // "" is the disabled "Custom (raw slider)" marker shown when the slider
+  // sits between presets; choosing nothing keeps the slider value.
+  if ($("similarityPreset").value === "") return;
   thresh.value = $("similarityPreset").value;
   threshVal.textContent = thresh.value;
   saveScanSettings();
@@ -73,6 +76,21 @@ $("optsToggle").addEventListener("click", () => {
   panel.hidden = !open;
   $("optsToggle").setAttribute("aria-expanded", open ? "true" : "false");
 });
+
+// —— Scan panel collapse ——
+// The setup form folds into a slim bar once a scan starts (or when results
+// are already loaded) so the results below get the screen; the bar re-opens
+// the form on click and shows the scanned paths while collapsed.
+$("scanCollapse").addEventListener("click", () => {
+  const collapsed = $("scanPanel").classList.toggle("collapsed");
+  $("scanCollapse").setAttribute("aria-expanded", collapsed ? "false" : "true");
+});
+
+function collapseScanPanel(pathsText = "") {
+  if (pathsText) $("scanCollapsePaths").textContent = pathsText;
+  $("scanPanel").classList.add("collapsed");
+  $("scanCollapse").setAttribute("aria-expanded", "false");
+}
 
 const settingIds = [
   "optExact",
@@ -169,8 +187,9 @@ function renderRecent() {
     .join("");
   box.querySelectorAll(".recent-chip").forEach((btn) => {
     btn.addEventListener("click", () => {
-      $("paths").value = btn.dataset.path;
-      $("paths").focus();
+      // Append like the native picker does; replacing wiped typed paths.
+      appendPickedPaths([btn.dataset.path]);
+      syncCrossFolderHint();
     });
   });
 }
@@ -247,6 +266,130 @@ pathWrap.addEventListener("drop", (e) => {
     const cleaned = text.trim().replace(/^file:\/\//, "");
     const cur = $("paths").value.trim();
     $("paths").value = cur ? `${cur}, ${cleaned}` : cleaned;
+    syncCrossFolderHint();
+  } else if (e.dataTransfer.files?.length) {
+    // Browsers never expose a dropped item's absolute path; say so instead of
+    // silently ignoring the drop.
+    toast("The browser can't read a dropped folder's location — use Folders… to pick it", "error");
+  }
+});
+
+// —— Cross-folder duplicate hint ——
+// Parallel streams (the default for several paths) never match files across
+// folders; say so next to the path field, where the user actually looks.
+function syncCrossFolderHint() {
+  const hint = $("crossFolderHint");
+  if (!hint) return;
+  const pathCount = $("paths")
+    .value.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean).length;
+  hint.hidden = !(pathCount > 1 && $("optParallel").checked);
+}
+$("paths").addEventListener("input", syncCrossFolderHint);
+$("optParallel").addEventListener("change", syncCrossFolderHint);
+syncCrossFolderHint();
+
+// —— Dependency-gated options ——
+// The server probes optional dependencies once at startup; options that need a
+// missing one are disabled with the reason, instead of failing at scan time.
+function applyCapabilities(caps) {
+  if (!caps) return;
+  const opencvReady = Boolean(caps.opencv && caps.yunet_model);
+  const noHumansReady = opencvReady || Boolean(caps.photon);
+  const gate = (inputId, wrapId, ready, reason) => {
+    const input = $(inputId);
+    const wrap = wrapId ? $(wrapId) : null;
+    if (!input) return;
+    input.disabled = !ready;
+    if (!ready) {
+      input.checked = false;
+      (wrap || input).title = reason;
+    } else {
+      (wrap || input).removeAttribute("title");
+    }
+  };
+  gate(
+    "optNoHumans",
+    "optNoHumansWrap",
+    noHumansReady,
+    "Non-Human detection needs OpenCV or Photon — run `dedupe doctor` for setup",
+  );
+  gate(
+    "optCountFaces",
+    "optCountFacesWrap",
+    Boolean(caps.opencv),
+    "Face counting needs OpenCV — run `dedupe doctor` for setup",
+  );
+  const backend = $("humanBackend");
+  if (backend) {
+    const optionReady = {
+      opencv: opencvReady,
+      photon: Boolean(caps.photon),
+      ensemble: opencvReady && Boolean(caps.photon),
+    };
+    const optionReason = {
+      opencv: "needs OpenCV and the bundled YuNet model",
+      photon: "needs the Moondream SDK (pip install -e '.[photon]')",
+      ensemble: "needs both OpenCV and the Moondream SDK",
+    };
+    for (const option of backend.options) {
+      option.disabled = !optionReady[option.value];
+      option.title = option.disabled ? optionReason[option.value] : "";
+    }
+    if (backend.selectedOptions[0]?.disabled) {
+      const firstReady = [...backend.options].find((option) => !option.disabled);
+      if (firstReady) backend.value = firstReady.value;
+    }
+  }
+  const hint = $("depHint");
+  if (hint) {
+    const missing = [];
+    if (!opencvReady) missing.push("OpenCV");
+    if (!caps.photon) missing.push("Photon");
+    if (!caps.ffmpeg) missing.push("ffmpeg (video similarity and thumbnails limited)");
+    hint.hidden = !missing.length;
+    hint.textContent = missing.length
+      ? `Not installed: ${missing.join(" · ")} — some options are disabled. Run dedupe doctor for details.`
+      : "";
+  }
+  syncHumanBackendVisibility();
+}
+
+// —— Exclusion check ——
+$("btnCheckExclusions").addEventListener("click", async () => {
+  const result = $("exclusionsCheckResult");
+  const paths = $("paths").value.split(",").map((value) => value.trim()).filter(Boolean);
+  const exclusions = $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean);
+  if (!paths.length) {
+    toast("Enter the scan folders first, then check exclusions");
+    $("paths").focus();
+    return;
+  }
+  if (!exclusions.length) {
+    result.hidden = false;
+    result.textContent = "No exclusion globs to check.";
+    return;
+  }
+  result.hidden = false;
+  result.textContent = "Checking…";
+  try {
+    const data = await api("/api/scan/check-exclusions", {
+      method: "POST",
+      body: JSON.stringify({ paths, exclusions }),
+    });
+    const parts = (data.patterns || []).map((entry) => {
+      const noun = entry.matches === 1 ? "match" : "matches";
+      return entry.matches > 0
+        ? `✓ ${entry.pattern} — ${entry.matches}${data.truncated ? "+" : ""} ${noun}`
+        : `⚠ ${entry.pattern} — matches nothing (typo?)`;
+    });
+    result.textContent = data.truncated
+      ? `${parts.join("  ·  ")}  ·  stopped early (large tree) — counts are lower bounds`
+      : parts.join("  ·  ");
+  } catch (error) {
+    result.hidden = true;
+    toast(error.message || "Could not check exclusions", "error");
   }
 });
 
@@ -256,4 +399,4 @@ function lowResolutionMaxPixels(id) {
   return Math.round(megapixels * 1_000_000);
 }
 
-export { updateWorkersUI, workersEl, saveRecent, renderRecent, lowResolutionMaxPixels };
+export { updateWorkersUI, workersEl, saveRecent, renderRecent, lowResolutionMaxPixels, collapseScanPanel, applyCapabilities, syncCrossFolderHint };

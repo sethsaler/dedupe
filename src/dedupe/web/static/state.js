@@ -24,6 +24,11 @@ const state = {
   actionBusy: false, // a file action run by this tab is in flight
   cpuCount: 0,
   autoWorkers: 0,
+  capabilities: null,
+  keepDecisionsError: null,
+  trashUndoClearedNotified: false,
+  dismissedSessionKey: "",
+  emptyResumeNotified: false,
   groupsVersion: -1, // tracks streaming updates mid-scan
   scanId: null,
   reviewSession: null,
@@ -39,6 +44,8 @@ const state = {
   // Paths trashed on the current triage page: their cards stay in place as
   // "Moved to Trash" placeholders so the grid never reflows mid-review.
   trashedInPlace: new Set(),
+  // Group ids whose selection the user changed; others show the suggestion.
+  touchedGroups: new Set(),
 };
 
 export { CSRF_TOKEN, GROUP_RENDER_CHUNK, state };

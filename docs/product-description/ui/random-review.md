@@ -33,7 +33,7 @@ The first arrow-key decision persists: the decision is applied server-side, vali
 
 ### While extended
 
-**Deciding.** `←` deletes the focused candidate (reviewed + selected), `→` keeps it (reviewed, unselected), and the pane advances — re-centering the candidate's media in the viewport on each step, as in the low-resolution review. The summary line reports reviewed and selected counts as in the other decision reviews. Decisions write through every group the file belongs to, exactly as in the [low-resolution review](low-res-review.md#while-extended): other independent branches see the reviewed state, and a Keep withdraws the file from duplicate groups' selections.
+**Deciding.** `←` deletes the focused candidate (reviewed + selected), `→` keeps it (reviewed, unselected), and the pane advances — re-centering the candidate's media in the viewport on each step, as in the low-resolution review. `↑` / `↓` step back and forward through the sample without deciding, also as in the low-resolution review. The summary line reports reviewed and selected counts as in the other decision reviews. Decisions write through every group the file belongs to, exactly as in the [low-resolution review](low-res-review.md#while-extended): other independent branches see the reviewed state, and a Keep withdraws the file from duplicate groups' selections.
 
 **Keeps are deliberately forgetful.** Unlike low-resolution candidates, a kept random candidate writes no durable decision — the keep-decisions sync applies only to the low-resolution category. Keeping a file in Random 50 means "not this one, today"; the next scan's sample does not remember.
 
