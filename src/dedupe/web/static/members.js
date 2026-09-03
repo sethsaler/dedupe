@@ -10,6 +10,29 @@ import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRati
 
 const MEMBER_PAGE_SIZE = 50;
 
+// The member sort select is kind-aware: each listed kind gets its own option
+// set, and its first option is the server order (no client re-sort).
+const MEMBER_SORT_OPTIONS = {
+  faces: [
+    ["faces-desc", "Most faces first"],
+    ["faces-asc", "Fewest faces first"],
+    ["newest", "Newest first"],
+  ],
+  all_files: [
+    ["path", "Folder order (path)"],
+    ["largest", "Largest first"],
+    ["newest", "Newest first"],
+    ["oldest", "Oldest first"],
+  ],
+};
+
+function memberSortFor(kind) {
+  const options = MEMBER_SORT_OPTIONS[kind];
+  if (!options) return null;
+  const saved = state.memberSortByKind[kind];
+  return options.some(([value]) => value === saved) ? saved : options[0][0];
+}
+
 function syncMemberPagination(pageCount, summaryText) {
   const bars = [
     $("memberPagination"),
@@ -110,6 +133,13 @@ function syncCardSelection(card, g, path) {
 }
 
 function updateDetailMeta(g) {
+  if (g.kind === "all_files") {
+    const reviewed = new Set(g.reviewed_paths || []);
+    const deleted = (g.deleted_paths || []).length;
+    $("detailMeta").textContent =
+      `${reviewed.size} of ${g.member_count} reviewed · ${deleted} in Trash · every scanned media file in this folder, whether or not it matched a category · Trash is one click and undoable`;
+    return;
+  }
   if (g.kind === "no_humans") {
     const reviewed = new Set(g.reviewed_paths || []);
     const selected = new Set(g.selected_for_removal || []);
@@ -172,6 +202,7 @@ async function selectGroup(id, { silent = false } = {}) {
     low_resolution: "Low resolution · under 1 megapixel",
     random_review: "Random review · fresh sample",
     faces: "Faces · OpenCV face counts",
+    all_files: `All files${g.root ? ` · ${basename(g.root)}` : ""}`,
   }[g.kind] || g.kind;
   $("detailTitle").textContent = isIndependentReview(g)
     ? `${kindLabel} · ${g.member_count} files`
@@ -219,11 +250,22 @@ function renderMembers(g) {
   const reviewedPaths = new Set(g.reviewed_paths || []);
   const deletedPaths = new Set(g.deleted_paths || []);
   let allMembers = g.members || [];
-  if (g.kind === "faces" && state.memberSort !== "faces-desc") {
+  const memberSort = memberSortFor(g.kind);
+  if (g.kind === "faces" && memberSort !== "faces-desc") {
     allMembers = [...allMembers].sort(
-      state.memberSort === "newest"
+      memberSort === "newest"
         ? (a, b) => (b.mtime || 0) - (a.mtime || 0)
         : (a, b) => (a.face_count || 0) - (b.face_count || 0),
+    );
+  }
+  if (g.kind === "all_files" && memberSort !== "path") {
+    const byPath = (a, b) => a.path.localeCompare(b.path);
+    allMembers = [...allMembers].sort(
+      memberSort === "largest"
+        ? (a, b) => (b.size || 0) - (a.size || 0) || byPath(a, b)
+        : memberSort === "oldest"
+          ? (a, b) => (a.mtime || 0) - (b.mtime || 0) || byPath(a, b)
+          : (a, b) => (b.mtime || 0) - (a.mtime || 0) || byPath(a, b),
     );
   }
   const triage = isPagedIndependentReview(g);
@@ -259,14 +301,26 @@ function renderMembers(g) {
   syncMemberPagination(pageCount, summaryText);
   const sortSelect = $("memberSort");
   if (sortSelect) {
-    sortSelect.hidden = g.kind !== "faces";
-    sortSelect.value = state.memberSort;
+    const options = MEMBER_SORT_OPTIONS[g.kind] || null;
+    sortSelect.hidden = !options;
+    if (options && sortSelect.dataset.kind !== g.kind) {
+      sortSelect.replaceChildren(
+        ...options.map(([value, label]) => new Option(label, value)),
+      );
+      sortSelect.dataset.kind = g.kind;
+    }
+    if (options) sortSelect.value = memberSortFor(g.kind);
   }
-  if (g.kind === "faces" && $("memberPagination")) $("memberPagination").hidden = false;
+  // The sort select lives in the top pagination bar, so sortable kinds keep
+  // that bar visible even when the group fits on one page.
+  if (MEMBER_SORT_OPTIONS[g.kind] && $("memberPagination")) $("memberPagination").hidden = false;
   if (isPagedIndependentReview(g)) {
     prefetchThumbnails(allMembers.slice(pageStart + members.length, pageStart + members.length + 8));
   }
-  state.lightboxItems = members
+  // Paged triage reviews sift through the whole group in the lightbox, not
+  // just the 50-card page: the page slice is only a grid-rendering concern.
+  const lightboxSource = isPagedIndependentReview(g) ? allMembers : members;
+  state.lightboxItems = lightboxSource
     .filter((member) => !deletedPaths.has(member.path))
     .map((member) => lightboxItemFor(member, g));
   updateDetailMeta(g);
@@ -319,7 +373,9 @@ function renderMembers(g) {
               ? "Randomly selected from this scan for a quick keep-or-delete check"
               : g.kind === "faces"
                 ? `OpenCV face detection found ${m.face_count} face${m.face_count === 1 ? "" : "s"} (heuristic, not a guarantee)`
-                : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
+                : g.kind === "all_files"
+                  ? "Every scanned media file in this folder appears here, category or not"
+                  : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
       const selectionTitle = isSel
         ? (isPagedIndependentReview(g) ? "Reviewed · selected" : "Selected for removal")
         : (isPagedIndependentReview(g) && reviewed ? "Reviewed · not selected" : "Not selected");
@@ -348,7 +404,7 @@ function renderMembers(g) {
               <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
             </div>`
         : isPagedIndependentReview(g)
-        ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button" title="${deleted ? "Restore from Trash" : "Move to Trash — one click"}">${deleted ? "Undo" : "Trash"}</button>`
+        ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button" title="${deleted ? "Restore from Trash" : "Move to Trash — one click"}">${deleted ? "Undo" : "Trash"}</button>${deleted ? "" : `<button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`}`
         : `<label class="selection-control">
                 <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
                 <span class="selection-copy">
@@ -728,10 +784,12 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
     state.trashedInPlace.delete(path);
     renderMembers(updated);
     scheduleRender({ groupList: true, selection: true });
-    if (fromLightbox) {
-      const member = (updated.members || []).find((item) => item.path === path);
-      if (member && !state.lightboxItems.some((item) => item.path === path)) {
-        state.lightboxItems.splice(state.lightboxIndex, 0, lightboxItemFor(member, updated));
+    // renderMembers rebuilt the lightbox list with the restored file back at
+    // its sorted position; when the overlay is open, jump back to it.
+    if (fromLightbox && !$("lightbox").hidden) {
+      const restoredIndex = state.lightboxItems.findIndex((item) => item.path === path);
+      if (restoredIndex >= 0) {
+        state.lightboxIndex = restoredIndex;
         updateLightbox();
       }
     }
@@ -812,10 +870,13 @@ document.querySelectorAll(".member-next").forEach((btn) => {
 });
 
 $("memberSort")?.addEventListener("change", (event) => {
-  state.memberSort = event.target.value;
-  state.memberPage = 0;
-  state.trashedInPlace.clear();
   const current = currentGroup();
+  if (current && MEMBER_SORT_OPTIONS[current.kind]) {
+    state.memberSortByKind[current.kind] = event.target.value;
+  }
+  state.memberPage = 0;
+  state.memberFocus = 0;
+  state.trashedInPlace.clear();
   if (current) renderMembers(current);
 });
 

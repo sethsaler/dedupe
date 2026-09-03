@@ -56,6 +56,9 @@ document.addEventListener("keydown", async (e) => {
     } else if (e.key === "z" || e.key === "Z") {
       if (!$("lbStageTools").hidden) $("lbZoom").click();
       e.preventDefault();
+    } else if (e.key === "r" || e.key === "R") {
+      $("lbReveal").click();
+      e.preventDefault();
     } else if (e.key === " " && !onButton) {
       if (!$("lbSelectWrap").hidden) $("lbSelect").click();
       e.preventDefault();

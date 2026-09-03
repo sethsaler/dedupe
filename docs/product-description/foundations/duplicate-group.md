@@ -2,7 +2,7 @@
 
 ## Summary
 
-The duplicate group is the object the whole product revolves around: a set of media files the scan believes belong together, plus a selection of which of them to remove. Exact and similar groups are true duplicates where one file should survive; the review categories (low-resolution, random, non-human, faces) are lists of independent candidates judged one by one. This document owns what a group is, how the *suggested keeper* is chosen, what the *selection* means, and the rules that keep at least one file alive in every duplicate group. Where groups appear and how the user moves among them is [Group list](../ui/group-list.md); what happens to a selection is [Actions and undo](actions-and-undo.md).
+The duplicate group is the object the whole product revolves around: a set of media files the scan believes belong together, plus a selection of which of them to remove. Exact and similar groups are true duplicates where one file should survive; the review categories (low-resolution, random, non-human, faces, all files) are lists of independent candidates judged one by one. This document owns what a group is, how the *suggested keeper* is chosen, what the *selection* means, and the rules that keep at least one file alive in every duplicate group. Where groups appear and how the user moves among them is [Group list](../ui/group-list.md); what happens to a selection is [Actions and undo](actions-and-undo.md).
 
 ## Anatomy of a group
 
@@ -65,7 +65,7 @@ The reclaimable-bytes figures everywhere in the UI are computed from the effecti
 
 - **Exact groups:** files with identical SHA-256, discovered through the size → partial hash → full hash funnel (see [Scan pipeline](scan-pipeline.md#how-each-detection-works)).
 - **Similar groups:** clustered around their best-ranked member from verified pairwise matches; a candidate set entirely contained in an exact group is dropped (it would say nothing new), but a set that mixes exact copies with a re-encoded copy survives as a similar group.
-- **Independent groups:** one collection per review category per scan — all low-resolution candidates in one group (smallest first), all non-human candidates in one (newest first), all faces candidates in one (highest face count first, then newest), and the random sample in one.
+- **Independent groups:** one collection per review category per scan — all low-resolution candidates in one group (smallest first), all non-human candidates in one (newest first), all faces candidates in one (highest face count first, then newest), and the random sample in one. The exception is the all-files category, which is not detector-driven: one group per *scanned folder*, holding that folder's entire media inventory in path order (see [The all-files review](../ui/all-files-review.md)).
 
 The whole group list is kept sorted with the most reclaimable space first, both in the final result and while groups stream in during a scan.
 

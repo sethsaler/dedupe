@@ -100,7 +100,8 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.locator("#resultSearch").fill("does-not-exist")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#resultSearch").fill("duplicate.png")
-    expect(page.locator(".group-item")).to_have_count(3)
+    # Exact, Low-res, Random, and the All-Files browse group all contain it.
+    expect(page.locator(".group-item")).to_have_count(4)
     page.get_by_role("tab", name="Exact 1").click()
     expect(page.locator(".group-item")).to_have_count(1)
     assert page.locator(".group-item").count() == 1
@@ -117,6 +118,56 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     ]
     assert page_errors == []
     assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_lingering_hover_shows_a_full_image_preview(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    thumb = page.locator("#members .thumb-wrap").first
+    thumb.wait_for(state="visible")
+
+    # A passing hover under a second never opens the quick-look.
+    thumb.hover()
+    page.wait_for_timeout(400)
+    assert page.locator("#hoverPreview").is_hidden()
+
+    # ...but lingering past one second shows the full-image preview, which then
+    # swaps the cached thumbnail for the large preview variant.
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    expect(page.locator("#hoverPreviewImage")).to_have_attribute(
+        "src", re.compile(r"variant=preview")
+    )
+
+    # Moving off the thumbnail dismisses it.
+    page.locator("#detailTitle").hover()
+    expect(page.locator("#hoverPreview")).to_be_hidden()
+
+    # Escape dismisses it too — and dismissal sticks until the pointer leaves
+    # and re-enters the thumbnail.
+    thumb.hover()
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    page.keyboard.press("Escape")
+    expect(page.locator("#hoverPreview")).to_be_hidden()
+
+    # Clicking through the quick-look still opens the real lightbox.
+    page.locator("#detailTitle").hover()
+    thumb.hover()
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    thumb.click()
+    page.locator("#lightbox").wait_for(state="visible")
+    expect(page.locator("#hoverPreview")).to_be_hidden()
+    page.locator("#lbClose").click()
+
+    assert page_errors == []
 
 
 @pytest.mark.e2e
@@ -201,11 +252,12 @@ def test_bulk_selection_and_advanced_filters(
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#filterPathPattern").fill("*keeper*")
-    expect(page.locator(".group-item")).to_have_count(3)
+    # Exact, Low-res, Random, and the All-Files browse group all contain it.
+    expect(page.locator(".group-item")).to_have_count(4)
     page.locator("#resultSearch").fill("keeper")
     page.locator("#issuesOnly").check()
     page.locator("#btnClearFilters").click()
-    expect(page.locator(".group-item")).to_have_count(3)
+    expect(page.locator(".group-item")).to_have_count(4)
     assert page.locator("#resultSearch").input_value() == ""
     assert not page.locator("#issuesOnly").is_checked()
 
@@ -283,6 +335,9 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
             "Delete All Selected Low-res + Random"
         )
         page.locator('.tab[data-kind="similar"]').click()
+        # Let the tab filter settle; the default All view also lists the
+        # All-Files browse group, so an unsettled list has more than one row.
+        expect(page.locator(".group-item")).to_have_count(1)
         page.locator(".group-item").click()
         expect(page.locator("#members .evidence")).to_contain_text([
             "100% Similar",
@@ -397,6 +452,173 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
         page.locator("#toast").filter(has_text="Moved").wait_for()
         expect(page.locator("#members .card")).to_have_count(2)
         expect(page.locator("#members .card.deleted")).to_have_count(1)
+
+
+@pytest.mark.e2e
+def test_all_files_review_trashes_uncategorized_files_from_the_lightbox(
+    page, tmp_path: Path
+) -> None:
+    """The Files tab sifts a whole folder: arrows step, d trashes, undo restores."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index, color in enumerate(((36, 128, 72), (110, 92, 28), (180, 60, 60))):
+        path = media / f"plain-{index}.png"
+        Image.new("RGB", (48, 32), color).save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    # No detector category matched: the result carries no review groups at all,
+    # and the app still synthesizes the per-folder All-Files browse group.
+    result = ScanResult(roots=[str(media)], files=records, groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.get_by_role("tab", name="Files 3").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        assert page.locator("#members .card").count() == 3
+        # The sidebar row names the scanned folder; the detail title does too.
+        expect(page.locator(".badge.all_files")).to_have_text("all files")
+        expect(page.locator(".group-item")).to_contain_text("media")
+        expect(page.locator("#detailTitle")).to_contain_text("All files")
+        expect(page.locator("#detailTitle")).to_contain_text("media")
+
+        # Cards are triage-style: one-click Trash, no selection checkboxes.
+        expect(page.locator("#members .card-actions .delete-candidate")).to_have_count(3)
+        expect(page.locator("#members .sel-cb")).to_have_count(0)
+
+        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbCounter")).to_have_text("1 / 3")
+        expect(page.locator("#lbDelete")).to_be_visible()
+
+        page.keyboard.press("ArrowRight")
+        expect(page.locator("#lbCounter")).to_have_text("2 / 3")
+        victim = Path(page.locator("#lbMeta").inner_text())
+
+        page.keyboard.press("d")
+        expect(page.locator("#modalBackdrop")).to_be_hidden()
+        page.locator("#toast").filter(has_text="Moved").wait_for()
+        assert not victim.exists()
+        # The lightbox auto-advances to the next file and keeps going.
+        expect(page.locator("#lightbox")).to_be_visible()
+        expect(page.locator("#lbCounter")).to_have_text("2 / 2")
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
+        expect(page.locator("#members .card.deleted")).to_have_count(1)
+
+        page.locator("#toastAction").click()
+        page.locator("#toast").filter(has_text="restored").wait_for()
+        assert victim.exists()
+        expect(page.locator("#members .card.deleted")).to_have_count(0)
+
+
+@pytest.mark.e2e
+def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
+    page, tmp_path: Path
+) -> None:
+    """The Files lightbox ignores the 50-card page edge; sorting and Reveal work mid-sift."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index in range(55):
+        # One deliberately larger file so "Largest first" has a clear winner.
+        dimensions = (64, 64) if index == 7 else (16, 16)
+        path = media / f"file-{index:02d}.png"
+        Image.new("RGB", dimensions, (index % 256, 100, 150)).save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime + index,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    result = ScanResult(roots=[str(media)], files=records, groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.get_by_role("tab", name="Files 55").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        # The grid still pages at 50…
+        assert page.locator("#members .card").count() == 50
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+
+        # …but the lightbox sifts the whole group without stopping at the edge.
+        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbCounter")).to_have_text("1 / 55")
+        for _ in range(50):
+            page.keyboard.press("ArrowRight")
+        expect(page.locator("#lbCounter")).to_have_text("51 / 55")
+        victim = Path(page.locator("#lbMeta").inner_text())
+        page.keyboard.press("d")
+        page.locator("#toast").filter(has_text="Moved").wait_for()
+        assert not victim.exists()
+        expect(page.locator("#lbCounter")).to_have_text("51 / 54")
+
+        # Undo with the lightbox still open jumps back to the restored file.
+        # (The toast renders under the overlay, so click it via the DOM.)
+        page.evaluate("document.querySelector('#toastAction').click()")
+        page.locator("#toast").filter(has_text="restored").wait_for()
+        assert victim.exists()
+        expect(page.locator("#lbCounter")).to_have_text("51 / 55")
+        expect(page.locator("#lbMeta")).to_contain_text(victim.name)
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
+
+        # Largest first surfaces the space hog.
+        page.locator("#memberSort").select_option("largest")
+        expect(page.locator("#members .card .name").first).to_have_text("file-07.png")
+
+        # `r` reveals the current file in Finder without leaving the lightbox.
+        revealed: list[str] = []
+
+        def fake_reveal(route) -> None:
+            revealed.append(route.request.url)
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body='{"path": "x", "exists": true}',
+            )
+
+        page.route("**/api/reveal*", fake_reveal)
+        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbMeta")).to_contain_text("file-07.png")
+        page.keyboard.press("r")
+        for _ in range(50):
+            if revealed:
+                break
+            page.wait_for_timeout(100)
+        assert revealed and "file-07.png" in revealed[0] and "open=1" in revealed[0]
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
 
 
 @pytest.mark.e2e
@@ -577,13 +799,13 @@ def test_tabs_and_group_list_are_keyboard_navigable(
     page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "exact"
     expect(page.locator('.tab[data-kind="exact"]')).to_have_attribute("aria-selected", "true")
-    expect(page.locator("#filteredCount")).to_have_text("1 of 3 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("1 of 4 groups shown")
     page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "similar"
-    expect(page.locator("#filteredCount")).to_have_text("0 of 3 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("0 of 4 groups shown")
     page.keyboard.press("Home")
     assert page.evaluate("document.activeElement.dataset.kind") == "all"
-    expect(page.locator("#filteredCount")).to_have_text("3 of 3 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("4 of 4 groups shown")
     # The auto-select marks its group item active synchronously at start; once
     # it exists, a j-initiated selection supersedes it and lands the focus.
     page.locator(".group-item.active").wait_for(state="attached")

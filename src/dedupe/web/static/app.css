@@ -1172,6 +1172,7 @@ kbd {
 .badge.low_resolution { background: #45282b; color: #ff9b9b; }
 .badge.random_review { background: #26364a; color: #9ec7ff; }
 .badge.faces { background: #3a2b4a; color: #d3a6ff; }
+.badge.all_files { background: #24444c; color: #8fd8e8; }
 
 .group-empty {
   padding: 28px 16px;
@@ -1847,6 +1848,31 @@ kbd {
   background: #14241c;
 }
 
+/* —— Hover preview (linger-to-look) —— */
+/* The quick-look is visual only: pointer-events pass through so the pointer
+   stays "over" the thumbnail and no flicker loop starts, and it sits below
+   the toast (40) and the lightbox (50). */
+.hover-preview {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgba(5, 7, 10, 0.72);
+  pointer-events: none;
+  animation: fade-in 0.18s var(--ease-out) both;
+}
+
+.hover-preview img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  animation: zoom-in 0.22s var(--ease-out) both;
+}
+
 /* —— Lightbox —— */
 .lightbox {
   position: fixed;
@@ -2192,6 +2218,7 @@ kbd {
   .badge.low_resolution { background: #f7dede; color: #b62f2f; }
   .badge.random_review { background: #dde9f7; color: #2a5aa8; }
   .badge.faces { background: #ece0f7; color: #7a4bb3; }
+  .badge.all_files { background: #d9edf2; color: #1f6e80; }
   .detail-tools > .btn { color: #3c465a; border-color: #c3cddd; background: #eef1f7; }
   .detail-tools > .btn:hover { border-color: #aebbcf; background: #e4e9f2; }
   .actionbar { background: rgba(243, 245, 249, 0.9); }

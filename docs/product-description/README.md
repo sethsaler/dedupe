@@ -117,6 +117,7 @@ ui/
   random-review.md               the Random 50 sample review
   no-person-review.md            the no-person-detected review and its engine choices
   faces-review.md                the faces review category and the face filters
+  all-files-review.md            the Files tab: sifting a whole scanned folder, category or not
   session-resume.md              the resumed-session banner, dropped files, discarding a saved review
 
 cli/
@@ -153,6 +154,7 @@ Status is one of `not started`, `drafted`, or `verified`.
 | ui/random-review.md | drafted |
 | ui/no-person-review.md | drafted |
 | ui/faces-review.md | drafted |
+| ui/all-files-review.md | drafted |
 | ui/session-resume.md | drafted |
 | cli/doctor.md | drafted |
 | cli/scan.md | drafted |

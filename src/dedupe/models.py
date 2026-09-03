@@ -25,6 +25,7 @@ class GroupKind(str, Enum):
     LOW_RESOLUTION = "low_resolution"
     RANDOM_REVIEW = "random_review"
     FACES = "faces"
+    ALL_FILES = "all_files"
 
 
 class ReviewPolicy(str, Enum):
@@ -195,6 +196,7 @@ class ReviewGroup:
             GroupKind.LOW_RESOLUTION,
             GroupKind.RANDOM_REVIEW,
             GroupKind.FACES,
+            GroupKind.ALL_FILES,
         ):
             return ReviewPolicy.INDEPENDENT_CANDIDATES
         return ReviewPolicy.KEEP_ONE

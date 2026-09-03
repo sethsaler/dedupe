@@ -42,7 +42,7 @@ From `foundations/scan-pipeline.md`:
 - Backends: opencv (default; YuNet presence 0.35 + flip/tiles + INRIA/Daimler HOG), photon (≈10 GB opt-in download; woman/girl/person/face), ensemble. A counted face (especially female) vetoes Non-Human. YuNet missing/corrupt → Non-Human fails closed (no candidates surfaced).
 
 From `foundations/duplicate-group.md`:
-- Kinds: exact, similar (keep-one policy); low_resolution, random_review, no_humans, faces (independent-candidate policy).
+- Kinds: exact, similar (keep-one policy); low_resolution, random_review, no_humans, faces, all_files (independent-candidate policy). All-files groups are built from the scan inventory when results load — one per scanned folder, path-ordered — and carry no selection semantics (bulk operations and selection rules never touch them).
 - Keeper ranking: pixels → size → mtime → shallower path → shorter name.
 - New exact/similar groups arrive pre-selected: everything except the suggested keeper (automatic rule).
 - Selection rules: automatic, newest, oldest, largest, smallest, shortest path, deselect all, select candidates (independent only: selects reviewed).
@@ -57,7 +57,7 @@ From `foundations/review-session.md`:
 - Corrupt/oversize session: reported, not loaded; app starts clean.
 
 From `foundations/actions-and-undo.md`:
-- Actions: Trash (system trash; no programmatic restore except per-candidate Non-Human/Faces restore), Quarantine (move, unique names, undoable via receipt), Isolate (copy by default; hardlink/symlink/move modes; `KEEP__` prefix; session folders under `_Dedupe Review`).
+- Actions: Trash (system trash; no programmatic restore except per-candidate Non-Human/Faces/Files restore), Quarantine (move, unique names, undoable via receipt), Isolate (copy by default; hardlink/symlink/move modes; `KEEP__` prefix; session folders under `_Dedupe Review`).
 - Safety layers in order: effective selection → batch preflight (lstat identity: symlink refused, regular file, in roots, size/device/inode/mtime match; exact groups re-hashed against keeper) → keeper validation with re-hash tolerance for metadata drift → immediate per-file revalidation → receipt.
 - Undo is all-or-nothing on preflight; restores in reverse order; always cross-volume; writes its own receipt. Dry-run receipts cannot be undone.
 - File actions hold a lock: scans and actions never overlap; concurrent requests get a locked refusal.
@@ -67,7 +67,7 @@ From `foundations/actions-and-undo.md`:
 Naming decisions:
 
 - The code's `ReviewGroup` is written "duplicate group" / "review category" per the glossary; `DuplicateGroup` is a legacy alias.
-- `NO_HUMANS` kind is written "Non-Human" (the UI's word); `RANDOM_REVIEW` as "Random 50".
+- `NO_HUMANS` kind is written "Non-Human" (the UI's word); `RANDOM_REVIEW` as "Random 50"; `ALL_FILES` as "Files" (the tab label) or "the all-files review".
 - CLI invocation dialect vs UI task dialect: both use the same interrupt rows and cross-cutting order from the README.
 
 From `ui/scan-setup.md`, `ui/group-list.md`, `ui/action-sheet.md`:
@@ -75,7 +75,7 @@ From `ui/scan-setup.md`, `ui/group-list.md`, `ui/action-sheet.md`:
 - Server model: one global lock; `scanning` and `acting` flags serialize everything (selections/actions refused during scans; scans/resume refused during actions).
 - Every mutating request needs the `X-Dedupe-Token` CSRF header and a matching `scan_id`; stale scan id → "stale scan session; refresh results".
 - Preview token: one-use, TTL 600 s (10 minutes), bound to (scan_id, action, scope, destination, sorted eligible paths). Stale verdicts: missing / expired / changed; each triggers an automatic re-preview, never a stale execute.
-- UI Trash splits: low-resolution + random-review selections are quarantined into `_Dedupe Quarantine` beside the scan root; everything else goes to system Trash. Two receipts. Per-candidate trash of Non-Human/Faces items goes to system Trash with a server-side restore (`deleted_files` map).
+- UI Trash splits: low-resolution + random-review selections are quarantined into `_Dedupe Quarantine` beside the scan root; everything else goes to system Trash. Two receipts. Per-candidate trash of Non-Human/Faces/Files items goes to system Trash with a server-side restore (`deleted_files` map).
 - Needs attention = member error OR session-deleted member OR not complete. Complete = ≥ member_count−1 selected (keep-one) or all members reviewed (independent).
 - Member cards paginate at 50 per page. Group list sorted most-reclaimable-first.
 - Keyboard: j/k/↓/↑ navigate shown groups; [/] attention groups (wrap, toast if none); u suggested selection; s rule chooser; a preview Trash; Space toggles focused card; Enter lightbox; ←/→ Delete/Keep in low-res + random decision review, else card focus / lightbox nav; Esc closes lightbox/help; ? help. All inactive while typing in inputs.
@@ -91,7 +91,7 @@ From `ui/scan-setup.md`, `ui/group-list.md`, `ui/action-sheet.md`:
 ## Order of work
 
 1. `foundations/` first, in this order: `scan-pipeline.md`, `duplicate-group.md`, `review-session.md`, `actions-and-undo.md`. Everything else links to them.
-2. `ui/` next, all nine documents. This is the hardest part and the bulk of the experience. Read `src/dedupe/web/app.py` and `static/app.js` end to end before starting any of them, because the screens hand off to each other and the documents must agree on where one ends and the next begins. `scan-setup.md` owns the scan flow up to results landing; `group-list.md` owns browsing, filtering, and selection; `action-sheet.md` owns preview/confirm/execute; the four review documents own their categories' review interactions; `session-resume.md` owns the resumed-session banner.
+2. `ui/` next, all ten documents. This is the hardest part and the bulk of the experience. Read `src/dedupe/web/app.py` and `static/app.js` end to end before starting any of them, because the screens hand off to each other and the documents must agree on where one ends and the next begins. `scan-setup.md` owns the scan flow up to results landing; `group-list.md` owns browsing, filtering, and selection; `action-sheet.md` owns preview/confirm/execute; the five review documents own their categories' review interactions; `session-resume.md` owns the resumed-session banner.
 3. The remaining `cli/` documents and `cross-cutting/`. These are independent of each other and can be drafted in parallel with subagents once the foundations and `ui/` documents exist to link to. Review every subagent result for consistency with the glossary and the established facts above before accepting it.
 4. Consistency pass over the whole set: same term for the same thing everywhere, no two documents describing the same behavior differently, every relative link resolves (`python3 check-links.py .` from wherever the checker lives), every document has a verification footer, every glossary term used is defined.
 5. Update the coverage table in `README.md` as you go: `drafted` when written, never `verified` (verification by hand is a separate pass).

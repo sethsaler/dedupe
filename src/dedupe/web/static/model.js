@@ -11,7 +11,7 @@ function isIndependentReview(g) {
 }
 
 function isPagedIndependentReview(g) {
-  return g?.kind === "no_humans" || g?.kind === "faces";
+  return g?.kind === "no_humans" || g?.kind === "faces" || g?.kind === "all_files";
 }
 
 function currentGroup() {

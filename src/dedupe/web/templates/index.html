@@ -203,7 +203,7 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>↑</kbd> back · <kbd>d</kbd> Trash Non-Human · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>↑</kbd> back · <kbd>d</kbd> Trash Non-Human/Faces/Files · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
@@ -218,6 +218,7 @@
           <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
           <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
           <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
+          <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">Files <span class="tab-count" id="countAllFiles">0</span></button>
         </div>
         <div class="result-controls" aria-label="Find and organize results">
           <div class="result-controls-heading">
@@ -384,7 +385,7 @@
             <button class="btn ghost member-prev" type="button">Previous</button>
             <span class="member-page-summary">1–50 of 50</span>
             <button class="btn ghost member-next" type="button">Next</button>
-            <select id="memberSort" aria-label="Sort Faces results" hidden>
+            <select id="memberSort" aria-label="Sort results" hidden>
               <option value="faces-desc">Most faces first</option>
               <option value="faces-asc">Fewest faces first</option>
               <option value="newest">Newest first</option>
@@ -412,6 +413,13 @@
       </button>
       <span class="action-busy-note" id="actionBusyNote" role="status" hidden></span>
     </footer>
+  </div>
+
+  <!-- Linger-to-preview: a non-interactive full-image quick-look, shown after
+       a second of hovering a thumbnail. It never takes focus or pointer input;
+       the lightbox stays the interactive full view. -->
+  <div class="hover-preview" id="hoverPreview" hidden aria-hidden="true">
+    <img id="hoverPreviewImage" alt="" />
   </div>
 
   <!-- Lightbox -->
@@ -455,6 +463,9 @@
         <button class="btn danger" id="lbDelete" type="button">Move to Trash</button>
         <span class="lb-action-hint">One click · recoverable from Trash · <kbd>d</kbd> or <kbd>⌫</kbd></span>
       </div>
+      <div class="lb-actions lb-reveal">
+        <button class="btn ghost" id="lbReveal" type="button" title="Reveal in Finder (r)">Reveal in Finder</button>
+      </div>
     </div>
     <button class="lb-nav next" id="lbNext" type="button" aria-label="Next">›</button>
   </div>
@@ -486,7 +497,8 @@
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
         <div><dt><kbd>a</kbd> / <kbd>A</kbd></dt><dd>Preview Trash for selected exact / similar matches</dd></div>
         <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · otherwise previous / next card · navigate in the lightbox</dd></div>
-        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human or Faces file to Trash (one click, undo from the toast) · in the lightbox, toggles removal for exact/similar files</dd></div>
+        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, or Files file to Trash (one click, undo from the toast) · in the lightbox, toggles removal for exact/similar files</dd></div>
+        <div><dt><kbd>r</kbd></dt><dd>In the lightbox: reveal the current file in Finder</dd></div>
         <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>

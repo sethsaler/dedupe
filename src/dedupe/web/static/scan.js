@@ -72,6 +72,7 @@ async function startScan() {
     $("countRandomReview").textContent = "0";
     $("countNoHumans").textContent = "0";
     $("countFaces").textContent = "0";
+    $("countAllFiles").textContent = "0";
     state.groups = [];
     state.allGroups = [];
     state.currentId = null;

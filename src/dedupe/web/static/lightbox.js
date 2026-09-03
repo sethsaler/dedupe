@@ -1,5 +1,6 @@
 // The full-screen comparison overlay.
 
+import { api } from "./api.js";
 import { setMemberSelected, trashReviewCandidate } from "./members.js";
 import { currentGroup, isIndependentReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
@@ -53,7 +54,8 @@ function stepLightbox(delta) {
 
 function prefetchLightboxNeighbors() {
   const count = state.lightboxItems.length;
-  for (const delta of [-1, 1]) {
+  // Warm further ahead than behind: sifting holds →, not ←.
+  for (const delta of [-1, 1, 2, 3]) {
     const neighbor = state.lightboxItems[(state.lightboxIndex + delta + count) % count];
     if (!neighbor || neighbor.mediaType === "video") continue;
     const image = new Image();
@@ -226,6 +228,14 @@ $("lbDelete").addEventListener("click", () => {
   const group = currentGroup();
   if (!item || !isPagedIndependentReview(group)) return;
   trashReviewCandidate(group, item.path, { fromLightbox: true });
+});
+
+// Reveal works for every kind — it answers "what is this file?" mid-sift.
+$("lbReveal").addEventListener("click", () => {
+  const item = state.lightboxItems[state.lightboxIndex];
+  if (!item) return;
+  api(`/api/reveal?path=${encodeURIComponent(item.path)}&open=1`)
+    .catch((error) => toast(error.message || String(error), "error"));
 });
 
 // —— Select-for-removal toggle (exact/similar groups) ——

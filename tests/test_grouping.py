@@ -7,11 +7,13 @@ import random
 from dedupe.actions import collect_selected_paths
 from dedupe.grouping import (
     apply_smart_select,
+    build_all_files_groups,
     build_faces_groups,
     build_groups,
     build_low_resolution_groups,
     build_no_human_groups,
     build_random_review_groups,
+    ensure_all_files_groups,
     pick_suggested_keep,
 )
 from dedupe.human_detection import human_detection_signature
@@ -20,6 +22,7 @@ from dedupe.models import (
     GroupKind,
     MediaType,
     ReviewGroup,
+    ReviewPolicy,
     ScanResult,
     SmartRule,
     effective_selected_paths,
@@ -498,3 +501,99 @@ def test_loaded_scan_drops_faces_group_with_no_current_face_counts() -> None:
         ).to_dict()
     ]
     assert ScanResult.from_dict(stale_only).groups == []
+
+
+def test_build_all_files_groups_covers_every_file_once_per_root() -> None:
+    a = _rec("/root-a/z.jpg", 100, 1)
+    b = _rec("/root-a/a.jpg", 200, 2)
+    c = _rec("/root b/q.jpg", 300, 3)
+    video = _rec("/root b/clip.mp4", 400, 4)
+    video.media_type = MediaType.VIDEO
+    video.extension = ".mp4"
+
+    groups = build_all_files_groups([a, b, c, video], ["/root-a", "/root b"])
+
+    assert [group.root for group in groups] == ["/root-a", "/root b"]
+    first, second = groups
+    assert first.kind == GroupKind.ALL_FILES
+    assert first.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+    # Members are path-ordered so sifting follows the folder structure.
+    assert [member.path for member in first.members] == [
+        "/root-a/a.jpg",
+        "/root-a/z.jpg",
+    ]
+    assert first.media_type == MediaType.IMAGE
+    assert [member.path for member in second.members] == [
+        "/root b/clip.mp4",
+        "/root b/q.jpg",
+    ]
+    assert second.media_type == MediaType.MIXED
+    # Browse groups start without selections or review progress.
+    assert first.selected_for_removal == []
+    assert first.reviewed_paths == []
+
+
+def test_build_all_files_groups_assigns_overlapping_roots_to_the_deeper_one() -> None:
+    inner = _rec("/lib/wedding/raw/img.jpg", 100, 1)
+    outer = _rec("/lib/other.jpg", 100, 1)
+
+    groups = build_all_files_groups([inner, outer], ["/lib", "/lib/wedding"])
+
+    by_root = {group.root: group for group in groups}
+    assert [member.path for member in by_root["/lib"].members] == ["/lib/other.jpg"]
+    assert [member.path for member in by_root["/lib/wedding"].members] == [
+        "/lib/wedding/raw/img.jpg",
+    ]
+
+
+def test_build_all_files_groups_skips_empty_roots() -> None:
+    member = _rec("/scanned/a.jpg", 100, 1)
+
+    groups = build_all_files_groups([member], ["/scanned", "/empty"])
+
+    assert [group.root for group in groups] == ["/scanned"]
+    assert build_all_files_groups([], ["/scanned"]) == []
+
+
+def test_ensure_all_files_groups_upgrades_older_results_once() -> None:
+    records = [_rec("/root/a.jpg", 100, 1), _rec("/root/b.jpg", 200, 2)]
+    result = ScanResult(roots=["/root"], files=records, groups=[])
+
+    ensure_all_files_groups(result)
+
+    assert len(result.groups) == 1
+    group = result.groups[0]
+    assert group.kind == GroupKind.ALL_FILES
+    assert group.root == "/root"
+    assert len(group.members) == 2
+
+    # Existing groups (and their review progress) survive; nothing duplicates.
+    group.reviewed_paths = ["/root/a.jpg"]
+    ensure_all_files_groups(result)
+    assert len(result.groups) == 1
+    assert result.groups[0].reviewed_paths == ["/root/a.jpg"]
+
+
+def test_smart_select_rules_never_touch_all_files_groups() -> None:
+    records = [_rec("/root/a.jpg", 100, 1), _rec("/root/b.jpg", 200, 2)]
+    result = ScanResult(roots=["/root"], files=records, groups=[])
+    ensure_all_files_groups(result)
+    group = result.groups[0]
+    group.reviewed_paths = ["/root/a.jpg"]
+
+    for rule in SmartRule:
+        apply_smart_select(group, rule)
+        assert group.selected_for_removal == []
+        assert group.suggested_keep is None
+
+
+def test_all_files_group_survives_a_session_roundtrip() -> None:
+    records = [_rec("/root/a.jpg", 100, 1)]
+    result = ScanResult(roots=["/root"], files=records, groups=[])
+    ensure_all_files_groups(result)
+
+    loaded = ScanResult.from_dict(result.to_dict())
+
+    assert [group.kind for group in loaded.groups] == [GroupKind.ALL_FILES]
+    assert loaded.groups[0].policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+    assert [member.path for member in loaded.groups[0].members] == ["/root/a.jpg"]

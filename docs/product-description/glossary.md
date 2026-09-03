@@ -8,13 +8,13 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **CLI.** The `dedupe` command and its subcommands (`scan`, `ui`, `isolate`, `undo`, `receipts`, `doctor`, plus the out-of-scope benchmarks). Running `dedupe PATH...` is a shortcut for `dedupe scan PATH...`.
 
-**Review category.** One of the ways a scan surfaces files for review: *Duplicates* (exact groups), *Similar images*, *Similar videos*, *Low-res*, *Random 50*, *Non-Human*, and *Faces*. Each appears as a tab in the sidebar with its own group list; *All* shows every group.
+**Review category.** One of the ways a scan surfaces files for review: *Duplicates* (exact groups), *Similar images*, *Similar videos*, *Low-res*, *Random 50*, *Non-Human*, *Faces*, and *Files* (every scanned media file, one group per scanned folder). Each appears as a tab in the sidebar with its own group list; *All* shows every group.
 
 ## The objects
 
 **Media file.** An image, GIF, or video found under the scanned folders. Nothing else is examined; other file types are skipped.
 
-**Duplicate group.** A set of media files the scan believes belong together for review. Groups come in several kinds: *exact* (byte-identical), *similar* (visually close images/GIFs or videos), *low resolution*, *random*, *non-human*, and *faces*. Exact and similar groups are duplicates of each other; the others are review lists of independent files.
+**Duplicate group.** A set of media files the scan believes belong together for review. Groups come in several kinds: *exact* (byte-identical), *similar* (visually close images/GIFs or videos), *low resolution*, *random*, *non-human*, *faces*, and *all files* (the whole media inventory of one scanned folder). Exact and similar groups are duplicates of each other; the others are review lists of independent files.
 
 **Member.** One media file inside a duplicate group.
 
@@ -22,7 +22,7 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Selection.** The set of members in a group currently marked for removal. Members are selected or deselected individually, by bulk operations, or by a selection rule. Only the selection is acted on when an action is confirmed.
 
-**Review candidate.** A file in an independent review category (*non-human*, *faces*, *low-res*, *random*) that is judged on its own, not against other members of a group. Candidates can be trashed and restored one at a time.
+**Review candidate.** A file in an independent review category (*non-human*, *faces*, *low-res*, *random*, *all files*) that is judged on its own, not against other members of a group. Candidates can be trashed and restored one at a time.
 
 **Receipt.** The JSON record written after a trash or quarantine action runs. It lists every file moved and where it went, and it is what `dedupe undo` and `dedupe receipts` read.
 

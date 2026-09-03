@@ -16,7 +16,8 @@ const state = {
   eventFailures: 0,
   memberFocus: 0,
   memberPage: 0,
-  memberSort: "faces-desc", // server order for Faces; only re-sort on demand
+  // Per-kind member ordering; the default entry is each kind's server order.
+  memberSortByKind: { faces: "faces-desc", all_files: "path" },
   lightboxItems: [],
   lightboxIndex: 0,
   scanning: false,

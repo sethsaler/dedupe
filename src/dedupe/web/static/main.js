@@ -3,6 +3,7 @@
 import "./actions.js";
 import "./groups.js";
 import "./help.js";
+import "./hoverpreview.js";
 import "./keyboard.js";
 import "./lightbox.js";
 import "./members.js";

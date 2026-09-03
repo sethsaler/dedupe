@@ -26,7 +26,11 @@ from flask import (
 from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups
 from ..cache import HashCache
 from ..engine import run_scan, run_scans_parallel
-from ..grouping import apply_smart_select, apply_smart_select_all
+from ..grouping import (
+    apply_smart_select,
+    apply_smart_select_all,
+    ensure_all_files_groups,
+)
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
 from ..keep_decisions import update_keep_decisions
@@ -50,11 +54,11 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 19
+WEB_API_VERSION = 20
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Independent review flows whose cards support direct per-file Trash + undo.
-INDEPENDENT_DELETE_KINDS = {"no_humans", "faces"}
+INDEPENDENT_DELETE_KINDS = {"no_humans", "faces", "all_files"}
 REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 
 # How long after the last tab closes before the server exits. Long enough for a
@@ -207,6 +211,10 @@ def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
     member always survives. Non-human candidate groups are independent files and
     may have every candidate selected.
     """
+    # All-Files browse groups have no selection semantics — the view trashes
+    # one click at a time — so a bulk mark would only corrupt review progress.
+    if group.kind == GroupKind.ALL_FILES:
+        return list(group.selected_for_removal)
     keep_one = group.policy == ReviewPolicy.KEEP_ONE
     keeper = None
     if keep_one and group.members:
@@ -567,6 +575,7 @@ def create_app(
 
     if initial_result is not None:
         with lock:
+            ensure_all_files_groups(initial_result)
             state["result"] = initial_result
             initial_result.recompute_stats()
             state["progress"] = ScanProgress(
@@ -581,6 +590,7 @@ def create_app(
         persist_result()
     elif loaded.result is not None:
         with lock:
+            ensure_all_files_groups(loaded.result)
             state["result"] = loaded.result
             loaded.result.recompute_stats()
             state["deleted_files"] = dict(loaded.deleted_files)
@@ -783,6 +793,7 @@ def create_app(
             state["review_session"] = report
             if report.result is None:
                 return jsonify(report.metadata()), 404
+            ensure_all_files_groups(report.result)
             state["result"] = report.result
             state["scan_id"] = secrets.token_hex(12)
             state["deleted_files"] = dict(report.deleted_files)
@@ -855,6 +866,7 @@ def create_app(
                 "low_resolution",
                 "random_review",
                 "faces",
+                "all_files",
             ):
                 groups = [g for g in groups if g.kind.value == kind]
             total = len(groups)
@@ -1072,6 +1084,7 @@ def create_app(
                         return
                     if not result.roots and result.errors:
                         raise RuntimeError("; ".join(result.errors))
+                    ensure_all_files_groups(result)
                     state["result"] = result
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
@@ -1444,6 +1457,36 @@ def create_app(
                     None,
                 )
                 if eligible is None:
+                    # A reviewed-but-kept decision in any independent review
+                    # vetoes the trash; name the review so the user knows
+                    # where to revise it instead of facing a bare refusal.
+                    veto = next(
+                        (
+                            candidate
+                            for candidate in (result.groups if result else [])
+                            if candidate.id != group.id
+                            and candidate.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+                            and path in {member.path for member in candidate.members}
+                            and path
+                            in set(candidate.reviewed_paths)
+                            - set(candidate.selected_for_removal)
+                        ),
+                        None,
+                    )
+                    if veto is not None:
+                        label = {
+                            "low_resolution": "Low-res",
+                            "random_review": "Random",
+                            "no_humans": "Non-Human",
+                            "faces": "Faces",
+                            "all_files": "Files",
+                        }[veto.kind.value]
+                        return jsonify(
+                            {
+                                "error": f"Kept in the {label} review — "
+                                "revise that decision before trashing it here"
+                            }
+                        ), 400
                     error = next(
                         (item.error for item in preview.items if item.path == path),
                         "This file is not safely eligible for deletion",

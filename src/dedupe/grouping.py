@@ -13,6 +13,7 @@ from .models import (
     GroupKind,
     MediaType,
     ReviewPolicy,
+    ScanResult,
     SmartRule,
 )
 
@@ -280,6 +281,72 @@ def build_faces_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
     return _build_independent_group(GroupKind.FACES, matching)
 
 
+def build_all_files_groups(
+    members: list[FileRecord],
+    roots: list[str | Path],
+) -> list[DuplicateGroup]:
+    """Build one browse collection per scanned root holding every scanned file.
+
+    The All-Files review view is not detector-driven: each group is the whole
+    media inventory of one scanned folder, ordered by path, so the user can
+    sift a folder for deletion candidates that matched no review category.
+    When roots overlap (scanning both ``a`` and ``a/b``), a file joins the
+    most specific root's group.
+    """
+    normalized: list[tuple[str, Path]] = []
+    for root in roots:
+        text = str(root)
+        key = str(Path(text))
+        normalized.append((key, Path(key)))
+    buckets: dict[str, list[FileRecord]] = {key: [] for key, _ in normalized}
+    for member in members:
+        path = Path(member.path)
+        best: str | None = None
+        best_depth = -1
+        for key, root in normalized:
+            if path.is_relative_to(root) and len(root.parts) > best_depth:
+                best = key
+                best_depth = len(root.parts)
+        if best is not None:
+            buckets[best].append(member)
+
+    groups: list[DuplicateGroup] = []
+    for key, _root in normalized:
+        bucket = sorted(buckets[key], key=lambda member: member.path)
+        if not bucket:
+            continue
+        media_types = {member.media_type for member in bucket}
+        media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
+        groups.append(
+            DuplicateGroup(
+                id=make_group_id(GroupKind.ALL_FILES, bucket),
+                kind=GroupKind.ALL_FILES,
+                media_type=media_type,
+                members=bucket,
+                selected_for_removal=[],
+                reviewed_paths=[],
+                suggested_keep=None,
+                root=key,
+            )
+        )
+    return groups
+
+
+def ensure_all_files_groups(result: ScanResult) -> None:
+    """Append per-root All-Files browse groups when the result lacks them.
+
+    Fresh engine results get these at scan completion in the web app; sessions
+    saved before the view existed are upgraded here on load. Existing groups
+    are left untouched so review progress (reviewed_paths) survives.
+    """
+    if any(group.kind == GroupKind.ALL_FILES for group in result.groups):
+        return
+    built = build_all_files_groups(result.files, result.roots)
+    if built:
+        result.groups.extend(built)
+        result.recompute_stats()
+
+
 def _build_independent_group(
     kind: GroupKind,
     members: list[FileRecord],
@@ -304,6 +371,10 @@ def _build_independent_group(
 
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     """Mutate selected_for_removal. Always keeps at least one file."""
+    if group.kind == GroupKind.ALL_FILES:
+        # All-Files browse groups have no selection semantics: the Files
+        # review trashes one click at a time, so rules must not touch them.
+        return
     members = group.members
     if not members:
         group.selected_for_removal = []

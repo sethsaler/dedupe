@@ -23,6 +23,7 @@ from dedupe.human_detection import human_detection_signature
 from dedupe.keep_decisions import load_keep_decisions
 from dedupe.models import (
     FileRecord,
+    GroupKind,
     MediaType,
     ScanDiagnostics,
     ScanProgress,
@@ -1027,6 +1028,214 @@ def test_faces_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
     assert original.read_bytes() == b"group photo"
 
 
+def test_all_files_group_is_served_per_scanned_root(tmp_path: Path) -> None:
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root b"
+    root_a.mkdir()
+    root_b.mkdir()
+    records = []
+    for root, name in ((root_a, "one.jpg"), (root_a, "two.jpg"), (root_b, "three.jpg")):
+        path = root / name
+        path.write_bytes(b"plain file, no review category")
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".jpg",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    # A result with no detector groups at all still gets the browse view.
+    result = ScanResult(
+        roots=[str(root_a), str(root_b)], files=records, groups=[]
+    )
+    client = create_app(result).test_client()
+
+    served = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()
+    assert served["total"] == 2
+    by_root = {group["root"]: group for group in served["groups"]}
+    assert set(by_root) == {str(root_a), str(root_b)}
+    assert [m["path"] for m in by_root[str(root_a)]["members"]] == [
+        str(root_a / "one.jpg"),
+        str(root_a / "two.jpg"),
+    ]
+    assert [m["path"] for m in by_root[str(root_b)]["members"]] == [str(root_b / "three.jpg")]
+    assert all(group["policy"] == "independent_candidates" for group in served["groups"])
+    # Other kind filters are unaffected by the browse groups.
+    assert client.get("/api/groups", query_string={"kind": "exact"}).get_json()["total"] == 0
+
+
+def test_all_files_candidate_can_be_deleted_and_undone(tmp_path: Path) -> None:
+    original = tmp_path / "misc" / "notes-photo.jpg"
+    original.parent.mkdir()
+    original.write_bytes(b"uncategorized but unwanted")
+    stat = original.stat()
+    record = FileRecord(
+        path=str(original),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[record], groups=[])
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    group = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()["groups"][0]
+    payload = {"group_id": group["id"], "path": str(original), "scan_id": scan_id}
+
+    preview = client.post("/api/review-candidate/delete", json=payload, headers=headers)
+    assert preview.status_code == 200
+    assert preview.get_json()["success_count"] == 1
+    assert original.exists()
+
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "dry_run": False},
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted_paths"] == [str(original)]
+    assert not original.exists()
+
+    fetched = client.get(f"/api/groups/{group['id']}").get_json()
+    assert fetched["deleted_paths"] == [str(original)]
+
+    undone = client.post("/api/review-candidate/undo", json=payload, headers=headers)
+    assert undone.status_code == 200
+    assert undone.get_json()["deleted_paths"] == []
+    assert original.read_bytes() == b"uncategorized but unwanted"
+
+
+def test_all_files_delete_refuses_a_changed_file(tmp_path: Path) -> None:
+    original = tmp_path / "doc-scan.jpg"
+    original.write_bytes(b"scanned bytes")
+    stat = original.stat()
+    record = FileRecord(
+        path=str(original),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[record], groups=[])
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    group = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()["groups"][0]
+    original.write_bytes(b"changed after the scan recorded this file")
+
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={
+            "group_id": group["id"],
+            "path": str(original),
+            "scan_id": scan_id,
+            "dry_run": False,
+        },
+        headers=headers,
+    )
+    assert deleted.status_code == 400
+    assert original.exists()
+
+
+def test_one_click_trash_explains_a_keep_veto_from_another_review(tmp_path: Path) -> None:
+    original = tmp_path / "small.jpg"
+    original.write_bytes(b"kept in low-res, trash attempted from Files")
+    stat = original.stat()
+    record = FileRecord(
+        path=str(original),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        width=100,
+        height=100,
+    )
+    result = ScanResult(
+        roots=[str(tmp_path)],
+        files=[record],
+        groups=build_low_resolution_groups([record]),
+    )
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Keep the file in the Low-res review (reviewed, not selected).
+    low_res = client.get(
+        "/api/groups", query_string={"kind": "low_resolution"}
+    ).get_json()["groups"][0]
+    kept = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_res["id"],
+            "decision_path": str(original),
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert kept.status_code == 200
+
+    browse = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()[
+        "groups"
+    ][0]
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={
+            "group_id": browse["id"],
+            "path": str(original),
+            "scan_id": scan_id,
+            "dry_run": False,
+        },
+        headers=headers,
+    )
+    assert deleted.status_code == 400
+    assert "Kept in the Low-res review" in deleted.get_json()["error"]
+    assert original.exists()
+
+    # Revising the Keep to a Delete lifts the veto.
+    client.post(
+        "/api/selection",
+        json={
+            "group_id": low_res["id"],
+            "decision_path": str(original),
+            "decision_remove": True,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={
+            "group_id": browse["id"],
+            "path": str(original),
+            "scan_id": scan_id,
+            "dry_run": False,
+        },
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert not original.exists()
+
+
 def test_candidate_trash_undo_survives_a_restart(tmp_path: Path) -> None:
     result = _faces_result(tmp_path)
     group = result.groups[0]
@@ -1229,7 +1438,8 @@ def test_unsuccessful_scan_restores_previous_result_and_session(
             break
         time.sleep(0.01)
     assert after["has_result"] is True
-    assert after["summary"]["group_count"] == 1
+    # The exact group plus the per-root All-Files browse group added at boot.
+    assert after["summary"]["group_count"] == 2
     assert after["scan_id"] not in {before["scan_id"], started["scan_id"]}
     assert after["groups_version"] > before["groups_version"]
     assert after["review_session"]["saved_at"] == before["review_session"]["saved_at"]
@@ -1415,9 +1625,14 @@ def test_bulk_selection_keeps_one_member_of_every_duplicate_group(tmp_path: Path
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["group_count"] == 2
+    # Scope is every group, including the per-root All-Files browse group.
+    assert body["group_count"] == 3
     assert body["selected_count"] == 2
     for group in result.groups:
+        if group.kind == GroupKind.ALL_FILES:
+            # Browse groups are excluded from bulk selection entirely.
+            assert not group.selected_for_removal
+            continue
         assert group.suggested_keep not in group.selected_for_removal
         assert len(group.selected_for_removal) == len(group.members) - 1
 
@@ -1436,7 +1651,9 @@ def test_bulk_selection_keeps_one_member_of_every_duplicate_group(tmp_path: Path
     ).get_json()
     assert inverted["selected_count"] == 2
     assert all(
-        group.suggested_keep not in group.selected_for_removal for group in result.groups
+        group.suggested_keep not in group.selected_for_removal
+        for group in result.groups
+        if group.kind != GroupKind.ALL_FILES
     )
 
 
@@ -1747,12 +1964,13 @@ def test_groups_endpoint_paginates_without_changing_default_behaviour(tmp_path: 
     second = client.get("/api/groups", query_string={"limit": 1, "offset": 1}).get_json()
     past_end = client.get("/api/groups", query_string={"limit": 1, "offset": 99}).get_json()
 
-    assert len(everything["groups"]) == 2
-    assert everything["total"] == 2
+    # Two duplicate groups plus the per-root All-Files browse group.
+    assert len(everything["groups"]) == 3
+    assert everything["total"] == 3
     assert [g["id"] for g in first["groups"] + second["groups"]] == [
-        g["id"] for g in everything["groups"]
+        g["id"] for g in everything["groups"][:2]
     ]
-    assert first["total"] == second["total"] == 2
+    assert first["total"] == second["total"] == 3
     assert past_end["groups"] == []
     assert everything["groups_version"] == first["groups_version"]
 
@@ -2185,7 +2403,9 @@ def test_streamed_groups_update_stats_incrementally(tmp_path: Path, monkeypatch)
             break
         time.sleep(0.02)
     assert status["scanning"] is False
-    assert status["summary"]["group_count"] == 2
+    # The two streamed exact groups plus the All-Files browse group added at
+    # scan completion.
+    assert status["summary"]["group_count"] == 3
     assert status["summary"]["selected_count"] == 2
 
 
@@ -2254,7 +2474,9 @@ def test_events_stream_delivers_groups_status_and_reset(tmp_path: Path, monkeypa
     # landed in the same wakeup as completion) is covered by the refetch.
     assert seen("event: reset")
     final = client.get("/api/groups?kind=all").get_json()
-    assert {g["id"] for g in final["groups"]} == {groups[0].id, groups[1].id}
+    # The completed result also carries the per-root All-Files browse group.
+    assert {g["id"] for g in final["groups"]} >= {groups[0].id, groups[1].id}
+    assert any(g["kind"] == "all_files" for g in final["groups"])
     stop_reading.set()
     # Do not response.close(): the reader thread can be blocked inside the
     # generator's idle wait, and closing then raises "generator already
@@ -2476,7 +2698,12 @@ def test_review_session_resume_and_discard_endpoints(tmp_path: Path) -> None:
     )
     assert resumed.status_code == 200
     groups = client.get("/api/groups").get_json()["groups"]
-    assert len(groups) == len(result.groups)
+    # Resume upgrades older sessions with the per-root All-Files browse group.
+    assert len(groups) == len(result.groups) + 1
+    browse = next(group for group in groups if group["kind"] == "all_files")
+    assert {member["path"] for member in browse["members"]} == {
+        record.path for record in result.files
+    }
 
     discarded = client.delete(
         "/api/review-session",

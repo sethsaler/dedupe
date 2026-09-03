@@ -5,7 +5,7 @@ import { groupComplete, groupNeedsAttention, groupSelectedCount, isIndependentRe
 import { scheduleRender } from "./render.js";
 import { selectGroup } from "./members.js";
 import { GROUP_RENDER_CHUNK, state } from "./state.js";
-import { $, escapeHtml, formatBytes, toast } from "./util.js";
+import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
 const GROUP_FETCH_PAGE = 250;
 // At most this many sidebar rows live in the DOM; scrolling slides the window.
@@ -59,6 +59,8 @@ function renderTabCounts() {
   $("countRandomReview").textContent = memberCount("random_review");
   $("countNoHumans").textContent = memberCount("no_humans");
   $("countFaces").textContent = memberCount("faces");
+  const countAllFiles = $("countAllFiles");
+  if (countAllFiles) countAllFiles.textContent = memberCount("all_files");
 }
 
 // The focused group survives a page reload: remembered in sessionStorage and
@@ -254,7 +256,10 @@ function groupItemHtml(g) {
     low_resolution: "low-res",
     random_review: "random",
     faces: "faces",
-  }[g.kind] || g.kind;
+  }[g.kind] || (g.kind === "all_files" ? "all files" : g.kind);
+  // All-Files groups are per scanned folder: name the folder so the sidebar
+  // row doubles as the folder picker.
+  const folderLabel = g.kind === "all_files" && g.root ? basename(g.root) : null;
   const reviewed = (g.reviewed_paths || []).length;
   const groupSummary = isIndependentReview(g)
     ? `${reviewed}/${g.member_count} reviewed${sel ? ` · ${sel} delete` : ""}`
@@ -266,7 +271,7 @@ function groupItemHtml(g) {
   return `
         <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" aria-current="${active ? "true" : "false"}">
           <div class="g-top">
-            <span>${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
+            <span>${folderLabel ? `${escapeHtml(folderLabel)} · ` : ""}${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
             <span class="badge ${g.kind}">${badgeLabel}</span>
           </div>
           <div class="g-state"><span class="g-state-glyph" aria-hidden="true">${stateGlyph}</span>${stateLabel}</div>
