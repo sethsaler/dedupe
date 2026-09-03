@@ -43,7 +43,7 @@ jobs:
         id: pw-version
         run: echo "version=$(python -m pip show playwright | awk '/^Version:/ {print $2}')" >> "$GITHUB_OUTPUT"
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
