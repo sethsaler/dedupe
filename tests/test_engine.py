@@ -81,6 +81,33 @@ def test_run_scan_cancel_midway_raises_promptly(tmp_path: Path) -> None:
     assert time.monotonic() - started < 30
 
 
+def test_parallel_streams_cancel_raises_interrupted_not_unbound(
+    tmp_path: Path,
+) -> None:
+    """Regression: a cancelled stream future left ``sub`` unbound, crashing the
+    merge loop with UnboundLocalError instead of a clean InterruptedError."""
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    for index in range(20):
+        _save(folder_a / f"a{index:02}.jpg", (index * 11 % 255, 40, 90), quality=90)
+        _save(folder_b / f"b{index:02}.jpg", (index * 7 % 255, 90, 40), quality=90)
+    calls = {"n": 0}
+
+    def cancelled() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 5
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        run_scans_parallel(
+            [folder_a, folder_b],
+            include_videos=False,
+            use_cache=False,
+            cancelled=cancelled,
+        )
+
+
 def test_run_scan_streams_groups_via_on_group(tmp_path: Path) -> None:
     """Groups should be published progressively (exact before similar finishes)."""
     data = b"identical-binary-payload-for-exact-match!!!"

@@ -740,8 +740,22 @@ def run_scan(
                 futures = {
                     name: stage_pool.submit(fn) for name, fn in stage_jobs.items()
                 }
-                for name, future in futures.items():
-                    stage_results[name] = future.result()
+                try:
+                    for name, future in futures.items():
+                        stage_results[name] = future.result()
+                except InterruptedError:
+                    # A cancelled scan keeps the work its stages completed:
+                    # records mutate in place as stages finish items, so store
+                    # what they carry before the cancel propagates. The next
+                    # scan's hydrate picks those hashes up.
+                    if cache is not None:
+                        try:
+                            cache.store_all(records)
+                            cache.close()
+                        except Exception:
+                            pass
+                        cache = None
+                    raise
 
         if run_exact:
             stage_durations["exact"] = stage_results["exact"]
@@ -1158,7 +1172,9 @@ def run_scans_parallel(
                 try:
                     sub = fut.result()
                 except InterruptedError:
+                    # The stream was cancelled; there is no `sub` to merge.
                     interrupted = True
+                    continue
                 except Exception as exc:
                     stream_errors.append(f"{root}: {exc}")
                     continue

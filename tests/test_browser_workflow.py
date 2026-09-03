@@ -955,3 +955,580 @@ def test_scan_setup_hints_and_exclusion_check(
     page.locator("#btnCheckExclusions").click()
     expect(page.locator("#exclusionsCheckResult")).to_contain_text("✓ a*")
     expect(page.locator("#exclusionsCheckResult")).to_contain_text("zzz-* — matches nothing")
+
+
+@pytest.mark.e2e
+def test_empty_path_scan_is_rejected(page, live_dedupe_server: str) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    # Empty field: the client refuses before any request leaves the browser.
+    page.locator("#btnScan").click()
+    expect(page.locator("#toastMessage")).to_have_text("Enter at least one folder path")
+    assert page.evaluate("document.activeElement.id") == "paths"
+    assert page.locator("#results").is_hidden()
+    assert page.locator("#emptyState").is_visible()
+    assert page.locator("#progressWrap").is_hidden()
+    assert page.locator(".group-item").count() == 0
+
+    # Whitespace-only input trims to the same refusal.
+    page.locator("#paths").fill("   ")
+    page.locator("#btnScan").click()
+    expect(page.locator("#toastMessage")).to_have_text("Enter at least one folder path")
+    assert page.locator("#results").is_hidden()
+
+    # The server-side guard carries the checklist's "paths required" error.
+    token = page.evaluate("document.querySelector('meta[name=dedupe-token]').content")
+    response = page.request.post(
+        f"{live_dedupe_server}/api/scan",
+        data={"paths": []},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert response.status == 400
+    assert response.json()["error"] == "paths required"
+    assert page.locator("#results").is_hidden()
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_attention_navigation_and_space_u_shortcuts(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # The Exact tab's one group is complete under the suggested selection, so
+    # no shown group needs attention — ] says so instead of moving.
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    page.keyboard.press("]")
+    expect(page.locator("#toastMessage")).to_have_text("No shown groups need attention")
+
+    # Space toggles the focused card's checkbox; u restores the suggestion.
+    page.locator(".group-item").click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    expect(page.locator("#members .card.selected")).to_have_count(1)
+    selected_index = page.evaluate(
+        "[...document.querySelectorAll('#members .card')]"
+        ".findIndex((card) => card.classList.contains('selected'))"
+    )
+    page.keyboard.press("ArrowRight")
+    if selected_index == 0:
+        # Keeper-ranking tie edge: the selected card is the first one.
+        page.keyboard.press("ArrowLeft")
+    page.locator("#members .card.focused").wait_for(state="attached")
+    assert page.evaluate(
+        "document.querySelector('#members .card.focused').classList.contains('selected')"
+    )
+    page.keyboard.press("Space")
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(0)
+    expect(page.locator("#members .card.selected")).to_have_count(0)
+    assert not page.evaluate(
+        "document.querySelector('#members .card.focused .sel-cb').checked"
+    )
+    page.keyboard.press("u")
+    page.locator("#toast").filter(has_text="Suggested selection applied").wait_for(
+        state="visible"
+    )
+    expect(page.locator("#members .card.selected")).to_have_count(1)
+    expect(page.locator("#members .card.keep")).to_have_count(1)
+    assert not page.evaluate(
+        "document.querySelector('#members .card.keep .sel-cb').checked"
+    )
+
+    # The unreviewed Low-res group needs attention: ] lands on it, and with a
+    # single candidate the next ] wraps back onto the same group. (Exact and
+    # Low-res both list one group, so the badge — not the count — proves the
+    # tab's list has re-rendered.)
+    page.locator('.tab[data-kind="low_resolution"]').click()
+    page.locator(".group-item .badge.low_resolution").wait_for(state="attached")
+    for _ in range(2):
+        page.keyboard.press("]")
+        focused = False
+        for _ in range(50):
+            focused = page.evaluate(
+                "document.activeElement?.classList?.contains('group-item')"
+            )
+            if focused:
+                break
+            page.wait_for_timeout(100)
+        assert focused
+        assert page.evaluate(
+            "document.activeElement.getAttribute('aria-current')"
+        ) == "true"
+        # innerText is CSS-uppercased; textContent carries the raw badge text.
+        assert "low-res" in page.evaluate("document.activeElement.textContent")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_lightbox_enter_wrap_focus_trap_and_esc(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    expect(page.locator("#members .card.selected")).to_have_count(1)
+
+    # → focuses a member card; Enter opens the lightbox on it and focus moves
+    # inside the overlay (onto the close control).
+    page.keyboard.press("ArrowRight")
+    page.locator("#members .card.focused").wait_for(state="attached")
+    page.keyboard.press("Enter")
+    page.locator("#lightbox").wait_for(state="visible")
+    assert page.evaluate(
+        "document.getElementById('lightbox').contains(document.activeElement)"
+    )
+    assert page.evaluate("document.activeElement.id") == "lbClose"
+
+    # The lightbox opened on the second of two members; → wraps past the end.
+    expect(page.locator("#lbCounter")).to_have_text("2 / 2")
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#lbCounter")).to_have_text("1 / 2")
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#lbCounter")).to_have_text("2 / 2")
+
+    # Tab stays trapped inside the overlay no matter how often it cycles.
+    for _ in range(6):
+        page.keyboard.press("Tab")
+        assert page.evaluate(
+            "document.getElementById('lightbox').contains(document.activeElement)"
+        )
+
+    # Escape closes without side effects and returns focus to the card that
+    # opened the lightbox; selections are untouched.
+    page.keyboard.press("Escape")
+    page.locator("#lightbox").wait_for(state="hidden")
+    assert page.evaluate(
+        "document.activeElement?.classList?.contains('thumb-wrap')"
+    )
+    assert page.evaluate(
+        "document.activeElement.closest('.card')?.classList?.contains('focused')"
+    )
+    expect(page.locator("#members .card.selected")).to_have_count(1)
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_stale_preview_re_previews_on_confirm(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    # Let the scan's own "Done" toast clear so it cannot swallow the click.
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalTitle")).to_have_text("Delete all selected exact matches?")
+    assert "preview valid for" in page.locator("#modalValidity").inner_text()
+
+    # A second tab on the same session moves the selection to the other file
+    # behind the open sheet (deselect the pick, then select the sibling).
+    tab2 = page.context.new_page()
+    tab2_errors: list[str] = []
+    tab2.on("pageerror", lambda error: tab2_errors.append(str(error)))
+    tab2.goto(live_dedupe_server, wait_until="domcontentloaded")
+    tab2.locator("#results").wait_for(state="visible", timeout=10_000)
+    tab2.locator(".group-item").first.click()
+    tab2.locator("#members .card").first.wait_for(state="visible")
+    tab2.locator("#members .card.selected .sel-cb").click()
+    expect(tab2.locator("#members .sel-cb:checked")).to_have_count(0)
+    expect(tab2.locator("#groupSelectionSummary")).to_have_text("0 of 2 selected for removal")
+    tab2.locator("#members .sel-cb").first.click()
+    expect(tab2.locator("#members .sel-cb:checked")).to_have_count(1)
+    expect(tab2.locator("#groupSelectionSummary")).to_have_text("1 of 2 selected for removal")
+
+    # Confirming with the stale token is refused; the client re-previews and
+    # re-opens the sheet with re-verified numbers instead of moving anything.
+    page.bring_to_front()
+    page.locator("#modalConfirm").click()
+    expect(page.locator("#toastMessage")).to_contain_text(
+        "selection changed since the preview"
+    )
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalTitle")).to_have_text("Delete all selected exact matches?")
+    expect(page.locator("#modalBody .preview-notice")).to_contain_text("re-verified")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert tab2_errors == []
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_escape_discards_preview_and_reopening_renews_the_token(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # Escape closes the sheet without moving anything; the preview dies with it.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    assert "preview valid for" in page.locator("#modalValidity").inner_text()
+    page.keyboard.press("Escape")
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+
+    # Reopening runs a fresh preview: the server-issued validity line is back.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    assert "preview valid for" in page.locator("#modalValidity").inner_text()
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_parallel_streams_toggle_controls_cross_folder_groups(
+    page, live_dedupe_server: str, tmp_path: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    Image.new("RGB", (48, 32), (25, 100, 180)).save(folder_a / "same.png")
+    shutil.copyfile(folder_a / "same.png", folder_b / "same.png")
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(f"{folder_a}, {folder_b}")
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    # Parallel streams (the default): one progress line per folder, and no
+    # cross-folder exact group is found.
+    expect(page.locator("#streamProgress .stream-row")).to_have_count(2)
+    expect(page.locator("#countExact")).to_have_text("0")
+    expect(page.locator("#countAll")).not_to_have_text("0")
+
+    # Forcing one pool finds the cross-folder duplicate.
+    page.locator("#scanCollapse").click()
+    page.locator("#optsToggle").click()
+    # Chip checkboxes are visually hidden behind their label; force the toggle.
+    page.locator("#optParallel").uncheck(force=True)
+    page.locator("#btnScan").click()
+    expect(page.locator("#countExact")).to_have_text("1", timeout=20_000)
+    # One-pool scans have no per-folder stream panel.
+    expect(page.locator("#streamProgress")).to_be_hidden()
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_resume_banner_reports_pruned_files_and_discard_starts_clean(
+    page, tmp_path: Path, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    session_path = tmp_path / "review.json"
+
+    # Scan once through the UI; completion persists the durable review session.
+    app = create_app(review_session_path=session_path)
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#paths").fill(str(duplicate_images))
+        page.locator("#btnScan").click()
+        page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+        assert session_path.exists()
+
+    # One scanned file changes on disk before the restart.
+    Image.new("RGB", (64, 64), (200, 30, 30)).save(duplicate_images / "duplicate.png")
+
+    # A new server over the same session file resumes without scanning and
+    # reports the pruned file with its reason.
+    resumed = create_app(review_session_path=session_path)
+    resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    with _serve_app(resumed) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator(".group-item").first.wait_for(state="attached")
+        # The exact group lost a member below its two-file minimum.
+        expect(page.locator("#countExact")).to_have_text("0")
+        expect(page.locator("#countAll")).to_have_text("3")
+        expect(page.locator("#sessionStatus")).to_be_visible()
+        expect(page.locator("#sessionStatusText")).to_contain_text("Resumed review")
+        expect(page.locator("#sessionStatusText")).to_contain_text("1 stale file pruned")
+        expect(page.locator("#sessionPrunedSummary")).to_contain_text(
+            "1 changed since the scan"
+        )
+        page.locator("#sessionPrunedSummary").click()
+        expect(page.locator("#sessionPrunedList")).to_contain_text("duplicate.png")
+        expect(page.locator("#sessionPrunedList")).to_contain_text("changed since scan")
+
+        # Discard removes the durable state and returns to the empty setup.
+        page.locator("#btnDiscardSession").click()
+        page.locator("#modalBackdrop").wait_for(state="visible")
+        expect(page.locator("#modalTitle")).to_have_text("Discard saved review?")
+        page.locator("#modalConfirm").click()
+        page.locator("#toast").filter(has_text="Saved review discarded").wait_for(
+            state="visible"
+        )
+        assert not session_path.exists()
+        expect(page.locator("#emptyState")).to_be_visible()
+        expect(page.locator("#results")).to_be_hidden()
+        expect(page.locator(".group-item")).to_have_count(0)
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_selections_survive_a_server_restart(
+    page, tmp_path: Path, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    session_path = tmp_path / "review.json"
+
+    # Scan, then undo the suggested selection (1 selected -> 0 selected).
+    app = create_app(review_session_path=session_path)
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#paths").fill(str(duplicate_images))
+        page.locator("#btnScan").click()
+        page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+        page.locator('.tab[data-kind="exact"]').click()
+        expect(page.locator(".group-item")).to_have_count(1)
+        page.locator(".group-item").click()
+        page.locator("#members .card").first.wait_for(state="visible")
+        expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
+        page.locator("#members .card.selected .sel-cb").click()
+        # The summary rewrites only after the selection POST (and its
+        # synchronous session persist) has completed.
+        expect(page.locator("#groupSelectionSummary")).to_have_text(
+            "0 of 2 selected for removal"
+        )
+
+    # A new server over the same session file restores groups and selections.
+    resumed = create_app(review_session_path=session_path)
+    resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    with _serve_app(resumed) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="exact"]').click()
+        expect(page.locator(".group-item")).to_have_count(1)
+        page.locator(".group-item").click()
+        page.locator("#members .card").first.wait_for(state="visible")
+        expect(page.locator("#members .sel-cb:checked")).to_have_count(0)
+        expect(page.locator("#members .card.selected")).to_have_count(0)
+        expect(page.locator("#groupSelectionSummary")).to_have_text(
+            "0 of 2 selected for removal"
+        )
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_sticky_toast_queues_newer_toasts(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # A sticky error toast stays until dismissed.
+    selection_calls: list[str] = []
+
+    def fail_selection(route) -> None:
+        selection_calls.append(route.request.url)
+        route.fulfill(status=500, content_type="application/json", body='{"error": "boom"}')
+
+    page.route("**/api/selection", fail_selection)
+    page.locator("#members .sel-cb").first.click()
+    page.locator("#toast").filter(has_text="boom").wait_for(state="visible")
+
+    # A repeat of the same failure collapses into the visible toast.
+    page.locator("#members .sel-cb").nth(1).click()
+    for _ in range(50):
+        if len(selection_calls) >= 2:
+            break
+        page.wait_for_timeout(100)
+    assert len(selection_calls) == 2
+    expect(page.locator("#toastMessage")).to_have_text("boom")
+
+    # A different failure queues behind the sticky toast, never replacing it.
+    smart_select_calls: list[str] = []
+    page.route(
+        "**/api/smart-select",
+        lambda route: (
+            smart_select_calls.append(route.request.url),
+            route.fulfill(status=500, content_type="application/json", body='{"error": "zap"}'),
+        ),
+    )
+    # Move focus off the checkbox so the "u" shortcut is not treated as typing.
+    page.locator("#detailTitle").click()
+    page.keyboard.press("u")
+    for _ in range(50):
+        if smart_select_calls:
+            break
+        page.wait_for_timeout(100)
+    assert smart_select_calls
+    page.wait_for_timeout(200)  # the toast() call trails the failed response
+    expect(page.locator("#toastMessage")).to_have_text("boom")
+
+    # Dismissing the sticky toast reveals the queued one; the queue then drains
+    # (the collapsed "boom" repeat does not resurface).
+    page.locator("#toastDismiss").click()
+    expect(page.locator("#toastMessage")).to_have_text("zap")
+    page.locator("#toastDismiss").click()
+    page.locator("#toast").wait_for(state="hidden")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_random_review_decision_mechanics(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    page.locator('.tab[data-kind="random_review"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    page.locator(".group-item").click()
+    page.locator("#members .decision-card").wait_for(state="visible")
+    assert page.locator("#members .decision-card").count() == 1
+
+    # ← stages a Delete and steps to the next candidate…
+    page.keyboard.press("ArrowLeft")
+    expect(page.locator("#detailMeta")).to_contain_text("1 reviewed")
+    assert "1 marked Delete" in page.locator("#detailMeta").inner_text()
+    expect(page.locator("#memberPagination .member-page-summary")).to_have_text("2 of 2")
+
+    # …→ keeps it, and the drained pile enables the shared review action.
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#detailMeta")).to_contain_text("2 reviewed")
+    assert "1 marked Delete" in page.locator("#detailMeta").inner_text()
+    assert "0 remaining" in page.locator("#detailMeta").inner_text()
+    expect(page.locator("#btnTrashReview")).to_be_enabled()
+    page.locator("#toast").filter(has_text="Review complete").wait_for(state="visible")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_scan_streams_groups_and_cancel_restores_previous(
+    page, live_dedupe_server: str, duplicate_images: Path, tmp_path: Path
+) -> None:
+    import os
+    import time
+
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    # Baseline scan completes fully; its results are what Cancel must restore.
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+    expect(page.locator("#countExact")).to_have_text("1")
+
+    # A bigger fixture: exact-duplicate pairs of random-noise PNGs, so groups
+    # keep streaming in while the similar-image stage is still hashing.
+    big = tmp_path / "big"
+    big.mkdir()
+    for index in range(125):
+        image_path = big / f"noise-{index:03d}-a.png"
+        Image.frombytes("RGB", (96, 96), os.urandom(96 * 96 * 3)).save(image_path)
+        shutil.copyfile(image_path, big / f"noise-{index:03d}-b.png")
+
+    # Start the second scan from the collapsed setup bar.
+    page.locator("#scanCollapse").click()
+    page.locator("#paths").fill(str(big))
+    page.locator("#btnScan").click()
+
+    # Groups stream into the sidebar before the scan completes. One evaluate
+    # per poll keeps the count and the scanning flag race-free.
+    streamed = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        snapshot = page.evaluate(
+            """() => ({
+                groups: document.querySelectorAll(".group-item").length,
+                scanning: !document.getElementById("btnCancelScan").hidden,
+            })"""
+        )
+        if snapshot["groups"] > 0:
+            streamed = snapshot
+            break
+        page.wait_for_timeout(100)
+    assert streamed is not None, "no groups streamed into the sidebar within 30s"
+    assert streamed["scanning"], "groups only appeared after the scan finished"
+
+    # Cancel mid-run: the cancel control lives in the collapsed setup panel.
+    # The "Cancelling…" toast is replaced almost immediately (the worker halts
+    # between work items), faster than wait_for polls — observe the toast's
+    # text transitions instead of waiting for a visible end state.
+    page.evaluate(
+        """() => {
+          window.__toastLog = [];
+          const el = document.getElementById("toastMessage");
+          new MutationObserver(() => window.__toastLog.push(el.textContent))
+            .observe(el, { childList: true, characterData: true, subtree: true });
+        }"""
+    )
+    page.locator("#scanCollapse").click()
+    page.locator("#btnCancelScan").click()
+    # The scan stops and the previous (duplicate_images) results come back.
+    expect(page.locator("#btnCancelScan")).to_be_hidden(timeout=30_000)
+    expect(page.locator("#countExact")).to_have_text("1", timeout=30_000)
+    expect(page.locator(".group-item")).to_have_count(4, timeout=30_000)
+    toast_log = page.evaluate("window.__toastLog")
+    assert any("Cancelling" in text for text in toast_log)
+    assert page_errors == []

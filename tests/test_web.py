@@ -1054,6 +1054,96 @@ def test_independent_review_rejects_invalid_explicit_decisions(tmp_path: Path) -
     assert invalid_decision.status_code == 400
 
 
+def test_random_review_keep_is_forgetful(tmp_path: Path) -> None:
+    # Random-review Keeps deliberately write no durable keep decision.
+    result = _result(tmp_path)
+    random_review = build_random_review_groups(result.files, count=2)[0]
+    result.groups = [random_review]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    keep = client.post(
+        "/api/selection",
+        json={
+            "group_id": random_review.id,
+            "decision_path": random_review.members[0].path,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+
+    assert keep.status_code == 200
+    assert load_keep_decisions() == {}
+
+
+def test_low_resolution_keep_withdraws_overlapping_duplicate_selection(tmp_path: Path) -> None:
+    # A Keep in Low-res vetoes the same file's selection in an exact group.
+    result = _result(tmp_path)
+    for record in result.files:
+        record.width = 320
+        record.height = 240
+    exact_group = result.groups[0]
+    low_resolution = build_low_resolution_groups(result.files)[0]
+    result.groups = [exact_group, low_resolution]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    path = next(
+        member.path
+        for member in exact_group.members
+        if member.path in set(exact_group.selected_for_removal)
+    )
+
+    keep = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_resolution.id,
+            "decision_path": path,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+
+    assert keep.status_code == 200
+    exact = next(
+        group
+        for group in client.get("/api/groups?kind=exact").get_json()["groups"]
+        if group["id"] == exact_group.id
+    )
+    assert path not in set(exact["selected_for_removal"])
+
+
+def test_trash_preview_refuses_a_symlinked_member(tmp_path: Path) -> None:
+    result = _result(tmp_path)
+    selected = Path(result.groups[0].selected_for_removal[0])
+    target = tmp_path / "elsewhere.jpg"
+    target.write_bytes(b"the real file lives here")
+    selected.unlink()
+    selected.symlink_to(target)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    preview = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "kinds": "exact", "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert preview.status_code == 200
+    payload = preview.get_json()
+    assert payload["fail_count"] == 1
+    item = next(i for i in payload["items"] if i["path"] == str(selected))
+    assert "symbolic link" in (item["error"] or "").lower()
+    assert selected.is_symlink() and target.exists()
+
+
 def test_media_endpoint_streams_only_scanned_files_with_range_support(tmp_path: Path) -> None:
     result = _result(tmp_path)
     client = create_app(result).test_client()

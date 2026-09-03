@@ -27,7 +27,9 @@ document.addEventListener("keydown", async (e) => {
   }
 
     if (!$("helpBackdrop").hidden && e.key === "Tab") {
-      trapTabKey($("helpBackdrop"), e);
+      // Never let Tab escape an open overlay: when the trap has nothing to
+      // cycle (controls briefly hidden mid-repaint), swallow the key instead.
+      if (!trapTabKey($("helpBackdrop"), e)) e.preventDefault();
       return;
     }
 
@@ -41,7 +43,9 @@ document.addEventListener("keydown", async (e) => {
 
     if (!$("lightbox").hidden) {
       if (e.key === "Tab") {
-        trapTabKey($("lightbox"), e);
+        // Same anti-escape guard as the help overlay: an empty moment in the
+        // focusable set must not hand focus to the page behind the lightbox.
+        if (!trapTabKey($("lightbox"), e)) e.preventDefault();
         return;
       }
       if (typing || e.target === $("lbVideo")) return;
