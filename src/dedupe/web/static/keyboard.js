@@ -115,6 +115,9 @@ document.addEventListener("keydown", async (e) => {
   } else if (e.key === "A") {
     $("btnTrashSimilar").click();
     e.preventDefault();
+  } else if (e.key === "D") {
+    $("btnTrashReview").click();
+    e.preventDefault();
   } else if (e.key === "Enter" && state.currentId) {
     const focused = document.querySelector("#members .card.focused .thumb-wrap");
     const index = Number(focused?.dataset.index ?? state.memberFocus ?? 0);
@@ -127,6 +130,16 @@ document.addEventListener("keydown", async (e) => {
     const card = document.querySelector("#members .card.focused:not(.deleted)") || cards[state.memberFocus] || cards[0];
     if (card?.dataset.path) {
       trashReviewCandidate(group, card.dataset.path);
+      e.preventDefault();
+    }
+  } else if ((e.key === "r" || e.key === "R") && state.currentId) {
+    // Same Reveal as the card's button (and the lightbox's r): works in every
+    // kind of group; decision-review cards have no Reveal control, so no-op.
+    const cards = [...document.querySelectorAll("#members .card:not(.deleted)")];
+    const card = document.querySelector("#members .card.focused:not(.deleted)") || cards[state.memberFocus] || cards[0];
+    const reveal = card?.querySelector(".reveal");
+    if (reveal) {
+      reveal.click();
       e.preventDefault();
     }
   } else if (e.key === " " && state.currentId) {

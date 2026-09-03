@@ -828,6 +828,61 @@ def test_tabs_and_group_list_are_keyboard_navigable(
 
 
 @pytest.mark.e2e
+def test_review_action_shortcut_and_card_reveal_from_the_keyboard(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    # Stage one Low-res deletion, then open its action from the keyboard.
+    page.locator('.tab[data-kind="low_resolution"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    page.locator(".group-item").click()
+    page.locator("#members .decision-card").wait_for(state="visible")
+    page.keyboard.press("ArrowLeft")
+    expect(page.locator("#detailMeta")).to_contain_text("1 marked Delete")
+    expect(page.locator("#btnTrashReview")).to_be_enabled()
+
+    page.keyboard.press("Shift+D")
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalTitle")).to_have_text(
+        "Delete all selected Low-res + Random review files?"
+    )
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+
+    # r on a focused card fires the same Reveal request as the card's button.
+    reveal_requests: list[str] = []
+    page.route(
+        "**/api/reveal*",
+        lambda route: (
+            reveal_requests.append(route.request.url),
+            route.fulfill(status=200, content_type="application/json", body="{}"),
+        ),
+    )
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    page.locator(".group-item").click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    page.keyboard.press("ArrowRight")
+    page.locator("#members .card.focused").wait_for(state="attached")
+    page.keyboard.press("r")
+    expect(page.locator("#members .card.focused")).to_have_count(1)
+    for _ in range(50):
+        if reveal_requests:
+            break
+        page.wait_for_timeout(100)
+    assert len(reveal_requests) == 1
+    assert "open=1" in reveal_requests[0]
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_scan_setup_hints_and_exclusion_check(
     page, live_dedupe_server: str, tmp_path: Path
 ) -> None:

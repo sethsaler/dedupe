@@ -41,7 +41,7 @@ Reviewing becomes consequential the first time a selection changes: the change i
 
 **Reviewing in independent categories.** In Low-res and Random 50 the detail pane is a one-item-at-a-time decision review: `←` means Delete this candidate, `→` means Keep it, applied to the focused member and advancing. A Keep is both a review and a veto; a Delete marks the candidate reviewed and selected. In Non-Human, Faces, and Files the list is paged with independent cards; decisions apply per candidate the same way, and candidates can additionally be trashed and restored one at a time from their cards (see their documents). The Files category has no selection semantics — bulk operations and selection rules leave it untouched; its files leave through one-click Trash.
 
-**Rules.** `u` applies the suggested (automatic) selection to the focused group; `s` opens the rule chooser for it (newest, oldest, largest, smallest, shortest path, deselect all — and select candidates in independent groups). `Space` toggles the focused member card's checkbox. Outside a decision review, `←`/`→` move the focused member card, and the card's preview button takes real keyboard focus so a screen reader announces it; `Space` and `Enter` keep their meanings there — toggle removal and open the [lightbox](lightbox.md). `Enter`/`Space` on any other focused button simply activate that button; the global meanings do not also fire.
+**Rules.** `u` applies the suggested (automatic) selection to the focused group; `s` opens the rule chooser for it (newest, oldest, largest, smallest, shortest path, deselect all — and select candidates in independent groups). `Space` toggles the focused member card's checkbox. `r` reveals the focused card's file in Finder, exactly like its Reveal button (decision-review cards have no Reveal control, so `r` does nothing there). Outside a decision review, `←`/`→` move the focused member card, and the card's preview button takes real keyboard focus so a screen reader announces it; `Space` and `Enter` keep their meanings there — toggle removal and open the [lightbox](lightbox.md). `Enter`/`Space` on any other focused button simply activate that button; the global meanings do not also fire.
 
 **Bulk selection.** The bulk controls apply one operation — select all, select none, invert, or a rule (smaller than keeper, larger/smaller than N MB, path contains, at least N faces) — to every group currently shown. The operation is re-derived on the server from its own state: keepers are never selected and at least one member of every duplicate group survives, whatever the browser asked. In independent groups, bulk-selecting candidates also marks them reviewed.
 
@@ -53,7 +53,7 @@ Reviewing becomes consequential the first time a selection changes: the change i
 
 ### Complete
 
-The list itself does not "complete"; the session does, when the user opens the [Action sheet](action-sheet.md) (`a` previews Trash for the exact selections, `A` for the similar ones). After an executed action, moved files vanish from their groups; groups that shrink below their minimum size (two members for duplicates, one for independent categories) dissolve from the list entirely.
+The list itself does not "complete"; the session does, when the user opens the [Action sheet](action-sheet.md) (`a` previews Trash for the exact selections, `A` for the similar ones, `D` for the staged Low-res and Random review selections). After an executed action, moved files vanish from their groups; groups that shrink below their minimum size (two members for duplicates, one for independent categories) dissolve from the list entirely.
 
 ## Modifiers
 
@@ -100,7 +100,7 @@ The list itself does not "complete"; the session does, when the user opens the [
 - Invert on a group whose keeper is unselected selects everything else; on a fully selected group it deselects everything except what the server's keeper rule restores.
 - A group hidden by filters keeps its selection, and bulk operations do not reach it — bulk applies to shown groups only, by design.
 - Bulk criteria never select files without a trusted face count when a minimum-face rule is used; unanalyzed media is skipped rather than guessed at.
-- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button.
+- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button and for `D` and the Low-res + Random button.
 - A filter that hides every group leaves the sidebar showing a plain "No groups in this filter." message — plain text, not a status announcement.
 
 ## Open questions and verification
