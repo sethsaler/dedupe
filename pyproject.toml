@@ -26,9 +26,9 @@ dev = [
     "pytest-playwright>=0.7.0",
     "ruff>=0.9.0",
 ]
-human = ["opencv-python-headless>=4.8.0,<5"]
+human = ["opencv-python-headless>=4.8.0,<6"]
 photon = ["moondream"]
-vision = ["opencv-python-headless>=4.8.0,<5", "moondream"]
+vision = ["opencv-python-headless>=4.8.0,<6", "moondream"]
 
 [project.scripts]
 dedupe = "dedupe.cli:main"
