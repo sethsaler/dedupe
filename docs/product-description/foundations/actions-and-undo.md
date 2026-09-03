@@ -2,11 +2,11 @@
 
 ## Summary
 
-Actions are the durable step of the whole product: the moment selected files actually move. There are three — **Trash**, **Quarantine**, and **Isolate** — each safer than the one before in a different direction: Trash uses the system trash, Quarantine moves files into a folder Dedupe controls (and can give back with `undo`), Isolate makes copies laid out for comparison without touching the originals at all. Every action is previewed first, every file is revalidated twice — once for the batch and once more immediately before its own move — and every executed trash or quarantine action writes a receipt. This document owns that safety model; the sheet where the user confirms is [Action sheet](../ui/action-sheet.md), the CLI commands are [`isolate`](../cli/isolate.md), [`undo`](../cli/undo.md), and [`receipts`](../cli/receipts.md).
+Actions are the durable step of the whole product: the moment selected files actually move. There are three — **Trash**, **Quarantine**, and **Isolate** — each safer than the one before in a different direction: Trash uses the system trash, Quarantine moves files into a folder Dedupe controls, Isolate makes copies laid out for comparison without touching the originals at all. Executed trash and quarantine actions can both be given back with undo. Every action is previewed first, every file is revalidated twice — once for the batch and once more immediately before its own move — and every executed trash or quarantine action writes a receipt. This document owns that safety model; the sheet where the user confirms is [Action sheet](../ui/action-sheet.md), the CLI commands are [`isolate`](../cli/isolate.md), [`undo`](../cli/undo.md), and [`receipts`](../cli/receipts.md).
 
 ## The three actions
 
-**Trash.** Selected files go to the macOS Trash via the system mechanism. Recovery is whatever Finder's Trash offers until it is emptied. Dedupe cannot programmatically restore trashed files — "Put Back" in Finder is the recovery path — with one exception: individual review candidates trashed from the Non-Human and Faces categories can be restored from the UI, because Dedupe remembers where each one went.
+**Trash.** Selected files go to the macOS Trash via the system mechanism. Recovery is whatever Finder's Trash offers until it is emptied, plus two programmatic paths Dedupe adds on top: individual review candidates trashed from the Non-Human, Faces, or Files categories can be restored from the UI, because Dedupe remembers where each one went; and a whole executed Trash action can be undone from its receipt (the result toast's Undo, or `dedupe undo`), because Dedupe records each file's Trash destination when it sends it there. A trashed file whose destination could not be determined — rare, and only off the macOS happy path — is recorded without one and can only come back through Finder.
 
 **Quarantine.** Selected files move into a quarantine folder the user chooses. Files keep their names; collisions get a unique suffix. Nothing is deleted — quarantine is a move, fully reversible with `dedupe undo` against the receipt. Quarantining to another volume is refused by default; it can be explicitly allowed, in which case Dedupe copies, verifies the copy, and only then removes the original.
 
@@ -26,9 +26,9 @@ Dry runs stop after step 2: the preview is a real preflight, not an estimate —
 
 ## Undo
 
-**Quarantine undo** (`dedupe undo`, or the UI's equivalent) reads a receipt and moves every successfully quarantined file back to its original path, in reverse order. The preflight is all-or-nothing: if any quarantined file is gone or any original path is now occupied, the entire undo is refused — nothing is partially restored. Restores always may cross volumes, since a quarantine folder may legitimately live on another disk. The undo itself writes a receipt.
+**Action undo** (`dedupe undo`, or the Undo button on the UI's result toast after an executed action) reads the action's receipt and moves every successfully moved file back to its original path, in reverse order — from the quarantine folder for a quarantine action, from the recorded Trash destination for a trash action. The preflight is all-or-nothing: if any moved file is gone from its recorded destination, has no recorded destination, or its original path is now occupied, the entire undo is refused — nothing is partially restored. (In the UI, an executed action that wrote several receipts — a Trash that split into a quarantine part and a system-trash part — restores them together: the sheet previews every receipt and the execute preflights all of them again before moving anything.) Restores always may cross volumes, since a quarantine folder or the Trash may legitimately live on another disk. The undo itself writes a receipt. Restoring returns files to disk only: it does not resurrect their review groups — restored files reappear in the review on the next scan.
 
-**Trash undo** does not exist as a command; the macOS Trash is the recovery mechanism. The exception is the per-candidate restore for Non-Human and Faces review items, which moves one trashed file back to its original path with the same occupied-path refusal.
+**Per-candidate trash undo** is the narrower sibling: one Non-Human, Faces, or Files candidate moves back to its original path with the same occupied-path refusal, from its card or the toast, for as long as the app's trash map remembers the destination (it survives restarts; a new scan ends it).
 
 ## Preview tokens
 
@@ -69,8 +69,8 @@ After an interrupted or failed action the receipt (when written) is authoritativ
 
 - A selection that spans overlapping groups (one file in an exact and a similar group) acts once; the last-survivor guarantee is evaluated against *every* duplicate group, including ones the action's filter does not include.
 - Quarantining two files with the same name produces two distinct destination names; undo returns both to their distinct originals.
-- Undo against a dry-run receipt is refused ("only executed quarantine receipts can be undone").
-- Undo whose receipt was already undone reports each file as missing from quarantine and does nothing.
+- Undo against a dry-run receipt is refused ("only executed trash or quarantine receipts can be undone").
+- Undo whose receipt was already undone reports each file as missing from its recorded destination and does nothing.
 - Isolate in move mode is the only isolate mode that can lose data; it is refused across filesystem boundaries unless explicitly allowed.
 - A file that became a symbolic link between scan and action is refused by name — acting on the link would silently act on its target.
 

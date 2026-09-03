@@ -740,79 +740,87 @@ def apply_actions(
     return result
 
 
-def undo_quarantine(
+def undo_action(
     action_log: str | Path,
     *,
     dry_run: bool = True,
     log_dir: str | Path | None = None,
     receipt_dir: str | Path | None = None,
 ) -> ActionResult:
-    """Restore a completed quarantine action from its receipt.
+    """Restore a completed trash or quarantine action from its receipt.
 
     ``action_log`` may be a path to a receipt or a receipt id (see
     :mod:`dedupe.receipts`); ids are resolved against ``receipt_dir`` (default:
     the standard log directory).
 
-    Trash restoration remains a Finder operation because send2trash does not expose
-    the final per-volume Trash destination reliably across platforms.
+    Every item restores from the destination recorded when the action ran:
+    the quarantine folder, or the per-volume Trash path that the trash batch
+    resolved. A trash item recorded without a resolved destination (the bare
+    ``"Trash"`` marker) cannot be restored programmatically — it fails
+    preflight like any other blocker, and any preflight failure refuses the
+    whole undo, so a bulk restore never half-applies.
     """
     log_path = resolve_receipt_path(action_log, receipt_dir)
     data = json.loads(log_path.read_text(encoding="utf-8"))
-    if data.get("action") != "quarantine" or data.get("dry_run"):
-        raise ValueError("only executed quarantine receipts can be undone")
+    action = str(data.get("action") or "")
+    if data.get("dry_run") or action not in ("trash", "quarantine"):
+        raise ValueError("only executed trash or quarantine receipts can be undone")
+    undo_kind = f"undo:{action}"
 
-    result = ActionResult(dry_run=dry_run, action="undo:quarantine")
+    result = ActionResult(dry_run=dry_run, action=undo_kind)
     planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
         if not item.get("ok") or not item.get("destination"):
             continue
-        quarantined = Path(item["destination"])
+        moved = Path(item["destination"])
         original = Path(item["path"])
         size = item.get("size")
         error = None
-        if not quarantined.is_file():
-            error = "quarantined file no longer exists"
+        if action == "trash" and item["destination"] == "Trash":
+            error = "trash destination was not recorded; restore this one in Finder"
+        elif not moved.is_file():
+            error = "moved file no longer exists at its recorded destination"
         elif original.exists() or original.is_symlink():
             error = "original path is already occupied"
         if error:
             result.items.append(
                 ActionItem(
-                    path=str(quarantined),
+                    path=str(moved),
                     ok=False,
-                    action="undo:quarantine",
+                    action=undo_kind,
                     destination=str(original),
                     error=error,
                     size=size,
                 )
             )
         else:
-            planned.append((quarantined, original, size))
+            planned.append((moved, original, size))
 
     if result.fail_count and not dry_run:
-        for quarantined, original, size in planned:
+        for moved, original, size in planned:
             result.items.append(
                 ActionItem(
-                    path=str(quarantined),
+                    path=str(moved),
                     ok=False,
-                    action="undo:quarantine",
+                    action=undo_kind,
                     destination=str(original),
                     error="undo cancelled because another item failed preflight",
                     size=size,
                 )
             )
     else:
-        for quarantined, original, size in planned:
+        for moved, original, size in planned:
             try:
                 if not dry_run:
                     original.parent.mkdir(parents=True, exist_ok=True)
-                    # Restores are always allowed to cross volumes: the quarantine
-                    # directory may legitimately live on another disk.
-                    _move_file(quarantined, original, allow_cross_device=True)
+                    # Restores are always allowed to cross volumes: the
+                    # quarantine folder or Trash may live on another disk.
+                    _move_file(moved, original, allow_cross_device=True)
                 result.items.append(
                     ActionItem(
-                        path=str(quarantined),
+                        path=str(moved),
                         ok=True,
-                        action="undo:quarantine",
+                        action=undo_kind,
                         destination=str(original),
                         size=size,
                     )
@@ -820,9 +828,9 @@ def undo_quarantine(
             except OSError as exc:
                 result.items.append(
                     ActionItem(
-                        path=str(quarantined),
+                        path=str(moved),
                         ok=False,
-                        action="undo:quarantine",
+                        action=undo_kind,
                         destination=str(original),
                         error=str(exc),
                         size=size,
@@ -832,6 +840,19 @@ def undo_quarantine(
     result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir or log_path.parent)
     return result
+
+
+def undo_quarantine(
+    action_log: str | Path,
+    *,
+    dry_run: bool = True,
+    log_dir: str | Path | None = None,
+    receipt_dir: str | Path | None = None,
+) -> ActionResult:
+    """Backward-compatible alias for :func:`undo_action` (quarantine receipts)."""
+    return undo_action(
+        action_log, dry_run=dry_run, log_dir=log_dir, receipt_dir=receipt_dir
+    )
 
 
 def _safe_name(name: str, max_len: int = 80) -> str:

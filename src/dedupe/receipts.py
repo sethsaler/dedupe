@@ -19,7 +19,7 @@ from pathlib import Path
 
 EXECUTED_PREFIX = "action"
 PREVIEW_PREFIX = "preview"
-UNDOABLE_ACTIONS = frozenset({"quarantine"})
+UNDOABLE_ACTIONS = frozenset({"quarantine", "trash"})
 
 
 class ReceiptError(RuntimeError):
@@ -141,13 +141,20 @@ def _undo_state(data: dict) -> tuple[bool, str | None]:
         return False, "dry-run previews change nothing"
     if action not in UNDOABLE_ACTIONS:
         return False, f"{action or 'unknown'} actions cannot be undone automatically"
+    moved = [item for item in data.get("items") or [] if item.get("ok")]
+    # The undo restores from the recorded destination; a trash item recorded
+    # as the bare "Trash" marker has none, and one blocked item refuses the
+    # whole undo (all-or-nothing), so the receipt only counts as undoable
+    # when every moved item carries a real destination.
     restorable = [
         item
-        for item in data.get("items") or []
-        if item.get("ok") and item.get("destination")
+        for item in moved
+        if item.get("destination") and item["destination"] != "Trash"
     ]
     if not restorable:
         return False, "receipt has no restorable items"
+    if len(restorable) != len(moved):
+        return False, "some moved files have no recorded destination"
     return True, None
 
 

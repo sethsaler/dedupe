@@ -57,7 +57,7 @@ From `foundations/review-session.md`:
 - Corrupt/oversize session: reported, not loaded; app starts clean.
 
 From `foundations/actions-and-undo.md`:
-- Actions: Trash (system trash; no programmatic restore except per-candidate Non-Human/Faces/Files restore), Quarantine (move, unique names, undoable via receipt), Isolate (copy by default; hardlink/symlink/move modes; `KEEP__` prefix; session folders under `_Dedupe Review`).
+- Actions: Trash (system trash; restores: per-candidate Non-Human/Faces/Files undo, and whole-action undo from the receipt via the result toast's Undo or `dedupe undo`), Quarantine (move, unique names, undoable via receipt), Isolate (copy by default; hardlink/symlink/move modes; `KEEP__` prefix; session folders under `_Dedupe Review`).
 - Safety layers in order: effective selection → batch preflight (lstat identity: symlink refused, regular file, in roots, size/device/inode/mtime match; exact groups re-hashed against keeper) → keeper validation with re-hash tolerance for metadata drift → immediate per-file revalidation → receipt.
 - Undo is all-or-nothing on preflight; restores in reverse order; always cross-volume; writes its own receipt. Dry-run receipts cannot be undone.
 - File actions hold a lock: scans and actions never overlap; concurrent requests get a locked refusal.

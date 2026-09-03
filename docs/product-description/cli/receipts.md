@@ -26,7 +26,7 @@ The directory is read synchronously. Corrupt receipts — unparseable JSON, wron
 
 ### While running
 
-**`list`** — flags: `--limit N` (default 20), `--no-previews` (hide dry-run receipts), `--undoable` (only receipts `undo` can consume). Each line: `{id}  {timestamp}  {action}  {executed|preview}  {N ok / M failed}  {bytes}{ undoable}` — where the timestamp comes from the receipt's `started_at` and is blank when the receipt predates that field (older receipts then show only the id and two spaces). Undoability has exact rules: executed quarantine receipts with at least one restorable item; dry-run previews, trash receipts, isolate receipts, and empty quarantines are not undoable, each for a stated reason available in `--json`.
+**`list`** — flags: `--limit N` (default 20), `--no-previews` (hide dry-run receipts), `--undoable` (only receipts `undo` can consume). Each line: `{id}  {timestamp}  {action}  {executed|preview}  {N ok / M failed}  {bytes}{ undoable}` — where the timestamp comes from the receipt's `started_at` and is blank when the receipt predates that field (older receipts then show only the id and two spaces). Undoability has exact rules: executed trash and quarantine receipts where every moved item has a real recorded destination (a trashed item recorded as the bare "Trash" marker disqualifies the whole receipt, because one blocked item refuses the whole undo); dry-run previews, isolate receipts, undo receipts, and receipts with no successfully moved items are not undoable, each for a stated reason available in `--json`.
 
 **`show`** — prints `Receipt: {id}`, the path, `Action: {action} ({executed|preview})`, `Started: … Completed: …`, `Result: N ok, M failed`, then one line per item (`[ok  ]` or `[failed]`, source, destination), `--items N` capping the list (default 20, 0 = all). Isolate receipts also show the review root. With `--json`, the raw receipt object.
 
@@ -62,7 +62,7 @@ The directory is read synchronously. Corrupt receipts — unparseable JSON, wron
 
 **Files on disk.** Reads the receipts directory; `prune --execute` deletes files. The directory itself is `~/.cache/dedupe/logs` by default; its full description is in [Files Dedupe writes](../cross-cutting/caches-and-files.md).
 
-**Safety and undo.** Pruning an undoable quarantine receipt destroys its ability to be undone — the command does not warn about this specifically, only lists `undoable` receipts as such in `list`. This is the one place the user can out-flank the safety model, deliberately.
+**Safety and undo.** Pruning an undoable receipt destroys its ability to be undone — the command does not warn about this specifically, only lists `undoable` receipts as such in `list`. This is the one place the user can out-flank the safety model, deliberately.
 
 **Review sessions.** None.
 

@@ -233,6 +233,51 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
 
 
 @pytest.mark.e2e
+def test_executed_trash_can_be_undone_from_the_result_toast(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    # Let the scan's own "Done" toast clear so it cannot swallow the click.
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # Execute the exact-match Trash for real; the fixture lands in the Trash.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalConfirm")).to_have_text("Move to Trash")
+    page.locator("#modalConfirm").click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    # The keeper ranking decides which name survives; exactly one file goes.
+    assert len(list(duplicate_images.iterdir())) == 1
+
+    # The result toast carries a sticky Undo; pressing it opens the restore
+    # sheet, which previews and then moves the file back to its original path.
+    expect(page.locator("#toastAction")).to_be_visible()
+    page.locator("#toastAction").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalTitle")).to_have_text("Restore 1 file?")
+    expect(page.locator("#modalBody")).to_contain_text("next scan")
+    page.locator("#modalConfirm").click()
+    page.locator("#toast").filter(has_text="Restored 1 file").wait_for(state="visible")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
+
+    # The review is not re-populated by the restore: the dissolved exact group
+    # stays gone until a rescan.
+    expect(page.locator('.tab[data-kind="exact"]')).to_contain_text("0")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_bulk_selection_and_advanced_filters(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:

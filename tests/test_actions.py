@@ -12,7 +12,7 @@ import pytest
 
 import dedupe.actions as actions_module
 import dedupe.receipts as receipts_module
-from dedupe.actions import apply_actions, undo_quarantine
+from dedupe.actions import apply_actions, undo_action, undo_quarantine
 from dedupe.exact import file_sha256
 from dedupe.grouping import apply_smart_select, build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
@@ -638,6 +638,79 @@ def test_undo_accepts_a_receipt_id(tmp_path: Path) -> None:
 def test_undo_rejects_unknown_receipt_id(tmp_path: Path) -> None:
     with pytest.raises(receipts_module.ReceiptNotFoundError):
         undo_quarantine("nope-1234", receipt_dir=tmp_path / "logs")
+
+
+def _trashed(tmp_path: Path, monkeypatch) -> actions_module.ActionResult:
+    """Execute a trash action against a redirected Trash directory."""
+    trash_dir = tmp_path / "trash"
+    monkeypatch.setattr(actions_module, "_send_to_trash", _fake_send_to_trash(trash_dir))
+    a = _rec(tmp_path / "a.jpg", b"same-bytes")
+    b = _rec(tmp_path / "b.jpg", b"same-bytes")
+    groups = build_groups([[a, b]], [])
+    return apply_actions(
+        groups,
+        action="trash",
+        dry_run=False,
+        roots=[str(tmp_path)],
+        log_dir=tmp_path / "logs",
+    )
+
+
+def test_trash_receipt_can_restore_file(tmp_path: Path, monkeypatch) -> None:
+    action = _trashed(tmp_path, monkeypatch)
+    moved_source = Path(action.items[0].path)
+    moved_destination = Path(action.items[0].destination or "")
+    assert not moved_source.exists() and moved_destination.exists()
+
+    restored = undo_action(action.log_path or "", dry_run=False)
+
+    assert restored.action == "undo:trash"
+    assert restored.success_count == 1
+    assert moved_source.exists() and not moved_destination.exists()
+    summaries = receipts_module.list_receipts(tmp_path / "logs")
+    trashes = [s for s in summaries if s.action == "trash"]
+    assert len(trashes) == 1 and trashes[0].undoable is True
+
+
+def test_trash_undo_refuses_an_unrecorded_destination(
+    tmp_path: Path, monkeypatch
+) -> None:
+    action = _trashed(tmp_path, monkeypatch)
+    receipt = json.loads(Path(action.log_path).read_text(encoding="utf-8"))
+    receipt["items"][0]["destination"] = "Trash"
+    Path(action.log_path).write_text(json.dumps(receipt), encoding="utf-8")
+    trashed_copy = tmp_path / "trash" / Path(action.items[0].path).name
+
+    result = undo_action(action.log_path, dry_run=False)
+
+    assert result.success_count == 0 and result.fail_count == 1
+    assert "not recorded" in (result.items[0].error or "")
+    assert trashed_copy.exists()
+    assert not Path(action.items[0].path).exists()
+    summaries = receipts_module.list_receipts(tmp_path / "logs")
+    trash = next(s for s in summaries if s.action == "trash")
+    assert trash.undoable is False
+
+
+def test_undo_rejects_previews_and_unsupported_actions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    action = _trashed(tmp_path, monkeypatch)
+    preview = apply_actions(
+        build_groups([[_rec(tmp_path / "c.jpg", b"x2"), _rec(tmp_path / "d.jpg", b"x2")]], []),
+        action="trash",
+        dry_run=True,
+        roots=[str(tmp_path)],
+        log_dir=tmp_path / "logs",
+    )
+    with pytest.raises(ValueError, match="executed trash or quarantine"):
+        undo_action(preview.log_path or "", dry_run=False)
+
+    receipt = json.loads(Path(action.log_path).read_text(encoding="utf-8"))
+    receipt["action"] = "isolate"
+    Path(action.log_path).write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="executed trash or quarantine"):
+        undo_action(action.log_path, dry_run=False)
 
 
 def test_receipts_list_show_and_prune(tmp_path: Path) -> None:

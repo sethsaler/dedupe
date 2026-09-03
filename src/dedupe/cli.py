@@ -20,7 +20,7 @@ from .actions import (
     format_bytes,
     isolate_groups,
     summarize_scan,
-    undo_quarantine,
+    undo_action,
 )
 from .engine import run_scan, run_scans_parallel
 from .grouping import apply_smart_select_all
@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     undo = sub.add_parser(
         "undo",
-        help="Restore an executed quarantine action from its JSON receipt",
+        help="Restore an executed trash or quarantine action from its JSON receipt",
     )
     undo.add_argument(
         "action_log",
@@ -594,7 +594,7 @@ def cmd_undo(args: argparse.Namespace) -> int:
     from .receipts import ReceiptError
 
     try:
-        result = undo_quarantine(
+        result = undo_action(
             args.action_log,
             dry_run=not args.execute,
             receipt_dir=getattr(args, "log_dir", None),

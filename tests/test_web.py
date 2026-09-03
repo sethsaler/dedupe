@@ -224,6 +224,150 @@ def test_mutating_api_rejects_cross_origin_and_plain_text(tmp_path: Path) -> Non
     assert valid.get_json()["success_count"] == 1
 
 
+def _fake_web_trash(dest_dir: Path):
+    """Redirect trash into a temp directory so tests don't pollute the real Trash."""
+
+    def _send_to_trash(src: Path, batch=None) -> Path:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target = dest_dir / src.name
+        n = 1
+        while target.exists():
+            target = dest_dir / f"{src.stem}_{n}{src.suffix}"
+            n += 1
+        import shutil
+
+        shutil.move(str(src), str(target))
+        return target
+
+    return _send_to_trash
+
+
+def _trash_exact_pair(client, headers: dict, scan_id: str) -> dict:
+    preview = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "kinds": "exact", "scan_id": scan_id},
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    executed = client.post(
+        "/api/action",
+        json={
+            "action": "trash",
+            "dry_run": False,
+            "kinds": "exact",
+            "scan_id": scan_id,
+            "preview_token": preview.get_json()["preview_token"],
+        },
+        headers=headers,
+    )
+    assert executed.status_code == 200
+    return executed.get_json()
+
+
+def test_action_undo_restores_an_executed_trash(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash")
+    )
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    executed = _trash_exact_pair(client, headers, scan_id)
+    assert executed["success_count"] == 1
+    trashed_path = next(item["path"] for item in executed["items"] if item["ok"])
+    assert not Path(trashed_path).exists()
+
+    preview = client.post(
+        "/api/action/undo",
+        json={"receipts": [executed["log_path"]], "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    assert preview.get_json()["success_count"] == 1
+
+    restored = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [executed["log_path"]],
+            "dry_run": False,
+            "scan_id": scan_id,
+            "preview_token": preview.get_json()["preview_token"],
+        },
+        headers=headers,
+    )
+    assert restored.status_code == 200
+    assert restored.get_json()["success_count"] == 1
+    assert Path(trashed_path).exists()
+    # The review is not re-populated: the moved member stays out of the group.
+    groups = client.get("/api/groups?kind=exact").get_json()["groups"]
+    assert all(
+        trashed_path not in {member["path"] for member in group["members"]}
+        for group in groups
+    )
+
+
+def test_action_undo_refuses_a_blocked_restore(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash")
+    )
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    executed = _trash_exact_pair(client, headers, scan_id)
+    item = next(item for item in executed["items"] if item["ok"])
+    # Something new now occupies the original path.
+    Path(item["path"]).write_bytes(b"blocking")
+
+    preview = client.post(
+        "/api/action/undo",
+        json={"receipts": [executed["log_path"]], "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert preview.get_json()["fail_count"] == 1
+
+    refused = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [executed["log_path"]],
+            "dry_run": False,
+            "scan_id": scan_id,
+            "preview_token": preview.get_json()["preview_token"],
+        },
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert "nothing was restored" in refused.get_json()["error"]
+    assert Path(item["destination"]).exists()
+
+
+def test_action_undo_validates_the_request(tmp_path: Path) -> None:
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    missing = client.post(
+        "/api/action/undo", json={"scan_id": scan_id}, headers=headers
+    )
+    assert missing.status_code == 400
+
+    unknown = client.post(
+        "/api/action/undo",
+        json={"receipts": ["no-such-receipt"], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert unknown.status_code == 404
+
+    stale = client.post(
+        "/api/action/undo",
+        json={"receipts": ["x"], "scan_id": "stale"},
+        headers=headers,
+    )
+    assert stale.status_code == 409
+
+
 def test_parallel_scan_streams_report_per_folder_and_tag_groups(tmp_path: Path) -> None:
     data = b"identical-binary-payload-for-exact-match!!!"
     folder_a = tmp_path / "a"

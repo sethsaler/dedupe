@@ -300,6 +300,77 @@ function setActionBusy(busy, label = "") {
   }
 }
 
+// —— Action undo (restore an executed Trash from its receipts) ——
+
+async function undoAction(receipts, { attempt = 0 } = {}) {
+  setActionBusy(true, "Verifying the restore against the files on disk…");
+  let preview;
+  try {
+    preview = await api("/api/action/undo", {
+      method: "POST",
+      body: JSON.stringify({ receipts, scan_id: state.scanId, dry_run: true }),
+    });
+  } catch (e) {
+    setActionBusy(false);
+    toast(e.message || String(e), "error");
+    return;
+  }
+  setActionBusy(false);
+
+  const restorable = (preview.items || []).filter((item) => !item.error);
+  const blocked = (preview.items || []).filter((item) => item.error);
+  const totalBytes = restorable.reduce((sum, item) => sum + (item.size || 0), 0);
+  const blockedNote = blocked.length
+    ? `<p><strong>${blocked.length} cannot be restored:</strong> ${escapeHtml(blocked[0].error)} (${escapeHtml(basename(blocked[0].destination || blocked[0].path))})${blocked.length > 1 ? ` · and ${blocked.length - 1} more` : ""}</p><p>Nothing restores while any file is blocked — resolve it, then press Undo again.</p>`
+    : "";
+  const ok = await confirmModal({
+    title: `Restore ${restorable.length} file${restorable.length === 1 ? "" : "s"}?`,
+    body: `<div class="review-sheet"><p><strong>${restorable.length} files · ${formatBytes(totalBytes)}</strong> return to their original locations on disk.</p>${blockedNote}<p>The current review is not re-populated — restored files reappear on the next scan.</p></div>`,
+    confirmLabel: "Restore files",
+    danger: false,
+    validitySeconds: Number(preview.preview_expires_in) || null,
+  });
+  if (ok === "expired") {
+    if (attempt >= MAX_PREVIEW_REFRESHES) {
+      toast("Undo preview keeps expiring — press Undo again when ready", "error");
+      return;
+    }
+    toast("Undo preview expired — re-checking the files…");
+    return undoAction(receipts, { attempt: attempt + 1 });
+  }
+  if (!ok) return;
+
+  setActionBusy(true, "Restoring files…");
+  try {
+    const res = await api("/api/action/undo", {
+      method: "POST",
+      body: JSON.stringify({
+        receipts,
+        scan_id: state.scanId,
+        dry_run: false,
+        preview_token: preview.preview_token,
+      }),
+    });
+    toast(
+      res.fail_count
+        ? `Restored ${res.success_count}, ${res.fail_count} failed`
+        : `Restored ${res.success_count} file${res.success_count === 1 ? "" : "s"} to their original locations`,
+      res.fail_count ? "error" : "ok",
+    );
+    setActionBusy(false);
+  } catch (e) {
+    const stale = e.data?.preview_stale
+      || /preview expired|selection changed|fresh preview/i.test(e.message);
+    if (stale && attempt < MAX_PREVIEW_REFRESHES) {
+      // Never restore on a stale token: re-run the dry run and re-confirm.
+      toast(`${e.message} — re-checking now…`);
+      return undoAction(receipts, { attempt: attempt + 1 });
+    }
+    setActionBusy(false);
+    toast(e.message || String(e), "error");
+  }
+}
+
 async function runDelete(scope, options = {}) {
   const { attempt = 0, notice = "" } = options;
   const scopeLabel = scopeLabelFor(scope);
@@ -415,7 +486,18 @@ async function runDelete(scope, options = {}) {
         msg += ` · ${basename(failed.path)}: ${failed.error}`;
       }
     }
-    toast(msg, res.fail_count ? "" : "ok");
+    // Undo restores files to their original paths from the action's
+    // receipts; the toast is sticky so the restore never times out.
+    const undoReceipts = res.log_paths?.length
+      ? res.log_paths
+      : (res.log_path ? [res.log_path] : []);
+    toast(
+      msg,
+      res.fail_count ? "" : "ok",
+      undoReceipts.length
+        ? { actionLabel: "Undo", onAction: () => undoAction(undoReceipts) }
+        : {},
+    );
     await loadGroups();
     await refreshStatus();
     setActionBusy(false);

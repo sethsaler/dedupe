@@ -24,7 +24,7 @@ from flask import (
     send_file,
 )
 
-from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups
+from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups, undo_action
 from ..cache import HashCache
 from ..engine import run_scan, run_scans_parallel
 from ..grouping import (
@@ -55,7 +55,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 20
+WEB_API_VERSION = 21
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Independent review flows whose cards support direct per-file Trash + undo.
@@ -1977,6 +1977,94 @@ def create_app(
                     payload["preview_token"] = preview_token
                     payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
             return jsonify(payload)
+        finally:
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/action/undo")
+    def api_action_undo():
+        """Restore an executed trash/quarantine action from its receipt(s).
+
+        Files return to their original paths on disk; the current review is
+        not re-populated — restored files resurface on the next scan. The
+        dry-run issues a preview token bound to the exact restorable set, and
+        the execute preflights every receipt again before moving anything, so
+        a blocked item refuses the whole restore across all receipts.
+        """
+        from ..receipts import ReceiptError
+
+        data = request.get_json(silent=True) or {}
+        receipts = data.get("receipts") or []
+        if isinstance(receipts, str):
+            receipts = [receipts]
+        receipts = [str(reference) for reference in receipts]
+        dry_run = bool(data.get("dry_run", True))
+        if not receipts:
+            return jsonify({"error": "receipts required"}), 400
+
+        with lock:
+            if state["scanning"]:
+                return jsonify({"error": "wait for the scan to finish or cancel it"}), 409
+            if state["acting"]:
+                return jsonify({"error": "another file action is already running"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            state["acting"] = True
+
+        try:
+            previews = [
+                undo_action(reference, dry_run=True) for reference in receipts
+            ]
+            restorable = tuple(sorted(
+                item.destination for preview in previews for item in preview.items
+                if item.ok and item.destination
+            ))
+            manifest = (state["scan_id"], "undo", tuple(sorted(receipts)), None, restorable)
+            if dry_run:
+                result = ActionResult(dry_run=True, action="undo")
+                result.items = [item for preview in previews for item in preview.items]
+                payload = result.to_dict()
+                with lock:
+                    payload["preview_token"] = issue_preview_token(manifest)
+                payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
+                return jsonify(payload)
+
+            with lock:
+                verdict = consume_preview_token(data.get("preview_token"), manifest)
+                if verdict != "valid":
+                    return jsonify(stale_preview_payload(verdict)), 409
+            # Cross-receipt all-or-nothing: the manifest only matches the
+            # current restorable set, but the files could have moved since the
+            # dry run — re-verify before moving anything.
+            blocked = [
+                item
+                for preview in previews
+                for item in preview.items
+                if not item.ok
+            ]
+            if blocked:
+                first = blocked[0]
+                return jsonify(
+                    {
+                        "error": f"cannot undo: {first.error} ({first.path}) — "
+                        "nothing was restored",
+                        "preview_stale": False,
+                    }
+                ), 400
+            executed = [
+                undo_action(reference, dry_run=False) for reference in receipts
+            ]
+            result = ActionResult(dry_run=False, action="undo")
+            result.items = [item for run in executed for item in run.items]
+            payload = result.to_dict()
+            payload["log_paths"] = [run.log_path for run in executed if run.log_path]
+            return jsonify(payload)
+        except ReceiptError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except OSError as exc:
+            return jsonify({"error": str(exc)}), 400
         finally:
             with lock:
                 state["acting"] = False
