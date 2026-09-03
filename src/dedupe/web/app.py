@@ -7,6 +7,7 @@ import os
 import secrets
 import shutil
 import signal
+import sqlite3
 import threading
 import time
 import webbrowser
@@ -819,7 +820,9 @@ def create_app(
             try:
                 removed = discard_review_session(review_session_path)
             except OSError as exc:
-                return jsonify({"error": str(exc)}), 500
+                # A filesystem failure, not a server bug — same status the
+                # other file-touching endpoints use for OSError.
+                return jsonify({"error": str(exc)}), 400
             old_path = state["review_session"].path
             state["review_session"] = ReviewSessionLoad(path=old_path)
             state["result"] = None
@@ -1436,7 +1439,7 @@ def create_app(
                 roots=roots,
                 safety_groups=safety_groups,
             )
-            manifest = (state["scan_id"], "trash", "non-human", None, tuple(sorted(
+            manifest = (state["scan_id"], "trash", group.kind.value, None, tuple(sorted(
                 item.path for item in preview.items if item.ok
             )))
             if dry_run:
@@ -1662,12 +1665,12 @@ def create_app(
                 state["paths_version"] += 1
             persist_result()
             return jsonify({"ok": True, "marked_count": len(records)})
-        except Exception as exc:
+        except (OSError, sqlite3.Error) as exc:
             for record, status, detector, signature in prior:
                 record.human_detection_status = status
                 record.human_detector = detector
                 record.human_detection_signature = signature
-            return jsonify({"error": f"could not save manual reviews: {exc}"}), 500
+            return jsonify({"error": f"could not save manual reviews: {exc}"}), 400
         finally:
             if cache is not None:
                 cache.close()
@@ -1710,8 +1713,8 @@ def create_app(
                 state["paths_version"] += 1
             persist_result()
             return jsonify({"ok": True, "pair_count": pair_count})
-        except Exception as exc:
-            return jsonify({"error": f"could not save distinct review: {exc}"}), 500
+        except (OSError, sqlite3.Error) as exc:
+            return jsonify({"error": f"could not save distinct review: {exc}"}), 400
         finally:
             if cache is not None:
                 cache.close()

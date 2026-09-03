@@ -3,6 +3,7 @@
 import json
 import os
 import platform
+import sqlite3
 import subprocess
 import threading
 import time
@@ -2720,6 +2721,55 @@ def test_review_session_resume_and_discard_endpoints(tmp_path: Path) -> None:
         "/api/review-session/resume", json={}, headers={"X-Dedupe-Token": token}
     )
     assert missing.status_code == 404
+
+
+def test_review_session_discard_filesystem_failure_is_a_client_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = create_app(
+        initial_result=ScanResult(roots=[], files=[], groups=[]),
+        review_session_path=tmp_path / "state" / "review-session.json",
+    )
+    monkeypatch.setattr(
+        "dedupe.web.app.discard_review_session",
+        lambda path: (_ for _ in ()).throw(OSError("read-only filesystem")),
+    )
+    response = app.test_client().delete(
+        "/api/review-session",
+        content_type="application/json",
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+    assert response.status_code == 400
+    assert "read-only filesystem" in response.get_json()["error"]
+
+
+def test_mark_distinct_cache_failure_is_a_structured_client_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = _result(tmp_path)
+    result.groups = build_groups([], [result.files])
+    group = result.groups[0]
+    app = create_app(result)
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hashes.sqlite3")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    monkeypatch.setattr(
+        HashCache,
+        "mark_distinct",
+        lambda self, records: (_ for _ in ()).throw(sqlite3.OperationalError("locked")),
+    )
+
+    response = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert "could not save distinct review" in response.get_json()["error"]
+    # The failed write leaves the review untouched.
+    assert len(client.get("/api/groups?kind=similar").get_json()["groups"]) == 1
 
 
 def test_status_reports_capabilities_and_review_health(tmp_path: Path) -> None:
