@@ -611,10 +611,15 @@ def run_scan(
             started_at = time.monotonic()
             try:
 
-                def human_progress(phase: str, processed: int, total: int) -> None:
+                def human_progress(
+                    phase: str,
+                    processed: int,
+                    total: int,
+                    message: str | None = None,
+                ) -> None:
                     _stage_progress(
                         "human",
-                        f"Person detection {processed}/{total}",
+                        message or f"Person detection {processed}/{total}",
                         processed,
                         total,
                     )

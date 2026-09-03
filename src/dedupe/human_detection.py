@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import threading
 from collections.abc import Callable
@@ -27,12 +28,45 @@ from .similar_video import (
     probe_video,
 )
 
-ProgressCb = Callable[[str, int, int], None]
+ProgressCb = Callable[[str, int, int, str | None], None]
 
 DEFAULT_CONFIDENCE = 0.25
 DEFAULT_BACKEND = "opencv"
 DEFAULT_PHOTON_MODEL = "moondream3.1-9B-A2B"
 HUMAN_BACKENDS = ("opencv", "photon", "ensemble")
+
+#: Models that have started successfully on this machine. The Moondream SDK
+#: downloads ~10 GB on first use, inside its own call, with no progress hook —
+#: the marker lets the scan narrate that wait only when it is actually coming.
+PHOTON_READY_FILENAME = "photon-ready.json"
+
+
+def _photon_ready_path() -> Path:
+    return Path.home() / ".cache" / "dedupe" / PHOTON_READY_FILENAME
+
+
+def photon_model_ready(model_name: str) -> bool:
+    """True when this Photon model has started successfully here before."""
+    try:
+        data = json.loads(_photon_ready_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return model_name in set(data.get("models") or [])
+
+
+def mark_photon_model_ready(model_name: str) -> None:
+    path = _photon_ready_path()
+    try:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            models = set(data.get("models") or [])
+        except (OSError, ValueError):
+            models = set()
+        models.add(model_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"models": sorted(models)}), encoding="utf-8")
+    except OSError:
+        pass
 DETECT_MAX_SIDE = 960
 YUNET_SECOND_PASS_MAX_SIDE = 480
 YUNET_CLOSE_UP_MAX_SIDE = 320
@@ -605,11 +639,28 @@ def find_no_human_files(
             for detector in detectors:
                 detector.close()
     elif pending:
+        effective_model = photon_model.strip() or DEFAULT_PHOTON_MODEL
+        if (
+            normalized_backend in ("photon", "ensemble")
+            and progress
+            and not photon_model_ready(effective_model)
+        ):
+            # The SDK's first run downloads ~10 GB inside create_person_detector
+            # with no progress of its own; say so instead of sitting silent.
+            progress(
+                "human-detection",
+                len(cached),
+                len(candidates),
+                "Preparing the Photon model — first use downloads ~10 GB, "
+                "which can take a long time…",
+            )
         detector = create_person_detector(
             backend,
             confidence=confidence,
             photon_model=photon_model,
         )
+        if normalized_backend in ("photon", "ensemble"):
+            mark_photon_model_ready(effective_model)
         try:
             for index, record in enumerate(pending, start=len(cached) + 1):
                 if cancelled and cancelled():

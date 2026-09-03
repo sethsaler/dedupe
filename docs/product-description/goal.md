@@ -39,7 +39,7 @@ From `foundations/scan-pipeline.md`:
 - One-pool scan dedupes across folders; parallel-stream scan (per-folder) never does, and every stream's groups carry their source root.
 - Photos.app library roots are refused with an export message. Missing roots error and are skipped.
 - Corrupt files never abort a scan; failures go to per-stage diagnostics.
-- Backends: opencv (default; YuNet presence 0.35 + flip/tiles + INRIA/Daimler HOG), photon (≈10 GB opt-in download; woman/girl/person/face), ensemble. A counted face (especially female) vetoes Non-Human. YuNet missing/corrupt → Non-Human fails closed (no candidates surfaced).
+- Backends: opencv (default; YuNet presence 0.35 + flip/tiles + INRIA/Daimler HOG), photon (≈10 GB opt-in download; woman/girl/person/face; first use per model is narrated in the progress line and remembered in `~/.cache/dedupe/photon-ready.json`), ensemble. A counted face (especially female) vetoes Non-Human. YuNet missing/corrupt → Non-Human fails closed (no candidates surfaced).
 
 From `foundations/duplicate-group.md`:
 - Kinds: exact, similar (keep-one policy); low_resolution, random_review, no_humans, faces, all_files (independent-candidate policy). All-files groups are built from the scan inventory when results load — one per scanned folder, path-ordered — and carry no selection semantics (bulk operations and selection rules never touch them).

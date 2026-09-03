@@ -680,3 +680,77 @@ def test_pil_frames_applies_exif_orientation_after_draft(tmp_path: Path) -> None
 
     assert len(frames) == 1
     assert frames[0].shape == (200, 100, 3)
+
+
+class _PhotonFakeDetector:
+    backend = "photon:test"
+
+    def score(self, _frame):
+        return 0.0
+
+    def close(self):
+        return None
+
+
+def test_photon_first_use_announces_the_download_then_marks_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.human_detection as hd
+
+    monkeypatch.setattr(hd, "_photon_ready_path", lambda: tmp_path / "photon-ready.json")
+    monkeypatch.setattr(
+        hd, "create_person_detector", lambda *_args, **_kwargs: _PhotonFakeDetector()
+    )
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (40, 40), "white").save(path)
+    record = inventory([path])[0]
+
+    assert hd.photon_model_ready(hd.DEFAULT_PHOTON_MODEL) is False
+    messages: list[tuple] = []
+    result = find_no_human_files(
+        [record], backend="photon", progress=lambda *args: messages.append(args)
+    )
+
+    assert result == [record]
+    announced = [m for m in messages if len(m) > 3 and m[3] and "10 GB" in m[3]]
+    assert announced, messages
+    assert hd.photon_model_ready(hd.DEFAULT_PHOTON_MODEL) is True
+
+    # With the marker written, a later scan does not narrate a download.
+    messages.clear()
+    fresh = inventory([path])[0]
+    find_no_human_files(
+        [fresh], backend="photon", progress=lambda *args: messages.append(args)
+    )
+    assert not [m for m in messages if len(m) > 3 and m[3] and "10 GB" in m[3]]
+
+
+def test_photon_ready_marker_tolerates_a_corrupt_file(tmp_path: Path, monkeypatch) -> None:
+    import dedupe.human_detection as hd
+
+    marker = tmp_path / "photon-ready.json"
+    marker.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(hd, "_photon_ready_path", lambda: marker)
+    assert hd.photon_model_ready(hd.DEFAULT_PHOTON_MODEL) is False
+
+
+def test_opencv_backend_never_narrates_a_photon_download(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.human_detection as hd
+
+    monkeypatch.setattr(hd, "_photon_ready_path", lambda: tmp_path / "photon-ready.json")
+    monkeypatch.setattr(
+        hd, "create_person_detector", lambda *_args, **_kwargs: _PhotonFakeDetector()
+    )
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (40, 40), "white").save(path)
+    record = inventory([path])[0]
+    messages: list[tuple] = []
+
+    find_no_human_files(
+        [record], backend="opencv", workers=1, progress=lambda *args: messages.append(args)
+    )
+
+    assert not [m for m in messages if len(m) > 3 and m[3]]
+    assert hd.photon_model_ready(hd.DEFAULT_PHOTON_MODEL) is False
