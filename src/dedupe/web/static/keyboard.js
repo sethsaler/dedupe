@@ -148,7 +148,7 @@ document.addEventListener("keydown", async (e) => {
     }
   } else if (e.key === " " && state.currentId) {
     const cards = [...document.querySelectorAll("#members .card")];
-    const card = cards[state.memberFocus] || cards[0];
+    const card = document.querySelector("#members .card.focused") || cards[state.memberFocus] || cards[0];
     if (card) {
       const cb = card.querySelector(".sel-cb");
       if (cb) {

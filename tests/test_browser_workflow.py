@@ -1154,10 +1154,14 @@ def test_stale_preview_re_previews_on_confirm(
     tab2.locator("#results").wait_for(state="visible", timeout=10_000)
     tab2.locator(".group-item").first.click()
     tab2.locator("#members .card").first.wait_for(state="visible")
+    selected_index = tab2.evaluate(
+        "[...document.querySelectorAll('#members .card')]"
+        ".findIndex((card) => card.classList.contains('selected'))"
+    )
     tab2.locator("#members .card.selected .sel-cb").click()
     expect(tab2.locator("#members .sel-cb:checked")).to_have_count(0)
     expect(tab2.locator("#groupSelectionSummary")).to_have_text("0 of 2 selected for removal")
-    tab2.locator("#members .sel-cb").first.click()
+    tab2.locator("#members .sel-cb").nth(1 - selected_index).click()
     expect(tab2.locator("#members .sel-cb:checked")).to_have_count(1)
     expect(tab2.locator("#groupSelectionSummary")).to_have_text("1 of 2 selected for removal")
 

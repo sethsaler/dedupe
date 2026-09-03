@@ -10,6 +10,7 @@ const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
 
 // Focus is moved into the lightbox on open and restored on close.
 let previousFocus = null;
+let previousFocusPath = null;
 
 // Full-resolution zoom state (images only); panning is the zoomed stack's
 // native scroll, driven by drag.
@@ -28,6 +29,10 @@ function fullUrl(path) {
 function openLightbox(index) {
   if (!state.lightboxItems.length) return;
   previousFocus = document.activeElement;
+  previousFocusPath = (
+    previousFocus?.closest?.("#members .card")
+    || document.querySelector("#members .card.focused")
+  )?.dataset.path || null;
   state.lightboxIndex = Math.max(0, Math.min(index, state.lightboxItems.length - 1));
   updateLightbox();
   $("lightbox").hidden = false;
@@ -40,8 +45,15 @@ function closeLightbox() {
   $("lbVideo").removeAttribute("src");
   $("lbVideo").load();
   $("lightbox").hidden = true;
-  if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
+  const refreshedMember = previousFocusPath
+    ? $("members").querySelector(
+      `.card[data-path="${CSS.escape(previousFocusPath)}"] .thumb-wrap`,
+    )
+    : null;
+  const restoreFocus = refreshedMember || (previousFocus?.isConnected ? previousFocus : null);
+  restoreFocus?.focus();
   previousFocus = null;
+  previousFocusPath = null;
 }
 
 function stepLightbox(delta) {

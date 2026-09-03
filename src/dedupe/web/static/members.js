@@ -173,21 +173,38 @@ function updateDetailMeta(g) {
 
 async function selectGroup(id, { silent = false } = {}) {
   const myToken = ++state.selectToken;
+  const selectionStartFocus = document.activeElement;
+  const preserveMemberFocus = silent && state.currentId === id;
   state.currentId = id;
   rememberFocusedGroup(id);
-  state.memberFocus = 0;
-  state.memberPage = 0;
-  state.trashedInPlace.clear();
+  if (!preserveMemberFocus) {
+    state.memberFocus = 0;
+    state.memberPage = 0;
+    state.trashedInPlace.clear();
+  }
   ensureGroupVisible(id);
   markGroupListActive(id);
   const g = await api(`/api/groups/${id}`);
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
   if (state.selectToken !== myToken || g.id !== state.currentId) return;
+  // A scan-completion refresh can finish while the user is moving through
+  // member cards. Preserve the latest position and real DOM focus instead of
+  // replacing the focused button underneath the next keystroke.
+  const focusedMemberCard = preserveMemberFocus
+    ? document.activeElement?.closest?.("#members .card")
+    : null;
+  const focusedMemberPath = focusedMemberCard?.dataset.path;
+  if (focusedMemberCard) {
+    const focusedIndex = Number(focusedMemberCard.dataset.index);
+    if (Number.isFinite(focusedIndex)) state.memberFocus = focusedIndex;
+  }
   if (isDecisionReview(g)) {
     const reviewed = new Set(g.reviewed_paths || []);
-    const firstUnreviewed = (g.members || []).findIndex((member) => !reviewed.has(member.path));
-    state.memberFocus = firstUnreviewed >= 0 ? firstUnreviewed : 0;
+    if (!preserveMemberFocus) {
+      const firstUnreviewed = (g.members || []).findIndex((member) => !reviewed.has(member.path));
+      state.memberFocus = firstUnreviewed >= 0 ? firstUnreviewed : 0;
+    }
   }
   const idx = state.groups.findIndex((group) => group.id === g.id);
   if (idx >= 0) state.groups[idx] = g;
@@ -235,10 +252,21 @@ async function selectGroup(id, { silent = false } = {}) {
   $("btnSelectSuggested").textContent =
     isIndependentReview(g) ? "Select reviewed candidates" : "Use suggested";
   renderMembers(g);
+  if (focusedMemberPath) {
+    const focusedCard = $("members").querySelector(
+      `.card[data-path="${CSS.escape(focusedMemberPath)}"]`,
+    );
+    if (focusedCard) {
+      $("members").querySelectorAll(".card").forEach((card) => card.classList.remove("focused"));
+      focusedCard.classList.add("focused");
+      focusedCard.querySelector(".thumb-wrap")?.focus({ preventScroll: true });
+    }
+  }
   // keep list item in view; explicit (non-silent) selection moves focus too,
-  // so j/k navigation gives screen readers the group's announcement
+  // so j/k navigation gives screen readers the group's announcement. Do not
+  // steal focus back if the user reached a member or overlay while we fetched.
   const active = document.querySelector(`.group-item[data-id="${id}"]`);
-  if (active && !silent) {
+  if (active && !silent && document.activeElement === selectionStartFocus) {
     active.scrollIntoView({ block: "nearest" });
     active.focus({ preventScroll: true });
   }
