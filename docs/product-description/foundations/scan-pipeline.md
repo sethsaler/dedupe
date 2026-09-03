@@ -80,7 +80,7 @@ Groups stream to the UI the moment each one is finalized — the sidebar fills i
 
 ## Cancellation and failure
 
-Cancellation is checked between stages and inside every worker pool; a cancelled scan stops with phase `cancelled`, keeps whatever groups were already published, and writes nothing further. A scan is [safe to interrupt](../glossary.md) until an action runs against its results — the scan itself only writes to the hash cache at the end.
+Cancellation is checked between stages and inside every worker pool; a cancelled scan stops with phase `cancelled`, keeps whatever groups were already published, and writes nothing further — except the hash cache: the work each stage completed before the cancel is persisted as the cancel propagates, so a rerun reuses it. A scan is [safe to interrupt](../glossary.md) until an action runs against its results.
 
 A single corrupt or unreadable file never aborts the scan; this is deliberate, because media libraries always contain damaged files. Each failure is recorded on the file's record and summarized per stage in the result's diagnostics (attempted, succeeded, failed, skipped, duration, up to ten warnings per stage). Missing ffmpeg downgrades the video stage to a warning; an unavailable cache downgrades to running without one. Root-level problems (missing folder, Photos library) are reported as errors in the result.
 

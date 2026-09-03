@@ -27,7 +27,7 @@ The parser accepts `--port N` (default 8765), `--no-browser`, and `--load JSON` 
 
 ### Exit immediately
 
-`--help` prints the subcommand help. A port already in use fails at server bind time; the process reports the OSError and exits — the user sees a traceback rather than a friendly "port busy" message.
+`--help` prints the subcommand help. A port already in use is reported before anything else prints: `error: port 8765 is not available (Address already in use) — is another Dedupe UI already running?` on stderr, exit 2. (Until 2026-09-03 this surfaced as werkzeug's two-line notice and an uncaught `SystemExit` — see [bug-triage](../bug-triage.md) B-07.) One subtlety: the probe and the server bind `127.0.0.1` specifically, so a process listening on the *wildcard* address (e.g. `python3 -m http.server 8765` at defaults) does not count as "in use" — the loopback-specific bind still succeeds and the UI works.
 
 ### Begin running
 
@@ -63,7 +63,7 @@ The exit is clean: the launcher's Terminal window closes with the process.
 | The user aborts explicitly (Ctrl+C) | The process dies before binding. | The server stops at once; in-flight requests die; state not saved to the session file is lost. |
 | The user does something else mid-way | Not applicable. | The server exists to be used from the browser; multiple tabs share one server and one state, and the shutdown waits for the *last* tab. |
 | A clean complete happens elsewhere | Not applicable. | A completed action or scan is state the server holds; nothing else runs alongside. |
-| The environment fails | A busy port exits with an error at startup. | Server-side errors surface in the browser as error payloads; the process keeps serving. |
+| The environment fails | A busy port prints `error: port … is not available …` and exits 2 before the URL line prints. | Server-side errors surface in the browser as error payloads; the process keeps serving. |
 | The page or process goes away | No effect. | Closing the last tab triggers the graceful self-shutdown described above; killing the process loses in-memory state (preview tokens, an unsaved scan, any change in flight). |
 | Something else changes the target | No effect. | File changes are handled by revalidation at action time, not by the server itself. |
 | The input channel changes | stdin is never read. Closing the terminal sends SIGHUP and the process dies. | Same. |

@@ -107,7 +107,7 @@ The lightbox has no apply step; it ends. Esc closes it, returning to the group l
 ## Open questions and verification
 
 - The exact flicker-compare behavior (which two views it alternates, whether it holds while pressed, its labeling) is read from the control's event wiring in `lightbox.js`, not confirmed by hand.
-- Video members without a cached preview: the preview endpoint returns "no preview" for videos with no cached still — how the lightbox presents that state (placeholder vs blank) should be checked in the running product.
+- (Answered 2026-09-03.) The lightbox never depends on a cached still for video: it streams the video itself from `/api/media`, so there is no placeholder state in the overlay. The "No preview" state exists on *cards*: a thumbnail request that fails swaps the image for a text placeholder (`thumb-fallback`).
 
 Navigation wraps at both ends, neighboring previews are prefetched after every navigation, and a `current / total` position indicator sits under the preview — all three confirmed in `lightbox.js` (the wrap arithmetic, `prefetchLightboxNeighbors`, and the counter element) and covered by the browser workflow tests.
 

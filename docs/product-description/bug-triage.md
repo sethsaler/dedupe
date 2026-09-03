@@ -4,7 +4,7 @@ A consolidated list of the defects and inconsistencies that the feature document
 
 ## Summary
 
-Fifty-odd open questions across twenty-one documents collapsed to five entries after merging, plus one user-reported entry (B-06). Three are medium: one loses a promised undo path (the per-candidate restore), one meets every CLI user who presses Ctrl+C, and one made the decision reviews' staged deletions impossible to execute. Three are low — two polish issues in the receipts and doctor commands, one copy decision. One entry is a product call rather than a fix. The common thread in the mediums: paths the product promises that the implementation did not actually offer.
+Fifty-odd open questions across twenty-one documents collapsed to five entries after merging, plus one user-reported entry (B-06). Three are medium: one loses a promised undo path (the per-candidate restore), one meets every CLI user who presses Ctrl+C, and one made the decision reviews' staged deletions impossible to execute. Three are low — two polish issues in the receipts and doctor commands, one copy decision. One entry is a product call rather than a fix. The common thread in the mediums: paths the product promises that the implementation did not actually offer. The 2026-09-03 verification passes added four more entries (B-07 through B-10), all fixed in the same pass: two CLI output gaps, one cancel-path crash with a deadlock sibling, and one focus-trap race.
 
 | ID | Title | Severity | Area | Decision needed | Issue |
 | --- | --- | --- | --- | --- | --- |
@@ -14,6 +14,10 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 | B-04 | `doctor` prints the keep-decisions label as "Keep_Decisions" | low | cli | fix (done) | [#6](https://github.com/sethsaler/dedupe/issues/6) |
 | B-05 | The review-quarantine split of Trash is only explained after the fact | low | ui | product call (done: keep one button, lead with the split) | [#7](https://github.com/sethsaler/dedupe/issues/7) |
 | B-06 | Staged Low-res/Random deletions had no action entry point in the UI | medium | ui (action bar) | fix (done) | — |
+| B-07 | A busy UI port surfaced werkzeug's notice + an uncaught `SystemExit` | low | cli (ui) | fix (done) | — |
+| B-08 | `isolate` printed no per-item failure reasons on an all-or-nothing cancel | low | cli (isolate) | fix (done) | — |
+| B-09 | Cancelling a parallel-streams scan crashed the merge loop (`UnboundLocalError`) | medium | engine | fix (done) | — |
+| B-10 | Fast Tabbing could escape an overlay's focus trap mid-repaint | low | ui (a11y) | fix (done) | — |
 
 ## Medium
 
@@ -92,3 +96,53 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 - **Raised by:** user report, 2026-09-02; [ui/action-sheet.md](ui/action-sheet.md), [ui/low-res-review.md](ui/low-res-review.md#while-extended), [ui/random-review.md](ui/random-review.md#while-extended)
 - **Status:** Fixed in the working tree on 2026-09-02 (uncommitted at writing): a third action-bar button **Delete All Selected Low-res + Random** opens the Trash sheet scoped to review suggestions, leading with the `_Dedupe Quarantine` destination and a **Move to Quarantine** confirm; the decision-review summary line now names the button. Covered by `test_bulk_action_ui_separates_exact_matches_from_similars` and the extended e2e `test_low_resolution_review_uses_left_delete_and_right_keep`. Checklist item SHEET-01 has been rewritten to match.
 - **Issue:** none filed (reported directly).
+
+## Found by the 2026-09-03 verification passes (scripted + e2e)
+
+### B-07: A busy UI port surfaced werkzeug's notice + an uncaught `SystemExit`
+
+- **Where the user meets it:** Starting `dedupe ui` while something else already listens on the port (e.g. a previous Dedupe UI that never stopped).
+- **What happens / what was expected:** werkzeug printed "Address already in use / Port … is in use by another program…" and raised `SystemExit(1)`, which no layer caught. Expected ([cli/ui-command.md](cli/ui-command.md#exit-immediately), checklist UICMD-03): a deliberate error and exit. A scripting subtlety made this worse to pin down: `python3 -m http.server 8765` (the checklist's blocker) binds the *wildcard* address, and the UI binds `127.0.0.1` specifically — with `SO_REUSEADDR` on both, the two binds coexist on macOS and the UI actually works; only a loopback-bound blocker reproduces the failure.
+- **Reproduce:** 1. `python3 -m http.server --bind 127.0.0.1 8765`. 2. `dedupe ui`.
+- **Why (from the code):** `werkzeug.serving.make_server` converts the bind `OSError` into a printed message plus `SystemExit`; `cli.py` `cmd_ui` called `run_app` with no guard, and `main()` catches only `KeyboardInterrupt`.
+- **Severity:** `low`. Nothing damaged; an ugly failure on a routine condition.
+- **Decision needed:** `fix` (done). `cmd_ui` now probes the port with a plain bind (same `SO_REUSEADDR` semantics) before starting and prints `error: port N is not available (Address already in use) — is another Dedupe UI already running?`, exit 2; `run_app` also binds before printing the URL line so the URL never prints for a server that failed to start.
+- **Raised by:** checklist UICMD-03, scripted pass 2026-09-03.
+- **Status:** Fixed in the working tree on 2026-09-03; covered by `test_ui_on_a_busy_port_exits_cleanly`.
+- **Issue:** none filed (found and fixed in the same pass).
+
+### B-08: `isolate` printed no per-item failure reasons on an all-or-nothing cancel
+
+- **Where the user meets it:** `dedupe isolate results.json --execute` when a scanned file changed afterwards.
+- **What happens / what was expected:** The command printed `EXECUTED isolate: 0 ok, 13 failed` and a log path — but not *why*, although [cli/isolate.md](cli/isolate.md#begin-running) promises "every item is reported failed, either with its own reason or with 'isolate cancelled because another file failed preflight'" and `dedupe undo` prints exactly such `failed:` lines. The reasons existed only inside the receipt JSON.
+- **Reproduce:** 1. Scan a duplicate pair with `--json out.json`. 2. Modify one file. 3. `dedupe isolate out.json --execute`.
+- **Why (from the code):** `cli.py` `cmd_isolate` printed the summary, review root, and folder list but never iterated `action_result.items` for failures.
+- **Severity:** `low`. The cancel itself was correct (nothing placed); the user just could not see the reason without opening the receipt.
+- **Decision needed:** `fix` (done). `cmd_isolate` now prints `  failed: {path}: {reason}` per failed item, matching `cmd_undo`.
+- **Raised by:** checklist ISOLATE-04, scripted pass 2026-09-03.
+- **Status:** Fixed in the working tree on 2026-09-03; covered by `test_isolate_prints_per_item_failure_reasons`.
+- **Issue:** none filed (found and fixed in the same pass).
+
+### B-09: Cancelling a parallel-streams scan crashed the merge loop (`UnboundLocalError`)
+
+- **Where the user meets it:** Pressing Cancel (or Ctrl+C, after the cooperative-cancel fix) on a multi-folder scan with parallel streams on — the default whenever streams are enabled.
+- **What happens / what was expected:** The scan worker died with `UnboundLocalError: cannot access local variable 'sub'`, surfacing a sticky error toast with that Python-internals message. The previous results were still restored (the cancel wrapper caught it), so the visible harm was the cryptic error instead of a clean "Scan cancelled". Expected: a clean cancel.
+- **Reproduce:** 1. Start a default (parallel-streams) scan over a large folder in the UI. 2. Press Cancel mid-run. Surfaced mechanically by the e2e row SCANSET-04 (`test_scan_streams_groups_and_cancel_restores_previous`).
+- **Why (from the code):** `engine.py` `run_scans_parallel` caught `InterruptedError` from a stream future and set `interrupted = True` but did not `continue`, then tried to merge the unbound `sub`. A sibling hazard existed in `run_scan`'s dimensions stage, which set its done-event in a `finally` that did not cover its own cancel check — a cancel there hung the review stage's wait and deadlocked the stage pool (found by the scripted Ctrl+C pass on the CLI, which had just gained cooperative cancel).
+- **Severity:** `medium`. A routine action (cancel) produced a crash message; the deadlock variant could strand a scan indefinitely.
+- **Decision needed:** `fix` (done). The merge loop skips cancelled futures; the dimensions stage's `finally` now covers its waits and cancel check; cancelled scans also persist completed stage work to the hash cache as the cancel propagates, so a rerun reuses it (the behavior [scan-pipeline.md](foundations/scan-pipeline.md#cancellation-and-failure) always promised).
+- **Raised by:** checklist SCANSET-04 / SCANP-09, scripted + e2e passes, 2026-09-03.
+- **Status:** Fixed in the working tree on 2026-09-03; covered by `test_parallel_streams_cancel_raises_interrupted_not_unbound` (fails without the fix, verified by reverting) and `test_run_scan_cancel_midway_raises_promptly`.
+- **Issue:** none filed (found and fixed in the same pass).
+
+### B-10: Fast Tabbing could escape an overlay's focus trap mid-repaint
+
+- **Where the user meets it:** Holding or tapping Tab rapidly inside the lightbox or the help sheet.
+- **What happens / what was expected:** Very occasionally, focus landed on the page behind the overlay. Expected ([lightbox.md](ui/lightbox.md#start), checklist LIGHTBOX-03): Tab is trapped while the overlay is open, always.
+- **Reproduce:** Mechanical only: the e2e row LIGHTBOX-03 failed in some full-suite runs, never alone. A re-render that momentarily hides the overlay's controls empties the trap's focusable set; the un-prevented Tab then falls through to the browser's native focus order.
+- **Why (from the code):** `trapTabKey` (static/util.js) returns false when it finds nothing to cycle, and the keyboard handlers in static/keyboard.js did not `preventDefault` on that path.
+- **Severity:** `low`. Rare, timing-dependent, and self-correcting on the next Tab — but focus traps are an a11y promise.
+- **Decision needed:** `fix` (done). Both overlay Tab handlers now swallow the key when the trap has nothing to cycle.
+- **Raised by:** checklist LIGHTBOX-03 flake, e2e suite, 2026-09-03.
+- **Status:** Fixed in the working tree on 2026-09-03; three consecutive full e2e runs green after the fix (previously failing intermittently).
+- **Issue:** none filed (found and fixed in the same pass).

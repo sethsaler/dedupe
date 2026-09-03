@@ -86,7 +86,9 @@ From `ui/scan-setup.md`, `ui/group-list.md`, `ui/action-sheet.md`:
 - Thumbnails: only scanned files served; HEIC/TIFF transcoded; immutable cache headers. `/api/reveal` opens Finder (`open -R`) for allowed paths.
 - Decision reviews (low-res, random): ← Delete / → Keep applies to the focused member; Keep clears duplicate picks across overlapping independent branches; newest arrow decision wins; Keep decisions for low-res are synced to the keep-decisions file on every decision.
 - Bulk selection applies to *shown* groups only, re-derived server-side; bulk-selected independent candidates also become reviewed; min-faces criteria never match unanalyzed files.
-- Scan cancel is cooperative ("Cancelling after current work item…"); a failed/cancelled scan restores the previous result and voids preview tokens; multiple folders default to parallel streams.
+- Scan cancel is cooperative ("Cancelling after current work item…"); a failed/cancelled scan restores the previous result and voids preview tokens; multiple folders default to parallel streams. The CLI wires the same cooperative cancel to SIGINT (first Ctrl+C checkpoints, second interrupts immediately; both exit 130), and a cancelled scan persists its completed stage work to the hash cache so a rerun reuses it.
+- `dedupe ui` probes the port before binding: busy → `error: port N is not available (Address already in use) — is another Dedupe UI already running?`, exit 2, no URL line. The URL prints only after the bind succeeds.
+- `isolate` prints `  failed: {path}: {reason}` per failed item (same as `undo`) when preflight cancels the execute.
 
 ## Order of work
 

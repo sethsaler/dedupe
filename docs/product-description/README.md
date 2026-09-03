@@ -142,28 +142,28 @@ Status is one of `not started`, `drafted`, or `verified`.
 | glossary.md | drafted |
 | bug-triage.md | drafted |
 | verification/ (3 checklists) | drafted |
-| foundations/scan-pipeline.md | drafted |
-| foundations/duplicate-group.md | drafted |
-| foundations/review-session.md | drafted |
-| foundations/actions-and-undo.md | drafted |
+| foundations/scan-pipeline.md | verified |
+| foundations/duplicate-group.md | verified |
+| foundations/review-session.md | verified |
+| foundations/actions-and-undo.md | verified |
 | ui/scan-setup.md | drafted |
 | ui/group-list.md | drafted |
-| ui/lightbox.md | drafted |
+| ui/lightbox.md | verified |
 | ui/action-sheet.md | drafted |
-| ui/low-res-review.md | drafted |
-| ui/random-review.md | drafted |
-| ui/no-person-review.md | drafted |
+| ui/low-res-review.md | verified |
+| ui/random-review.md | verified |
+| ui/no-person-review.md | verified |
 | ui/faces-review.md | drafted |
-| ui/all-files-review.md | drafted |
+| ui/all-files-review.md | verified |
 | ui/session-resume.md | drafted |
-| cli/doctor.md | drafted |
-| cli/scan.md | drafted |
+| cli/doctor.md | verified |
+| cli/scan.md | verified |
 | cli/ui-command.md | drafted |
-| cli/isolate.md | drafted |
-| cli/undo.md | drafted |
-| cli/receipts.md | drafted |
-| cross-cutting/caches-and-files.md | drafted |
-| cross-cutting/optional-dependencies.md | drafted |
+| cli/isolate.md | verified |
+| cli/undo.md | verified |
+| cli/receipts.md | verified |
+| cross-cutting/caches-and-files.md | verified |
+| cross-cutting/optional-dependencies.md | verified |
 
 ## Reference
 

@@ -65,11 +65,11 @@ Deleting receipt files is safe for the product but destroys the undo path for th
 
 ## Thumbnails
 
-Previews are generated on demand and cached: browser-safe formats serve untouched for full-size lightbox views; formats like HEIC/TIFF are transcoded to JPEG for thumbnails and full views; videos get a still or no preview at all. Cached entries are keyed by the source file's mtime and size and served with immutable cache headers, so a cached body can never be stale. Only files that belong to the active scan are ever served. The on-disk location of the transcode store is listed under open questions; deleting it costs a regeneration, nothing more.
+Previews are generated on demand and cached: browser-safe formats serve untouched for full-size lightbox views; formats like HEIC/TIFF are transcoded to JPEG for thumbnails and full views; videos get a still or no preview at all. The store lives at `~/.cache/dedupe/thumbnails/` (overridable with `DEDUPE_THUMBNAIL_CACHE_DIR`), one JPEG per cache key in two-level fan-out directories, with the key derived from the source file's path, mtime, and size — so a cached body can never be stale, and entries are served with immutable cache headers. It is a bounded least-recently-used cache: when the store exceeds its 512 MB budget (`DEDUPE_THUMBNAIL_CACHE_BUDGET` bytes), the least-recently-touched entries are pruned, checked at most every 32 writes and no more often than every two minutes. Only files that belong to the active scan are ever served. Deleting the store costs a regeneration, nothing more.
 
 ## The YuNet model (read-only asset)
 
-The OpenCV person detector reads a bundled YuNet face model shipped with the installation (its MIT license sits at `src/dedupe/assets/LICENSE-YUNET.txt`). Dedupe never writes it. If it is missing, corrupt, or cannot start, the no-person review **fails closed**: no media is surfaced as Non-Human. `dedupe doctor` reports this as `OpenCV/YuNet (optional): not ready`.
+The OpenCV person detector reads a bundled YuNet face model shipped with the installation at `src/dedupe/assets/face_detection_yunet_2023mar.onnx` (its MIT license sits beside it at `src/dedupe/assets/LICENSE-YUNET.txt`; the InsightFace gender-age model `genderage_buffalo_l.onnx` ships there too, with its own license file). Dedupe never writes it. If it is missing, corrupt, or cannot start, the no-person review **fails closed**: no media is surfaced as Non-Human. `dedupe doctor` reports this as `OpenCV/YuNet (optional): not ready`.
 
 ## What `doctor` does to these paths
 
@@ -101,8 +101,8 @@ This document *is* the files-on-disk entry of the cross-cutting list; the remain
 
 ## Open questions and verification
 
-- The thumbnail transcode store's on-disk location and any eviction policy (the source README describes it as a bounded least-recently-used cache) were not confirmed from `web/media.py` in this pass.
-- The exact filename of the bundled YuNet model asset under `src/dedupe/assets/` was not confirmed.
-- Whether the receipts directory itself is created with private permissions, like the session directory, was not confirmed.
+- (Answered 2026-09-03.) The thumbnail transcode store is `~/.cache/dedupe/thumbnails/`, a 512 MB LRU with mtime/size-keyed entries; now covered in [Thumbnails](#thumbnails).
+- (Answered 2026-09-03.) The YuNet asset is `face_detection_yunet_2023mar.onnx`; see [The YuNet model](#the-yunet-model-read-only-asset).
+- (Answered 2026-09-03.) The receipts directory is created with default permissions (`drwxr-xr-x`), not the session directory's 0700 — observed on the drafting machine and in `_write_action_log`'s plain `mkdir(parents=True, exist_ok=True)`. Whether receipts (which list media paths) should get the session's private treatment is a product call, not a defect: nothing in a receipt is more revealing than the paths themselves.
 
-Verified against dedupe commit `2a6cede`.
+Verified against dedupe commit `2a6cede` (post-improvement working tree through 2026-09-03).
