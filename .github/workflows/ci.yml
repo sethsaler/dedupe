@@ -16,7 +16,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install --yes ffmpeg
       - uses: actions/setup-python@v5
@@ -32,7 +32,7 @@ jobs:
     name: Browser workflow (Python 3.11)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -58,7 +58,7 @@ jobs:
     name: macOS (Python 3.13)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -74,7 +74,7 @@ jobs:
     name: Lint and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
