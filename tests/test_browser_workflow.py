@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import threading
 import urllib.request
 from contextlib import contextmanager
@@ -769,6 +770,86 @@ def test_lightbox_shows_metadata_and_toggles_selection(
     page.keyboard.press("Escape")
     page.locator("#lightbox").wait_for(state="hidden")
     assert page_errors == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("viewport", [(1280, 800), (1000, 500), (390, 844)])
+@pytest.mark.parametrize("dimensions", [(1600, 900), (900, 1600), (2400, 400)])
+@pytest.mark.parametrize("kind", ["image", "compare", "video"])
+def test_lightbox_fits_media_without_cropping(
+    page, live_dedupe_server: str, tmp_path: Path, viewport, dimensions, kind
+) -> None:
+    """Media fits the space left by controls, including wrapped mobile text."""
+    width, height = dimensions
+    image_path = tmp_path / "preview.png"
+    image = Image.new("RGB", dimensions, "steelblue")
+    # Distinct edges make clipping visible in browser screenshots.
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width - 1, height - 1), outline="gold", width=12)
+    image.save(image_path)
+    page.route("**/api/thumbnail?*", lambda route: route.fulfill(path=image_path))
+    if kind == "video":
+        if not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg is required for the video layout fixture")
+        video_path = tmp_path / "preview.webm"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-loop", "1", "-i", str(image_path),
+             "-t", "1", "-r", "1", "-c:v", "libvpx", str(video_path)],
+            check=True, capture_output=True, timeout=30,
+        )
+        page.route("**/api/media?*", lambda route: route.fulfill(path=video_path))
+
+    page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+    page.emulate_media(reduced_motion="reduce")
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.evaluate("""async ({kind, width, height}) => {
+        const {state} = await import('/static/state.js');
+        const {openLightbox} = await import('/static/lightbox.js');
+        state.lightboxItems = [{
+            path: '/photos/a-long-folder-name/another-folder/portrait-or-landscape-preview.png',
+            mediaType: kind === 'video' ? 'video' : 'image',
+            kind: kind === 'compare' ? 'similar' : 'all_files',
+            keeper: '/photos/keeper.png', width, height, size: 123456,
+        }];
+        openLightbox(0);
+    }""", {"kind": kind, "width": width, "height": height})
+    selector = "#lbVideo" if kind == "video" else "#lbImage"
+    page.wait_for_function("""selector => {
+        const media = document.querySelector(selector);
+        return media.tagName === 'VIDEO' ? media.readyState >= 2 : media.naturalWidth > 0;
+    }""", arg=selector)
+    media = page.locator(selector)
+    box = media.bounding_box()
+    assert box is not None
+    assert box["width"] / box["height"] == pytest.approx(width / height, rel=0.01)
+    assert box["width"] > 0 and box["height"] > 0
+    for target in [selector, "#lbMeta", "#lbReveal", "#lbClose"]:
+        bounds = page.locator(target).bounding_box()
+        assert bounds is not None
+        assert bounds["x"] >= 0 and bounds["y"] >= 0
+        assert bounds["x"] + bounds["width"] <= viewport[0] + 1
+        assert bounds["y"] + bounds["height"] <= viewport[1] + 1
+    tools = page.locator("#lbVideoTools" if kind == "video" else "#lbStageTools")
+    assert box["y"] + box["height"] <= tools.bounding_box()["y"]
+    expect(media).to_have_css("border-radius", "0px")
+    expect(media).to_have_css("box-shadow", "none")
+    if kind == "compare":
+        expect(page.locator("#lbKeeperImage")).to_be_visible()
+        expect(page.locator("#lbCompareTools")).to_be_visible()
+    if kind == "image":
+        page.locator("#lbZoom").click()
+        expect(media).to_have_attribute("src", re.compile(r"variant=full"))
+        stack = page.locator("#lbImageStack")
+        assert stack.evaluate("""el =>
+            el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth
+        """)
+        assert stack.bounding_box()["y"] + stack.bounding_box()["height"] <= (
+            tools.bounding_box()["y"]
+        )
+        page.locator("#lbZoom").click()
+        expect(media).to_have_attribute("src", re.compile(r"variant=preview"))
 
 
 @pytest.mark.e2e

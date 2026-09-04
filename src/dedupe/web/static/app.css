@@ -215,7 +215,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .modal-validity.expiring { color: #f4c97d; }
 .preview-notice { margin: 0 0 10px; padding: 9px 11px; border: 1px solid var(--accent); border-radius: 7px; background: var(--accent-soft); color: var(--text); }
 
-.lb-image-stack { position: relative; display: grid; place-items: center; min-width: 0; max-height: calc(100vh - 170px); }
+.lb-image-stack { position: relative; display: grid; place-items: center; width: 100%; height: 100%; min-width: 0; min-height: 0; }
 .lb-image-stack img { grid-area: 1 / 1; }
 .lb-keeper-image { z-index: 2; }
 
@@ -1882,6 +1882,7 @@ kbd {
   backdrop-filter: blur(10px);
   display: grid;
   grid-template-columns: 48px 1fr 48px;
+  grid-template-rows: minmax(0, 1fr);
   align-items: center;
   padding: 48px 16px 28px;
   gap: 8px;
@@ -1896,26 +1897,39 @@ kbd {
   align-items: center;
   gap: 12px;
   min-width: 0;
-  max-height: 100%;
+  min-height: 0;
+  height: 100%;
+}
+
+.lb-stage > * { flex-shrink: 0; }
+
+/* Reserve room for the actual controls and wrapped metadata, not a fixed
+   viewport offset. Only explicit zoom may overflow this media viewport. */
+.lb-media {
+  flex: 1 1 0;
+  width: 100%;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  container-type: size;
 }
 
 .lb-stage img,
 .lb-stage video {
   max-width: 100%;
-  max-height: calc(100vh - 120px);
+  max-height: 100cqh;
   object-fit: contain;
-  border-radius: 8px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   animation: zoom-in 0.22s var(--ease-out) both;
 }
 
 .lb-stage video {
-  width: min(1100px, 100%);
-  background: #000;
+  width: auto;
+  height: auto;
 }
 
 .lb-video-tools {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 8px;

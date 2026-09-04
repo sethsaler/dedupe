@@ -427,9 +427,12 @@
     <button class="lb-close" id="lbClose" type="button" aria-label="Close">✕</button>
     <button class="lb-nav prev" id="lbPrev" type="button" aria-label="Previous">‹</button>
     <div class="lb-stage">
-      <div class="lb-image-stack" id="lbImageStack">
-        <img id="lbImage" alt="Current file preview" />
-        <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+      <div class="lb-media">
+        <div class="lb-image-stack" id="lbImageStack">
+          <img id="lbImage" alt="Current file preview" />
+          <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+        </div>
+        <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
       </div>
       <div class="lb-stage-tools" id="lbStageTools" hidden>
         <button class="btn ghost" id="lbZoom" type="button" aria-pressed="false" title="Full-resolution zoom (z)">Zoom</button>
@@ -439,7 +442,6 @@
         <input id="lbOpacity" type="range" min="0" max="100" value="50" />
         <button class="btn ghost" id="lbFlicker" type="button" aria-pressed="false">Hold to flicker keeper</button>
       </div>
-      <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
       <div class="lb-video-tools" id="lbVideoTools" hidden>
         <label for="lbSpeed">Playback speed</label>
         <select id="lbSpeed">
