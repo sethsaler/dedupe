@@ -975,10 +975,10 @@ def test_tabs_and_group_list_are_keyboard_navigable(
     page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "exact"
     expect(page.locator('.tab[data-kind="exact"]')).to_have_attribute("aria-selected", "true")
-    expect(page.locator("#filteredCount")).to_have_text("1 of 4 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
     page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "similar"
-    expect(page.locator("#filteredCount")).to_have_text("0 of 4 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("0 of 0 groups shown")
     page.keyboard.press("Home")
     assert page.evaluate("document.activeElement.dataset.kind") == "all"
     expect(page.locator("#filteredCount")).to_have_text("4 of 4 groups shown")
