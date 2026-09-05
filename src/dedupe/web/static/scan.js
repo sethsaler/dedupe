@@ -192,6 +192,7 @@ function applyFiltersSoon() {
   });
 });
 $("btnClearFilters").addEventListener("click", () => {
+  clearTimeout(filterDebounce);
   for (const id of LIVE_FILTER_IDS) $(id).value = "";
   $("selectionFilter").value = "all";
   $("filterFaces").value = "any";
@@ -199,6 +200,17 @@ $("btnClearFilters").addEventListener("click", () => {
   $("hideCompleted").checked = false;
   resetGroupListWindow();
   renderGroupList();
+});
+$("groupList").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-empty-action]")?.dataset.emptyAction;
+  if (action === "clear") {
+    $("btnClearFilters").click();
+    $("resultSearch").focus();
+  } else if (action === "all") {
+    const tab = tabButtons.find((tab) => tab.dataset.kind === "all");
+    tab.focus();
+    activateTab(tab);
+  }
 });
 $("btnNextReview").addEventListener("click", () => {
   const candidates = state.groups.filter(groupNeedsAttention);

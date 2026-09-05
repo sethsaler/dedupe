@@ -122,6 +122,56 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
 
 
 @pytest.mark.e2e
+def test_empty_results_offer_recovery_without_changing_selections(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible", timeout=20_000)
+    exact_tab = page.locator('.tab[data-kind="exact"]')
+    exact_tab.click()
+    page.locator(".group-item").first.click()
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
+    expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
+    page.locator("#resultSort").select_option("date")
+
+    page.locator("#resultSearch").fill("not-a-file")
+    empty = page.locator(".group-empty")
+    expect(empty).to_contain_text("No matching groups")
+    expect(page.locator("#filteredCount")).to_have_text("0 of 1 groups shown")
+    # Keyboard activation restores results and moves focus out of the removed button.
+    empty.get_by_role("button", name="Clear filters").focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("#resultSearch")).to_be_focused()
+    expect(page.locator(".group-item")).to_have_count(1)
+    expect(exact_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#resultSort")).to_have_value("date")
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
+
+    page.locator("#advancedFilters summary").click()
+    page.locator("#filterMinWidth").fill("99999")
+    expect(empty).to_contain_text("No matching groups")
+    empty.get_by_role("button", name="Clear filters").click()
+    expect(page.locator("#filterMinWidth")).to_have_value("")
+    expect(page.locator(".group-item")).to_have_count(1)
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
+
+    # A genuinely empty category should not imply that clearing filters will help.
+    page.locator('.tab[data-kind="faces"]').click()
+    expect(empty).to_contain_text("No groups in this category")
+    expect(empty.get_by_role("button", name="Clear filters")).to_have_count(0)
+    empty.get_by_role("button", name="View all categories").click()
+    all_tab = page.locator('.tab[data-kind="all"]')
+    expect(all_tab).to_be_focused()
+    expect(all_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator(".group-item")).to_have_count(4)
+    exact_tab.click()
+    page.locator(".group-item").first.click()
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
+
+
+@pytest.mark.e2e
 def test_lingering_hover_shows_a_full_image_preview(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:

@@ -224,6 +224,7 @@ function applyResultControls() {
   const filters = advancedFilters();
   $("advancedFilterFlag").hidden = !filters.active;
   let groups = state.allGroups.filter((g) => state.kind === "all" || g.kind === state.kind);
+  const categoryCount = groups.length;
   groups = groups.filter((g) => {
     const selected = groupSelectedCount(g) > 0;
     if (query && !(g.members || []).some((member) => member.path.toLowerCase().includes(query))) return false;
@@ -245,7 +246,7 @@ function applyResultControls() {
     return (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
   });
   state.groups = groups;
-  $("filteredCount").textContent = `${groups.length} of ${state.allGroups.length} groups shown`;
+  $("filteredCount").textContent = `${groups.length} of ${categoryCount} groups shown`;
 }
 
 function groupItemHtml(g) {
@@ -391,7 +392,20 @@ function renderGroupList() {
   const list = wireGroupList();
   if (!state.groups.length) {
     state.groupListStart = 0;
-    list.innerHTML = `<div class="group-empty">No groups in this filter.</div>`;
+    const categoryHasGroups = state.allGroups.some((g) => state.kind === "all" || g.kind === state.kind);
+    const title = categoryHasGroups ? "No matching groups" : state.scanning
+      ? "Waiting for results" : state.allGroups.length ? "No groups in this category" : "No groups to review";
+    const hint = categoryHasGroups
+      ? "Try a different search or clear your filters. Your file selections will stay unchanged."
+      : state.scanning ? "Results will appear here as the scan progresses."
+      : state.allGroups.length ? "Choose another category to continue reviewing your files."
+      : "Choose a folder and start a new scan to find files to review.";
+    list.innerHTML = `<div class="group-empty">
+      <strong>${title}</strong>
+      <p>${hint}</p>
+      ${categoryHasGroups ? '<button class="btn ghost" type="button" data-empty-action="clear">Clear filters</button>'
+        : state.kind !== "all" && state.allGroups.length ? '<button class="btn ghost" type="button" data-empty-action="all">View all categories</button>' : ""}
+    </div>`;
     $("groupMore").innerHTML = "";
     syncEarlierSlot();
     return;
