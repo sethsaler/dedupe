@@ -86,12 +86,19 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     assert page.locator("#members .card.keep").count() == 1
     assert page.locator("#members .sel-cb:checked").count() == 1
 
-    preview = page.locator("#members .thumb-wrap").first
-    preview_box = preview.bounding_box()
-    assert preview_box is not None
-    assert preview_box["width"] / preview_box["height"] == pytest.approx(48 / 32, rel=0.02)
+    # selectGroup replaces the member DOM after the first paint. Measure in
+    # this wait so a mid-wait re-render retries instead of returning None.
+    page.wait_for_function(
+        """() => {
+          const wrap = document.querySelector("#members .thumb-wrap");
+          if (!wrap) return false;
+          const box = wrap.getBoundingClientRect();
+          return box.width > 0 && box.height > 0
+            && Math.abs(box.width / box.height - 48 / 32) < 0.02;
+        }"""
+    )
 
-    preview.click()
+    page.locator("#members .thumb-wrap").first.click()
     page.locator("#lightbox").wait_for(state="visible")
     page.locator("#lbClose").click()
     page.locator("#lightbox").wait_for(state="hidden")
