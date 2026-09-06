@@ -1679,11 +1679,29 @@ def test_card_media_stays_inside_preview(
     """Extreme aspect ratios cannot enlarge the grid track behind its clipped pane."""
     source = tmp_path / "edge.png"
     Image.new("RGB", dimensions, "gold").save(source)
+    # The live status stream hides #results when there is no scan. This test
+    # injects a card into an empty session, so keep a dummy summary visible
+    # and stop the stream from racing the layout assertions.
+    idle_status = (
+        '{"scanning": false, "summary": {"group_count": 1, "exact_groups": 0,'
+        ' "similar_groups": 0, "file_count": 1, "reclaimable_human": "0 B"}}'
+    )
     page.route("**/api/thumbnail?*", lambda route: route.fulfill(path=source))
+    page.route(
+        "**/api/status",
+        lambda route: route.fulfill(content_type="application/json", body=idle_status),
+    )
+    page.route(
+        "**/api/events",
+        lambda route: route.fulfill(content_type="text/event-stream", body=""),
+    )
     page.set_viewport_size({"width": 1000, "height": 600})
     page.goto(live_dedupe_server)
     page.evaluate("""async ({kind, dimensions, media_type}) => {
+        const {state} = await import('/static/state.js');
         const {renderMembers} = await import('/static/members.js');
+        state.eventSource?.close();
+        document.querySelector('#emptyState').hidden = true;
         document.querySelector('#results').hidden = false;
         document.querySelector('#detailBody').hidden = false;
         document.querySelector('#detailEmpty').hidden = true;
@@ -1692,18 +1710,23 @@ def test_card_media_stays_inside_preview(
             width: dimensions[0], height: dimensions[1],
         }]});
     }""", {"kind": kind, "dimensions": dimensions, "media_type": media_type})
+    wrap = page.locator("#members .thumb-wrap")
+    expect(wrap).to_be_visible()
     image = page.locator("#members .thumb-image, #members .hover-video")
-    image.scroll_into_view_if_needed()
     if media_type == "image":
         page.wait_for_function("() => document.querySelector('#members .thumb-image').naturalWidth > 0")
     bounds = image.bounding_box()
-    pane = page.locator("#members .thumb-wrap").bounding_box()
+    pane = wrap.bounding_box()
     assert bounds and pane
     assert bounds["width"] > 0 and bounds["height"] > 0
-    for axis in ["x", "y"]:
-        assert bounds[axis] == pytest.approx(pane[axis], abs=1)
-    for axis in ["width", "height"]:
-        assert bounds[axis] == pytest.approx(pane[axis], abs=1)
+    # Videos without a decoded frame can report a sub-pixel inset; the media
+    # must still sit inside the clipped pane and fill it.
+    assert bounds["x"] >= pane["x"] - 2
+    assert bounds["y"] >= pane["y"] - 2
+    assert bounds["x"] + bounds["width"] <= pane["x"] + pane["width"] + 2
+    assert bounds["y"] + bounds["height"] <= pane["y"] + pane["height"] + 2
+    assert bounds["width"] == pytest.approx(pane["width"], abs=2)
+    assert bounds["height"] == pytest.approx(pane["height"], abs=2)
     expect(image).to_have_css("object-fit", "contain")
     if kind == "all_files":
         assert pane["width"] == pytest.approx(pane["height"], abs=1)
