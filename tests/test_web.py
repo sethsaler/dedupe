@@ -3125,3 +3125,22 @@ def test_keep_decisions_write_failure_is_surfaced_in_status(
 
     status = client.get("/api/status").get_json()
     assert status["keep_decisions_error"] == "disk full"
+
+
+def test_thumbnail_composites_only_resized_pixels(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from dedupe.web import media
+
+    source = tmp_path / "large-alpha.png"
+    Image.new("RGBA", (3200, 2000), (200, 100, 0, 128)).save(source)
+    original = media._flatten_to_rgb
+    sizes = []
+
+    def capture_size(image):
+        sizes.append(image.size)
+        return original(image)
+
+    monkeypatch.setattr(media, "_flatten_to_rgb", capture_size)
+    media.image_thumbnail_bytes(source)
+    assert sizes == [(1600, 1000)]

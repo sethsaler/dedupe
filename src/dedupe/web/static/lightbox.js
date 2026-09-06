@@ -66,10 +66,12 @@ function stepLightbox(delta) {
 
 function prefetchLightboxNeighbors() {
   const count = state.lightboxItems.length;
+  const seen = new Set([state.lightboxItems[state.lightboxIndex]?.path]);
   // Warm further ahead than behind: sifting holds →, not ←.
   for (const delta of [-1, 1, 2, 3]) {
     const neighbor = state.lightboxItems[(state.lightboxIndex + delta + count) % count];
-    if (!neighbor || neighbor.mediaType === "video") continue;
+    if (!neighbor || neighbor.mediaType === "video" || seen.has(neighbor.path)) continue;
+    seen.add(neighbor.path);
     const image = new Image();
     image.decoding = "async";
     image.src = previewUrl(neighbor.path);

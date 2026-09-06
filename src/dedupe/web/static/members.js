@@ -10,6 +10,19 @@ import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRati
 
 const MEMBER_PAGE_SIZE = 50;
 
+let activeVideo = null;
+function stopInlineVideo() {
+  if (!activeVideo) return;
+  activeVideo.pause();
+  activeVideo.removeAttribute("src");
+  activeVideo.load(); // Cancel buffering and restore the poster.
+  activeVideo = null;
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopInlineVideo();
+});
+$("members").addEventListener("click", stopInlineVideo, true);
+
 // The member sort select is kind-aware: each listed kind gets its own option
 // set, and its first option is the server order (no client re-sort).
 const MEMBER_SORT_OPTIONS = {
@@ -273,6 +286,7 @@ async function selectGroup(id, { silent = false } = {}) {
 }
 
 function renderMembers(g) {
+  stopInlineVideo();
   const box = $("members");
   const selected = new Set(g.selected_for_removal || []);
   const reviewedPaths = new Set(g.reviewed_paths || []);
@@ -412,7 +426,7 @@ function renderMembers(g) {
         : (isPagedIndependentReview(g) ? "Click to review and remove" : "Click to remove this file");
       const mediaPreview = m.media_type === "video"
         ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
-        : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" />`;
+        : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
       const overlayDelete = isPagedIndependentReview(g) && !deleted
         ? `<button class="thumb-delete delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click, undo from the toast" aria-label="Move ${escapeHtml(fileName)} to Trash">Trash</button>`
         : "";
@@ -492,6 +506,8 @@ function renderMembers(g) {
       setPreviewAspectRatio(wrap, video.videoWidth, video.videoHeight);
     });
     wrap.addEventListener("pointerenter", () => {
+      stopInlineVideo();
+      activeVideo = video;
       video.muted = true;
       if (!video.src) video.src = video.dataset.src;
       video.play().catch(() => {
@@ -499,8 +515,7 @@ function renderMembers(g) {
       });
     });
     wrap.addEventListener("pointerleave", () => {
-      video.pause();
-      if (video.readyState > 0) video.currentTime = 0;
+      if (activeVideo === video) stopInlineVideo();
     });
   });
 

@@ -1667,3 +1667,59 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     toast_log = page.evaluate("window.__toastLog")
     assert any("Cancelling" in text for text in toast_log)
     assert page_errors == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("kind", ["exact", "all_files", "random_review"])
+@pytest.mark.parametrize("dimensions", [(400, 2400), (2400, 400)])
+@pytest.mark.parametrize("media_type", ["image", "video"])
+def test_card_media_stays_inside_preview(
+    page, live_dedupe_server, tmp_path, kind, dimensions, media_type
+):
+    """Extreme aspect ratios cannot enlarge the grid track behind its clipped pane."""
+    source = tmp_path / "edge.png"
+    Image.new("RGB", dimensions, "gold").save(source)
+    page.route("**/api/thumbnail?*", lambda route: route.fulfill(path=source))
+    page.set_viewport_size({"width": 1000, "height": 600})
+    page.goto(live_dedupe_server)
+    page.evaluate("""async ({kind, dimensions, media_type}) => {
+        const {renderMembers} = await import('/static/members.js');
+        document.querySelector('#results').hidden = false;
+        document.querySelector('#detailBody').hidden = false;
+        document.querySelector('#detailEmpty').hidden = true;
+        renderMembers({id: 'fit-test', kind, members: [{
+            path: '/fixture/edge.png', media_type, size: 100,
+            width: dimensions[0], height: dimensions[1],
+        }]});
+    }""", {"kind": kind, "dimensions": dimensions, "media_type": media_type})
+    image = page.locator("#members .thumb-image, #members .hover-video")
+    image.scroll_into_view_if_needed()
+    if media_type == "image":
+        page.wait_for_function("() => document.querySelector('#members .thumb-image').naturalWidth > 0")
+    bounds = image.bounding_box()
+    pane = page.locator("#members .thumb-wrap").bounding_box()
+    assert bounds and pane
+    assert bounds["width"] > 0 and bounds["height"] > 0
+    for axis in ["x", "y"]:
+        assert bounds[axis] == pytest.approx(pane[axis], abs=1)
+    for axis in ["width", "height"]:
+        assert bounds[axis] == pytest.approx(pane[axis], abs=1)
+    expect(image).to_have_css("object-fit", "contain")
+    if kind == "all_files":
+        assert pane["width"] == pytest.approx(pane["height"], abs=1)
+    else:
+        assert pane["height"] <= 600 * 0.58 + 1
+
+    if media_type == "video":
+        page.route("**/api/media?*", lambda route: route.abort())
+        page.locator("#members .thumb-wrap").hover()
+        expect(image).to_have_attribute("src", re.compile(r"/api/media"))
+        page.mouse.move(0, 0)
+        expect(image).not_to_have_attribute("src", re.compile(r".+"))
+    elif kind == "all_files":
+        page.locator("#members .thumb-wrap").hover()
+        expect(page.locator("#hoverPreview")).to_be_visible(timeout=5000)
+        preview = page.locator("#hoverPreviewImage").bounding_box()
+        assert preview and preview["x"] >= 0 and preview["y"] >= 0
+        assert preview["x"] + preview["width"] <= 1000
+        assert preview["y"] + preview["height"] <= 600

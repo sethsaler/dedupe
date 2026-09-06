@@ -95,9 +95,10 @@ def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
             # PIL ignores draft() for formats that do not support it.
             img.draft("RGB", (max_side, max_side))
         img = ImageOps.exif_transpose(img)
-        img = _flatten_to_rgb(img)
         if max_side is not None:
             img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS, reducing_gap=3.0)
+        # Composite resized pixels to avoid full-resolution RGB/RGBA copies.
+        img = _flatten_to_rgb(img)
         output = BytesIO()
         img.save(output, format="JPEG", quality=quality)
         return output.getvalue()
