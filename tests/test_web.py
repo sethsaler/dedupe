@@ -3144,3 +3144,16 @@ def test_thumbnail_composites_only_resized_pixels(tmp_path, monkeypatch):
     monkeypatch.setattr(media, "_flatten_to_rgb", capture_size)
     media.image_thumbnail_bytes(source)
     assert sizes == [(1600, 1000)]
+
+
+def test_similarity_percentage_includes_animation_tiles():
+    from dedupe.similar_image import encode_tile_phashes
+    from dedupe.web.app import similarity_percent
+
+    common = {"size": 1, "mtime": 1, "media_type": MediaType.GIF, "extension": ".gif"}
+    keeper = FileRecord(path="/keeper.gif", **common)
+    member = FileRecord(path="/copy.gif", **common)
+    keeper.phash = keeper.dhash = member.phash = member.dhash = "0000000000000000"
+    keeper.tile_phashes = encode_tile_phashes(("0000000000000000",) * 40)
+    member.tile_phashes = encode_tile_phashes(("00000000000000ff",) * 40)
+    assert similarity_percent(member, keeper) == 88.1

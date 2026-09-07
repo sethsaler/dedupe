@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-HUMAN_DETECTION_CACHE_VERSION = "human-presence-v4-recall"
+HUMAN_DETECTION_CACHE_VERSION = "human-presence-v5-detail"
 MANUALLY_CONFIRMED_HUMAN_STATUS = "person_confirmed"
 CACHEABLE_HUMAN_STATUSES = frozenset(
     {"person_detected", "no_person_detected", MANUALLY_CONFIRMED_HUMAN_STATUS}

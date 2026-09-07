@@ -18,6 +18,7 @@ from .models import (
     DuplicateGroup,
     FileRecord,
     GroupKind,
+    MediaType,
     ReviewPolicy,
     ScanResult,
     effective_selected_paths,
@@ -25,7 +26,12 @@ from .models import (
 from .parallel import map_parallel, resolve_workers
 from .receipts import receipt_filename, resolve_log_dir, resolve_receipt_path
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
-from .similar_image import compute_image_hashes
+from .similar_image import (
+    compute_image_hashes,
+    compute_image_hashes_with_tiles,
+    decode_tile_phashes,
+    is_near_identical,
+)
 from .similar_video import (
     DEFAULT_THRESHOLD as VID_THRESHOLD,
 )
@@ -471,7 +477,16 @@ def _revalidate_keeper(
             return False, "retained member content no longer matches its scan hash"
 
         if keep.phash:
-            current_phash, *_ = compute_image_hashes(path)
+            saved_tiles = decode_tile_phashes(keep.tile_phashes)
+            if keep.media_type == MediaType.GIF or (saved_tiles and len(saved_tiles) > 5):
+                current_phash, _dh, _w, _h, current_tiles = compute_image_hashes_with_tiles(path)
+                # A matching first frame alone cannot validate an animation.
+                if not saved_tiles or not current_tiles or not is_near_identical(
+                    path, path, tiles_a=saved_tiles, tiles_b=current_tiles,
+                ):
+                    return False, "retained member animation no longer matches; rescan required"
+            else:
+                current_phash, *_ = compute_image_hashes(path)
             if current_phash:
                 import imagehash
 

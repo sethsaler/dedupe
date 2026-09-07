@@ -10,6 +10,7 @@ Memory-conscious: images are drafted/thumbnail-scaled before hashing so a
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -41,9 +42,11 @@ TILE_NORMALIZE = 256
 # Only records without stored tile hashes reach the path cache; keep it large
 # enough that a big scan never re-decodes the same file twice.
 TILE_CACHE_SIZE = 65536
-# Tile hashes now come from the hashing pass decode. Tag stored values so tiles
-# written by the previous tiling pipeline are recomputed instead of compared.
-TILE_HASH_VERSION = "t2"
+# Animation tiles retain ordered, time-aligned samples. Older first-frame-only
+# tiles cannot verify animations and must be recomputed.
+TILE_HASH_VERSION = "t3"
+ANIMATION_HASH_FRAMES = 8
+MIN_ASPECT_RATIO_SIMILARITY = 0.95
 # A process pool sidesteps GIL contention in the pHash/dHash/tile math (small
 # numpy/scipy ops hold the GIL even though Pillow's decoder releases it), but
 # costs an interpreter spawn plus Pillow/imagehash imports per worker. Only
@@ -136,43 +139,38 @@ def compute_image_hashes_with_tiles(
         except Exception:
             pass
 
-        # For animated GIF: sample first / mid / last frames.
-        frames = []
-        if animated and path.suffix.lower() == ".gif":
-            n = getattr(img, "n_frames", 1) or 1
-            indices = sorted({0, n // 2, max(0, n - 1)})
-            for i in indices:
-                img.seek(i)
-                frames.append(_downscale_for_hash(img))
-        else:
-            frames = [_downscale_for_hash(img)]
-
-        # Primary fingerprint from first frame (near-identical intent).
-        # For multi-frame GIFs, XOR sampled frame hashes so re-encoded clones still match.
-        phashes = [imagehash.phash(f) for f in frames]
-        dhashes = [imagehash.dhash(f) for f in frames]
-
-        if len(phashes) == 1:
-            phash = str(phashes[0])
-            dhash = str(dhashes[0])
-        else:
-            combined_p = phashes[0]
-            combined_d = dhashes[0]
-            for h in phashes[1:]:
-                combined_p = imagehash.ImageHash(combined_p.hash ^ h.hash)
-            for h in dhashes[1:]:
-                combined_d = imagehash.ImageHash(combined_d.hash ^ h.hash)
-            phash = str(combined_p)
-            dhash = str(combined_d)
+        frames = _hash_frames(img)
+        # Candidate lookup uses the first frame. Verification below preserves
+        # frame order; XOR used to erase order and cancel repeated frame hashes.
+        phash = str(imagehash.phash(frames[0]))
+        dhash = str(imagehash.dhash(frames[0]))
 
         tiles: tuple[str, ...] | None = None
         if with_tiles:
             try:
-                tiles = tuple(str(t) for t in _tile_phashes_from_image(frames[0]))
+                tiles = tuple(str(t) for frame in frames for t in _tile_phashes_from_image(frame))
             except Exception:
                 tiles = None
 
         return phash, dhash, width, height, tiles
+
+
+def _hash_frames(img) -> list:
+    """Sample animations in playback order and time, independent of frame rate."""
+    if not getattr(img, "is_animated", False):
+        return [_downscale_for_hash(img)]
+    starts = []
+    duration = 0.0
+    for index in range(img.n_frames):
+        img.seek(index)
+        starts.append(duration)
+        duration += max(10.0, float(img.info.get("duration", 100) or 100))
+    frames = []
+    for sample in range(ANIMATION_HASH_FRAMES):
+        timestamp = sample * (duration - 0.001) / (ANIMATION_HASH_FRAMES - 1)
+        img.seek(max(0, bisect_right(starts, timestamp) - 1))
+        frames.append(_downscale_for_hash(img))
+    return frames
 
 
 def _image_hash_job(
@@ -229,7 +227,7 @@ def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
                 img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
             except Exception:
                 pass
-            tiles = _tile_phashes_from_image(_downscale_for_hash(img))
+            tiles = [tile for frame in _hash_frames(img) for tile in _tile_phashes_from_image(frame)]
             return tuple(str(t) for t in tiles)
     except Exception:
         return None
@@ -262,19 +260,14 @@ def is_near_identical(
     True if regional structure matches (same image / scale / quality variants).
     False for same-person different-pose shots that can still pass global pHash.
     """
-    if tiles_a is not None and tiles_b is not None and len(tiles_a) == len(tiles_b):
-        import imagehash
-
-        dists = [
-            int(imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b))
-            for a, b in zip(tiles_a, tiles_b, strict=True)
-        ]
-    else:
-        dists = tile_distances(path_a, path_b)
-    if dists is None:
-        # Fail open only when we cannot verify — safer for rare decode errors
-        # is fail closed for "similar"; require tiles when possible.
+    if tiles_a is None:
+        tiles_a = _tile_phashes_for_path(path_a)
+    if tiles_b is None:
+        tiles_b = _tile_phashes_for_path(path_b)
+    if not tiles_a or not tiles_b or len(tiles_a) != len(tiles_b):
+        # Missing evidence or a still/animation mismatch cannot establish similarity.
         return False
+    dists = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(tiles_a, tiles_b, strict=True)]
     if max(dists) > tile_max:
         return False
     return not sum(dists) / len(dists) > tile_mean
@@ -302,6 +295,14 @@ def _record_tile_phashes(record: FileRecord) -> tuple[str, ...] | None:
     if values:
         record.tile_phashes = encode_tile_phashes(values)
     return values
+
+
+def _compatible_aspect_ratios(a: FileRecord, b: FileRecord) -> bool:
+    if not (a.width and a.height and b.width and b.height):
+        return True
+    left = a.width * b.height
+    right = b.width * a.height
+    return min(left, right) / max(left, right) >= MIN_ASPECT_RATIO_SIMILARITY
 
 
 def find_similar_image_groups(
@@ -337,10 +338,17 @@ def find_similar_image_groups(
         return []
 
     # Compute hashes (parallel when uncached)
-    need = [r for r in media if not (r.phash and r.dhash)]
+    need = [
+        r for r in media
+        if not (r.phash and r.dhash)
+        # Old GIF global hashes XORed frames. Never compare them to first-frame hashes.
+        or (r.media_type == MediaType.GIF and not decode_tile_phashes(r.tile_phashes))
+    ]
     cached = total - len(need)
     if need:
         by_path = {r.path: r for r in need}
+        for record in need:
+            record.phash = record.dhash = record.tile_phashes = None
 
         def hash_progress(done: int, _total: int) -> None:
             if progress:
@@ -439,11 +447,8 @@ def find_similar_image_groups(
                     if dhash_distance > dhash_threshold:
                         continue
                 # Near-identical: also prefer similar aspect ratio
-                if rec.width and rec.height and other.width and other.height:
-                    ar_a = rec.width / max(rec.height, 1)
-                    ar_b = other.width / max(other.height, 1)
-                    if abs(ar_a - ar_b) > 0.15:
-                        continue
+                if not _compatible_aspect_ratios(rec, other):
+                    continue
                 tiles_a = _record_tile_phashes(rec)
                 tiles_b = _record_tile_phashes(other)
                 if not tiles_a or not tiles_b:
@@ -493,6 +498,8 @@ def _bruteforce_groups(
         ha = imagehash.hex_to_hash(a.phash)  # type: ignore[arg-type]
         for b in hashed[i + 1 :]:
             if tuple(sorted((a.path, b.path))) in distinct_pairs:
+                continue
+            if not _compatible_aspect_ratios(a, b):
                 continue
             hb = imagehash.hex_to_hash(b.phash)  # type: ignore[arg-type]
             if (ha - hb) > threshold:

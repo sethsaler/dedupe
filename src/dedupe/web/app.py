@@ -49,6 +49,7 @@ from ..review_session import (
     load_review_session,
     save_review_session,
 )
+from ..similar_image import TILE_HASH_VERSION
 from ..similar_video import aligned_position_indexes
 from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
@@ -132,8 +133,8 @@ def similarity_percent(member, keeper) -> float | None:
             result = _hash_difference(left, right)
             if result is not None:
                 comparisons.append(result)
-        left_tiles = _stored_hashes(member.tile_phashes, ("t2",))
-        right_tiles = _stored_hashes(keeper.tile_phashes, ("t2",))
+        left_tiles = _stored_hashes(member.tile_phashes, ("t2", TILE_HASH_VERSION))
+        right_tiles = _stored_hashes(keeper.tile_phashes, ("t2", TILE_HASH_VERSION))
         if len(left_tiles) == len(right_tiles):
             comparisons.extend(
                 result

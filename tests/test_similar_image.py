@@ -359,3 +359,110 @@ def test_large_batches_hash_with_process_pool(tmp_path: Path, monkeypatch) -> No
     assert {Path(record.path).name for record in groups[0]} == {"a.jpg", "b.jpg"}
     # Hashes computed in worker processes must land back on the parent records.
     assert all(record.phash for record in records)
+
+
+def _animation_frames():
+    frames = []
+    for index in range(3):
+        image = Image.new("RGB", (128, 128), "navy")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((index * 35, 10, index * 35 + 25, 90), fill="gold")
+        frames.append(image)
+    return frames
+
+
+def _save_animation(path, frames, duration=100):
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=duration, loop=0)
+
+
+def test_gifs_with_same_first_frame_and_reordered_content_do_not_match(tmp_path):
+    frames = _animation_frames()
+    a, b = tmp_path / "abc.gif", tmp_path / "acb.gif"
+    _save_animation(a, frames)
+    _save_animation(b, [frames[0], frames[2], frames[1]])
+    from dedupe.scanner import inventory
+
+    assert find_similar_image_groups(inventory([a, b]), workers=1) == []
+    assert not is_near_identical(str(a), str(b))
+
+
+def test_gif_match_uses_playback_time_instead_of_frame_count(tmp_path):
+    frames = _animation_frames()
+    a, b = tmp_path / "original.gif", tmp_path / "reencoded.gif"
+    _save_animation(a, frames, [100, 200, 100])
+    middle = frames[1].copy()
+    # A tiny encoder difference keeps these frames separate without changing the scene.
+    middle.putpixel((0, 0), (255, 255, 255))
+    _save_animation(b, [frames[0], frames[1], middle, frames[2]], 100)
+    from dedupe.scanner import inventory
+
+    with Image.open(b) as image:
+        assert image.n_frames == 4
+    groups = find_similar_image_groups(inventory([a, b]), workers=1)
+    assert len(groups) == 1 and len(groups[0]) == 2
+
+
+def test_gif_with_different_frame_timing_does_not_match(tmp_path):
+    frames = _animation_frames()
+    a, b = tmp_path / "hold-middle.gif", tmp_path / "hold-last.gif"
+    _save_animation(a, frames, [100, 200, 100])
+    _save_animation(b, frames, [100, 100, 200])
+    assert not is_near_identical(str(a), str(b))
+
+
+def test_gif_legacy_xor_hashes_are_recomputed(tmp_path):
+    from dedupe.scanner import inventory
+    from dedupe.similar_image import decode_tile_phashes
+
+    a, b = tmp_path / "a.gif", tmp_path / "b.gif"
+    _save_animation(a, _animation_frames())
+    _save_animation(b, _animation_frames())
+    records = inventory([a, b])
+    for record in records:
+        record.phash = record.dhash = "0000000000000000"
+        record.tile_phashes = "t2:" + ",".join(["0000000000000000"] * 5)
+    assert len(find_similar_image_groups(records, workers=1)) == 1
+    assert all(len(decode_tile_phashes(record.tile_phashes)) == 40 for record in records)
+    assert all(record.phash != "0000000000000000" for record in records)
+
+
+def test_aspect_ratio_check_is_proportional_in_both_search_paths(monkeypatch):
+    import dedupe.similar_image as module
+
+    def record(path, width, height):
+        return FileRecord(
+            path=path, size=1, mtime=1, media_type=MediaType.IMAGE, extension=".jpg",
+            width=width, height=height, phash="0000000000000000", dhash="0000000000000000",
+            tile_phashes=module.encode_tile_phashes(("0000000000000000",) * 5),
+        )
+
+    monkeypatch.setattr(module, "is_near_identical", lambda *_a, **_kw: True)
+    for records, expected in [
+        ([record("/a", 40, 100), record("/b", 54, 100)], False),
+        ([record("/a", 600, 100), record("/b", 620, 100)], True),
+    ]:
+        assert bool(find_similar_image_groups(records, workers=1)) is expected
+        assert bool(module._bruteforce_groups(records, 6, 10, 8, 5.0, None)) is expected
+
+
+def test_supplied_animation_tiles_cannot_fall_back_to_same_path(tmp_path):
+    path = tmp_path / "animation.gif"
+    _save_animation(path, _animation_frames())
+    assert not is_near_identical(
+        str(path), str(path),
+        tiles_a=("0000000000000000",) * 40,
+        tiles_b=("0000000000000000",) * 5,
+    )
+
+
+def test_failed_legacy_gif_rehash_discards_old_fingerprint(tmp_path):
+    from dedupe.scanner import inventory
+
+    a, b = tmp_path / "a.gif", tmp_path / "b.gif"
+    for path in (a, b):
+        path.write_bytes(b"corrupt GIF")
+    records = inventory([a, b])
+    for record in records:
+        record.phash = record.dhash = "0000000000000000"
+    assert find_similar_image_groups(records, workers=1) == []
+    assert all(record.phash is None and record.error for record in records)

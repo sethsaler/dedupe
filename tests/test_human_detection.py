@@ -30,11 +30,11 @@ from dedupe.scanner import inventory
 
 def test_detector_signature_pins_recall_settings() -> None:
     signature = human_detection_signature("opencv")
-    assert signature.startswith("human-presence-v4-recall|")
+    assert signature.startswith("human-presence-v5-detail|")
     assert "face-confidence=0.35" in signature
     assert "face-flip=1" in signature
     assert "face-tiles=2x2" in signature
-    assert "frame-decode=v2" in signature
+    assert "frame-decode=v3" in signature
 
 
 def test_blank_landscape_is_review_candidate(tmp_path: Path) -> None:
@@ -754,3 +754,59 @@ def test_opencv_backend_never_narrates_a_photon_download(
 
     assert not [m for m in messages if len(m) > 3 and m[3]]
     assert hd.photon_model_ready(hd.DEFAULT_PHOTON_MODEL) is False
+
+
+@pytest.mark.parametrize("subject_size", [64, 96])
+def test_distant_face_is_not_a_non_human_candidate(tmp_path: Path, subject_size: int) -> None:
+    """Real YuNet regression: downsampling before tiling erased these faces."""
+    pytest.importorskip("cv2")
+    source_path = Path(__file__).parent / "fixtures" / "astronaut.png"
+    with Image.open(source_path) as source:
+        canvas = Image.new("RGB", (1920, 1280), (40, 120, 70))
+        canvas.paste(source.resize((subject_size, subject_size)), (1150, 730))
+    path = tmp_path / "distant.png"
+    canvas.save(path)
+    record = inventory([path])[0]
+
+    assert find_no_human_files([record], workers=1) == []
+    assert record.human_detection_status == "person_detected"
+
+
+def test_human_animation_checks_frames_between_first_middle_and_last(tmp_path: Path) -> None:
+    frames = [Image.new("RGB", (64, 64), (0, index, 0)) for index in range(9)]
+    frames[2] = Image.new("RGB", (64, 64), "red")
+    path = tmp_path / "brief-person.gif"
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100)
+    record = inventory([path])[0]
+
+    class RedFrameDetector:
+        backend = "test"
+
+        def score(self, frame):
+            return 1.0 if frame[0, 0, 0] > 200 else 0.0
+
+    assert _media_person_evidence(record, RedFrameDetector()) == (True, 3, 1.0)
+
+
+def test_old_no_person_decision_is_reanalyzed(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (64, 64), "green").save(path)
+    record = inventory([path])[0]
+    record.human_detection_status = "no_person_detected"
+    record.human_detection_signature = "human-presence-v4-recall|opencv|frame-decode=v2"
+
+    class PositiveDetector:
+        backend = "test"
+
+        def score(self, frame):
+            return 1.0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "dedupe.human_detection.create_person_detector", lambda *_a, **_kw: PositiveDetector()
+    )
+    assert find_no_human_files([record], workers=1) == []
+    assert record.human_detection_signature == human_detection_signature()
+    assert record.human_detection_status == "person_detected"

@@ -52,8 +52,11 @@ After the last stage, everything the scan learned is written back to the hash ca
 | --- | --- |
 | Global image pHash | ≤ 6 |
 | Candidate pairing dHash | ≤ 10 |
+| Aspect-ratio agreement | ≥ 95% |
 | Tile pHash, worst tile | ≤ 8 |
 | Tile pHash, mean | ≤ 5.0 |
+
+Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: animations with the same opening frame but different later content are rejected. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
 
 Groups are built around the best-ranked member (see [Duplicate group](duplicate-group.md)), never by chaining fuzzy matches transitively. Pairs the user previously marked *distinct* are never regrouped while the decision is current.
 
@@ -63,7 +66,7 @@ Groups are built around the best-ranked member (see [Duplicate group](duplicate-
 
 **Random review.** A fresh, unique sample of up to **50** scanned images, GIFs, and videos, for spot-checking the scan's judgment. The count is configurable down to zero.
 
-**No person.** Offline person detection on images, representative GIF frames, and up to 16 directly-seeked video frames, with early exit on positive evidence. Video frames are extracted in chunks of four per ffmpeg process (at most four processes per video) instead of one process per frame. Backends: `opencv` (default; bundled YuNet face model first at a recall-first 0.35 presence threshold, with a 320 px close-up scale, a mirrored pass, and 2×2 overlapping tiles, then INRIA and Daimler full-body HOG), `photon` (opt-in, roughly 10 GB model download on first use; queries woman / girl / person / face), `ensemble` (OpenCV first, Photon on uncertain frames). Photon and ensemble no-person piles are re-checked with YuNet + genderage; any counted face, especially a female face, is kept. When face counting is also enabled, Non-Human groups are built after those counts land so the same veto applies. The review is conservative and fails closed: if the YuNet model is missing, corrupt, or cannot start, no media is surfaced as Non-Human. See [No-person review](../ui/no-person-review.md).
+**No person.** Offline person detection on images, up to 16 GIF frames, and up to 16 directly-seeked video frames, with early exit on positive evidence. Video frames are extracted in chunks of four per ffmpeg process (at most four processes per video) instead of one process per frame. Backends: `opencv` (default; bundled YuNet face model first at a recall-first 0.35 presence threshold, with a 320 px close-up scale, a mirrored pass, and 2×2 overlapping tiles, then INRIA and Daimler full-body HOG), `photon` (opt-in, roughly 10 GB model download on first use; queries woman / girl / person / face), `ensemble` (OpenCV first, Photon on uncertain frames). Photon and ensemble no-person piles are re-checked with YuNet + genderage; any counted face, especially a female face, is kept. When face counting is also enabled, Non-Human groups are built after those counts land so the same veto applies. The review is conservative and fails closed: if the YuNet model is missing, corrupt, or cannot start, no media is surfaced as Non-Human. Photo detail is retained for the tiled face checks so small, distant faces are not lost by shrinking the whole photo first. Older no-person decisions are re-analyzed on the next scan; manual human confirmations remain in force. See [No-person review](../ui/no-person-review.md).
 
 **Faces.** OpenCV counts faces (and classifies them male/female) in images, GIF frames, and duration-scaled 4–16 sampled video frames (about one frame per five seconds, extracted in a single ffmpeg pass). Images already at or below the second detection pass's 480 px scale skip that redundant pass. Files with at least one face become faces candidates, ordered by face count. Face counting is heuristic and can miscount; the UI says so where deletion is offered.
 

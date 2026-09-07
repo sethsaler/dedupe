@@ -68,6 +68,8 @@ def mark_photon_model_ready(model_name: str) -> None:
     except OSError:
         pass
 DETECT_MAX_SIDE = 960
+# Preserve detail for regional face checks; each inference still caps at 960px.
+DETECT_INPUT_MAX_SIDE = DETECT_MAX_SIDE * 2
 YUNET_SECOND_PASS_MAX_SIDE = 480
 YUNET_CLOSE_UP_MAX_SIDE = 320
 YUNET_SCORE_THRESHOLD = 0.55
@@ -245,6 +247,12 @@ class _OpenCVPersonDetector:
         import numpy as np
 
         frame = np.ascontiguousarray(rgb_frame)
+        # Tile the retained input, not an already downsampled full-frame view.
+        # Otherwise a distant face may lose the pixels that make it detectable.
+        face_score = self._face_score(frame)
+        if face_score > 0:
+            return face_score
+
         height, width = frame.shape[:2]
         longest = max(width, height)
         if longest > DETECT_MAX_SIDE:
@@ -254,10 +262,6 @@ class _OpenCVPersonDetector:
                 (max(1, round(width * scale)), max(1, round(height * scale))),
                 interpolation=self.cv2.INTER_AREA,
             )
-
-        face_score = self._face_score(frame)
-        if face_score > 0:
-            return face_score
 
         # HOG needs a moderately sized frame and targets upright people.
         body_score = self._body_score(frame)
@@ -366,11 +370,10 @@ def human_detection_signature(
     """Identify detector inputs that must match before a result can be reused."""
     normalized = backend.strip().lower()
     parts = [HUMAN_DETECTION_CACHE_VERSION, normalized]
-    # Frame extraction changed (chunked ffmpeg seeks, draft-mode JPEG decode)
-    # and can shift results marginally; pin it so prior cached decisions are
-    # re-analyzed. Appended here so the version-prefix check in human_policy
-    # still recognizes these decisions.
-    parts.append("frame-decode=v2")
+    # Decoder detail and animation coverage affect no-person decisions.
+    parts.append("frame-decode=v3")
+    parts.append(f"input-max-side={DETECT_INPUT_MAX_SIDE}")
+    parts.append(f"animation-frames={HUMAN_VIDEO_MAX_FRAMES}")
     if normalized in {"opencv", "ensemble"}:
         parts.append(f"confidence={max(0.0, float(confidence)):g}")
         parts.append(f"yunet={YUNET_MODEL_SHA256[:12]}")
@@ -382,7 +385,7 @@ def human_detection_signature(
     return "|".join(parts)
 
 
-def _pil_frames(path: Path):
+def _pil_frames(path: Path, *, max_side: int = DETECT_MAX_SIDE, max_frames: int = 3):
     """Yield RGB arrays for a still image or representative GIF frames."""
     import numpy as np
     from PIL import Image, ImageOps
@@ -396,17 +399,23 @@ def _pil_frames(path: Path):
 
     with Image.open(path) as image:
         # JPEG decodes straight at a reduced DCT scale with draft() — much
-        # faster on high-resolution photos, and detection resizes to
-        # ≤DETECT_MAX_SIDE anyway. Other formats ignore the hint. EXIF
-        # orientation is still applied afterwards, below.
-        image.draft("RGB", (DETECT_MAX_SIDE, DETECT_MAX_SIDE))
+        # faster on high-resolution photos. Retain the requested detail for
+        # regional detection; other formats ignore the hint. Apply EXIF next.
+        image.draft("RGB", (max_side, max_side))
         frame_count = int(getattr(image, "n_frames", 1))
-        indexes = sorted({0, frame_count // 2, max(0, frame_count - 1)})
+        count = min(frame_count, max_frames)
+        indexes = (
+            [0] if count <= 1
+            else sorted({round(i * (frame_count - 1) / (count - 1)) for i in range(count)})
+        )
+        if max_frames == 3:
+            # Preserve the face-counter's existing first/middle/last sampling.
+            indexes = sorted({0, frame_count // 2, max(0, frame_count - 1)})
         for index in indexes:
             image.seek(index)
             frame = ImageOps.exif_transpose(image) if frame_count == 1 else image
             rgb = frame.convert("RGB")
-            rgb.thumbnail((DETECT_MAX_SIDE, DETECT_MAX_SIDE))
+            rgb.thumbnail((max_side, max_side))
             yield np.asarray(rgb)
 
 
@@ -426,7 +435,10 @@ def _media_person_evidence(
     max_confidence = 0.0
     try:
         if record.media_type in (MediaType.IMAGE, MediaType.GIF):
-            for frame in _pil_frames(Path(record.path)):
+            for frame in _pil_frames(
+                Path(record.path), max_side=DETECT_INPUT_MAX_SIDE,
+                max_frames=HUMAN_VIDEO_MAX_FRAMES,
+            ):
                 frames_analyzed += 1
                 max_confidence = max(max_confidence, detector.score(frame))
                 if max_confidence > 0:

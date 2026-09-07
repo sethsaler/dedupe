@@ -871,3 +871,40 @@ def test_concurrent_executes_on_the_same_selection_move_each_file_once(tmp_path:
     assert sum(result.fail_count for result in outcomes) == 1
     assert len(list(quarantine.iterdir())) == 1
     assert len([p for p in (Path(a.path), Path(b.path)) if p.exists()]) == 1
+
+
+@pytest.mark.parametrize("change_animation", [False, True])
+def test_gif_keeper_drift_rechecks_later_frames(tmp_path: Path, change_animation: bool) -> None:
+    from PIL import Image, ImageDraw
+
+    from dedupe.scanner import inventory
+    from dedupe.similar_image import compute_image_hashes_with_tiles, encode_tile_phashes
+
+    frames = []
+    for index in range(3):
+        image = Image.new("RGB", (128, 128), "navy")
+        ImageDraw.Draw(image).rectangle((index * 35, 10, index * 35 + 25, 90), fill="gold")
+        frames.append(image)
+    path = tmp_path / "keeper.gif"
+
+    def save(sequence):
+        sequence[0].save(path, save_all=True, append_images=sequence[1:], duration=100)
+
+    save(frames)
+    keeper = inventory([path])[0]
+    phash, dhash, width, height, tiles = compute_image_hashes_with_tiles(path)
+    keeper.phash, keeper.dhash = phash, dhash
+    keeper.width, keeper.height = width, height
+    keeper.tile_phashes = encode_tile_phashes(tiles)
+    group = DuplicateGroup(
+        id="gif-drift", kind=GroupKind.SIMILAR, media_type=MediaType.GIF,
+        members=[keeper], suggested_keep=keeper.path,
+    )
+    if change_animation:
+        save([frames[0], frames[2], frames[1]])
+        assert compute_image_hashes_with_tiles(path)[0] == keeper.phash
+    else:
+        os.utime(path, None)
+    valid, error = actions_module._revalidate_keeper(keeper, group)
+    assert valid is not change_animation
+    assert (error is not None) is change_animation
