@@ -725,6 +725,79 @@ def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
 
 
 @pytest.mark.e2e
+def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -> None:
+    """The Files pager advances past 50 entries; sidebar Next stays put alone."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index in range(55):
+        path = media / f"file-{index:02d}.png"
+        Image.new("RGB", (16, 16), (index % 256, 100, 150)).save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime + index,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    result = ScanResult(roots=[str(media)], files=records, groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.get_by_role("tab", name="Files 55").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        expect(page.locator("#members .card")).to_have_count(50)
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+
+        # The top pager's Next shows the last five files…
+        page.locator("#memberPagination .member-next").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "51–55 of 55"
+        )
+        expect(page.locator("#members .card")).to_have_count(5)
+        expect(page.locator("#members .card .name").first).to_have_text("file-50.png")
+
+        # …and the bottom pager's Previous returns to the first page.
+        page.locator("#memberPaginationBottom .member-prev").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+        expect(page.locator("#members .card")).to_have_count(50)
+
+        # With a single group needing attention, the sidebar Next explains
+        # instead of reselecting the open group (which used to reset the page).
+        page.locator("#memberPagination .member-next").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "51–55 of 55"
+        )
+        page.locator("#btnNextReview").click()
+        page.locator("#toast").filter(
+            has_text="Already showing the only group that needs attention"
+        ).wait_for(state="visible")
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "51–55 of 55"
+        )
+        expect(page.locator("#members .card")).to_have_count(5)
+
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_a_shortcut_opens_action_sheet_and_enter_respects_focus(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:

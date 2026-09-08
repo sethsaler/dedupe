@@ -216,7 +216,14 @@ $("btnNextReview").addEventListener("click", () => {
   const candidates = state.groups.filter(groupNeedsAttention);
   if (!candidates.length) return toast("No unreviewed results need attention", "ok");
   const current = candidates.findIndex((group) => group.id === state.currentId);
-  selectGroup(candidates[(current + 1) % candidates.length].id)
+  const target = candidates[(current + 1) % candidates.length];
+  // A single-group view (one Files folder, Faces, Non-Human) is its own only
+  // candidate: re-selecting it would refetch the same group and reset the
+  // member page to the first cards, so stay put and say so instead.
+  if (target.id === state.currentId) {
+    return toast("Already showing the only group that needs attention", "ok");
+  }
+  selectGroup(target.id)
     .catch((e) => toast(e.message || String(e), "error"));
 });
 
