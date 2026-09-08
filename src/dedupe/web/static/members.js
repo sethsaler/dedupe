@@ -46,6 +46,34 @@ function memberSortFor(kind) {
   return options.some(([value]) => value === saved) ? saved : options[0][0];
 }
 
+// Modified-time windows (seconds) for the Files tab's member filter.
+// A month counts as 30 days.
+const MODIFIED_CUTOFF_SECONDS = {
+  hour: 3600,
+  day: 86400,
+  week: 7 * 86400,
+  month: 30 * 86400,
+};
+
+const MODIFIED_LABELS = {
+  hour: "the last hour",
+  day: "the last day",
+  week: "the last week",
+  month: "the last month",
+};
+
+// Narrow a member list to files modified inside the selected window.
+// "any" (or an unknown value) returns the list untouched; files without a
+// recorded mtime never match an active window.
+function applyModifiedFilter(members) {
+  const window = MODIFIED_CUTOFF_SECONDS[state.memberModified];
+  if (window == null) return members;
+  const cutoff = Date.now() / 1000 - window;
+  return (members || []).filter(
+    (member) => member?.mtime != null && member.mtime >= cutoff,
+  );
+}
+
 function syncMemberPagination(pageCount, summaryText) {
   const bars = [
     $("memberPagination"),
@@ -310,6 +338,11 @@ function renderMembers(g) {
           : (a, b) => (b.mtime || 0) - (a.mtime || 0) || byPath(a, b),
     );
   }
+  // The Files tab's modified-time filter narrows the cards (and the
+  // lightbox order, which follows this same list) before paging.
+  if (g.kind === "all_files") {
+    allMembers = applyModifiedFilter(allMembers);
+  }
   const triage = isPagedIndependentReview(g);
   box.classList.toggle("triage-grid", triage);
   if (triage && !state.showDeleted) {
@@ -354,6 +387,16 @@ function renderMembers(g) {
     }
     if (options) sortSelect.value = memberSortFor(g.kind);
   }
+  const modifiedSelect = $("memberModified");
+  if (modifiedSelect) {
+    const showModified = g.kind === "all_files";
+    modifiedSelect.hidden = !showModified;
+    if (showModified) {
+      modifiedSelect.value = MODIFIED_CUTOFF_SECONDS[state.memberModified] != null
+        ? state.memberModified
+        : "any";
+    }
+  }
   // The sort select lives in the top pagination bar, so sortable kinds keep
   // that bar visible even when the group fits on one page.
   if (MEMBER_SORT_OPTIONS[g.kind] && $("memberPagination")) $("memberPagination").hidden = false;
@@ -370,10 +413,13 @@ function renderMembers(g) {
   updateGroupSelectionText(g);
   if (triage && !members.length) {
     const hiddenDeleted = !state.showDeleted && deletedPaths.size;
+    const modifiedWindow = g.kind === "all_files" ? MODIFIED_LABELS[state.memberModified] : null;
     box.innerHTML = `<div class="triage-empty">${
       hiddenDeleted
         ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`
-        : "Nothing left in this review pile."
+        : modifiedWindow
+          ? `No files in this folder were modified in ${modifiedWindow}.`
+          : "Nothing left in this review pile."
     }</div>`;
     return;
   }
@@ -901,9 +947,11 @@ function changeMemberPage(delta) {
   }
   if (!current || !isGridPagedGroup(current)) return;
   // Mirror renderMembers: only the triage reviews hide trashed members.
-  const visible = isPagedIndependentReview(current) && !state.showDeleted
+  let visible = isPagedIndependentReview(current) && !state.showDeleted
     ? (current.members || []).filter((member) => !(current.deleted_paths || []).includes(member.path))
     : (current.members || []);
+  // Mirror renderMembers: the Files tab's modified-time filter applies too.
+  if (current?.kind === "all_files") visible = applyModifiedFilter(visible);
   const pageCount = Math.max(1, Math.ceil(visible.length / MEMBER_PAGE_SIZE));
   const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
   if (nextPage === state.memberPage) return;
@@ -931,6 +979,17 @@ $("memberSort")?.addEventListener("change", (event) => {
   state.memberPage = 0;
   state.memberFocus = 0;
   state.trashedInPlace.clear();
+  if (current) renderMembers(current);
+});
+
+// The Files tab's modified-time filter: re-render the member cards
+// immediately, starting back on the first page.
+$("memberModified")?.addEventListener("change", (event) => {
+  state.memberModified = event.target.value;
+  state.memberPage = 0;
+  state.memberFocus = 0;
+  state.trashedInPlace.clear();
+  const current = currentGroup();
   if (current) renderMembers(current);
 });
 

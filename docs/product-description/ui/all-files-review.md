@@ -45,6 +45,8 @@ The review becomes consequential at the first per-candidate trash: the file is p
 
 **Sorting.** The card pager's sort control offers four orders: Folder order (path) — the default, following the folder tree — Largest first, Newest first, and Oldest first. Largest first surfaces the space hogs immediately, which is usually the point of a deletion sift. The lightbox steps in the same order as the grid.
 
+**Modified filter.** Beside the sort control, a time filter narrows the cards to files modified in the last hour, day, week, or month (a month counts as 30 days), or back to any time. It applies instantly to the cards, the page count, and the lightbox order; when nothing in the folder falls in the window, the pane says so instead of showing cards.
+
 **Revealing.** Each card and the lightbox (`r`) offer **Reveal in Finder**, so an ambiguous thumbnail can be inspected in place mid-sift.
 
 **Progress.** The detail header counts reviewed files and trashed files: trashed candidates count as reviewed, and a file the user decided about in another category — a low-res `←`/`→` decision — arrives pre-marked reviewed here, since the decision was already made. A reviewed-and-unselected file (a Keep anywhere, or a trashed-then-restored file) vetoes its deletion everywhere, including a one-click trash here: the refusal names the vetoing review — "Kept in the Low-res review — revise that decision before trashing it here" — so the user knows where to go.

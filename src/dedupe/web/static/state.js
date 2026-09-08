@@ -18,6 +18,8 @@ const state = {
   memberPage: 0,
   // Per-kind member ordering; the default entry is each kind's server order.
   memberSortByKind: { faces: "faces-desc", all_files: "path" },
+  // Modified-time window for the Files tab's member list ("any" = no filtering).
+  memberModified: "any",
   lightboxItems: [],
   lightboxIndex: 0,
   scanning: false,

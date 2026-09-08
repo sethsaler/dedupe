@@ -390,6 +390,13 @@
               <option value="faces-asc">Fewest faces first</option>
               <option value="newest">Newest first</option>
             </select>
+            <select id="memberModified" aria-label="Filter by modified time" hidden>
+              <option value="any">Any time</option>
+              <option value="hour">Last hour</option>
+              <option value="day">Last day</option>
+              <option value="week">Last week</option>
+              <option value="month">Last month</option>
+            </select>
           </nav>
           <div class="members" id="members"></div>
           <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="Review result pages (bottom)" hidden>
