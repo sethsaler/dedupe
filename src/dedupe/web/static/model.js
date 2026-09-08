@@ -14,6 +14,14 @@ function isPagedIndependentReview(g) {
   return g?.kind === "no_humans" || g?.kind === "faces" || g?.kind === "all_files";
 }
 
+// Keep-one duplicate groups (exact/similar) render the same 50-card grid pages
+// as the triage reviews once they outgrow a single page. Triage-only behavior
+// (Trash affordances, deleted placeholders) still keys off
+// isPagedIndependentReview above — this is only the grid-rendering concern.
+function isGridPagedGroup(g) {
+  return isPagedIndependentReview(g) || g?.kind === "exact" || g?.kind === "similar";
+}
+
 function currentGroup() {
   return state.allGroups.find((group) => group.id === state.currentId)
     || state.groups.find((group) => group.id === state.currentId);
@@ -45,4 +53,4 @@ function markGroupTouched(id) {
   if (id) state.touchedGroups.add(id);
 }
 
-export { isDecisionReview, isIndependentReview, isPagedIndependentReview, currentGroup, patchGroup, groupSelectedCount, groupComplete, groupNeedsAttention, markGroupTouched };
+export { isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, currentGroup, patchGroup, groupSelectedCount, groupComplete, groupNeedsAttention, markGroupTouched };

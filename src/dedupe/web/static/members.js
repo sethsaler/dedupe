@@ -3,7 +3,7 @@
 import { api } from "./api.js";
 import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
-import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, markGroupTouched, patchGroup } from "./model.js";
+import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast } from "./util.js";
@@ -319,9 +319,10 @@ function renderMembers(g) {
   }
   syncDeletedToggle(g);
   const decisionReview = isDecisionReview(g);
+  const gridPaged = isGridPagedGroup(g);
   const pageCount = decisionReview
     ? Math.max(1, allMembers.length)
-    : isPagedIndependentReview(g)
+    : gridPaged
       ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
       : 1;
   state.memberPage = Math.max(0, Math.min(pageCount - 1, state.memberPage));
@@ -332,7 +333,7 @@ function renderMembers(g) {
   const pageStart = decisionReview ? state.memberFocus : state.memberPage * MEMBER_PAGE_SIZE;
   const members = decisionReview
     ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
-    : isPagedIndependentReview(g)
+    : gridPaged
     ? allMembers.slice(pageStart, pageStart + MEMBER_PAGE_SIZE)
     : allMembers;
   const summaryText = allMembers.length
@@ -356,12 +357,12 @@ function renderMembers(g) {
   // The sort select lives in the top pagination bar, so sortable kinds keep
   // that bar visible even when the group fits on one page.
   if (MEMBER_SORT_OPTIONS[g.kind] && $("memberPagination")) $("memberPagination").hidden = false;
-  if (isPagedIndependentReview(g)) {
+  if (gridPaged) {
     prefetchThumbnails(allMembers.slice(pageStart + members.length, pageStart + members.length + 8));
   }
-  // Paged triage reviews sift through the whole group in the lightbox, not
+  // Paged groups sift through the whole group in the lightbox, not
   // just the 50-card page: the page slice is only a grid-rendering concern.
-  const lightboxSource = isPagedIndependentReview(g) ? allMembers : members;
+  const lightboxSource = gridPaged ? allMembers : members;
   state.lightboxItems = lightboxSource
     .filter((member) => !deletedPaths.has(member.path))
     .map((member) => lightboxItemFor(member, g));
@@ -533,7 +534,16 @@ function renderMembers(g) {
     cb.addEventListener("change", async () => {
       const changedPath = cb.dataset.path;
       const checks = [...box.querySelectorAll(".sel-cb")];
-      const selectedPaths = checks.filter((c) => c.checked).map((c) => c.dataset.path);
+      const pagePaths = new Set(checks.map((c) => c.dataset.path));
+      // Paged keep-one groups render one 50-card page at a time: keep the
+      // off-page picks and only add/drop the visible page's checkboxes.
+      // (Single-page groups render every card, so this matches the old
+      // visible-only list exactly.)
+      const offPageKept = (g.selected_for_removal || []).filter((path) => !pagePaths.has(path));
+      const selectedPaths = [
+        ...offPageKept,
+        ...checks.filter((c) => c.checked).map((c) => c.dataset.path),
+      ];
       const previousSelected = new Set(g.selected_for_removal || []);
       try {
         const updated = await api("/api/selection", {
@@ -889,8 +899,9 @@ function changeMemberPage(delta) {
     renderMembers(current);
     return;
   }
-  if (!current || !isPagedIndependentReview(current)) return;
-  const visible = !state.showDeleted
+  if (!current || !isGridPagedGroup(current)) return;
+  // Mirror renderMembers: only the triage reviews hide trashed members.
+  const visible = isPagedIndependentReview(current) && !state.showDeleted
     ? (current.members || []).filter((member) => !(current.deleted_paths || []).includes(member.path))
     : (current.members || []);
   const pageCount = Math.max(1, Math.ceil(visible.length / MEMBER_PAGE_SIZE));

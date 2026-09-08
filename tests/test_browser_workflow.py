@@ -17,7 +17,7 @@ from werkzeug.serving import make_server
 
 from dedupe.grouping import build_groups, build_no_human_groups
 from dedupe.human_detection import human_detection_signature
-from dedupe.models import FileRecord, MediaType, ScanResult
+from dedupe.models import FileRecord, GroupKind, MediaType, ReviewGroup, ScanResult
 from dedupe.web.app import create_app
 
 
@@ -793,6 +793,103 @@ def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -
             "51–55 of 55"
         )
         expect(page.locator("#members .card")).to_have_count(5)
+
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_exact_group_pager_pages_past_50_and_keeps_selection(page, tmp_path: Path) -> None:
+    """Exact groups over 50 members page like the triage reviews; picks survive page turns."""
+    media = tmp_path / "media"
+    media.mkdir()
+    first = media / "file-00.png"
+    Image.new("RGB", (16, 16), (25, 100, 180)).save(first)
+    records = []
+    for index in range(55):
+        path = media / f"file-{index:02d}.png"
+        if index:
+            shutil.copyfile(first, path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime + index,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    group = ReviewGroup(
+        id="exact-1",
+        kind=GroupKind.EXACT,
+        media_type=MediaType.IMAGE,
+        members=records,
+        selected_for_removal=[record.path for record in records[1:]],
+        suggested_keep=records[0].path,
+    )
+    result = ScanResult(roots=[str(media)], files=records, groups=[group])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.get_by_role("tab", name="Exact 1").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .card").first.wait_for(state="visible")
+        expect(page.locator("#members .card")).to_have_count(50)
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+
+        # The top pager's Next shows the last five files…
+        page.locator("#memberPagination .member-next").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "51–55 of 55"
+        )
+        expect(page.locator("#members .card")).to_have_count(5)
+
+        # …and the bottom pager's Previous returns to the first page.
+        page.locator("#memberPaginationBottom .member-prev").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+        expect(page.locator("#members .card")).to_have_count(50)
+
+        # Unchecking a pick on page one survives a round trip to page two:
+        # the POST merges the visible page instead of replacing the selection.
+        page.locator("#members .card .sel-cb").nth(1).click()
+        expect(page.locator("#groupSelectionSummary")).to_have_text(
+            "53 of 55 selected for removal"
+        )
+        page.locator("#memberPagination .member-next").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "51–55 of 55"
+        )
+        page.locator("#memberPaginationBottom .member-prev").click()
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "1–50 of 55"
+        )
+        expect(page.locator("#members .card .sel-cb").nth(1)).not_to_be_checked()
+        expect(page.locator("#groupSelectionSummary")).to_have_text(
+            "53 of 55 selected for removal"
+        )
+
+        # The lightbox sifts the whole group without stopping at the page edge.
+        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbCounter")).to_have_text("1 / 55")
+        for _ in range(50):
+            page.keyboard.press("ArrowRight")
+        expect(page.locator("#lbCounter")).to_have_text("51 / 55")
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
 
     assert page_errors == []
 
