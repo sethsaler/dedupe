@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PIL import Image, ImageDraw
 
 from dedupe.models import FileRecord, MediaType
@@ -235,6 +236,39 @@ def test_downscaled_duplicate_still_matches(tmp_path: Path) -> None:
     assert is_near_identical(str(hi.resolve()), str(lo.resolve()))
     groups = find_similar_image_groups([_rec_for(hi), _rec_for(lo)], threshold=8)
     assert len(groups) == 1
+
+
+@pytest.mark.parametrize("size", [(512, 512), (512, 384), (384, 512)])
+@pytest.mark.parametrize("small_side", [240, 128])
+def test_resized_download_below_tile_size_still_matches(tmp_path, size, small_side):
+    """Thumbnail downloads must occupy the same regional canvas as originals."""
+    import dedupe.similar_image as module
+    from dedupe.cache import HashCache
+    from dedupe.scanner import inventory
+
+    with Image.open(Path(__file__).parent / "fixtures" / "astronaut.png") as image:
+        base = image.convert("RGB").crop((0, 0, *size))
+    original, download = tmp_path / "original.jpg", tmp_path / "download.jpg"
+    base.save(original, quality=95)
+    small = base.copy()
+    small.thumbnail((small_side, small_side), Image.Resampling.LANCZOS)
+    small.save(download, quality=75)
+    expected = {str(original), str(download)}
+
+    cache = HashCache(tmp_path / "hashes.sqlite")
+    try:
+        for cached in (False, True):
+            records = inventory([original, download])
+            if cached:
+                assert cache.hydrate(records) == 2
+                records.reverse()  # Matching must work in either pair order.
+            groups = find_similar_image_groups(records, workers=1)
+            assert [{record.path for record in group} for group in groups] == [expected]
+            fallback = module._bruteforce_groups(records, 6, 10, 8, 5.0, None)
+            assert [{record.path for record in group} for group in fallback] == [expected]
+            cache.store_all(records)
+    finally:
+        cache.close()
 
 
 def test_different_pose_rejected_by_tiles(tmp_path: Path) -> None:

@@ -201,7 +201,7 @@ def _image_hash_job(
         return path, None, None, None, None, None, f"{ERROR_IMAGE_HASH_FAILED}: {exc}"
 
 
-def _tile_phashes_from_image(img) -> list:
+def _tile_phashes_from_image(img, comparison_side: int = TILE_NORMALIZE) -> list:
     """pHash of 4 quadrants + center crop after size normalization."""
     import imagehash
     from PIL import Image as PILImage
@@ -209,7 +209,7 @@ def _tile_phashes_from_image(img) -> list:
     # Letterbox into a fixed square so aspect ratio is preserved and scales match.
     canvas = PILImage.new("RGB", (TILE_NORMALIZE, TILE_NORMALIZE), (0, 0, 0))
     src = img.convert("RGB")
-    src.thumbnail((TILE_NORMALIZE, TILE_NORMALIZE), PILImage.Resampling.BILINEAR)
+    src.thumbnail((comparison_side, comparison_side), PILImage.Resampling.BILINEAR)
     ox = (TILE_NORMALIZE - src.width) // 2
     oy = (TILE_NORMALIZE - src.height) // 2
     canvas.paste(src, (ox, oy))
@@ -226,7 +226,9 @@ def _tile_phashes_from_image(img) -> list:
 
 
 @lru_cache(maxsize=TILE_CACHE_SIZE)
-def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
+def _tile_phashes_for_path(
+    path: str, comparison_side: int = TILE_NORMALIZE
+) -> tuple[str, ...] | None:
     """Run-cached tile hashes for records that carry no stored tile hashes."""
     _ensure_image_deps()
     _register_heif()
@@ -242,7 +244,10 @@ def _tile_phashes_for_path(path: str) -> tuple[str, ...] | None:
                 img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
             except Exception:
                 pass
-            tiles = [tile for frame in _hash_frames(img) for tile in _tile_phashes_from_image(frame)]
+            tiles = [
+                tile for frame in _hash_frames(img)
+                for tile in _tile_phashes_from_image(frame, comparison_side)
+            ]
             return tuple(str(t) for t in tiles)
     except Exception:
         return None
@@ -270,6 +275,8 @@ def is_near_identical(
     tile_mean: float = DEFAULT_TILE_MEAN,
     tiles_a: tuple[str, ...] | None = None,
     tiles_b: tuple[str, ...] | None = None,
+    dimensions_a: tuple[int | None, int | None] | None = None,
+    dimensions_b: tuple[int | None, int | None] | None = None,
 ) -> bool:
     """
     True if regional structure matches (same image / scale / quality variants).
@@ -282,6 +289,25 @@ def is_near_identical(
     if not tiles_a or not tiles_b or len(tiles_a) != len(tiles_b):
         # Missing evidence or a still/animation mismatch cannot establish similarity.
         return False
+    try:
+        dimensions_a = dimensions_a or probe_image_dimensions(path_a)
+        dimensions_b = dimensions_b or probe_image_dimensions(path_b)
+    except (OSError, ValueError):
+        return False
+    if all(dimensions_a) and all(dimensions_b):
+        side_a = min(TILE_NORMALIZE, max(dimensions_a))
+        side_b = min(TILE_NORMALIZE, max(dimensions_b))
+        if side_a != side_b:
+            # thumbnail never enlarges small downloads. Compare at the smaller
+            # copy's scale so both hashes see the same content and padding.
+            # Keep pair-specific hashes out of the persistent per-file cache.
+            side = min(side_a, side_b)
+            if side_a > side:
+                tiles_a = _tile_phashes_for_path(path_a, side)
+            if side_b > side:
+                tiles_b = _tile_phashes_for_path(path_b, side)
+            if not tiles_a or not tiles_b or len(tiles_a) != len(tiles_b):
+                return False
     dists = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(tiles_a, tiles_b, strict=True)]
     if max(dists) > tile_max:
         return False
@@ -567,6 +593,8 @@ def find_similar_image_groups(
                     tile_mean=tile_mean,
                     tiles_a=tiles_a,
                     tiles_b=tiles_b,
+                    dimensions_a=(rec.width, rec.height),
+                    dimensions_b=(other.width, other.height),
                 ):
                     continue
                 # Dense detail: reject burst-like concentrated local changes.
@@ -626,7 +654,9 @@ def _bruteforce_groups(
             ) > dhash_threshold:
                 continue
             if not is_near_identical(
-                a.path, b.path, tile_max=tile_max, tile_mean=tile_mean
+                a.path, b.path, tile_max=tile_max, tile_mean=tile_mean,
+                dimensions_a=(a.width, a.height),
+                dimensions_b=(b.width, b.height),
             ):
                 continue
             if not is_dense_match(
