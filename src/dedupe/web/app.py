@@ -12,6 +12,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import replace
+from itertools import combinations
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -56,11 +57,14 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 21
+WEB_API_VERSION = 22
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
-#: Independent review flows whose cards support direct per-file Trash + undo.
-INDEPENDENT_DELETE_KINDS = {"no_humans", "faces", "all_files"}
+#: Flows whose members support direct per-file Trash + undo. The independent
+#: review piles work one candidate at a time; similar groups use it for the
+#: swipe review's same-photo (left swipe) decision, with keeper protection
+#: re-derived through apply_actions.
+IMMEDIATE_DELETE_KINDS = {"no_humans", "faces", "all_files", "similar"}
 REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 
 # How long after the last tab closes before the server exits. Long enough for a
@@ -272,6 +276,74 @@ def sync_low_resolution_keeps(result: ScanResult, paths: set[str]) -> str | None
     return None
 
 
+def drop_marked_distinct_groups(result: ScanResult, cache_path: str | Path | None) -> int:
+    """Remove similar groups the user already marked distinct, when still current.
+
+    A loaded result (``dedupe ui --load``, or an older saved session) can carry
+    similar groups that a fresh scan would suppress through the hash cache's
+    distinct pairs. Drop a similar group only when every pair of its members
+    is a still-current distinct decision, judged against the members' present
+    on-disk identity — changed or unreadable files keep their group, so no
+    unreviewed similarity is ever hidden. Never raises: without a readable
+    cache every group is kept.
+    """
+    candidates = [
+        group
+        for group in result.groups
+        if group.kind == GroupKind.SIMILAR and len(group.members) >= 2
+    ]
+    if not candidates:
+        return 0
+    try:
+        cache = HashCache(cache_path)
+    except (OSError, sqlite3.Error):
+        return 0
+    try:
+        current: dict[str, object] = {}
+        for group in candidates:
+            for member in group.members:
+                if member.path not in current:
+                    try:
+                        file_stat = os.stat(member.path)
+                    except OSError:
+                        current[member.path] = None
+                        continue
+                    current[member.path] = replace(
+                        member,
+                        size=int(file_stat.st_size),
+                        mtime=float(file_stat.st_mtime),
+                        mtime_ns=int(file_stat.st_mtime_ns),
+                        device=int(file_stat.st_dev),
+                        inode=int(file_stat.st_ino),
+                    )
+        covered = set()
+        for group in candidates:
+            fresh = [current[member.path] for member in group.members]
+            if any(record is None for record in fresh):
+                continue
+            valid = cache.distinct_pairs(fresh)
+            if all(
+                tuple(sorted((left.path, right.path))) in valid
+                for left, right in combinations(fresh, 2)
+            ):
+                covered.add(group.id)
+        if not covered:
+            return 0
+        result.groups = [
+            group
+            for group in result.groups
+            if group.kind != GroupKind.SIMILAR or group.id not in covered
+        ]
+        return len(covered)
+    except (OSError, sqlite3.Error):
+        return 0
+    finally:
+        try:
+            cache.close()
+        except Exception:
+            pass
+
+
 def detect_capabilities() -> dict:
     """Probe optional dependencies once; the UI gates scan options on this."""
     from ..human_detection import YUNET_MODEL_PATH
@@ -300,6 +372,7 @@ def detect_capabilities() -> dict:
 def create_app(
     initial_result: ScanResult | None = None,
     review_session_path: str | Path | None = None,
+    cache_path: str | Path | None = None,
 ) -> Flask:
     app = Flask(
         __name__,
@@ -309,7 +382,7 @@ def create_app(
     csrf_token = secrets.token_urlsafe(32)
     app.config["SECRET_KEY"] = secrets.token_hex(32)
     app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
-    app.config["DEDUPE_CACHE_PATH"] = None
+    app.config["DEDUPE_CACHE_PATH"] = cache_path
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     capabilities = detect_capabilities()
     lock = threading.RLock()
@@ -577,6 +650,10 @@ def create_app(
 
     if initial_result is not None:
         with lock:
+            # A results file from an earlier scan predates later distinct
+            # reviews; drop what a fresh scan would suppress before installing
+            # it, so marked groups do not resurface (and are not saved back).
+            drop_marked_distinct_groups(initial_result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(initial_result)
             state["result"] = initial_result
             initial_result.recompute_stats()
@@ -592,6 +669,9 @@ def create_app(
         persist_result()
     elif loaded.result is not None:
         with lock:
+            # Heals sessions saved before a distinct review (e.g. poisoned by
+            # an earlier --load): covered groups never reach the review list.
+            drop_marked_distinct_groups(loaded.result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(loaded.result)
             state["result"] = loaded.result
             loaded.result.recompute_stats()
@@ -1408,7 +1488,7 @@ def create_app(
                     candidate
                     for candidate in (result.groups if result else [])
                     if candidate.id == group_id
-                    and candidate.kind.value in INDEPENDENT_DELETE_KINDS
+                    and candidate.kind.value in IMMEDIATE_DELETE_KINDS
                 ),
                 None,
             )
@@ -1510,6 +1590,18 @@ def create_app(
                     selected for selected in original_selected if selected != path
                 ]
                 group.reviewed_paths = list(dict.fromkeys([*original_reviewed, path]))
+                # The swipe deck can re-anchor and trash the suggested keeper;
+                # re-pick so keeper protection never guards a trashed file.
+                if group.suggested_keep == path:
+                    live = [
+                        member
+                        for member in group.members
+                        if member.path not in state["deleted_files"]
+                    ]
+                    if live:
+                        from ..grouping import pick_suggested_keep
+
+                        group.suggested_keep = pick_suggested_keep(live)
                 if result is not None:
                     result.recompute_stats()
                     refresh_selected_count_locked()
@@ -1537,7 +1629,7 @@ def create_app(
                     candidate
                     for candidate in (result.groups if result else [])
                     if candidate.id == group_id
-                    and candidate.kind.value in INDEPENDENT_DELETE_KINDS
+                    and candidate.kind.value in IMMEDIATE_DELETE_KINDS
                 ),
                 None,
             )
@@ -1680,9 +1772,17 @@ def create_app(
 
     @app.post("/api/similar/mark-distinct")
     def api_mark_similar_distinct():
-        """Persist one Similar group as pairwise distinct and remove it from review."""
+        """Persist Similar files as pairwise distinct and remove them from review.
+
+        With no ``path`` the whole group is marked pairwise distinct and
+        dissolved, as before. With ``path`` only that member is decided: the
+        ``anchor``/suggested-keeper pair is recorded as distinct (future scans
+        never regroup those two files) and the member leaves the group; the
+        group dissolves once fewer than two members remain.
+        """
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
+        member_path = data.get("path")
         with lock:
             if state["scanning"] or state["acting"]:
                 return jsonify({"error": "reviews are locked during active work"}), 409
@@ -1699,7 +1799,20 @@ def create_app(
             )
             if group is None:
                 return jsonify({"error": "similar group not found"}), 404
-            records = list(group.members)
+            member = next(
+                (m for m in group.members if m.path == member_path), None
+            )
+            if member_path is not None and member is None:
+                return jsonify({"error": "member not found in group"}), 404
+            anchor_path = data.get("anchor") or group.suggested_keep
+            anchor = next(
+                (m for m in group.members if m.path == anchor_path), None
+            )
+            if member is not None and anchor is None:
+                return jsonify({"error": "anchor is not a member of this group"}), 400
+            if member is not None and anchor.path == member.path:
+                return jsonify({"error": "a file cannot be distinct from itself"}), 400
+            records = [anchor, member] if member is not None else list(group.members)
             state["acting"] = True
 
         cache = None
@@ -1707,15 +1820,116 @@ def create_app(
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
             pair_count = cache.mark_distinct(records)
             with lock:
-                result.groups = [candidate for candidate in result.groups if candidate.id != group_id]
+                if member is not None:
+                    group.members = [
+                        m for m in group.members if m.path != member.path
+                    ]
+                    group.selected_for_removal = [
+                        path for path in group.selected_for_removal
+                        if path != member.path
+                    ]
+                    group.reviewed_paths = [
+                        path for path in group.reviewed_paths
+                        if path != member.path
+                    ]
+                if member is None or len(group.members) < 2:
+                    result.groups = [
+                        candidate
+                        for candidate in result.groups
+                        if candidate.id != group_id
+                    ]
                 result.recompute_stats()
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                dissolved = all(
+                    candidate.id != group_id for candidate in result.groups
+                )
+                payload = None if dissolved else group_payload(group)
             persist_result()
-            return jsonify({"ok": True, "pair_count": pair_count})
+            return jsonify({
+                "ok": True,
+                "pair_count": pair_count,
+                "dissolved": dissolved,
+                "group": payload,
+            })
         except (OSError, sqlite3.Error) as exc:
             return jsonify({"error": f"could not save distinct review: {exc}"}), 400
+        finally:
+            if cache is not None:
+                cache.close()
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/similar/unmark-distinct")
+    def api_unmark_similar_distinct():
+        """Undo one pair-level distinct decision and return the member to review.
+
+        Deletes the recorded pair and re-inserts the member into its group when
+        the group is still under review. When the group already dissolved, the
+        pair row is still dropped — the files can regroup on the next scan.
+        """
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        member_path = data.get("path")
+        if not member_path:
+            return jsonify({"error": "path is required"}), 400
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "reviews are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            group = next(
+                (
+                    candidate
+                    for candidate in (result.groups if result else [])
+                    if candidate.id == group_id and candidate.kind.value == "similar"
+                ),
+                None,
+            )
+            anchor_path = (
+                data.get("anchor") or (group.suggested_keep if group else None)
+            )
+            if anchor_path is None:
+                return jsonify({"error": "anchor is required for a dissolved group"}), 400
+            record = next(
+                (
+                    file
+                    for file in (result.files if result else [])
+                    if file.path == member_path
+                ),
+                None,
+            )
+            if group is not None and record is None:
+                return jsonify({"error": "file is not part of this scan"}), 404
+            if group is not None and member_path in {
+                member.path for member in group.members
+            }:
+                return jsonify(group_payload(group))
+            state["acting"] = True
+
+        cache = None
+        try:
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            removed = cache.unmark_distinct_pair(anchor_path, member_path)
+            with lock:
+                if group is not None:
+                    group.members = [*group.members, record]
+                    result.recompute_stats()
+                    refresh_selected_count_locked()
+                    state["groups_version"] = state.get("groups_version", 0) + 1
+                    state["paths_version"] += 1
+                payload = group_payload(group) if group is not None else None
+            if group is not None:
+                persist_result()
+            return jsonify({
+                "ok": True,
+                "removed_pairs": removed,
+                "group": payload,
+            })
+        except (OSError, sqlite3.Error) as exc:
+            return jsonify({"error": f"could not undo distinct review: {exc}"}), 400
         finally:
             if cache is not None:
                 cache.close()

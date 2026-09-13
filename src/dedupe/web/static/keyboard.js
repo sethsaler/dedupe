@@ -5,6 +5,7 @@ import { closeLightbox, openLightbox } from "./lightbox.js";
 import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
 import { currentGroup, groupNeedsAttention, isDecisionReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
+import { decideSwipe, skipSwipe, swipeActive, undoSwipe } from "./swipe.js";
 import { $, toast, trapTabKey } from "./util.js";
 
 // —— Keyboard ——
@@ -51,6 +52,27 @@ document.addEventListener("keydown", async (e) => {
       if (typing || e.target === $("lbVideo")) return;
     // A focused button handles Space/Enter natively (e.g. hold-to-flicker).
     const onButton = e.target?.tagName === "BUTTON";
+    if (swipeActive()) {
+      // In swipe review the lightbox keeps the ←/→ decide grammar and applies
+      // it to the file on screen (the deck's reference card is not decidable).
+      const itemPath = state.lightboxItems[state.lightboxIndex]?.path;
+      if (e.key === "ArrowLeft" || e.key === "d" || e.key === "Delete") {
+        decideSwipe("same", itemPath);
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "ArrowRight") {
+        decideSwipe("distinct", itemPath);
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "Backspace") {
+        undoSwipe();
+        e.preventDefault();
+        return;
+      }
+      // Other keys (r, z, Space) keep their normal lightbox meaning.
+    }
     if (e.key === "ArrowLeft") {
       $("lbPrev").click();
       e.preventDefault();
@@ -91,8 +113,10 @@ document.addEventListener("keydown", async (e) => {
 
   if (e.key === "j" || e.key === "ArrowDown") {
     // In a decision review, ↓ steps to the next candidate without deciding;
+    // in the swipe deck it sends the card to the back ("decide later").
     // j always moves between groups.
     if (e.key === "ArrowDown" && isDecisionReview(currentGroup())) changeMemberPage(1);
+    else if (e.key === "ArrowDown" && swipeActive()) skipSwipe();
     else navGroup(1);
     e.preventDefault();
   } else if (e.key === "k" || e.key === "ArrowUp") {
@@ -107,10 +131,10 @@ document.addEventListener("keydown", async (e) => {
   } else if (e.key === "[") {
     navAttention(-1);
     e.preventDefault();
-  } else if (e.key === "u" && state.currentId) {
+  } else if (e.key === "u" && state.currentId && !swipeActive()) {
     $("btnSelectSuggested").click();
     e.preventDefault();
-  } else if (e.key === "s" && state.currentId) {
+  } else if (e.key === "s" && state.currentId && !swipeActive()) {
     $("btnSmartGroup").click();
     e.preventDefault();
   } else if (e.key === "a") {
@@ -123,11 +147,25 @@ document.addEventListener("keydown", async (e) => {
     $("btnTrashReview").click();
     e.preventDefault();
   } else if (e.key === "Enter" && state.currentId) {
+    if (swipeActive()) {
+      // The deck's lightbox order is reference first, then candidates.
+      openLightbox(state.lightboxItems.length > 1 ? 1 : 0);
+      e.preventDefault();
+      return;
+    }
     const focused = document.querySelector("#members .card.focused .thumb-wrap");
     const index = Number(focused?.dataset.index ?? state.memberFocus ?? 0);
     openLightbox(Number.isFinite(index) ? index : 0);
     e.preventDefault();
   } else if (["d", "Delete", "Backspace"].includes(e.key) && state.currentId) {
+    if (swipeActive()) {
+      // Same grammar as the deck buttons: d/Delete calls it the same photo
+      // (Trash); ⌫ undoes the last swipe decision.
+      if (e.key === "Backspace") undoSwipe();
+      else decideSwipe("same");
+      e.preventDefault();
+      return;
+    }
     const group = currentGroup();
     if (!isPagedIndependentReview(group)) return;
     const cards = [...document.querySelectorAll("#members .card:not(.deleted)")];
@@ -137,6 +175,14 @@ document.addEventListener("keydown", async (e) => {
       e.preventDefault();
     }
   } else if ((e.key === "r" || e.key === "R") && state.currentId) {
+    if (swipeActive()) {
+      const reveal = document.querySelector("#members .swipe-top .reveal");
+      if (reveal) {
+        reveal.click();
+        e.preventDefault();
+      }
+      return;
+    }
     // Same Reveal as the card's button (and the lightbox's r): works in every
     // kind of group; decision-review cards have no Reveal control, so no-op.
     const cards = [...document.querySelectorAll("#members .card:not(.deleted)")];
@@ -159,6 +205,11 @@ document.addEventListener("keydown", async (e) => {
     e.preventDefault();
   } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && state.currentId) {
     const current = currentGroup();
+    if (swipeActive()) {
+      decideSwipe(e.key === "ArrowLeft" ? "same" : "distinct");
+      e.preventDefault();
+      return;
+    }
     if (isDecisionReview(current)) {
       const member = (current.members || [])[state.memberFocus];
       if (member) await reviewCandidate(current, member.path, e.key === "ArrowLeft");

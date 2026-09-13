@@ -278,6 +278,16 @@ class HashCache:
         self._conn.commit()
         return count
 
+    def unmark_distinct_pair(self, path_a: str, path_b: str) -> int:
+        """Drop one recorded distinct pair (undo of a pair-level review)."""
+        left, right = sorted((path_a, path_b))
+        cursor = self._conn.execute(
+            "DELETE FROM distinct_similar_pairs WHERE path_a = ? AND path_b = ?",
+            (left, right),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def distinct_pairs(self, records: list[FileRecord]) -> set[tuple[str, str]]:
         """Return reviewed-distinct pairs whose two file identities still match."""
         by_path = {record.path: record for record in records}

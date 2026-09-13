@@ -55,8 +55,12 @@ After the last stage, everything the scan learned is written back to the hash ca
 | Aspect-ratio agreement | ≥ 95% |
 | Tile pHash, worst tile | ≤ 8 |
 | Tile pHash, mean | ≤ 5.0 |
+| Dense detail, worst 16×16 block of a 128 px thumbnail | ≤ 3.0 mean abs difference, unless the spike dominates (worst/mean > 8×) |
+| Dense detail, global spread | always passes (recompression, rescaling, rotation, exposure shifts differ everywhere, not in one spot) |
 
-Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: animations with the same opening frame but different later content are rejected. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
+Pairs that pass the tile check get one final dense comparison: both images are reduced to 128 px grayscale thumbnails and differenced block by block over an 8×8 grid. A pair is rejected only when a single block differs strongly *and* that spike dominates the overall difference — the signature of a burst shot (a blink, a shifted hand) on top of an otherwise identical frame. Global resampling spreads small differences across every block, so true re-exports still match. An unreadable thumbnail never rejects on its own; the tile verdict stands.
+
+Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: animations with the same opening frame but different later content are rejected. The dense check compares first frames only. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
 
 Groups are built around the best-ranked member (see [Duplicate group](duplicate-group.md)), never by chaining fuzzy matches transitively. Pairs the user previously marked *distinct* are never regrouped while the decision is current.
 

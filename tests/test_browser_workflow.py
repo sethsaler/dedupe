@@ -442,6 +442,13 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
         # All-Files browse group, so an unsettled list has more than one row.
         expect(page.locator(".group-item")).to_have_count(1)
         page.locator(".group-item").click()
+        # Similar groups open as a side-by-side pair: the suggested keeper
+        # anchors the reference panel and the other member is under review.
+        expect(page.locator("#members .swipe-keeper")).to_be_visible()
+        expect(page.locator("#members .swipe-card.swipe-top")).to_be_visible()
+        expect(page.locator("#members .swipe-sim")).to_contain_text("99.8% match")
+        # The classic list view stays available behind the view toggle.
+        page.locator("#btnSimilarView").click()
         expect(page.locator("#members .evidence")).to_contain_text([
             "100% Similar",
             "99.8% Similar",
@@ -452,6 +459,81 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
             "Delete all selected similar matches?"
         )
         page.locator("#modalCancel").click()
+
+
+@pytest.mark.e2e
+def test_similar_swipe_deck_decides_pairs_with_undo(page, tmp_path: Path) -> None:
+    """→ keeps both copies and never re-pairs them; ← calls it the same photo
+    and moves the copy to Trash; ⌫ undoes the last decision."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for name, phash in (
+        ("keeper.png", "0000000000000000"),
+        ("first.png", "0000000000000001"),
+        ("second.png", "0000000000000002"),
+    ):
+        path = media / name
+        Image.new("RGB", (48, 32), (25, 100, 180)).save(path)
+        stat = path.stat()
+        records.append(FileRecord(
+            path=str(path),
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=".png",
+            width=48,
+            height=32,
+            phash=phash,
+            dhash="0000000000000000",
+            tile_phashes="t2:" + ",".join(["0000000000000000"] * 5),
+        ))
+    groups = build_groups([], [records])
+    groups[0].suggested_keep = records[0].path
+    app = create_app(
+        ScanResult(roots=[str(media)], files=records, groups=groups),
+        review_session_path=tmp_path / "review.json",
+    )
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator(".group-item")).to_have_count(1)
+        page.locator(".group-item").click()
+
+        # The reference anchors the left panel; the copy under review sits on
+        # the right as the draggable card.
+        expect(page.locator("#members .swipe-keeper")).to_be_visible()
+        expect(page.locator("#members .swipe-card")).to_have_count(1)
+        expect(page.locator("#detailMeta")).to_contain_text("0 of 2 compared")
+
+        # → marks the pair distinct: both files stay on disk and the next
+        # pair cycles in.
+        page.keyboard.press("ArrowRight")
+        page.locator("#toast").filter(has_text="Different").wait_for(state="visible")
+        expect(page.locator("#members .swipe-card")).to_have_count(1)
+        assert (media / "first.png").exists()
+        # The Undo toast is sticky — dismiss it so the next toast can show.
+        page.locator("#toastDismiss").click()
+
+        # ← calls it the same photo: the copy moves to Trash and the deck
+        # reports completion.
+        page.keyboard.press("ArrowLeft")
+        page.locator("#toast").filter(has_text="Same photo").wait_for(state="visible")
+        assert not (media / "second.png").exists()
+        assert (media / "keeper.png").exists()
+        expect(page.locator("#members .swipe-done")).to_be_visible()
+        expect(page.locator("#detailMeta")).to_contain_text("1 in Trash")
+        page.locator("#toastDismiss").click()
+
+        # ⌫ undoes the Trash: the card returns to the deck and the file comes
+        # back.
+        page.keyboard.press("Backspace")
+        page.locator("#toast").filter(has_text="restored").wait_for(state="visible")
+        assert (media / "second.png").exists()
+        expect(page.locator("#members .swipe-top")).to_be_visible()
 
 
 @contextmanager
@@ -798,8 +880,9 @@ def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -
 
 
 @pytest.mark.e2e
-def test_exact_group_pager_pages_past_50_and_keeps_selection(page, tmp_path: Path) -> None:
-    """Exact groups over 50 members page like the triage reviews; picks survive page turns."""
+def test_exact_copy_list_shows_every_copy_and_keeps_selection(page, tmp_path: Path) -> None:
+    """Exact groups render the keeper-picker copy list — every copy in one
+    scrollable list, no paging — and per-copy picks update the selection."""
     media = tmp_path / "media"
     media.mkdir()
     first = media / "file-00.png"
@@ -842,46 +925,24 @@ def test_exact_group_pager_pages_past_50_and_keeps_selection(page, tmp_path: Pat
         page.locator("#results").wait_for(state="visible", timeout=10_000)
         page.get_by_role("tab", name="Exact 1").click()
         page.locator(".group-item").first.click()
-        page.locator("#members .card").first.wait_for(state="visible")
-        expect(page.locator("#members .card")).to_have_count(50)
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "1–50 of 55"
-        )
+        page.locator("#members .copy-row").first.wait_for(state="visible")
+        expect(page.locator("#members .copy-row")).to_have_count(55)
+        expect(page.locator("#memberPagination")).to_be_hidden()
+        # The suggested keeper stays; every other copy is marked for removal.
+        expect(page.locator("#members .copy-row.keep")).to_have_count(1)
+        expect(page.locator("#members .copy-row.selected")).to_have_count(54)
 
-        # The top pager's Next shows the last five files…
-        page.locator("#memberPagination .member-next").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "51–55 of 55"
-        )
-        expect(page.locator("#members .card")).to_have_count(5)
-
-        # …and the bottom pager's Previous returns to the first page.
-        page.locator("#memberPaginationBottom .member-prev").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "1–50 of 55"
-        )
-        expect(page.locator("#members .card")).to_have_count(50)
-
-        # Unchecking a pick on page one survives a round trip to page two:
-        # the POST merges the visible page instead of replacing the selection.
-        page.locator("#members .card .sel-cb").nth(1).click()
+        # Unchecking a pick keeps the copy list stable — it re-renders in
+        # place rather than paging.
+        page.locator("#members .copy-row .sel-cb").nth(1).click()
         expect(page.locator("#groupSelectionSummary")).to_have_text(
             "53 of 55 selected for removal"
         )
-        page.locator("#memberPagination .member-next").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "51–55 of 55"
-        )
-        page.locator("#memberPaginationBottom .member-prev").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "1–50 of 55"
-        )
-        expect(page.locator("#members .card .sel-cb").nth(1)).not_to_be_checked()
-        expect(page.locator("#groupSelectionSummary")).to_have_text(
-            "53 of 55 selected for removal"
-        )
+        expect(page.locator("#members .copy-row")).to_have_count(55)
+        expect(page.locator("#members .copy-row .sel-cb").nth(1)).not_to_be_checked()
+        expect(page.locator("#members .copy-row.keep")).to_have_count(2)
 
-        # The lightbox sifts the whole group without stopping at the page edge.
+        # The lightbox sifts the whole group.
         page.locator("#members .thumb-wrap").first.click()
         page.locator("#lightbox").wait_for(state="visible")
         expect(page.locator("#lbCounter")).to_have_text("1 / 55")

@@ -10,7 +10,9 @@ from dedupe.models import FileRecord, MediaType
 from dedupe.similar_image import (
     compute_image_hashes,
     compute_image_hashes_with_tiles,
+    dense_difference,
     find_similar_image_groups,
+    is_dense_match,
     is_near_identical,
     tile_distances,
 )
@@ -453,6 +455,83 @@ def test_supplied_animation_tiles_cannot_fall_back_to_same_path(tmp_path):
         tiles_a=("0000000000000000",) * 40,
         tiles_b=("0000000000000000",) * 5,
     )
+
+
+def _astronaut_burst_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Two frames differing by a small shifted patch (stand-in for burst shots)."""
+    fixture = Path(__file__).parent / "fixtures" / "astronaut.png"
+    base = Image.open(fixture).convert("RGB")
+    a = tmp_path / "frame1.jpg"
+    b = tmp_path / "frame2.jpg"
+    base.save(a, format="JPEG", quality=92)
+    changed = base.copy()
+    changed.paste(base.crop((200, 200, 260, 260)), (206, 203))
+    changed.save(b, format="JPEG", quality=92)
+    return a, b
+
+
+def test_burst_like_local_change_not_grouped(tmp_path: Path) -> None:
+    """Tile-passing pair with a concentrated local change must not group."""
+    a, b = _astronaut_burst_pair(tmp_path)
+    # The older gates pass this pair (the reported false positive)...
+    assert is_near_identical(str(a.resolve()), str(b.resolve()))
+    # ...while the dense detail check rejects it.
+    assert not is_dense_match(str(a.resolve()), str(b.resolve()))
+    assert find_similar_image_groups([_rec_for(a), _rec_for(b)], workers=1) == []
+
+
+def test_dense_match_keeps_true_reexports(tmp_path: Path) -> None:
+    """Recompression and rescaling spread tiny diffs everywhere, so they pass."""
+    fixture = Path(__file__).parent / "fixtures" / "astronaut.png"
+    base = Image.open(fixture).convert("RGB")
+    a = tmp_path / "orig.jpg"
+    base.save(a, format="JPEG", quality=92)
+    variants = []
+    low = tmp_path / "lowq.jpg"
+    base.save(low, format="JPEG", quality=60)
+    variants.append(low)
+    small = tmp_path / "small.jpg"
+    base.resize((base.width // 2, base.height // 2)).save(small, format="JPEG", quality=80)
+    variants.append(small)
+    for variant in variants:
+        assert is_dense_match(str(a.resolve()), str(variant.resolve()))
+    groups = find_similar_image_groups([_rec_for(a)] + [_rec_for(v) for v in variants], workers=1)
+    assert len(groups) == 1 and len(groups[0]) == 3
+
+
+def test_dense_match_tolerates_global_resampling(tmp_path: Path) -> None:
+    """Sub-degree rotation shifts edges everywhere without a local spike."""
+    fixture = Path(__file__).parent / "fixtures" / "astronaut.png"
+    base = Image.open(fixture).convert("RGB")
+    a = tmp_path / "orig.jpg"
+    base.save(a, format="JPEG", quality=92)
+    rotated = tmp_path / "rotated.jpg"
+    base.rotate(0.5, resample=Image.Resampling.BICUBIC, expand=False).save(
+        rotated, format="JPEG", quality=92
+    )
+    assert is_dense_match(str(a.resolve()), str(rotated.resolve()))
+
+
+def test_dense_match_fails_open_on_unreadable(tmp_path: Path) -> None:
+    """A thumbnail that cannot load preserves the tile check's verdict."""
+    a, _b = _astronaut_burst_pair(tmp_path)
+    missing = tmp_path / "gone.jpg"
+    assert dense_difference(str(a.resolve()), str(missing)) is None
+    assert is_dense_match(str(a.resolve()), str(missing))
+
+
+def test_bruteforce_path_applies_dense_check(tmp_path: Path) -> None:
+    """The no-BK-tree fallback rejects burst-like pairs too."""
+    import dedupe.similar_image as module
+
+    a, b = _astronaut_burst_pair(tmp_path)
+    records = []
+    for path in (a, b):
+        record = _rec_for(path)
+        phash, dhash, width, height = compute_image_hashes(path)
+        record.phash, record.dhash, record.width, record.height = phash, dhash, width, height
+        records.append(record)
+    assert module._bruteforce_groups(records, 6, 10, 8, 5.0, None) == []
 
 
 def test_failed_legacy_gif_rehash_discards_old_fingerprint(tmp_path):

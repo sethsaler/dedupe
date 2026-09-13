@@ -1,8 +1,10 @@
 """Perceptual near-duplicate detection for images and GIFs.
 
 Uses global pHash/dHash for candidate finding, then a regional tile pHash
-check to reject "same scene, different pose" false positives while still
-matching true duplicates at different resolutions/quality.
+check to reject "same scene, different pose" false positives, then a dense
+detail check to reject burst-like pairs whose difference is concentrated in
+one spot (a blink, a shifted hand) while still matching true duplicates at
+different resolutions/quality.
 
 Memory-conscious: images are drafted/thumbnail-scaled before hashing so a
 12MP phone photo never becomes a full-res RGB buffer in the worker pool.
@@ -33,6 +35,19 @@ DHASH_THRESHOLD = 10
 DEFAULT_TILE_MAX = 8
 # And average tile distance under this (catches spread-out pose diffs).
 DEFAULT_TILE_MEAN = 5.0
+# Dense detail check: grayscale thumbnails compared block by block. A pair is
+# rejected only when one block differs a lot AND the difference is
+# concentrated there (max/mean ratio high). Global resampling (recompression,
+# rescaling, sub-degree rotation, exposure shifts) spreads small differences
+# everywhere, so it passes; a burst-like local change spikes one block.
+# Calibrated on tests/fixtures/astronaut.png: true re-exports score max ≤ 1.5
+# at ratio ≤ 2, burst-like 60px shifts score max ≥ 4.9 at ratio ≥ 20.
+DENSE_THUMB_SIZE = 128
+DENSE_GRID = 8
+DEFAULT_DENSE_LOCAL_MAX = 3.0
+DEFAULT_DENSE_CONCENTRATION = 8.0
+# Thumbnails are 16 KB each; this caps the run-local cache around 16 MB.
+DENSE_CACHE_SIZE = 1024
 
 # pHash/dHash only need ~32×32 DCT input; anything larger is wasted decode/RAM.
 # 512 keeps edge structure for rescaled/quality variants without loading full HEIC/JPEG.
@@ -273,6 +288,92 @@ def is_near_identical(
     return not sum(dists) / len(dists) > tile_mean
 
 
+@lru_cache(maxsize=DENSE_CACHE_SIZE)
+def _dense_thumb_for_path(path: str):
+    """Run-cached grayscale thumbnail for the dense detail check.
+
+    Same decode ladder as the tile path so stills and animation first frames
+    compare under identical normalization. Resizing (not letterboxing) keeps
+    tiny images comparable without padding mismatches.
+    """
+    _ensure_image_deps()
+    _register_heif()
+    from PIL import Image, ImageOps
+
+    try:
+        with Image.open(path) as img:
+            if not getattr(img, "is_animated", False):
+                img = ImageOps.exif_transpose(img)
+            try:
+                img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
+            except Exception:
+                pass
+            if getattr(img, "is_animated", False):
+                frame = _hash_frames(img)[0]
+            else:
+                frame = _downscale_for_hash(img)
+            return frame.convert("L").resize(
+                (DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR
+            )
+    except Exception:
+        return None
+
+
+def dense_difference(path_a: str, path_b: str) -> tuple[float, float] | None:
+    """Mean and worst-block mean abs difference of grayscale thumbnails.
+
+    None if either thumbnail fails to load.
+    """
+    from PIL import ImageChops, ImageStat
+
+    ta = _dense_thumb_for_path(path_a)
+    tb = _dense_thumb_for_path(path_b)
+    if ta is None or tb is None:
+        return None
+    diff = ImageChops.difference(ta, tb)
+    width, height = diff.size
+    total = 0.0
+    worst = 0.0
+    count = 0
+    for i in range(DENSE_GRID):
+        for j in range(DENSE_GRID):
+            block = diff.crop(
+                (
+                    i * width // DENSE_GRID,
+                    j * height // DENSE_GRID,
+                    (i + 1) * width // DENSE_GRID,
+                    (j + 1) * height // DENSE_GRID,
+                )
+            )
+            mean = ImageStat.Stat(block).mean[0]
+            total += mean
+            worst = max(worst, mean)
+            count += 1
+    return (total / count if count else 0.0), worst
+
+
+def is_dense_match(
+    path_a: str,
+    path_b: str,
+    *,
+    local_max: float = DEFAULT_DENSE_LOCAL_MAX,
+    concentration: float = DEFAULT_DENSE_CONCENTRATION,
+) -> bool:
+    """True unless one image region differs in a concentrated, burst-like way.
+
+    Only rejects when the worst block exceeds local_max AND dominates the
+    overall mean by concentration. Unreadable thumbnails fail open, preserving
+    the tile check's verdict.
+    """
+    result = dense_difference(path_a, path_b)
+    if result is None:
+        return True
+    mean, worst = result
+    if worst <= local_max or mean <= 0:
+        return True
+    return not worst / mean > concentration
+
+
 def encode_tile_phashes(values: tuple[str, ...]) -> str:
     """Serialize tile hashes with the version that produced them."""
     return f"{TILE_HASH_VERSION}:" + ",".join(values)
@@ -312,6 +413,8 @@ def find_similar_image_groups(
     dhash_threshold: int = DHASH_THRESHOLD,
     tile_max: int = DEFAULT_TILE_MAX,
     tile_mean: float = DEFAULT_TILE_MEAN,
+    dense_local_max: float = DEFAULT_DENSE_LOCAL_MAX,
+    dense_concentration: float = DEFAULT_DENSE_CONCENTRATION,
     skip_paths: set[str] | None = None,
     distinct_pairs: set[tuple[str, str]] | None = None,
     progress: ProgressCb | None = None,
@@ -324,6 +427,7 @@ def find_similar_image_groups(
     1. Global pHash via BK-tree (fast candidates)
     2. Secondary dHash + aspect-ratio filter
     3. Regional tile pHash (reject pose / composition changes)
+    4. Dense detail check (reject burst-like concentrated local changes)
     """
     skip_paths = skip_paths or set()
     distinct_pairs = distinct_pairs or set()
@@ -405,6 +509,8 @@ def find_similar_image_groups(
             progress,
             cancelled,
             distinct_pairs,
+            dense_local_max,
+            dense_concentration,
         )
 
     # Parse each hash once. The old FileRecord-based distance function converted
@@ -463,6 +569,14 @@ def find_similar_image_groups(
                     tiles_b=tiles_b,
                 ):
                     continue
+                # Dense detail: reject burst-like concentrated local changes.
+                if not is_dense_match(
+                    rec.path,
+                    other.path,
+                    local_max=dense_local_max,
+                    concentration=dense_concentration,
+                ):
+                    continue
                 adjacency[rec.path].add(other.path)
                 adjacency[other.path].add(rec.path)
             if progress and (i + 1) % 20 == 0:
@@ -473,6 +587,7 @@ def find_similar_image_groups(
     finally:
         # Records retain hashes for this run and the disk cache; free path cache.
         _tile_phashes_for_path.cache_clear()
+        _dense_thumb_for_path.cache_clear()
 
     return cluster_around_best(hashed, adjacency, distinct_pairs)
 
@@ -486,6 +601,8 @@ def _bruteforce_groups(
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
     distinct_pairs: set[tuple[str, str]] | None = None,
+    dense_local_max: float = DEFAULT_DENSE_LOCAL_MAX,
+    dense_concentration: float = DEFAULT_DENSE_CONCENTRATION,
 ) -> list[list[FileRecord]]:
     import imagehash
 
@@ -512,11 +629,19 @@ def _bruteforce_groups(
                 a.path, b.path, tile_max=tile_max, tile_mean=tile_mean
             ):
                 continue
+            if not is_dense_match(
+                a.path,
+                b.path,
+                local_max=dense_local_max,
+                concentration=dense_concentration,
+            ):
+                continue
             adjacency[a.path].add(b.path)
             adjacency[b.path].add(a.path)
         if progress and (i + 1) % 20 == 0:
             progress("image-cluster", i + 1, len(hashed))
 
     _tile_phashes_for_path.cache_clear()
+    _dense_thumb_for_path.cache_clear()
 
     return cluster_around_best(hashed, adjacency, distinct_pairs)

@@ -49,6 +49,17 @@ const state = {
   trashedInPlace: new Set(),
   // Group ids whose selection the user changed; others show the suggestion.
   touchedGroups: new Set(),
+  // Similar review layout: "swipe" (pair deck) or "grid" (classic cards).
+  similarView: "swipe",
+  // Per-group swipe review state, keyed by group id so it survives re-renders:
+  // the reference (anchor) path, the remaining deck order, and the decisions
+  // available for undo.
+  swipeAnchors: new Map(),
+  swipeDeckOrder: new Map(),
+  swipeUndo: new Map(),
+  // A swipe decision is in flight; held input queues like the review flows.
+  swipeBusy: false,
+  pendingSwipeDecision: null,
 };
 
 export { CSRF_TOKEN, GROUP_RENDER_CHUNK, state };

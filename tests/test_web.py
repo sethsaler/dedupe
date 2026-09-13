@@ -1621,6 +1621,169 @@ def test_similar_group_can_be_marked_distinct(tmp_path: Path) -> None:
     cache.close()
 
 
+def _similar_result(tmp_path: Path, names=("sim-a.jpg", "sim-b.jpg", "sim-c.jpg")) -> ScanResult:
+    records = []
+    for name in names:
+        path = tmp_path / name
+        path.write_bytes(f"payload for {name}".encode())
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".jpg",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    return ScanResult(
+        roots=[str(tmp_path)],
+        files=records,
+        groups=build_groups([], [records]),
+    )
+
+
+def test_similar_member_can_be_trashed_and_undone(tmp_path: Path) -> None:
+    result = _similar_result(tmp_path, names=("sim-a.jpg", "sim-b.jpg"))
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    duplicate = next(member.path for member in group.members if member.path != keeper)
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    payload = {"group_id": group.id, "path": duplicate, "scan_id": scan_id}
+
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "dry_run": False},
+        headers=headers,
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted_paths"] == [duplicate]
+    assert not Path(duplicate).exists()
+    assert Path(keeper).exists()
+
+    # The last surviving member can never be trashed: the retained copy is
+    # already in the Trash, so the preflight refuses it.
+    refused = client.post(
+        "/api/review-candidate/delete",
+        json={**payload, "path": keeper, "dry_run": False},
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert Path(keeper).exists()
+
+    undone = client.post("/api/review-candidate/undo", json=payload, headers=headers)
+    assert undone.status_code == 200
+    assert undone.get_json()["deleted_paths"] == []
+    assert Path(duplicate).read_bytes() == f"payload for {Path(duplicate).name}".encode()
+
+
+def test_similar_pair_mark_distinct_removes_one_member(tmp_path: Path) -> None:
+    result = _similar_result(tmp_path)
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    others = [member.path for member in group.members if member.path != keeper]
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[0], "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["pair_count"] == 1
+    assert payload["dissolved"] is False
+    remaining = {member["path"] for member in payload["group"]["members"]}
+    assert remaining == {keeper, others[1]}
+    cache = HashCache(cache_path)
+    assert cache.distinct_pairs(result.files) == {
+        tuple(sorted((keeper, others[0])))
+    }
+
+    # Marking the last pair dissolves the group entirely.
+    response = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[1], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.get_json()["dissolved"] is True
+    assert response.get_json()["group"] is None
+    assert client.get("/api/groups?kind=similar").get_json()["groups"] == []
+    cache.close()
+
+
+def test_unmark_distinct_restores_the_member(tmp_path: Path) -> None:
+    result = _similar_result(tmp_path)
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    member_path = next(
+        member.path for member in group.members if member.path != keeper
+    )
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": member_path, "scan_id": scan_id},
+        headers=headers,
+    )
+    restored = client.post(
+        "/api/similar/unmark-distinct",
+        json={"group_id": group.id, "path": member_path, "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert restored.status_code == 200
+    payload = restored.get_json()
+    assert payload["removed_pairs"] == 1
+    restored_paths = {member["path"] for member in payload["group"]["members"]}
+    assert restored_paths == {member.path for member in group.members} | {member_path}
+    cache = HashCache(cache_path)
+    assert cache.distinct_pairs(result.files) == set()
+    cache.close()
+
+
+def test_mark_distinct_pair_rejects_a_non_member(tmp_path: Path) -> None:
+    result = _similar_result(tmp_path)
+    group = result.groups[0]
+    app = create_app(result)
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hashes.sqlite3")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    response = client.post(
+        "/api/similar/mark-distinct",
+        json={
+            "group_id": group.id,
+            "path": str(tmp_path / "elsewhere.jpg"),
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 404
+    assert "member not found" in response.get_json()["error"]
+
+
 def test_scan_rejects_unknown_human_backend(tmp_path: Path) -> None:
     app = create_app()
     response = app.test_client().post(

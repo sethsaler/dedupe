@@ -1,9 +1,11 @@
 // The detail pane: member cards, review flows, per-candidate trash/undo.
 
 import { api } from "./api.js";
+import { renderExactReview } from "./exact.js";
 import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
+import { renderSwipeReview, swipeActive } from "./swipe.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast } from "./util.js";
@@ -266,12 +268,18 @@ async function selectGroup(id, { silent = false } = {}) {
     ? `${kindLabel} · ${g.member_count} files`
     : `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
   const deletedPaths = new Set(g.deleted_paths || []);
+  const swipeMode = g.kind === "similar" && state.similarView === "swipe";
   $("btnMarkRemainingHuman").hidden =
     g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
-  $("btnMarkDistinct").hidden = g.kind !== "similar";
+  // In swipe mode the deck decides one pair at a time; the whole-group
+  // distinct button only belongs to the list view.
+  $("btnMarkDistinct").hidden = g.kind !== "similar" || swipeMode;
+  updateSimilarViewToggle(g);
   $("nonHumanBanner").hidden = g.kind !== "no_humans";
   syncDeletedToggle(g);
-  $("candidateReviewBanner").hidden = !isDecisionReview(g);
+  $("candidateReviewBanner").hidden = !(isDecisionReview(g) || swipeMode);
+  $("candidateKeys").hidden = swipeMode;
+  $("swipeKeys").hidden = !swipeMode;
   if (isDecisionReview(g)) {
     $("candidateReviewTitle").textContent = g.kind === "low_resolution"
       ? "Low-resolution deletion suggestions"
@@ -279,8 +287,15 @@ async function selectGroup(id, { silent = false } = {}) {
     $("candidateReviewDescription").textContent = g.kind === "low_resolution"
       ? "These files are below 1 megapixel. Decide one at a time; nothing moves until final confirmation."
       : "A fresh random sample from this scan. Use the arrow keys to decide quickly. Keep decisions here are not remembered between scans.";
+  } else if (swipeMode) {
+    $("candidateReviewTitle").textContent = "Same photo, or different?";
+    $("candidateReviewDescription").textContent =
+      "Compare each copy against the reference on the left. Swipe left — or press ← — when it is the same photo (the copy moves to Trash, undoable); swipe right or press → for a different photo (keeps both and never re-pairs them).";
   }
-  document.querySelector(".selection-toolbar").hidden = isIndependentReview(g);
+  // The custom review layouts (exact copy list, similar swipe deck) own
+  // selection themselves, so the checkbox toolbar stays hidden for them.
+  document.querySelector(".selection-toolbar").hidden =
+    isIndependentReview(g) || swipeMode || g.kind === "exact";
   $("smartRule").querySelectorAll("option").forEach((option) => {
     const candidateOnly = option.value === "select_candidates";
     option.disabled = isIndependentReview(g)
@@ -316,6 +331,16 @@ async function selectGroup(id, { silent = false } = {}) {
 function renderMembers(g) {
   stopInlineVideo();
   const box = $("members");
+  // Custom review layouts own the member area entirely (their own pagination
+  // model, lightbox list, and detail meta).
+  if (g.kind === "similar" && state.similarView === "swipe") {
+    renderSwipeReview(g);
+    return;
+  }
+  if (g.kind === "exact") {
+    renderExactReview(g);
+    return;
+  }
   const selected = new Set(g.selected_for_removal || []);
   const reviewedPaths = new Set(g.reviewed_paths || []);
   const deletedPaths = new Set(g.deleted_paths || []);
@@ -963,6 +988,39 @@ function changeMemberPage(delta) {
   const topPager = $("memberPagination");
   if (topPager) topPager.scrollIntoView({ block: "start", behavior: "instant" });
 }
+
+// Similar groups default to the swipe deck; the header toggle flips to the
+// classic card list (which keeps checkboxes, bulk selection, and the
+// whole-group "Mark as distinct" button).
+const SIMILAR_VIEW_KEY = "dedupe.similarView";
+try {
+  const savedView = localStorage.getItem(SIMILAR_VIEW_KEY);
+  if (savedView === "grid" || savedView === "swipe") state.similarView = savedView;
+} catch {
+  /* private mode */
+}
+
+function updateSimilarViewToggle(g) {
+  const btn = $("btnSimilarView");
+  if (!btn) return;
+  const show = g?.kind === "similar";
+  btn.hidden = !show;
+  if (!show) return;
+  const swipe = state.similarView === "swipe";
+  btn.setAttribute("aria-pressed", swipe ? "true" : "false");
+  btn.textContent = swipe ? "☰ List view" : "⇄ Swipe review";
+}
+
+$("btnSimilarView")?.addEventListener("click", () => {
+  state.similarView = state.similarView === "swipe" ? "grid" : "swipe";
+  try {
+    localStorage.setItem(SIMILAR_VIEW_KEY, state.similarView);
+  } catch {
+    /* private mode */
+  }
+  const g = currentGroup();
+  if (g) selectGroup(g.id, { silent: true }).catch((e) => toast(e.message, "error"));
+});
 
 document.querySelectorAll(".member-prev").forEach((btn) => {
   btn.addEventListener("click", () => changeMemberPage(-1));
