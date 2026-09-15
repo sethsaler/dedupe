@@ -260,7 +260,7 @@ $("btnMarkDistinct").addEventListener("click", async () => {
   if (!current || current.kind !== "similar") return;
   const ok = await confirmModal({
     title: "Mark as distinct?",
-    body: `<div class="review-sheet"><p>Mark these <strong>${current.member_count} files</strong> as distinct?</p><p>This group will stay hidden in future scans unless one of the files changes.</p></div>`,
+    body: `<div class="review-sheet"><p>Mark these <strong>${current.member_count} files</strong> as distinct?</p><p>This group will stay hidden in future scans unless one of the files' contents changes.</p></div>`,
     confirmLabel: "Mark as distinct",
     danger: false,
   });

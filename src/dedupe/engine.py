@@ -8,7 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from .cache import HashCache
+from .cache import DistinctReviews, HashCache
 from .exact import (
     ERROR_PARTIAL_HASH_FAILED,
     ERROR_SHA256_FAILED,
@@ -343,10 +343,10 @@ def run_scan(
 
     if run_any_stage:
         check_cancelled()
-        distinct_pairs = (
-            cache.distinct_pairs(records)
+        distinct = (
+            cache.distinct_reviews(records)
             if (run_similar and cache is not None)
-            else set()
+            else DistinctReviews.empty()
         )
         image_count = len(
             [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
@@ -509,7 +509,7 @@ def run_scan(
                 img_groups = find_similar_image_groups(
                     records,
                     threshold=image_threshold,
-                    distinct_pairs=distinct_pairs,
+                    distinct=distinct,
                     progress=img_progress,
                     workers=cpu_workers,
                     cancelled=cancelled,
@@ -533,7 +533,7 @@ def run_scan(
                 vid_groups = find_similar_video_groups(
                     records,
                     threshold=video_threshold,
-                    distinct_pairs=distinct_pairs,
+                    distinct=distinct,
                     progress=vid_progress,
                     workers=n_workers,
                     cancelled=cancelled,

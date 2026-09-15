@@ -1726,6 +1726,82 @@ def test_similar_pair_mark_distinct_removes_one_member(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_pairwise_distinct_dissolve_suppresses_all_participant_pairs(tmp_path: Path) -> None:
+    """Finishing a group pair-by-pair also suppresses the member-vs-member
+    pairs the swipe UI never showed side by side."""
+    from itertools import combinations
+
+    result = _similar_result(tmp_path)
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    others = [member.path for member in group.members if member.path != keeper]
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    first = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[0], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert first.get_json()["dissolved"] is False
+    second = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[1], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert second.get_json()["dissolved"] is True
+
+    cache = HashCache(cache_path)
+    expected = {
+        tuple(sorted(pair)) for pair in combinations([keeper, *others], 2)
+    }
+    assert cache.distinct_pairs(result.files) == expected
+    cache.close()
+
+
+def test_whole_group_mark_distinct_covers_dismissed_members(tmp_path: Path) -> None:
+    """Finishing with the group button after pair-level swipe decisions must
+    also suppress pairs involving the already-dismissed member."""
+    from itertools import combinations
+
+    result = _similar_result(
+        tmp_path, names=("sim-a.jpg", "sim-b.jpg", "sim-c.jpg", "sim-d.jpg")
+    )
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    others = [member.path for member in group.members if member.path != keeper]
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    pair = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[0], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert pair.get_json()["dissolved"] is False
+    whole = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert whole.get_json()["dissolved"] is True
+
+    cache = HashCache(cache_path)
+    expected = {
+        tuple(sorted(pair_)) for pair_ in combinations([keeper, *others], 2)
+    }
+    assert cache.distinct_pairs(result.files) == expected
+    cache.close()
+
+
 def test_unmark_distinct_restores_the_member(tmp_path: Path) -> None:
     result = _similar_result(tmp_path)
     group = result.groups[0]

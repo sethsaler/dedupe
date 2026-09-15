@@ -53,6 +53,30 @@ def test_suggested_keep_prefers_resolution() -> None:
     assert pick_suggested_keep([low, high]) == high.path
 
 
+def test_clustering_never_reunites_a_reviewed_distinct_pair() -> None:
+    """A pair marked distinct must not co-member a group even when both files
+    match a shared third file; the undecided pairs still group."""
+    from dedupe.cache import DistinctReviews
+    from dedupe.grouping import cluster_around_best
+
+    a = _rec("/a.jpg", 100, 1)
+    b = _rec("/b.jpg", 200, 2)
+    c = _rec("/c.jpg", 300, 3)
+    adjacency = {
+        a.path: {b.path, c.path},
+        b.path: {a.path, c.path},
+        c.path: {a.path, b.path},
+    }
+    distinct = DistinctReviews.from_pairs({tuple(sorted((a.path, b.path)))})
+
+    groups = cluster_around_best([a, b, c], adjacency, distinct)
+
+    assert len(groups) == 1
+    paths = {member.path for member in groups[0]}
+    assert len(paths) == 2
+    assert not {a.path, b.path} <= paths
+
+
 def test_similar_group_selects_lower_resolution_for_removal_by_default() -> None:
     low = _rec("/a/small.jpg", size=5000, mtime=10, w=100, h=100)
     high = _rec("/b/big.jpg", size=4000, mtime=5, w=4000, h=3000)

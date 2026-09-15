@@ -45,7 +45,7 @@ Reviewing becomes consequential the first time a selection changes: the change i
 
 **Bulk selection.** The bulk controls apply one operation — select all, select none, invert, or a rule (smaller than keeper, larger/smaller than N MB, path contains, at least N faces) — to every group currently shown. The operation is re-derived on the server from its own state: keepers are never selected and at least one member of every duplicate group survives, whatever the browser asked. In independent groups, bulk-selecting candidates also marks them reviewed.
 
-**Marking groups done with.** A similar group's detail header offers **Mark as distinct**: the group's files are recorded as pairwise distinct in the hash cache and the group disappears from this and future scans (until a file changes). The button asks for confirmation with those words first.
+**Marking groups done with.** A similar group's detail header offers **Mark as distinct**: the group's files are recorded as pairwise distinct in the hash cache and the group disappears from this and future scans. The button asks for confirmation with those words first. Deciding pair by pair in the swipe review records each shown pair as it is decided; when the last member leaves and the group dissolves, every pair among the review's participants is recorded, including member-vs-member pairs the swipe view never showed side by side — the files can never regroup. Distinct decisions follow the files through renames and metadata-only drift (touch, re-download, remount) and lapse only when a file's content actually changes.
 
 **Live update.** While a scan streams, groups appear and re-sort as they arrive; selection controls stay locked until the scan finishes.
 

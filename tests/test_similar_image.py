@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
+from dedupe.cache import DistinctReviews
 from dedupe.models import FileRecord, MediaType
 from dedupe.similar_image import (
     compute_image_hashes,
@@ -202,10 +203,46 @@ def test_reviewed_distinct_pair_is_not_grouped(tmp_path: Path) -> None:
     groups = find_similar_image_groups(
         [left_record, right_record],
         threshold=10,
-        distinct_pairs={pair},
+        distinct=DistinctReviews.from_pairs({pair}),
     )
 
     assert groups == []
+
+
+def test_reviewed_distinct_pair_survives_metadata_drift(tmp_path: Path) -> None:
+    """The engine path: same bytes under fresh stat metadata (touch, iCloud
+    re-download) must not resurrect a reviewed pair — the matcher confirms the
+    review against freshly computed hashes."""
+    from dedupe.cache import HashCache
+
+    left = tmp_path / "left.jpg"
+    right = tmp_path / "right.jpg"
+    _make_image(left, (40, 80, 120), quality=95)
+    _make_image(right, (40, 80, 120), quality=60)
+
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    reviewed = []
+    for path in (left, right):
+        record = _rec_for(path)
+        record.phash, record.dhash, record.width, record.height = compute_image_hashes(path)
+        reviewed.append(record)
+    cache.mark_distinct(reviewed)
+
+    # Rescan finds the same files under drifted stat metadata, before any
+    # hashing stage has run (no perceptual hashes on the records yet).
+    drifted = []
+    for record in reviewed:
+        drift = _rec_for(Path(record.path))
+        drift.mtime = record.mtime + 100
+        drift.mtime_ns = 9_999_999_999
+        drift.device = 99
+        drift.inode = 9_999_999
+        drifted.append(drift)
+    reviews = cache.distinct_reviews(drifted)
+    assert cache.distinct_pairs(drifted) == set()  # stat alone cannot confirm
+
+    assert find_similar_image_groups(drifted, threshold=10, distinct=reviews) == []
+    cache.close()
 
 
 def test_dissimilar_not_grouped(tmp_path: Path) -> None:

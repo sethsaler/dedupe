@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from itertools import combinations
 from pathlib import Path
+from typing import NamedTuple
 
 from .human_policy import CACHEABLE_HUMAN_STATUSES, MANUALLY_CONFIRMED_HUMAN_STATUS
 from .models import FileRecord, MediaType
@@ -88,6 +90,100 @@ def default_cache_path() -> Path:
     return base / "hashes.sqlite3"
 
 
+def _content_identity(rec: FileRecord) -> str:
+    """Perceptual content identity for reviewed-distinct pairs.
+
+    Survives metadata-only drift (mtime/inode/device changes, renames); a real
+    content change produces different perceptual hashes and revives the pair
+    for review. Empty when the record carries no perceptual hash yet, which
+    only ever means "cannot confirm" — never "confirmed distinct".
+    """
+    if rec.media_type in (MediaType.IMAGE, MediaType.GIF):
+        if rec.phash or rec.dhash:
+            return (
+                f"{CACHE_ALGORITHM_VERSION}|img:{rec.phash or ''}:{rec.dhash or ''}"
+            )
+    elif rec.media_type == MediaType.VIDEO and rec.video_fingerprint:
+        return f"{CACHE_ALGORITHM_VERSION}|vid:{rec.video_fingerprint}"
+    return ""
+
+
+def _parse_identity(identity: str) -> tuple[int, int, int] | None:
+    """(device, inode, size) from a stored identity string, when recoverable."""
+    try:
+        size, _mtime_ns, _mtime, device, inode = json.loads(identity)
+    except (ValueError, TypeError):
+        return None
+    if device is None or inode is None or size is None:
+        return None
+    return (int(device), int(inode), int(size))
+
+
+class _DistinctEntry(NamedTuple):
+    # True when both sides' stored stat identities match the current records
+    # (unchanged files — found at their stored paths or after a pure rename).
+    stat_ok: bool
+    # Stored perceptual content identity per resolved current path; consulted
+    # only when stat_ok is False (metadata drifted) and compared against the
+    # records' *current* hashes, which exist by the time matchers ask.
+    content: tuple[tuple[str, str], tuple[str, str]]
+
+
+class DistinctReviews:
+    """Reviewed-distinct pairs resolved against one scan's records.
+
+    A pair stays suppressed while both files' stored stat identities still
+    match (unchanged files, renamed or not), or while both stored content
+    identities match the records' current perceptual hashes (metadata-only
+    drift). A real content change fails both checks and the pair may surface
+    for review again.
+    """
+
+    def __init__(self, entries: dict[tuple[str, str], list[_DistinctEntry]]) -> None:
+        self._entries = entries
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+    @classmethod
+    def empty(cls) -> DistinctReviews:
+        return cls({})
+
+    @classmethod
+    def from_pairs(cls, pairs: set[tuple[str, str]]) -> DistinctReviews:
+        """Test helper: a resolver that always suppresses the given path pairs."""
+        return cls(
+            {
+                tuple(sorted(pair)): [_DistinctEntry(True, (("", ""), ("", "")))]
+                for pair in pairs
+            }
+        )
+
+    def is_distinct(self, a: FileRecord, b: FileRecord) -> bool:
+        for entry in self._entries.get(tuple(sorted((a.path, b.path))), ()):
+            if entry.stat_ok:
+                return True
+            expected = dict(entry.content)
+            content_a = expected.get(a.path, "")
+            content_b = expected.get(b.path, "")
+            if (
+                content_a
+                and content_b
+                and content_a == _content_identity(a)
+                and content_b == _content_identity(b)
+            ):
+                return True
+        return False
+
+    def stat_pairs(self) -> set[tuple[str, str]]:
+        """Pairs confirmed by stat identity alone (no hash check needed)."""
+        return {
+            pair
+            for pair, entries in self._entries.items()
+            if any(entry.stat_ok for entry in entries)
+        }
+
+
 class HashCache:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path else default_cache_path()
@@ -141,12 +237,25 @@ class HashCache:
             CREATE TABLE IF NOT EXISTS distinct_similar_pairs (
                 path_a TEXT NOT NULL,
                 identity_a TEXT NOT NULL,
+                content_a TEXT,
                 path_b TEXT NOT NULL,
                 identity_b TEXT NOT NULL,
+                content_b TEXT,
                 PRIMARY KEY (path_a, path_b)
             )
             """
         )
+        distinct_existing = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(distinct_similar_pairs)"
+            ).fetchall()
+        }
+        for column in ("content_a", "content_b"):
+            if column not in distinct_existing:
+                self._conn.execute(
+                    f"ALTER TABLE distinct_similar_pairs ADD COLUMN {column} TEXT"
+                )
         existing = {
             row[1] for row in self._conn.execute("PRAGMA table_info(hashes)").fetchall()
         }
@@ -261,50 +370,123 @@ class HashCache:
             self._conn.execute(
                 """
                 INSERT INTO distinct_similar_pairs (
-                    path_a, identity_a, path_b, identity_b
-                ) VALUES (?, ?, ?, ?)
+                    path_a, identity_a, content_a, path_b, identity_b, content_b
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_a, path_b) DO UPDATE SET
                     identity_a=excluded.identity_a,
-                    identity_b=excluded.identity_b
+                    content_a=excluded.content_a,
+                    identity_b=excluded.identity_b,
+                    content_b=excluded.content_b
                 """,
                 (
                     left.path,
                     self._identity(left),
+                    _content_identity(left),
                     right.path,
                     self._identity(right),
+                    _content_identity(right),
                 ),
             )
             count += 1
         self._conn.commit()
         return count
 
-    def unmark_distinct_pair(self, path_a: str, path_b: str) -> int:
-        """Drop one recorded distinct pair (undo of a pair-level review)."""
+    def unmark_distinct_pair(
+        self,
+        path_a: str,
+        path_b: str,
+        records: list[FileRecord] | None = None,
+    ) -> int:
+        """Drop one recorded distinct pair (undo of a pair-level review).
+
+        The files may have been renamed since the review; when no row matches
+        the given paths, fall back to the current files' stored identities.
+        """
         left, right = sorted((path_a, path_b))
         cursor = self._conn.execute(
             "DELETE FROM distinct_similar_pairs WHERE path_a = ? AND path_b = ?",
             (left, right),
         )
+        removed = cursor.rowcount
+        if not removed and records:
+            wanted = {
+                self._identity(rec)
+                for rec in records
+                if rec.path in (left, right)
+            }
+            if len(wanted) == 2:
+                stale = [
+                    (row["path_a"], row["path_b"])
+                    for row in self._conn.execute(
+                        "SELECT path_a, identity_a, path_b, identity_b "
+                        "FROM distinct_similar_pairs"
+                    )
+                    if row["identity_a"] in wanted and row["identity_b"] in wanted
+                ]
+                for stored_a, stored_b in stale:
+                    removed += self._conn.execute(
+                        "DELETE FROM distinct_similar_pairs "
+                        "WHERE path_a = ? AND path_b = ?",
+                        (stored_a, stored_b),
+                    ).rowcount
         self._conn.commit()
-        return cursor.rowcount
+        return removed
+
+    def distinct_reviews(self, records: list[FileRecord]) -> DistinctReviews:
+        """Resolve reviewed-distinct rows against one scan's records.
+
+        Each side of a stored row is found by path, then by its full stored
+        identity (a pure rename/move keeps it), then by device+inode+size
+        (rename combined with metadata drift — the content check downstream
+        still has to confirm before the pair is suppressed).
+        """
+        by_path: dict[str, FileRecord] = {}
+        by_identity: dict[str, FileRecord] = {}
+        by_inode: dict[tuple[int, int, int], FileRecord] = {}
+        for rec in records:
+            by_path[rec.path] = rec
+            by_identity[self._identity(rec)] = rec
+            if rec.device is not None and rec.inode is not None:
+                by_inode.setdefault((rec.device, rec.inode, rec.size), rec)
+
+        entries: dict[tuple[str, str], list[_DistinctEntry]] = {}
+        for row in self._conn.execute(
+            "SELECT path_a, identity_a, content_a, path_b, identity_b, content_b "
+            "FROM distinct_similar_pairs"
+        ):
+            sides = []
+            for path, identity in (
+                (row["path_a"], row["identity_a"]),
+                (row["path_b"], row["identity_b"]),
+            ):
+                rec = by_path.get(path) or by_identity.get(identity)
+                if rec is None:
+                    parsed = _parse_identity(identity)
+                    if parsed is not None:
+                        rec = by_inode.get(parsed)
+                sides.append((rec, identity))
+            (rec_a, identity_a), (rec_b, identity_b) = sides
+            if rec_a is None or rec_b is None:
+                continue
+            stat_ok = (
+                self._identity(rec_a) == identity_a
+                and self._identity(rec_b) == identity_b
+            )
+            key = tuple(sorted((rec_a.path, rec_b.path)))
+            entries.setdefault(key, []).append(
+                _DistinctEntry(
+                    stat_ok,
+                    (
+                        (rec_a.path, row["content_a"] or ""),
+                        (rec_b.path, row["content_b"] or ""),
+                    ),
+                )
+            )
+        return DistinctReviews(entries)
 
     def distinct_pairs(self, records: list[FileRecord]) -> set[tuple[str, str]]:
-        """Return reviewed-distinct pairs whose two file identities still match."""
-        by_path = {record.path: record for record in records}
-        pairs: set[tuple[str, str]] = set()
-        for row in self._conn.execute(
-            "SELECT path_a, identity_a, path_b, identity_b FROM distinct_similar_pairs"
-        ):
-            left = by_path.get(row["path_a"])
-            right = by_path.get(row["path_b"])
-            if left is None or right is None:
-                continue
-            if (
-                self._identity(left) == row["identity_a"]
-                and self._identity(right) == row["identity_b"]
-            ):
-                pairs.add((left.path, right.path))
-        return pairs
+        """Reviewed-distinct pairs confirmed by stat identity alone."""
+        return self.distinct_reviews(records).stat_pairs()
 
     @staticmethod
     def _apply_row(rec: FileRecord, row: dict) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import random
 from pathlib import Path
 
+from .cache import DistinctReviews
 from .human_policy import may_enter_no_person_review
 from .models import (
     DuplicateGroup,
@@ -45,7 +46,7 @@ def rank_keep_candidate(rec: FileRecord) -> tuple:
 def cluster_around_best(
     records: list[FileRecord],
     adjacency: dict[str, set[str]],
-    distinct_pairs: set[tuple[str, str]] | None = None,
+    distinct: DistinctReviews | None = None,
 ) -> list[list[FileRecord]]:
     """Build disjoint groups whose members all directly match the best-ranked member.
 
@@ -61,10 +62,10 @@ def cluster_around_best(
     )
     by_path = {record.path: record for record in records}
     remaining = set(by_path)
-    distinct_pairs = distinct_pairs or set()
+    reviews = distinct or DistinctReviews.empty()
 
     def is_distinct(path_a: str, path_b: str) -> bool:
-        return tuple(sorted((path_a, path_b))) in distinct_pairs
+        return reviews.is_distinct(by_path[path_a], by_path[path_b])
 
     groups: list[list[FileRecord]] = []
     for keeper in ordered:

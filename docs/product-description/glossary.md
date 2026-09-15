@@ -38,7 +38,7 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Keep decision.** A durable record (stored in the keep-decisions file) that a specific file was reviewed and kept. A kept decision matches a file by its identity; if the file changes, the decision no longer applies.
 
-**Distinct.** A similar group the user has marked *Mark as distinct*: its files are recorded as not duplicates of each other, and the group stays hidden in future scans unless one of the files changes.
+**Distinct.** A similar group the user has marked *Mark as distinct*: its files are recorded as not duplicates of each other, and the group stays hidden in future scans. The record holds both the files' stat identity and their perceptual content identity, so renames and metadata-only changes (a touched mtime, an iCloud re-download, a remounted drive) keep the pair hidden; only an actual content change lets it resurface.
 
 ## Engines and detection
 

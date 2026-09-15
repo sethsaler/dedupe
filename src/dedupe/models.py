@@ -193,6 +193,11 @@ class ReviewGroup:
     suggested_keep: str | None = None
     # Source scan root when folders are scanned as independent parallel streams.
     root: str | None = None
+    # Members and anchors of pair-level *Mark as distinct* decisions. When the
+    # group dissolves, every pair among the participants is recorded so the
+    # reviewed files can never regroup — including member-vs-member pairs the
+    # swipe UI never showed side by side.
+    distinct_participants: list[str] = field(default_factory=list)
 
     @property
     def policy(self) -> ReviewPolicy:
@@ -244,6 +249,7 @@ class ReviewGroup:
             "reclaimable_bytes": self.reclaimable_bytes,
             "member_count": len(self.members),
             "root": self.root,
+            "distinct_participants": list(self.distinct_participants),
         }
 
     @classmethod
@@ -293,6 +299,9 @@ class ReviewGroup:
             ],
             suggested_keep=data.get("suggested_keep"),
             root=data.get("root"),
+            # Participants survive dismissed members: do not filter to
+            # member_paths like the selection lists above.
+            distinct_participants=list(data.get("distinct_participants", [])),
         )
 
 

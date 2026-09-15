@@ -17,6 +17,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
+from .cache import DistinctReviews
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_IMAGE_WORKERS_CAP, map_parallel, resolve_workers
@@ -442,7 +443,7 @@ def find_similar_image_groups(
     dense_local_max: float = DEFAULT_DENSE_LOCAL_MAX,
     dense_concentration: float = DEFAULT_DENSE_CONCENTRATION,
     skip_paths: set[str] | None = None,
-    distinct_pairs: set[tuple[str, str]] | None = None,
+    distinct: DistinctReviews | None = None,
     progress: ProgressCb | None = None,
     workers: int | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -456,7 +457,7 @@ def find_similar_image_groups(
     4. Dense detail check (reject burst-like concentrated local changes)
     """
     skip_paths = skip_paths or set()
-    distinct_pairs = distinct_pairs or set()
+    distinct = distinct or DistinctReviews.empty()
     n_workers = resolve_workers(workers, cap=DEFAULT_IMAGE_WORKERS_CAP)
     media = [
         r
@@ -534,7 +535,7 @@ def find_similar_image_groups(
             tile_mean,
             progress,
             cancelled,
-            distinct_pairs,
+            distinct,
             dense_local_max,
             dense_concentration,
         )
@@ -569,7 +570,7 @@ def find_similar_image_groups(
                 if positions[other.path] > i
             )
             for other in candidates:
-                if tuple(sorted((rec.path, other.path))) in distinct_pairs:
+                if distinct and distinct.is_distinct(rec, other):
                     continue
                 # Secondary dHash check to reduce false positives
                 if rec.path in dhashes and other.path in dhashes:
@@ -617,7 +618,7 @@ def find_similar_image_groups(
         _tile_phashes_for_path.cache_clear()
         _dense_thumb_for_path.cache_clear()
 
-    return cluster_around_best(hashed, adjacency, distinct_pairs)
+    return cluster_around_best(hashed, adjacency, distinct)
 
 
 def _bruteforce_groups(
@@ -628,13 +629,13 @@ def _bruteforce_groups(
     tile_mean: float,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
-    distinct_pairs: set[tuple[str, str]] | None = None,
+    distinct: DistinctReviews | None = None,
     dense_local_max: float = DEFAULT_DENSE_LOCAL_MAX,
     dense_concentration: float = DEFAULT_DENSE_CONCENTRATION,
 ) -> list[list[FileRecord]]:
     import imagehash
 
-    distinct_pairs = distinct_pairs or set()
+    distinct = distinct or DistinctReviews.empty()
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
 
     for i, a in enumerate(hashed):
@@ -642,7 +643,7 @@ def _bruteforce_groups(
             raise InterruptedError("scan cancelled")
         ha = imagehash.hex_to_hash(a.phash)  # type: ignore[arg-type]
         for b in hashed[i + 1 :]:
-            if tuple(sorted((a.path, b.path))) in distinct_pairs:
+            if distinct and distinct.is_distinct(a, b):
                 continue
             if not _compatible_aspect_ratios(a, b):
                 continue
@@ -674,4 +675,4 @@ def _bruteforce_groups(
     _tile_phashes_for_path.cache_clear()
     _dense_thumb_for_path.cache_clear()
 
-    return cluster_around_best(hashed, adjacency, distinct_pairs)
+    return cluster_around_best(hashed, adjacency, distinct)

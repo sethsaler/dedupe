@@ -62,7 +62,7 @@ Pairs that pass the tile check get one final dense comparison: both images are r
 
 Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: animations with the same opening frame but different later content are rejected. The dense check compares first frames only. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
 
-Groups are built around the best-ranked member (see [Duplicate group](duplicate-group.md)), never by chaining fuzzy matches transitively. Pairs the user previously marked *distinct* are never regrouped while the decision is current.
+Groups are built around the best-ranked member (see [Duplicate group](duplicate-group.md)), never by chaining fuzzy matches transitively. Pairs the user previously marked *distinct* are never regrouped while the decision is current — the matcher and the clustering pass both consult the recorded pairs, which follow the files through renames and metadata-only drift via their perceptual content identity and lapse only on a real content change.
 
 **Similar videos.** Each video is fingerprinted by sampling up to 16 positions along its timeline and hashing one small frame per position, extracted with direct ffmpeg seeks (the file is opened once, not decoded end to end). Two videos are similar when their fingerprints agree at normalized positions within a mean Hamming distance of **8**. Videos require ffmpeg; without it the stage is skipped with a warning in the diagnostics.
 

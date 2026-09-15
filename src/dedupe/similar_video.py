@@ -18,6 +18,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
+from .cache import DistinctReviews
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
@@ -532,13 +533,13 @@ def find_similar_video_groups(
     records: list[FileRecord],
     *,
     threshold: int = DEFAULT_THRESHOLD,
-    distinct_pairs: set[tuple[str, str]] | None = None,
+    distinct: DistinctReviews | None = None,
     progress: ProgressCb | None = None,
     workers: int | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """Cluster near-identical videos by fingerprint Hamming distance."""
-    distinct_pairs = distinct_pairs or set()
+    distinct = distinct or DistinctReviews.empty()
     videos = [r for r in records if r.media_type == MediaType.VIDEO]
     if len(videos) < 2:
         return []
@@ -648,8 +649,8 @@ def find_similar_video_groups(
         left = fingerprints[i]
         for j in indexes:
             b = hashed[j]
-            # Only pay for the ordered key when reviews exist to look up.
-            if distinct_pairs and tuple(sorted((a.path, b.path))) in distinct_pairs:
+            # Only pay for the lookup when reviews exist.
+            if distinct and distinct.is_distinct(a, b):
                 continue
             right = fingerprints[j]
             # These aligned positions are necessarily under the existing maximum.
@@ -683,4 +684,4 @@ def find_similar_video_groups(
     if progress:
         progress("video-cluster", len(hashed), len(hashed), "")
 
-    return cluster_around_best(hashed, adjacency, distinct_pairs)
+    return cluster_around_best(hashed, adjacency, distinct)

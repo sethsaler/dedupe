@@ -283,9 +283,9 @@ def drop_marked_distinct_groups(result: ScanResult, cache_path: str | Path | Non
     similar groups that a fresh scan would suppress through the hash cache's
     distinct pairs. Drop a similar group only when every pair of its members
     is a still-current distinct decision, judged against the members' present
-    on-disk identity — changed or unreadable files keep their group, so no
-    unreviewed similarity is ever hidden. Never raises: without a readable
-    cache every group is kept.
+    on-disk identity — changed, renamed, or unreadable files keep their
+    group, so no unreviewed similarity is ever hidden. Never raises: without
+    a readable cache every group is kept.
     """
     candidates = [
         group
@@ -315,15 +315,25 @@ def drop_marked_distinct_groups(result: ScanResult, cache_path: str | Path | Non
                         mtime_ns=int(file_stat.st_mtime_ns),
                         device=int(file_stat.st_dev),
                         inode=int(file_stat.st_ino),
+                        # The session's hashes predate the stat refresh: blank
+                        # them so a metadata-drifted file cannot be confirmed
+                        # distinct from stale perceptual data. Fresh scans
+                        # re-verify content during matching; a loaded session
+                        # stays conservative and keeps the group instead.
+                        phash=None,
+                        dhash=None,
+                        tile_phashes=None,
+                        video_fingerprint=None,
                     )
+        fresh_records = [rec for rec in current.values() if rec is not None]
+        reviews = cache.distinct_reviews(fresh_records)
         covered = set()
         for group in candidates:
             fresh = [current[member.path] for member in group.members]
             if any(record is None for record in fresh):
                 continue
-            valid = cache.distinct_pairs(fresh)
             if all(
-                tuple(sorted((left.path, right.path))) in valid
+                reviews.is_distinct(left, right)
                 for left, right in combinations(fresh, 2)
             ):
                 covered.add(group.id)
@@ -1778,7 +1788,10 @@ def create_app(
         dissolved, as before. With ``path`` only that member is decided: the
         ``anchor``/suggested-keeper pair is recorded as distinct (future scans
         never regroup those two files) and the member leaves the group; the
-        group dissolves once fewer than two members remain.
+        group dissolves once fewer than two members remain. Dissolution
+        records every pair among the review's participants, so members the
+        swipe UI only ever compared against the anchor can never regroup
+        with each other either.
         """
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
@@ -1819,6 +1832,7 @@ def create_app(
         try:
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
             pair_count = cache.mark_distinct(records)
+            backfill: list = []
             with lock:
                 if member is not None:
                     group.members = [
@@ -1832,6 +1846,9 @@ def create_app(
                         path for path in group.reviewed_paths
                         if path != member.path
                     ]
+                    group.distinct_participants = sorted(
+                        {*group.distinct_participants, anchor.path, member.path}
+                    )
                 if member is None or len(group.members) < 2:
                     result.groups = [
                         candidate
@@ -1846,6 +1863,23 @@ def create_app(
                     candidate.id != group_id for candidate in result.groups
                 )
                 payload = None if dissolved else group_payload(group)
+                if dissolved and (member is not None or group.distinct_participants):
+                    # The group is finished: suppress every pair among everyone
+                    # who took part in the review — swipe participants plus the
+                    # members just dismissed — including member-vs-member pairs
+                    # the swipe UI never showed side by side.
+                    involved = set(group.distinct_participants) | {
+                        m.path for m in group.members
+                    }
+                    if len(involved) > 2:
+                        by_path = {f.path: f for f in (result.files if result else [])}
+                        backfill = [
+                            by_path[path]
+                            for path in sorted(involved)
+                            if path in by_path
+                        ]
+            if len(backfill) > 2:
+                pair_count = cache.mark_distinct(backfill)
             persist_result()
             return jsonify({
                 "ok": True,
@@ -1912,10 +1946,19 @@ def create_app(
         cache = None
         try:
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
-            removed = cache.unmark_distinct_pair(anchor_path, member_path)
+            removed = cache.unmark_distinct_pair(
+                anchor_path,
+                member_path,
+                result.files if result else None,
+            )
             with lock:
                 if group is not None:
                     group.members = [*group.members, record]
+                    group.distinct_participants = [
+                        path
+                        for path in group.distinct_participants
+                        if path != member_path
+                    ]
                     result.recompute_stats()
                     refresh_selected_count_locked()
                     state["groups_version"] = state.get("groups_version", 0) + 1

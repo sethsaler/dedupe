@@ -59,6 +59,27 @@ def test_review_session_round_trip_is_private(tmp_path: Path) -> None:
     assert stat.S_IMODE(session_path.parent.stat().st_mode) == 0o700
 
 
+def test_distinct_participants_round_trip(tmp_path: Path) -> None:
+    """Pair-level distinct decisions survive save/load so a later dissolve
+    can still suppress every participant pair — including dismissed members."""
+    session_path = tmp_path / "state" / "review.json"
+    result = _result(tmp_path)
+    dismissed = str(tmp_path / "dismissed.jpg")
+    result.groups[0].distinct_participants = [result.files[0].path, dismissed]
+
+    save_review_session(result, session_path)
+    loaded = load_review_session(session_path)
+
+    assert loaded.error is None
+    assert loaded.result is not None
+    # Dismissed members are no longer group members; participants must not be
+    # pruned down to current membership.
+    assert loaded.result.groups[0].distinct_participants == [
+        result.files[0].path,
+        dismissed,
+    ]
+
+
 def test_review_session_prunes_changed_files_and_dissolves_group(tmp_path: Path) -> None:
     session_path = tmp_path / "state" / "review.json"
     result = _result(tmp_path)

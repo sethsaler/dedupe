@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dedupe.cache import DistinctReviews
 from dedupe.models import FileRecord, MediaType
 from dedupe.similar_video import (
     HASH_FRAME_SIZE,
@@ -249,8 +250,51 @@ def test_video_clustering_uses_duration_without_changing_matches(monkeypatch) ->
 
     reviewed_pair = tuple(sorted((original.path, close.path)))
     assert find_similar_video_groups(
-        [original, close, too_long, different], distinct_pairs={reviewed_pair}
+        [original, close, too_long, different],
+        distinct=DistinctReviews.from_pairs({reviewed_pair}),
     ) == []
+
+
+def test_reviewed_distinct_video_pair_survives_metadata_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same fingerprint under fresh stat metadata keeps the pair suppressed."""
+    from dedupe.cache import HashCache
+
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    fingerprint_a = "v3:" + ",".join(["0123456789abcdef"] * 8)
+    fingerprint_b = "v3:" + ",".join(["0123456789abcdee"] * 8)
+
+    def record(path: Path, inode: int, mtime: float, fingerprint: str) -> FileRecord:
+        return FileRecord(
+            path=str(path),
+            size=1,
+            mtime=mtime,
+            media_type=MediaType.VIDEO,
+            extension=".mp4",
+            device=2,
+            inode=inode,
+            mtime_ns=int(mtime * 1_000_000_000),
+            video_fingerprint=fingerprint,
+            duration=10.0,
+        )
+
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    cache.mark_distinct(
+        [
+            record(tmp_path / "a.mp4", 10, 1.0, fingerprint_a),
+            record(tmp_path / "b.mp4", 11, 1.0, fingerprint_b),
+        ]
+    )
+
+    drifted = [
+        record(tmp_path / "a.mp4", 10, 1.0, fingerprint_a),
+        record(tmp_path / "b.mp4", 99, 2.0, fingerprint_b),
+    ]
+    reviews = cache.distinct_reviews(drifted)
+    assert cache.distinct_pairs(drifted) == set()  # stat alone cannot confirm
+    assert find_similar_video_groups(drifted, distinct=reviews) == []
+    cache.close()
 
 
 def _synthetic_video_records(seed: int = 7, count: int = 40) -> list[FileRecord]:
@@ -314,7 +358,7 @@ def _reference_video_groups(records, threshold: int = 8):
                 continue
             adjacency[a.path].add(b.path)
             adjacency[b.path].add(a.path)
-    return cluster_around_best(records, adjacency, set())
+    return cluster_around_best(records, adjacency)
 
 
 def test_duration_bucketing_matches_exhaustive_comparison(monkeypatch) -> None:
