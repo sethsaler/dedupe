@@ -139,10 +139,10 @@ function renderSession(metadata, resumed = false) {
   state.reviewSession = metadata || null;
   const available = !!metadata?.available;
   const corrupt = !!metadata?.corrupt;
-  const dismissed = sessionBannerKey(metadata) === state.dismissedSessionKey
+  const dismissible = sessionBannerKey(metadata) === state.dismissedSessionKey
     && state.dismissedSessionKey !== "";
-  $("sessionStatus").hidden = (!available && !corrupt) || dismissed;
-  if (dismissed) return;
+  $("sessionStatus").hidden = (!available && !corrupt) || dismissible;
+  if (dismissible) return;
   $("sessionStatus").classList.toggle("warn", corrupt);
   if (!available && !corrupt) return;
   if (corrupt) {
@@ -150,11 +150,15 @@ function renderSession(metadata, resumed = false) {
     $("sessionStatusText").textContent =
       `The saved review could not be read (${metadata.error || "unreadable file"}). Scan again, or discard it to start clean.`;
     $("btnDiscardSession").textContent = "Discard unreadable review";
+    $("btnResumeSession").hidden = true;
     renderPrunedDetail(null);
     return;
   }
   $("sessionFlag").textContent = "✔";
   $("btnDiscardSession").textContent = "Discard saved review";
+  // The offer stands until the user takes it (or discards): a peeked session
+  // has not been revalidated or installed, so keep the resume action visible.
+  $("btnResumeSession").hidden = !metadata.peeked;
   const when = metadata.saved_at ? new Date(metadata.saved_at).toLocaleString() : "an earlier session";
   const pruned = metadata.pruned_files ? ` · ${metadata.pruned_files} stale file${metadata.pruned_files === 1 ? "" : "s"} pruned` : "";
   $("sessionStatusText").textContent = `${resumed ? "Resumed" : "Saved"} review from ${when}${pruned}`;

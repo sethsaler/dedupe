@@ -2,7 +2,7 @@
 
 ## Summary
 
-Scan setup is where every session begins: the user names one or more folders, optionally narrows what gets scanned, and starts the scan whose results fill the rest of the UI. It is the top of the single page served at `http://127.0.0.1:8765`, and it is also where a resumed session announces itself. Starting a scan replaces whatever results were loaded; the scan itself, stage by stage, is owned by [The scan pipeline](../foundations/scan-pipeline.md).
+Scan setup is where every session begins: the user names one or more folders, optionally narrows what gets scanned, and starts the scan whose results fill the rest of the UI. It is the top of the single page served at `http://127.0.0.1:8765`, and it is also where a saved session announces itself with its resume offer. Starting a scan replaces whatever results were loaded; the scan itself, stage by stage, is owned by [The scan pipeline](../foundations/scan-pipeline.md).
 
 ## The simple case
 
@@ -23,7 +23,7 @@ stateDiagram-v2
 
 ### Start
 
-The page loads with whatever the server already holds: nothing (the setup form prominent), a completed result (the group list, with the setup form collapsed to its slim bar above it — no paths summary, since the server does not report what was scanned), or a resumed session (same, plus the [resumed-session banner](session-resume.md)). A page reload during a scan also collapses the form, leaving the live progress panel visible. The path field accepts one or more paths, comma-separated (a drag-and-drop or the native picker appends to the list); `~` is expanded by the server. Around it:
+The page loads with whatever the server already holds: nothing (the setup form prominent, plus the [resume banner](session-resume.md) when a saved review exists), a completed result (the group list, with the setup form collapsed to its slim bar above it — no paths summary, since the server does not report what was scanned), or a resumed session (same, plus the banner now reporting what resume pruned). A page reload during a scan also collapses the form, leaving the live progress panel visible. The path field accepts one or more paths, comma-separated (a drag-and-drop or the native picker appends to the list); `~` is expanded by the server. Around it:
 
 - **Folders…** opens the native folder picker; **Files…** opens a file picker for scanning specific files. Picked paths are appended to the field, deduplicated. Dragging text or a URI onto the field appends it the same way; dropping actual files or folders whose drag carries no text gets an error toast — "The browser can't read a dropped folder's location — use Folders… to pick it" — because the browser never exposes a dropped item's absolute path.
 - **Recent folders** appear as chips below the field; clicking one appends its path to the field (deduplicated), exactly like the native picker. Recent paths are remembered in the browser's local storage.
@@ -36,7 +36,7 @@ Pressing Scan with an empty path list does nothing server-side: the request is r
 
 ### End without changing anything
 
-Leaving the page without scanning records nothing. The server's auto-shutdown (closing the last tab stops the server) applies; see [`ui`](../cli/ui-command.md). A resumed session that the user never touches stays saved exactly as it was.
+Leaving the page without scanning records nothing. The server's auto-shutdown (closing the last tab stops the server) applies; see [`ui`](../cli/ui-command.md). A saved session that the user never resumes stays saved exactly as it was.
 
 ### Become extended
 
@@ -61,7 +61,7 @@ The progress line becomes the final summary; the result — files, groups, diagn
 | Scan options (thresholds, backends, toggles) | Define what this scan detects; defaults per [Scan pipeline](../foundations/scan-pipeline.md). Remembered in local storage for next time. | Options cannot change mid-scan; the next scan picks them up. |
 | Exclusion globs | Remove matching paths before anything is read. | Same: fixed for the run. |
 | Parallel streams vs one pool | Decided at start (default: streams when more than one folder). Cross-folder duplicates only exist in one-pool mode. | Fixed for the run. |
-| Saved review session present | A prior session auto-loads on server start; a scan replaces it and saves the new one when complete. | No effect on the running scan. |
+| Saved review session present | A prior session is offered through the banner, not auto-loaded; a scan replaces it and saves the new one when complete. | No effect on the running scan. |
 
 ## Cancel and interrupt
 
@@ -74,7 +74,7 @@ The progress line becomes the final summary; the result — files, groups, diagn
 | The page or process goes away | No effect. | The scan runs server-side and continues through a browser reload — the page re-attaches to the running scan via its event stream (a server-sent-events channel, with a 350 ms status poll as fallback). Closing the last tab schedules server shutdown (1.5 s grace); a reload in time cancels it. Killing the server process loses the in-progress scan and whatever groups had streamed. |
 | Something else changes the target | No effect until files are read. | Files are read as the scan reaches them; changes after reading are not noticed until revalidation at action time ([Actions and undo](../foundations/actions-and-undo.md#the-safety-model)). |
 | The input channel changes | No effect. | No effect. |
-| A resumed review supersedes | A resume is what the page shows instead of blank setup; starting a scan replaces it. | Resume/discard requests are locked out while scanning. |
+| A resumed review supersedes | The resume offer stands in the banner; starting a scan replaces the saved session once it completes. | Resume/discard requests are locked out while scanning. |
 
 ## Interactions with other systems
 

@@ -67,7 +67,7 @@ The exit is clean: the launcher's Terminal window closes with the process.
 | The page or process goes away | No effect. | Closing the last tab triggers the graceful self-shutdown described above; killing the process loses in-memory state (preview tokens, an unsaved scan, any change in flight). |
 | Something else changes the target | No effect. | File changes are handled by revalidation at action time, not by the server itself. |
 | The input channel changes | stdin is never read. Closing the terminal sends SIGHUP and the process dies. | Same. |
-| A resumed review supersedes | That is the startup behavior with a saved session. | Resume is a browser-side operation against this server. |
+| A resumed review supersedes | A saved session is offered (not loaded) at startup; the load happens on the browser's resume click. | Resume is a browser-side operation against this server. |
 
 ## Interactions with other systems
 
@@ -75,7 +75,7 @@ The exit is clean: the launcher's Terminal window closes with the process.
 
 **Safety and undo.** None directly; the safety model lives in the actions the browser confirms.
 
-**Review sessions.** A saved session auto-loads at startup; a completed scan saves one. See [Session resume](../ui/session-resume.md).
+**Review sessions.** A saved session is offered at startup through the banner — the server starts clean until the browser resumes it; a completed scan saves one. See [Session resume](../ui/session-resume.md).
 
 **Optional dependencies.** The server imports flask — a required package; `dedupe doctor` reports it. Detection dependencies affect scans, not serving.
 

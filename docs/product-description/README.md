@@ -45,7 +45,7 @@ Every feature document follows the same skeleton so that documents are comparabl
    - The page or process goes away: browser reload or tab closed, terminal window closed, app restarted.
    - Something else changes the target: a file is changed, moved, or deleted on disk after the scan; a path becomes a symbolic link; a file ends up outside the scanned roots.
    - The input channel changes: stdin or stdout closed (CLI); no counterpart in the UI — the cell says "No effect."
-   - A resumed review supersedes: a saved review session is restored and stale entries are pruned.
+   - A resumed review supersedes: a saved review session is offered, then restored on resume and stale entries are pruned.
 6. **Interactions with other systems.** In this fixed order: **files on disk** (caches, receipts, session files, `_Dedupe Review`), **safety and undo** (trash, quarantine, isolate, receipts), **review sessions**, **optional dependencies** (ffmpeg, OpenCV, Photon), **concurrency and resource limits**, **macOS specifics** (Photos.app libraries, Finder Trash), **configuration and defaults**. Include each even when the answer is "no interaction."
 7. **Edge cases.** Anything a user could notice that is not covered above.
 8. **Open questions and verification.** The source repo commit the document was verified against, and any behavior that could not be confirmed.
@@ -118,7 +118,7 @@ ui/
   no-person-review.md            the no-person-detected review and its engine choices
   faces-review.md                the faces review category and the face filters
   all-files-review.md            the Files tab: sifting a whole scanned folder, category or not
-  session-resume.md              the resumed-session banner, dropped files, discarding a saved review
+  session-resume.md              the resume offer and banner, dropped files, discarding a saved review
 
 cli/
   doctor.md                      dependency and path health check (the pilot)

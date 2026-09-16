@@ -104,8 +104,10 @@ The confirmation sheet counts down how long its preview stays valid. If the prev
 while the sheet is open, the execute is never attempted with a stale token: the selection is
 re-verified automatically and you confirm the refreshed numbers.
 
-Completed reviews resume automatically after an app restart. Use **Discard saved review**
-to clear the saved session. Changed, missing, or out-of-root files are removed from a
+After an app restart the page starts clean at the scan setup — the last scan's results are
+not loaded. A banner offers **Resume saved review** to pick the previous review back up
+(groups, selections, and review state); use **Discard saved review** to clear the saved
+session instead. Changed, missing, or out-of-root files are removed from a
 resumed review before it is shown, and every file is still revalidated immediately before an
 action. The resumed-session banner reports how many files were pruned and why (no longer on
 disk, changed since the scan, outside the scanned folders, became a symbolic link, could not

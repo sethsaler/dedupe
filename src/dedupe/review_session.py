@@ -58,15 +58,20 @@ class ReviewSessionLoad:
     corrupt: bool = False
     # Trashed review candidates (path -> Trash destination) from the saved scan.
     deleted_files: dict[str, str] = field(default_factory=dict)
+    # True when only the session's identity was read at startup (peek): the
+    # file exists and is readable, but its result was neither built nor
+    # revalidated. Such a load is banner metadata, never an active review.
+    peeked: bool = False
 
     @property
     def available(self) -> bool:
-        return self.result is not None
+        return self.result is not None or self.peeked
 
     def metadata(self) -> dict:
         return {
             "path": str(self.path) if self.path else None,
             "available": self.available,
+        "peeked": self.peeked,
             "saved_at": self.saved_at,
             "roots": list(self.result.roots) if self.result else [],
             "pruned_files": self.pruned_files,
@@ -210,6 +215,31 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
             report.saved_at = saved["saved_at"]
         except OSError as exc:
             report.error = f"loaded but could not persist stale-file pruning: {exc}"
+    return report
+
+
+def peek_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
+    """Read only the session's saved-at identity, without building a result.
+
+    The server starts clean: results from the last scan are not installed
+    until the user resumes. This peek answers just the banner's questions —
+    is there a saved review, when was it saved — at a fraction of the cost
+    of a load (which revalidates every file on disk).
+    """
+    target = Path(path).expanduser() if path is not None else default_review_session_path()
+    report = ReviewSessionLoad(path=target, peeked=True)
+    try:
+        with target.open("rb") as stream:
+            envelope = json.load(stream)
+        if envelope.get("version") != REVIEW_SESSION_VERSION:
+            raise ValueError(f"unsupported review session version: {envelope.get('version')!r}")
+        report.saved_at = envelope.get("saved_at")
+    except FileNotFoundError:
+        return ReviewSessionLoad(path=target)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        report.error = str(exc)
+        report.corrupt = True
+        report.peeked = False
     return report
 
 

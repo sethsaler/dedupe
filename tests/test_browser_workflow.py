@@ -1633,7 +1633,7 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
 
 
 @pytest.mark.e2e
-def test_resume_banner_reports_pruned_files_and_discard_starts_clean(
+def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
     page, tmp_path: Path, duplicate_images: Path
 ) -> None:
     page_errors: list[str] = []
@@ -1653,18 +1653,26 @@ def test_resume_banner_reports_pruned_files_and_discard_starts_clean(
     # One scanned file changes on disk before the restart.
     Image.new("RGB", (64, 64), (200, 30, 30)).save(duplicate_images / "duplicate.png")
 
-    # A new server over the same session file resumes without scanning and
-    # reports the pruned file with its reason.
+    # A new server starts clean: the banner offers the saved review instead of
+    # loading it, and resuming revalidates against disk and reports the pruned
+    # file with its reason.
     resumed = create_app(review_session_path=session_path)
     resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(resumed) as url:
         page.goto(url, wait_until="domcontentloaded")
-        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        # The page opens on the empty setup with the offer in the banner.
+        expect(page.locator("#emptyState")).to_be_visible()
+        expect(page.locator(".group-item")).to_have_count(0)
+        expect(page.locator("#sessionStatus")).to_be_visible()
+        expect(page.locator("#btnResumeSession")).to_be_visible()
+        expect(page.locator("#sessionStatusText")).to_contain_text("Saved review from")
+
+        page.locator("#btnResumeSession").click()
+        expect(page.locator("#results")).to_be_visible()
         page.locator(".group-item").first.wait_for(state="attached")
         # The exact group lost a member below its two-file minimum.
         expect(page.locator("#countExact")).to_have_text("0")
         expect(page.locator("#countAll")).to_have_text("3")
-        expect(page.locator("#sessionStatus")).to_be_visible()
         expect(page.locator("#sessionStatusText")).to_contain_text("Resumed review")
         expect(page.locator("#sessionStatusText")).to_contain_text("1 stale file pruned")
         expect(page.locator("#sessionPrunedSummary")).to_contain_text(
@@ -1673,6 +1681,8 @@ def test_resume_banner_reports_pruned_files_and_discard_starts_clean(
         page.locator("#sessionPrunedSummary").click()
         expect(page.locator("#sessionPrunedList")).to_contain_text("duplicate.png")
         expect(page.locator("#sessionPrunedList")).to_contain_text("changed since scan")
+        # Once resumed, the offer is spent: only discard remains in the banner.
+        expect(page.locator("#btnResumeSession")).to_be_hidden()
 
         # Discard removes the durable state and returns to the empty setup.
         page.locator("#btnDiscardSession").click()
@@ -1717,11 +1727,12 @@ def test_selections_survive_a_server_restart(
             "0 of 2 selected for removal"
         )
 
-    # A new server over the same session file restores groups and selections.
+    # A new server starts clean; resuming restores groups and selections.
     resumed = create_app(review_session_path=session_path)
     resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(resumed) as url:
         page.goto(url, wait_until="domcontentloaded")
+        page.locator("#btnResumeSession").click()
         page.locator("#results").wait_for(state="visible", timeout=10_000)
         page.locator('.tab[data-kind="exact"]').click()
         expect(page.locator(".group-item")).to_have_count(1)

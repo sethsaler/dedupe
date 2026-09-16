@@ -31,6 +31,7 @@ from dedupe.models import (
     ScanResult,
     StageDiagnostics,
 )
+from dedupe.review_session import save_review_session
 from dedupe.web import app as web_app
 from dedupe.web import media as web_media
 from dedupe.web.app import WEB_API_VERSION, create_app
@@ -651,9 +652,7 @@ def test_mutations_reject_stale_scan_generation(tmp_path: Path) -> None:
     assert response.status_code == 409
 
 
-def test_app_instances_resume_saved_review_without_sharing_runtime_state(
-    tmp_path: Path,
-) -> None:
+def test_app_starts_clean_and_offers_the_saved_review(tmp_path: Path) -> None:
     first = create_app(_result(tmp_path))
     second = create_app()
 
@@ -661,9 +660,80 @@ def test_app_instances_resume_saved_review_without_sharing_runtime_state(
     second_status = second.test_client().get("/api/status").get_json()
 
     assert first_status["has_result"] is True
-    assert second_status["has_result"] is True
+    assert second_status["has_result"] is False
     assert first_status["scan_id"] != second_status["scan_id"]
-    assert second_status["progress"]["message"] == "Resumed saved review"
+    # The peeked session is banner metadata: offered, never auto-installed.
+    assert second_status["review_session"]["available"] is True
+    assert second_status["review_session"]["peeked"] is True
+    assert second_status["review_session"]["saved_at"]
+    assert second_status["progress"]["message"] != "Resumed saved review"
+
+    # A restart of the first app (explicit result handed over) is unaffected:
+    # the result installs immediately and persists over the saved session.
+    third = create_app(_result(tmp_path))
+    third_status = third.test_client().get("/api/status").get_json()
+    assert third_status["has_result"] is True
+    assert third_status["review_session"]["available"] is True
+
+
+def test_resume_endpoint_installs_the_saved_review(tmp_path: Path) -> None:
+    session_path = tmp_path / "state" / "review-session.json"
+    prior = _result(tmp_path)
+    save_review_session(prior, session_path)
+
+    app = create_app(review_session_path=session_path)
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    before = client.get("/api/status").get_json()
+    assert before["has_result"] is False
+
+    resumed = client.post(
+        "/api/review-session/resume", json={}, headers={"X-Dedupe-Token": token}
+    )
+    assert resumed.status_code == 200
+    payload = resumed.get_json()
+    assert payload["available"] is True
+    assert payload["peeked"] is False
+    assert payload["saved_at"] == before["review_session"]["saved_at"]
+
+    after = client.get("/api/status").get_json()
+    assert after["has_result"] is True
+    assert after["progress"]["message"] == "Resumed saved review"
+    # Resume upgrades older sessions with the per-root All-Files browse group.
+    groups = client.get("/api/groups").get_json()["groups"]
+    assert len(groups) == len(prior.groups) + 1
+    browse = next(group for group in groups if group["kind"] == "all_files")
+    assert {member["path"] for member in browse["members"]} == {
+        record.path for record in prior.files
+    }
+    # The status payload and the resume response agree on the new generation.
+    assert after["scan_id"] == payload["scan_id"]
+    assert after["scan_id"] != before["scan_id"]
+
+
+def test_resume_drops_groups_marked_distinct_since_the_save(tmp_path: Path) -> None:
+    session_path = tmp_path / "state" / "review-session.json"
+    cache_path = tmp_path / "hashes.sqlite3"
+    result = _result(tmp_path)
+    result.groups = build_groups([], [result.files])
+    save_review_session(result, session_path)
+
+    # Marked distinct after the save: a fresh scan would suppress the group,
+    # so the resume must heal it away instead of resurfacing it.
+    cache = HashCache(cache_path)
+    cache.mark_distinct(result.files)
+    cache.close()
+
+    app = create_app(review_session_path=session_path)
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    resumed = client.post(
+        "/api/review-session/resume",
+        json={},
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+    assert resumed.status_code == 200
+    assert client.get("/api/groups?kind=similar").get_json()["groups"] == []
 
 
 def test_status_exposes_web_api_version() -> None:
@@ -1491,11 +1561,17 @@ def test_candidate_trash_undo_survives_a_restart(tmp_path: Path) -> None:
     assert deleted.status_code == 200
     assert not original.exists()
 
-    # "Restart": a fresh app resumes from the saved session with no initial result.
+    # "Restart": a fresh app starts clean and offers the saved review; the
+    # resume revalidates the session and restores the deleted-files map.
     restarted = create_app(review_session_path=review_path)
     client2 = restarted.test_client()
     headers2 = {"X-Dedupe-Token": restarted.config["DEDUPE_CSRF_TOKEN"]}
-    scan_id2 = client2.get("/api/status").get_json()["scan_id"]
+    assert client2.get("/api/status").get_json()["has_result"] is False
+    resumed = client2.post(
+        "/api/review-session/resume", json={}, headers=headers2
+    )
+    assert resumed.status_code == 200
+    scan_id2 = resumed.get_json()["scan_id"]
 
     fetched = client2.get(f"/api/groups/{group.id}").get_json()
     assert fetched["deleted_paths"] == [str(original)]

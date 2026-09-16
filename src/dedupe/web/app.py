@@ -48,6 +48,7 @@ from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
     load_review_session,
+    peek_review_session,
     save_review_session,
 )
 from ..similar_image import TILE_HASH_VERSION
@@ -57,7 +58,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 22
+WEB_API_VERSION = 23
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Flows whose members support direct per-file Trash + undo. The independent
@@ -396,9 +397,16 @@ def create_app(
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     capabilities = detect_capabilities()
     lock = threading.RLock()
-    loaded = ReviewSessionLoad(path=Path(review_session_path) if review_session_path else None)
-    if initial_result is None:
-        loaded = load_review_session(review_session_path)
+    # The server starts clean: the saved review is offered through the banner
+    # (resume button), never auto-installed. A peek reads only the session's
+    # identity, deferring the expensive per-file revalidation to an explicit
+    # resume. An explicit initial_result (CLI --load / --ui handoff) is still
+    # installed below and persisted over the saved session.
+    loaded = peek_review_session(review_session_path)
+    if initial_result is not None:
+        loaded = ReviewSessionLoad(
+            path=Path(review_session_path) if review_session_path else None
+        )
     state: dict = {
         "result": None,
         "progress": ScanProgress(),
@@ -677,25 +685,11 @@ def create_app(
             )
             refresh_selected_count_locked()
         persist_result()
-    elif loaded.result is not None:
-        with lock:
-            # Heals sessions saved before a distinct review (e.g. poisoned by
-            # an earlier --load): covered groups never reach the review list.
-            drop_marked_distinct_groups(loaded.result, app.config["DEDUPE_CACHE_PATH"])
-            ensure_all_files_groups(loaded.result)
-            state["result"] = loaded.result
-            loaded.result.recompute_stats()
-            state["deleted_files"] = dict(loaded.deleted_files)
-            state["scan_id"] = secrets.token_hex(12)
-            state["progress"] = ScanProgress(
-                phase="done",
-                done=True,
-                files_found=len(loaded.result.files),
-                groups_found=len(loaded.result.groups),
-                message="Resumed saved review",
-                elapsed_seconds=loaded.result.diagnostics.total_duration_seconds,
-            )
-            refresh_selected_count_locked()
+    elif loaded.available:
+        # Nothing to install at startup: the peeked session is banner
+        # metadata only. The resume endpoint builds, heals, revalidates,
+        # and installs the saved review when the user asks for it.
+        pass
 
     @app.get("/")
     def index():
@@ -885,6 +879,9 @@ def create_app(
             state["review_session"] = report
             if report.result is None:
                 return jsonify(report.metadata()), 404
+            # Heals sessions saved before a distinct review (e.g. poisoned by
+            # an earlier --load): covered groups never reach the review list.
+            drop_marked_distinct_groups(report.result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(report.result)
             state["result"] = report.result
             state["scan_id"] = secrets.token_hex(12)

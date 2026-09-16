@@ -2,11 +2,11 @@
 
 ## Summary
 
-The review session is how a finished review survives an app restart. When a scan completes, its results — files, groups, selections, reviewed paths, and the destinations of any trashed review candidates — are saved to a single JSON file; the next time the app starts, the session is offered back, every file in it is revalidated against the disk, anything that no longer matches is pruned, and the user resumes where they left off. This document owns the save format's guarantees, the pruning rules and their reasons, and what *resume* commits to. The banner the user actually sees is [Session resume](../ui/session-resume.md); what can be done with the resumed selections is [Actions and undo](actions-and-undo.md).
+The review session is how a finished review survives an app restart. When a scan completes, its results — files, groups, selections, reviewed paths, and the destinations of any trashed review candidates — are saved to a single JSON file; the next time the app starts, the session is offered back through a banner, and when the user resumes, every file in it is revalidated against the disk, anything that no longer matches is pruned, and the user resumes where they left off. Nothing is loaded automatically — a restart opens at the scan setup. This document owns the save format's guarantees, the pruning rules and their reasons, and what *resume* commits to. The banner the user actually sees is [Session resume](../ui/session-resume.md); what can be done with the resumed selections is [Actions and undo](actions-and-undo.md).
 
 ## The simple case
 
-The user scans, reviews some groups, and quits the app (or the machine restarts, or the server is stopped). The scan result was saved atomically the moment the scan finished, and saved again whenever selections changed enough to persist. On the next start, the app finds the session file, checks every file it mentions, drops the ones that changed or vanished, and shows the resumed review with a banner reporting what was dropped and why. The user continues reviewing; a confirmed action works exactly as it would have before the restart.
+The user scans, reviews some groups, and quits the app (or the machine restarts, or the server is stopped). The scan result was saved atomically the moment the scan finished, and saved again whenever selections changed enough to persist. On the next start, the app peeks at the session file — enough to announce "Saved review from {when}" with a resume button — and loads nothing. When the user clicks resume, the app checks every file the session mentions, drops the ones that changed or vanished, and shows the resumed review with a banner reporting what was dropped and why. The user continues reviewing; a confirmed action works exactly as it would have before the restart.
 
 ## Where the session lives
 
@@ -16,8 +16,8 @@ The session file is `~/.local/state/dedupe/review-session.json` (honoring `XDG_S
 
 ```mermaid
 stateDiagram-v2
-    [*] --> found : session file exists
-    found --> revalidating : version accepted
+    [*] --> found : session file exists (peeked at startup)
+    found --> revalidating : user clicks Resume, version accepted
     revalidating --> resumed : valid files kept, stale files pruned
     resumed --> [*] : user continues reviewing
     found --> refused : corrupt or oversize
@@ -26,7 +26,7 @@ stateDiagram-v2
 
 ### Loading
 
-The file is read and its version checked (currently version 1; anything else is reported as corrupt, not guessed at). A file that cannot be parsed — truncated, hand-edited, wrong shape — is reported as corrupt with its error; the app starts clean and the file is left alone for inspection.
+The startup peek reads only the file's version and saved-at timestamp, to decide whether a banner is offered — no result is built and no file is checked. The full read happens on the resume click: the file is parsed and its version checked (currently version 1; anything else is reported as corrupt, not guessed at). A file that cannot be parsed — truncated, hand-edited, wrong shape — is reported as corrupt with its error; the app starts clean and the file is left alone for inspection.
 
 ### Revalidating
 
@@ -73,7 +73,7 @@ What remains is installed as the current scan result exactly as if it had just b
 
 **Optional dependencies.** None: revalidation reads file metadata only; no decoding or hashing happens at resume time.
 
-**Concurrency and resource limits.** Revalidation is a single-threaded metadata pass over the session's files; for a very large session it is the slowest part of startup, bounded by the 64 MB session cap.
+**Concurrency and resource limits.** Revalidation is a single-threaded metadata pass over the session's files; for a very large session it is the slowest part of a resume, bounded by the 64 MB session cap. It runs on the resume click, not at startup, so the app opens at the scan setup without waiting.
 
 **macOS specifics.** Files evicted by iCloud (present in the folder but not on disk in full) fail the readability check and are pruned like any missing file.
 
@@ -85,7 +85,7 @@ What remains is installed as the current scan result exactly as if it had just b
 - A group that loses members in pruning keeps its original id; selections stored against that id still apply to the survivors.
 - Pruning can collapse a keep-one group to a single file, which then disappears entirely — a lone survivor is not a duplicate.
 - The same file pruned from three groups counts once in the banner's total.
-- If the session file exists but the scan it describes had zero groups, the app resumes an empty result rather than starting blank.
+- If the session file exists but the scan it describes had zero groups, a resume loads an empty result rather than starting blank.
 
 ## Open questions and verification
 

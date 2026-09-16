@@ -238,6 +238,22 @@ $("btnRescanSession").addEventListener("click", () => {
   startScan();
 });
 
+$("btnResumeSession").addEventListener("click", async () => {
+  const button = $("btnResumeSession");
+  button.disabled = true;
+  try {
+    const resumed = await api("/api/review-session/resume", { method: "POST", body: "{}" });
+    state.scanId = resumed.scan_id || state.scanId;
+    await refreshStatus();
+    toast("Saved review resumed", "ok");
+  } catch (error) {
+    toast(error.message || String(error), "error");
+    refreshStatus().catch(() => {});
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("btnDiscardSession").addEventListener("click", async () => {
   const ok = await confirmModal({
     title: "Discard saved review?",
