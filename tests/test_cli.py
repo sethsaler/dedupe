@@ -86,6 +86,88 @@ def test_scan_can_target_low_resolution_media_types(tmp_path: Path, monkeypatch)
     assert captured["low_resolution_video_max_pixels"] == 2_500_000
 
 
+def _exact_pair_result(tmp_path: Path) -> ScanResult:
+    from dedupe.grouping import build_groups
+    from dedupe.models import FileRecord, MediaType
+
+    records = []
+    for name in ("a.jpg", "b.jpg"):
+        path = tmp_path / name
+        path.write_bytes(b"same duplicate")
+        st = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=st.st_size,
+                mtime=st.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".jpg",
+            )
+        )
+    return ScanResult(
+        roots=[str(tmp_path)],
+        files=records,
+        groups=build_groups([records], []),
+    )
+
+
+def test_scan_action_kinds_scopes_trash_and_quarantine(tmp_path: Path, monkeypatch) -> None:
+    """--kinds forwards a group-kind filter to the post-scan trash/quarantine."""
+    from dedupe.actions import ActionResult
+
+    monkeypatch.setattr(
+        cli, "run_scan", lambda paths, **kwargs: _exact_pair_result(tmp_path)
+    )
+    captured: dict = {}
+
+    def fake_apply_actions(groups, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return ActionResult(dry_run=kwargs["dry_run"], action=kwargs["action"])
+
+    monkeypatch.setattr(cli, "apply_actions", fake_apply_actions)
+
+    assert cli.main(["scan", str(tmp_path), "--action", "trash", "--execute"]) == 0
+    assert captured["kinds"] is None
+
+    assert (
+        cli.main(["scan", str(tmp_path), "--action", "trash", "--kinds", "exact", "--execute"])
+        == 0
+    )
+    assert captured["kinds"] == {"exact"}
+
+    assert cli.main(["scan", str(tmp_path), "--action", "trash", "--kinds", "duplicates"]) == 0
+    assert captured["kinds"] == {"exact", "similar"}
+
+    assert (
+        cli.main(
+            [
+                "scan",
+                str(tmp_path),
+                "--action",
+                "quarantine",
+                "--kinds",
+                "exact",
+                "--quarantine-dir",
+                str(tmp_path / "q"),
+            ]
+        )
+        == 0
+    )
+    assert captured["kinds"] == {"exact"}
+
+
+def test_scan_kinds_is_rejected_for_isolate(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli, "run_scan", lambda paths, **kwargs: _exact_pair_result(tmp_path)
+    )
+
+    code = cli.main(["scan", str(tmp_path), "--action", "isolate", "--kinds", "exact"])
+
+    assert code == 2
+    assert "--isolate-kinds" in capsys.readouterr().err
+
+
 def test_doctor_json_exit_status_only_tracks_core_readiness(monkeypatch, capsys) -> None:
     report = {
         "application": {"name": "dedupe", "version": "1.2.3"},

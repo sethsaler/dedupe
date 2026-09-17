@@ -181,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--quarantine-dir", type=str, default=None)
     scan.add_argument(
+        "--kinds",
+        choices=["all", "duplicates", "exact", "similar"],
+        default="all",
+        help="Limit --action trash/quarantine to these group kinds (default: all). "
+        "'exact' keeps one ranked copy per byte-identical group and removes the rest.",
+    )
+    scan.add_argument(
         "--review-dir",
         type=str,
         default=None,
@@ -514,6 +521,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     if args.action != "none":
         dry = not args.execute
+        if args.kinds != "all" and args.action == "isolate":
+            print(
+                "error: --kinds applies to trash/quarantine; "
+                "use --isolate-kinds for isolate",
+                file=sys.stderr,
+            )
+            return 2
+        if args.kinds == "all":
+            action_kinds = None
+        elif args.kinds == "duplicates":
+            action_kinds = {"exact", "similar"}
+        else:
+            action_kinds = {args.kinds}
         if args.action == "quarantine":
             if not args.quarantine_dir:
                 print("error: --quarantine-dir required for quarantine", file=sys.stderr)
@@ -524,6 +544,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 quarantine_dir=args.quarantine_dir,
                 dry_run=dry,
                 roots=result.roots,
+                kinds=action_kinds,
                 allow_cross_device=args.allow_cross_device,
             )
         elif args.action == "trash":
@@ -532,6 +553,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 action="trash",
                 dry_run=dry,
                 roots=result.roots,
+                kinds=action_kinds,
             )
         elif args.action == "isolate":
             kinds = None if args.isolate_kinds == "all" else {args.isolate_kinds}
