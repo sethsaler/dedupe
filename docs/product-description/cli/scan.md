@@ -6,7 +6,7 @@
 
 ## The simple case
 
-`dedupe scan ~/Pictures` walks the folder, printing a single updating progress line — phase, counts, message — then a summary: how many files, exact and similar groups, low-resolution and random-review candidates, reclaimable space; a diagnostics block with failures, cache hits, and duration; nothing moves. Adding `--json results.json` also writes the complete result for later use. Adding `--action trash` prints what *would* move (dry-run is the default); adding `--execute` makes it real.
+`dedupe scan ~/Pictures` walks the folder, printing a single updating progress line — phase, counts, message — then a summary: how many files, exact and similar groups, low-resolution and random-review candidates, reclaimable space; a diagnostics block with failures, cache hits, and duration; nothing moves. Adding `--json results.json` also writes the complete result for later use. Adding `--action trash` prints what *would* move (dry-run is the default); adding `--execute` makes it real. Adding `--kinds exact` narrows the action to the byte-identical groups alone — every exact group keeps its ranked keeper and every other copy moves, with no per-group review.
 
 ## The interaction, event by event
 
@@ -62,7 +62,7 @@ Exit code is 0 whenever the command runs to completion — including scans that 
 | Exclusions: `--exclude GLOB` (repeatable) | Remove matching paths from the walk. | Fixed. |
 | Performance: `--workers N` (0 = auto), `--parallel`, `--max-streams N`, `--no-cache` | Auto workers are conservative and stage-capped ([Scan pipeline](../foundations/scan-pipeline.md#interactions-with-other-systems)); `--parallel` scans each folder as its own stream. | Fixed. |
 | Output: `--json FILE`, `--smart RULE` | JSON result file; the smart rule applied to every group before acting (default `automatic`). | Fixed. |
-| Action: `--action none\|trash\|quarantine\|isolate` with `--dry-run` (default) / `--execute`, `--quarantine-dir`, `--review-dir`, `--isolate-mode`, `--isolate-kinds`, `--allow-cross-device`, `--ui`, `--port` | What happens after the scan; dry-run previews unless `--execute`. | Fixed. |
+| Action: `--action none\|trash\|quarantine\|isolate` with `--dry-run` (default) / `--execute`, `--kinds all\|duplicates\|exact\|similar`, `--quarantine-dir`, `--review-dir`, `--isolate-mode`, `--isolate-kinds`, `--allow-cross-device`, `--ui`, `--port` | What happens after the scan; dry-run previews unless `--execute`. `--kinds` scopes trash/quarantine to one kind of group (`exact` = byte-identical groups only; default `all`); isolate has its own `--isolate-kinds`. | Fixed. |
 | stdout is a pipe | The progress line still prints carriage returns — scripts see them as one long line; the summary is plain text on either. | No effect. |
 
 Selections in the CLI are made by the `--smart` rule alone — there is no interactive selection; users who want to choose per group use the web UI.
@@ -101,6 +101,8 @@ Selections in the CLI are made by the `--smart` rule alone — there is no inter
 - `dedupe ~/Pictures` (bare path) is the same scan; the shortcut only fires when the first argument is not a known subcommand and does not start with `-`.
 - `--smart deselect_all` with `--action trash --execute` scans, selects nothing, and the action block reports 0 ok — a harmless no-op.
 - `--action quarantine` without `--quarantine-dir` exits 2 with "error: --quarantine-dir required for quarantine" — before any action work.
+- `--kinds exact --action trash --execute` is the fully automatic exact-duplicate cleanup: the `--smart` rule (default `automatic`) picks each exact group's keeper, and the action removes every other copy — each file re-hashed against its keeper immediately before it moves ([Actions and undo](../foundations/actions-and-undo.md)).
+- `--kinds` with `--action isolate` exits 2 with "error: --kinds applies to trash/quarantine; use --isolate-kinds for isolate".
 - The progress line overwrites itself with `\r`; redirecting output to a file captures every intermediate state on one line each.
 - A scan that found no media still prints its summary and diagnostics and exits 0.
 
@@ -110,4 +112,4 @@ Selections in the CLI are made by the `--smart` rule alone — there is no inter
 - The summary format comes from `summarize_scan` in `actions.py`; its exact lines were not reproduced here verbatim.
 - `--ui` after an executed action serves the post-action result; the interplay with the review session save on UI startup was not exercised.
 
-Verified against dedupe commit `2a6cede`.
+Verified against the post-improvement working tree (2026-09 improvement phases + the `--kinds` auto-delete-exact work; pinned at `2a6cede` plus later improvement commits and uncommitted working-tree changes).
