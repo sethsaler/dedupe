@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import NamedTuple
@@ -241,6 +242,8 @@ class HashCache:
                 path_b TEXT NOT NULL,
                 identity_b TEXT NOT NULL,
                 content_b TEXT,
+                source TEXT NOT NULL DEFAULT 'verified',
+                recorded_at TEXT,
                 PRIMARY KEY (path_a, path_b)
             )
             """
@@ -251,10 +254,16 @@ class HashCache:
                 "PRAGMA table_info(distinct_similar_pairs)"
             ).fetchall()
         }
-        for column in ("content_a", "content_b"):
+        distinct_migrations = {
+            "content_a": "TEXT",
+            "content_b": "TEXT",
+            "source": "TEXT NOT NULL DEFAULT 'verified'",
+            "recorded_at": "TEXT",
+        }
+        for column, declaration in distinct_migrations.items():
             if column not in distinct_existing:
                 self._conn.execute(
-                    f"ALTER TABLE distinct_similar_pairs ADD COLUMN {column} TEXT"
+                    f"ALTER TABLE distinct_similar_pairs ADD COLUMN {column} {declaration}"
                 )
         existing = {
             row[1] for row in self._conn.execute("PRAGMA table_info(hashes)").fetchall()
@@ -363,20 +372,35 @@ class HashCache:
             )
         )
 
-    def mark_distinct(self, records: list[FileRecord]) -> int:
-        """Persist every pair in a reviewed Similar group as intentionally distinct."""
+    def mark_distinct(
+        self, records: list[FileRecord], *, source: str = "verified"
+    ) -> int:
+        """Persist every pair in a reviewed Similar group as intentionally distinct.
+
+        ``source`` records how the pair was decided: ``verified`` for pairs
+        the user compared side by side (or explicitly confirmed as a whole
+        group), ``inferred`` for the pairs backfilled at dissolution that
+        were never shown together. A re-mark never downgrades a verified
+        row to inferred.
+        """
+        stamp = datetime.now(UTC).isoformat()
         count = 0
         for left, right in combinations(sorted(records, key=lambda rec: rec.path), 2):
             self._conn.execute(
                 """
                 INSERT INTO distinct_similar_pairs (
-                    path_a, identity_a, content_a, path_b, identity_b, content_b
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    path_a, identity_a, content_a, path_b, identity_b, content_b,
+                    source, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_a, path_b) DO UPDATE SET
                     identity_a=excluded.identity_a,
                     content_a=excluded.content_a,
                     identity_b=excluded.identity_b,
-                    content_b=excluded.content_b
+                    content_b=excluded.content_b,
+                    source=CASE
+                        WHEN excluded.source = 'verified' THEN 'verified'
+                        ELSE distinct_similar_pairs.source END,
+                    recorded_at=excluded.recorded_at
                 """,
                 (
                     left.path,
@@ -385,6 +409,8 @@ class HashCache:
                     right.path,
                     self._identity(right),
                     _content_identity(right),
+                    source,
+                    stamp,
                 ),
             )
             count += 1
@@ -431,6 +457,106 @@ class HashCache:
                     ).rowcount
         self._conn.commit()
         return removed
+
+    def list_distinct_pairs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        path_contains: str | None = None,
+    ) -> tuple[list[dict], int]:
+        """Recorded distinct pairs for the decisions view, newest first.
+
+        ``path_contains`` filters with a plain case-insensitive substring
+        against either side's path. Returns ``(rows, total)``; legacy rows
+        without a timestamp sort last.
+        """
+        where = ""
+        params: list = []
+        if path_contains:
+            where = " WHERE instr(lower(path_a), ?) > 0 OR instr(lower(path_b), ?) > 0"
+            params = [path_contains.lower(), path_contains.lower()]
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM distinct_similar_pairs{where}", params
+        ).fetchone()[0]
+        rows = self._conn.execute(
+            f"""
+            SELECT path_a, path_b, source, recorded_at
+            FROM distinct_similar_pairs{where}
+            ORDER BY (recorded_at IS NULL), recorded_at DESC, path_a, path_b
+            LIMIT ? OFFSET ?
+            """,
+            [*params, max(0, int(limit)), max(0, int(offset))],
+        ).fetchall()
+        return (
+            [
+                {
+                    "path_a": row["path_a"],
+                    "path_b": row["path_b"],
+                    "source": row["source"] or "verified",
+                    "recorded_at": row["recorded_at"],
+                }
+                for row in rows
+            ],
+            int(total),
+        )
+
+    def backfill_distinct_content(self, records: list[FileRecord]) -> int:
+        """Fill perceptual content identities onto rows recorded before hashing.
+
+        Rows written while a file carried no perceptual hash (legacy caches,
+        decisions recorded from unhashed loaded sessions) are stat-only: any
+        metadata touch revives the pair for review. Once a scan has hashed
+        the file again, the row can carry the content identity and survive
+        drift. Only sides whose stored stat identity still matches the
+        current record are backfilled — a changed file must not have its
+        decision hardened. Returns the number of rows updated.
+        """
+        by_path: dict[str, FileRecord] = {}
+        by_identity: dict[str, FileRecord] = {}
+        for rec in records:
+            by_path[rec.path] = rec
+            by_identity.setdefault(self._identity(rec), rec)
+        updated = 0
+        rows = self._conn.execute(
+            "SELECT path_a, identity_a, content_a, path_b, identity_b, content_b "
+            "FROM distinct_similar_pairs "
+            "WHERE content_a IS NULL OR content_a = '' "
+            "   OR content_b IS NULL OR content_b = ''"
+        ).fetchall()
+        for row in rows:
+            fills: dict[str, str] = {}
+            for path_key, identity_key, content_key in (
+                ("path_a", "identity_a", "content_a"),
+                ("path_b", "identity_b", "content_b"),
+            ):
+                if row[content_key]:
+                    continue
+                rec = by_path.get(row[path_key]) or by_identity.get(row[identity_key])
+                # Renames keep the stored identity; drift does not. Only an
+                # identity match proves the hashes describe the decided file.
+                if rec is None or self._identity(rec) != row[identity_key]:
+                    continue
+                content = _content_identity(rec)
+                if content:
+                    fills[content_key] = content
+            if fills:
+                self._conn.execute(
+                    "UPDATE distinct_similar_pairs "
+                    "SET content_a = COALESCE(?, content_a), "
+                    "    content_b = COALESCE(?, content_b) "
+                    "WHERE path_a = ? AND path_b = ?",
+                    (
+                        fills.get("content_a"),
+                        fills.get("content_b"),
+                        row["path_a"],
+                        row["path_b"],
+                    ),
+                )
+                updated += 1
+        if updated:
+            self._conn.commit()
+        return updated
 
     def distinct_reviews(self, records: list[FileRecord]) -> DistinctReviews:
         """Resolve reviewed-distinct rows against one scan's records.

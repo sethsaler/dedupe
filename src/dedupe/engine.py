@@ -800,6 +800,11 @@ def run_scan(
     cache_errors: list[str] = []
     if cache is not None:
         try:
+            if run_similar:
+                # Distinct rows recorded before a file was hashed are
+                # stat-only; now that the scan re-hashed everything, give
+                # them the content identity that survives metadata drift.
+                cache.backfill_distinct_content(records)
             cache.store_all(records)
         except Exception as exc:
             cache_errors.append(f"cache store failed: {exc}")
