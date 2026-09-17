@@ -129,6 +129,44 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
 
 
 @pytest.mark.e2e
+def test_delete_all_exact_duplicates_auto_selects_and_trashes(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator('.tab[data-kind="exact"]').click()
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    # Let the scan's own "Done" toast clear so it cannot swallow the click.
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # Clear the suggested selection first (the exact copy list owns its own
+    # per-copy Remove toggles): auto-delete must not depend on it.
+    checked = page.locator("#members .sel-cb:checked")
+    checked.first.wait_for(state="visible")
+    assert checked.count() == 1
+    checked.first.uncheck()
+    expect(page.locator("#btnTrashExact")).to_be_disabled()
+    expect(page.locator("#btnTrashAllExact")).to_be_enabled()
+
+    # One click re-selects every non-keeper across all exact groups, previews,
+    # and on confirm trashes them — exactly one copy of the pair survives.
+    page.locator("#btnTrashAllExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalConfirm")).to_have_text("Move to Trash")
+    page.locator("#modalConfirm").click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    assert len(list(duplicate_images.iterdir())) == 1
+    expect(page.locator('.tab[data-kind="exact"]')).to_contain_text("0")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_empty_results_offer_recovery_without_changing_selections(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:

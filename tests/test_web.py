@@ -265,6 +265,43 @@ def _trash_exact_pair(client, headers: dict, scan_id: str) -> dict:
     return executed.get_json()
 
 
+def test_auto_delete_exact_reselects_every_non_keeper(tmp_path: Path) -> None:
+    """The Delete All Exact Duplicates button = smart-select Automatic over every
+    exact group, then the standard exact Trash preview/confirm flow — even if the
+    user cleared selections first."""
+    result = _result(tmp_path)
+    group = result.groups[0]
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    cleared = client.post(
+        "/api/selection",
+        json={"group_id": group.id, "selected": [], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert cleared.status_code == 200
+    assert group.selected_for_removal == []
+
+    applied = client.post(
+        "/api/smart-select",
+        json={"rule": "automatic", "group_ids": [group.id], "scan_id": scan_id},
+        headers=headers,
+    )
+    assert applied.status_code == 200
+    assert len(group.selected_for_removal) == 1
+    assert group.suggested_keep not in group.selected_for_removal
+
+    preview = client.post(
+        "/api/action",
+        json={"action": "trash", "dry_run": True, "kinds": "exact", "scan_id": scan_id},
+        headers=headers,
+    ).get_json()
+    assert preview["success_count"] == 1
+    assert {item["path"] for item in preview["items"]} == set(group.selected_for_removal)
+
+
 def test_action_undo_restores_an_executed_trash(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash")
