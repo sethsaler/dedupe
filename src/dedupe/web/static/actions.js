@@ -64,7 +64,6 @@ function effectiveSelection(scope) {
 
 function updateSelectionSummary() {
   for (const [id, scope] of [
-    ["btnTrashExact", "exact"],
     ["btnTrashSimilar", "similar"],
     ["btnTrashReview", "review_suggestions"],
   ]) {
@@ -75,21 +74,11 @@ function updateSelectionSummary() {
       ? `${count} selected ${scopeLabelFor(scope).toLowerCase()}`
       : `No ${scopeLabelFor(scope).toLowerCase()} selected`;
   }
-  // The auto-delete button does not depend on the current selection: it acts
-  // on every exact group, so it is enabled whenever exact groups exist.
-  const source = state.allGroups.length ? state.allGroups : state.groups;
-  const exactGroups = source.filter(
-    (g) => g.kind === "exact" && (g.members || []).length >= 2,
-  ).length;
-  const autoButton = $("btnTrashAllExact");
-  autoButton.disabled = state.actionBusy || exactGroups === 0;
-  autoButton.title = exactGroups
-    ? `Trash every exact duplicate, keeping one copy per group (${exactGroups} group${exactGroups === 1 ? "" : "s"})`
-    : "No exact duplicate groups";
 }
 
 async function applyRuleToCurrentGroup(rule, successMessage) {
   if (!state.currentId) return toast("Select a group first");
+  if (currentGroup()?.kind === "exact") return;
   try {
     const g = await api("/api/smart-select", {
       method: "POST",
@@ -528,39 +517,7 @@ async function runDelete(scope, options = {}) {
   }
 }
 
-// Auto-delete: select every exact group's non-keeper members (the Automatic
-// rule keeps each group's suggested keeper), then run the standard Trash flow
-// — preview, confirm, execute, undo — over that fresh selection.
-async function runAutoDeleteExact() {
-  const source = state.allGroups.length ? state.allGroups : state.groups;
-  const exactIds = source
-    .filter((g) => g.kind === "exact" && (g.members || []).length >= 2)
-    .map((g) => g.id);
-  if (!exactIds.length) {
-    toast("No exact duplicate groups", "error");
-    return;
-  }
-  try {
-    await api("/api/smart-select", {
-      method: "POST",
-      body: JSON.stringify({
-        rule: "automatic",
-        group_ids: exactIds,
-        scan_id: state.scanId,
-      }),
-    });
-    exactIds.forEach(markGroupTouched);
-    await loadGroups({ preserveSelection: true });
-  } catch (e) {
-    toast(e.message, "error");
-    return;
-  }
-  await runDelete("exact");
-}
-
-$("btnTrashAllExact").addEventListener("click", runAutoDeleteExact);
-$("btnTrashExact").addEventListener("click", () => runDelete("exact"));
 $("btnTrashSimilar").addEventListener("click", () => runDelete("similar"));
 $("btnTrashReview").addEventListener("click", () => runDelete("review_suggestions"));
 
-export { updateSelectionSummary, applyRuleToCurrentGroup, runDelete };
+export { updateSelectionSummary, applyRuleToCurrentGroup, runDelete, undoAction };

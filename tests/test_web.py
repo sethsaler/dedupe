@@ -132,8 +132,9 @@ def test_status_transports_diagnostics_and_completed_elapsed(tmp_path: Path) -> 
 def test_bulk_action_ui_separates_exact_matches_from_similars(tmp_path: Path) -> None:
     page = create_app(_result(tmp_path)).test_client().get("/").get_data(as_text=True)
 
-    assert 'id="btnTrashExact"' in page
-    assert "Delete All Selected Exact Matches" in page
+    assert 'id="btnTrashExact"' not in page
+    assert 'id="btnTrashAllExact"' not in page
+    assert "exact duplicates move to Trash automatically" in page
     assert 'id="btnTrashSimilar"' in page
     assert "Delete All Selected Similar Matches" in page
     assert 'id="btnTrashReview"' in page
@@ -448,9 +449,68 @@ def test_parallel_scan_streams_report_per_folder_and_tag_groups(tmp_path: Path) 
     assert {Path(stream["root"]).name for stream in status["streams"]} == {"a", "b"}
 
     groups = client.get("/api/groups?kind=exact").get_json()["groups"]
-    # No cross-folder dedup: one exact group per folder, each tagged with its root.
-    assert len(groups) == 2
-    assert {Path(group["root"]).name for group in groups} == {"a", "b"}
+    # Auto-trash leaves one survivor per stream, never deduping across roots.
+    assert groups == []
+    assert status["auto_deleted_exact"]["success_count"] == 2
+    assert len(list(folder_a.iterdir())) == len(list(folder_b.iterdir())) == 1
+
+
+@pytest.mark.parametrize("blocked", [None, "trash_error", "changed", "keep"])
+def test_scan_auto_trash_counts_only_successes_and_preserves_survivors(
+    tmp_path: Path, monkeypatch, blocked: str | None
+) -> None:
+    records, groups = _two_exact_groups(tmp_path)
+    keepers = {group.suggested_keep for group in groups}
+    targets = {path for group in groups for path in group.selected_for_removal}
+    blocked_path = groups[0].selected_for_removal[0]
+    review = build_random_review_groups(records)
+    result = ScanResult(roots=[str(tmp_path)], files=records, groups=groups + review)
+    if blocked == "keep":
+        review[0].reviewed_paths = [blocked_path]
+        review[0].selected_for_removal = []
+    elif blocked == "changed":
+        # Preserve identity/size/mtime; only a fresh hash can catch this change.
+        path = Path(blocked_path)
+        stat = path.stat()
+        path.write_bytes(b"x" * stat.st_size)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+
+    def fake_trash(path, batch=None):
+        if blocked == "trash_error" and str(path) == blocked_path:
+            raise OSError("Trash unavailable")
+        destination = trash / path.name
+        path.rename(destination)
+        return destination
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(actions_module, "_send_to_trash", fake_trash)
+    monkeypatch.setattr(web_app, "run_scan", lambda *args, **kwargs: result)
+    app = create_app(review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    assert client.post("/api/scan", json={"paths": [str(tmp_path)]}, headers=headers).status_code == 200
+    status = _wait_idle(client)
+    assert status["error"] is None
+    outcome = status["auto_deleted_exact"]
+    assert outcome["success_count"] == (2 if blocked is None else 1)
+    assert outcome["fail_count"] == (1 if blocked in {"changed", "trash_error"} else 0)
+    removed = targets if blocked is None else targets - {blocked_path}
+    assert all(Path(path).exists() for path in keepers)
+    assert all(not Path(path).exists() for path in removed)
+    assert all(Path(path).exists() for path in targets - removed)
+    # No deleted path remains in overlapping review groups or persisted Files.
+    saved = json.loads((tmp_path / "review.json").read_text())
+    assert all(path not in json.dumps(saved) for path in removed)
+    payload = client.get("/api/groups").get_json()
+    assert all(path not in json.dumps(payload) for path in removed)
+    receipt = json.loads(Path(outcome["log_path"]).read_text())
+    assert {item["path"] for item in receipt["items"] if item["ok"]} == removed
+    # Status reads/reconnections never repeat the destructive action.
+    assert client.get("/api/status").get_json()["auto_deleted_exact"] == outcome
+    assert len(list(trash.iterdir())) == len(removed)
 
 
 def test_scan_endpoint_forwards_low_resolution_media_types(
@@ -786,7 +846,7 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'id="btnSelectSuggested"' in html
     assert 'id="btnClearGroup"' in html
     assert "Apply to this group" in html
-    assert "Delete All Selected Exact Matches" in html
+    assert "Delete All Selected Exact Matches" not in html
     assert "Delete All Selected Similar Matches" in html
     assert 'id="actionScope"' not in html
     assert "Preview quarantine" not in html
@@ -2783,11 +2843,16 @@ def test_scan_cancel_racing_completion_leaves_state_coherent(
     status = _wait_idle(client)
 
     assert cancelled["status"] in (200, 409)
-    assert status["scan_id"] == started["scan_id"]
     assert status["error"] is None
     assert status["progress"]["done"] is True
-    assert status["progress"]["message"].startswith("Done")
-    assert status["summary"]["group_count"] == len(completed.groups)
+    if status["progress"]["phase"] == "cancelled":
+        assert status["auto_deleted_exact"] is None
+        assert all(Path(file.path).exists() for file in completed.files)
+    else:
+        assert status["scan_id"] == started["scan_id"]
+        assert status["progress"]["message"].startswith("Done")
+        assert status["auto_deleted_exact"]["success_count"] == 1
+        assert status["summary"]["group_count"] == len(completed.groups)
     stale_cancel = client.post(
         "/api/scan/cancel", json={"scan_id": status["scan_id"]}, headers=headers
     )
@@ -2990,10 +3055,10 @@ def test_streamed_groups_update_stats_incrementally(tmp_path: Path, monkeypatch)
             break
         time.sleep(0.02)
     assert status["scanning"] is False
-    # The two streamed exact groups plus the All-Files browse group added at
-    # scan completion.
-    assert status["summary"]["group_count"] == 3
-    assert status["summary"]["selected_count"] == 2
+    # Exact groups dissolve after automatic trash; only Files remains.
+    assert status["summary"]["group_count"] == 1
+    assert status["summary"]["selected_count"] == 0
+    assert status["auto_deleted_exact"]["success_count"] == 2
 
 
 def test_events_stream_delivers_groups_status_and_reset(tmp_path: Path, monkeypatch) -> None:
@@ -3061,8 +3126,8 @@ def test_events_stream_delivers_groups_status_and_reset(tmp_path: Path, monkeypa
     # landed in the same wakeup as completion) is covered by the refetch.
     assert seen("event: reset")
     final = client.get("/api/groups?kind=all").get_json()
-    # The completed result also carries the per-root All-Files browse group.
-    assert {g["id"] for g in final["groups"]} >= {groups[0].id, groups[1].id}
+    # The reset removes the automatically trashed exact groups.
+    assert not {g["id"] for g in final["groups"]} & {groups[0].id, groups[1].id}
     assert any(g["kind"] == "all_files" for g in final["groups"])
     stop_reading.set()
     # Do not response.close(): the reader thread can be blocked inside the
@@ -3232,8 +3297,9 @@ def test_reveal_open_requires_token_and_invokes_finder(tmp_path: Path, monkeypat
     assert opened == [["open", "-R", scanned]]
 
 
+@pytest.mark.parametrize("busy", [None, "scanning", "acting"])
 def test_shutdown_stops_server_after_grace_and_new_request_cancels(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, busy: str | None,
 ) -> None:
     class FakeServer:
         def __init__(self) -> None:
@@ -3243,6 +3309,7 @@ def test_shutdown_stops_server_after_grace_and_new_request_cancels(
             self.shutdown_calls += 1
 
     # Cancellation: a request during the grace period keeps the server alive.
+    monkeypatch.setattr(web_app, "SHUTDOWN_GRACE_SECONDS", 0.05)
     app = create_app()
     fake = FakeServer()
     app.extensions["dedupe_server"] = fake
@@ -3252,12 +3319,20 @@ def test_shutdown_stops_server_after_grace_and_new_request_cancels(
     response = client.post("/api/shutdown", json={}, headers={"X-Dedupe-Token": token})
     assert response.status_code == 200
     client.get("/api/status")  # a reloaded page cancels the pending shutdown
-    time.sleep(2.0)
+    time.sleep(0.15)
     assert fake.shutdown_calls == 0
 
-    # Uninterrupted: the grace timer fires and stops the server.
+    # Busy work defers shutdown through multiple grace periods so automatic
+    # Trash has time to finish and write its receipt after the tab closes.
+    state = app.extensions["dedupe_state"]
+    if busy:
+        state[busy] = True
     response = client.post("/api/shutdown", json={}, headers={"X-Dedupe-Token": token})
     assert response.status_code == 200
+    if busy:
+        time.sleep(0.15)
+        assert fake.shutdown_calls == 0
+        state[busy] = False
     deadline = time.monotonic() + 5
     while not fake.shutdown_calls and time.monotonic() < deadline:
         time.sleep(0.05)

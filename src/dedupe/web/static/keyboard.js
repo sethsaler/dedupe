@@ -137,9 +137,6 @@ document.addEventListener("keydown", async (e) => {
   } else if (e.key === "s" && state.currentId && !swipeActive()) {
     $("btnSmartGroup").click();
     e.preventDefault();
-  } else if (e.key === "a") {
-    $("btnTrashExact").click();
-    e.preventDefault();
   } else if (e.key === "A") {
     $("btnTrashSimilar").click();
     e.preventDefault();

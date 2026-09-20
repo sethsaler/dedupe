@@ -1,6 +1,7 @@
 // Status polling + SSE stream, scan progress, session banner, diagnostics.
 
 import { api } from "./api.js";
+import { undoAction } from "./actions.js";
 import { addStreamedGroup, loadGroups } from "./groups.js";
 import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
 import { state } from "./state.js";
@@ -234,7 +235,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     statusEl.textContent = "Scanning…";
     statusEl.classList.remove("error");
     $("btnScan").disabled = true;
-    $("btnCancelScan").hidden = false;
+    $("btnCancelScan").hidden = s.progress?.phase === "auto-trash";
     $("btnScan").querySelector(".btn-label").textContent = "Scanning…";
     const p = s.progress || {};
     const total = p.files_found || 0;
@@ -324,7 +325,18 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
-  if (scanCompleted) {
+  const autoDeleted = s.auto_deleted_exact;
+  if (!s.scanning && autoDeleted && state.autoDeleteNotified !== s.scan_id) {
+    state.autoDeleteNotified = s.scan_id;
+    const count = autoDeleted.success_count;
+    let message = `${count} exact duplicate${count === 1 ? "" : "s"} auto-deleted (moved to Trash)`;
+    if (autoDeleted.fail_count) message += ` · ${autoDeleted.fail_count} could not be deleted; scan again to retry`;
+    if (autoDeleted.log_error) message += ` · Receipt could not be saved: ${autoDeleted.log_error}`;
+    toast(message, autoDeleted.fail_count || autoDeleted.log_error ? "error" : "ok",
+      count && autoDeleted.log_path
+        ? { actionLabel: "Undo", onAction: () => undoAction([autoDeleted.log_path]) }
+        : {});
+  } else if (scanCompleted) {
     if (s.error) toast(s.error, "error");
     else toast(s.progress.message || "Scan complete", "ok");
   }

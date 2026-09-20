@@ -1,13 +1,8 @@
-// Exact-match review: byte-identical files need no visual comparison, only a
-// survivor. The view shows one shared preview and a compact list of copies —
-// pick the keeper and every other copy is marked for removal; a per-row
-// Remove toggle keeps fine control (keeping more than one copy) possible.
+// Exact matches are automatically trashed after scanning. This read-only view
+// also covers streamed groups, protected copies, and files that could not move.
 
 import { api } from "./api.js";
-import { applyResultControls, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { openLightbox } from "./lightbox.js";
-import { markGroupTouched, patchGroup } from "./model.js";
-import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, toast } from "./util.js";
 
@@ -19,12 +14,11 @@ function thumbUrl(path) {
   return `/api/thumbnail?path=${encodeURIComponent(path)}`;
 }
 
-function copyRowHtml(g, member, index, survivors, lightboxIndex) {
+function copyRowHtml(g, member, index, lightboxIndex) {
   const selected = new Set(g.selected_for_removal || []);
   const isSelected = selected.has(member.path);
   const isSurvivor = !isSelected;
   const isSuggested = member.path === g.suggested_keep;
-  const soleSurvivor = isSurvivor && survivors.size === 1;
   const dims = Number.isFinite(member.width) && Number.isFinite(member.height)
     && member.width > 0 && member.height > 0
     ? `${member.width}×${member.height}`
@@ -32,12 +26,9 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
   const chips = [
     isSurvivor ? '<span class="copy-chip keeping">Keeping</span>' : "",
     isSuggested ? '<span class="copy-chip suggested">Suggested</span>' : "",
-    isSelected ? '<span class="copy-chip removing">Will be removed</span>' : "",
+    isSelected ? `<span class="copy-chip removing">${state.scanning ? "Automatic removal" : "Not auto-deleted"}</span>` : "",
     member.error ? `<span class="copy-chip error" title="${escapeHtml(member.error)}">Scan issue</span>` : "",
   ].join("");
-  const keepTitle = soleSurvivor
-    ? "The surviving copy"
-    : "Keep only this copy — every other copy is marked for removal";
   const thumb = thumbUrl(member.path);
   // Same hover affordances as the member grid: videos play on hover, GIFs
   // animate, stills linger-preview through the .thumb-wrap/.thumb-image hooks.
@@ -68,40 +59,9 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
         </div>
       </div>
       <div class="copy-side">
-        <button class="copy-keep" data-path="${escapeHtml(member.path)}" type="button" aria-pressed="${soleSurvivor}" title="${keepTitle}">
-          <span class="copy-radio" aria-hidden="true"></span>Keep
-        </button>
-        <label class="copy-remove" title="Mark this copy for removal">
-          <input type="checkbox" class="sel-cb" data-path="${escapeHtml(member.path)}" ${isSelected ? "checked" : ""} />
-          Remove
-        </label>
         <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
       </div>
     </article>`;
-}
-
-async function postSelection(g, selected) {
-  const updated = await api("/api/selection", {
-    method: "POST",
-    body: JSON.stringify({
-      group_id: g.id,
-      selected: [...selected],
-      scan_id: state.scanId,
-    }),
-  });
-  markGroupTouched(g.id);
-  patchGroup(updated);
-  return updated;
-}
-
-function afterSelection(updated) {
-  renderExactReview(updated);
-  if (selectionFiltersActive() || !updateGroupListItem(updated)) {
-    scheduleRender({ groupList: true });
-  } else {
-    applyResultControls();
-  }
-  scheduleRender({ selection: true });
 }
 
 function renderExactReview(g) {
@@ -113,9 +73,7 @@ function renderExactReview(g) {
   }
 
   const members = g.members || [];
-  const selected = new Set(g.selected_for_removal || []);
   const deleted = new Set(g.deleted_paths || []);
-  const survivors = new Set(members.filter((member) => !selected.has(member.path)).map((member) => member.path));
   const keeper = members.find((member) => member.path === g.suggested_keep) || members[0];
 
   state.lightboxItems = members
@@ -132,15 +90,8 @@ function renderExactReview(g) {
     }));
 
   $("detailMeta").textContent =
-    `${formatBytes(g.reclaimable_bytes)} reclaimable · ${members.length} byte-identical copies · pick the one to keep, the rest are marked for removal`;
-
-  // The toolbar is hidden in this layout, but keep the selection summary text
-  // current — the action bar and other consumers still read it.
-  const selectionBase = `${selected.size} of ${members.length} selected for removal`;
-  $("groupSelectionSummary").textContent =
-    selected.size > 0 && !state.touchedGroups.has(g.id)
-      ? `Suggested selection — ${selectionBase} · adjust freely`
-      : selectionBase;
+    `${members.length} byte-identical copies · exact duplicates move to Trash automatically after scanning`;
+  $("groupSelectionSummary").textContent = "";
 
   const lightboxIndexByPath = new Map(
     state.lightboxItems.map((item, lightboxIndex) => [item.path, lightboxIndex]),
@@ -157,28 +108,16 @@ function renderExactReview(g) {
         ${preview}
         <div class="exact-banner-copy">
           <strong>${members.length} identical copies</strong>
-          <span class="muted">Byte-identical SHA-256 match — only the locations differ. Choose the copy that stays; the rest move to Trash when you run the action below.</span>
+          <span class="muted">Byte-identical SHA-256 match. Exact duplicates move to Trash automatically after scanning, keeping one copy. Protected or unavailable files stay here; scan again to retry.</span>
         </div>
       </div>
       <div class="copy-list">
-        ${members.map((member, index) => copyRowHtml(g, member, index, survivors, lightboxIndexByPath.get(member.path) ?? index)).join("")}
+        ${members.map((member, index) => copyRowHtml(g, member, index, lightboxIndexByPath.get(member.path) ?? index)).join("")}
       </div>
     </div>`;
 
   box.querySelectorAll(".copy-thumb").forEach((thumb) => {
     setPreviewAspectRatio(thumb, thumb.dataset.previewWidth, thumb.dataset.previewHeight);
-  });
-
-  box.querySelectorAll(".copy-keep").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const keepPath = btn.dataset.path;
-      const picks = members.map((member) => member.path).filter((path) => path !== keepPath);
-      try {
-        afterSelection(await postSelection(g, picks));
-      } catch (error) {
-        toast(error.message, "error");
-      }
-    });
   });
 
   box.querySelectorAll(".hover-video").forEach((video) => {
@@ -207,20 +146,6 @@ function renderExactReview(g) {
     });
     wrap.addEventListener("pointerleave", () => {
       image.src = image.dataset.thumbnail;
-    });
-  });
-
-  box.querySelectorAll(".sel-cb").forEach((cb) => {
-    cb.addEventListener("change", async () => {
-      const next = new Set(g.selected_for_removal || []);
-      if (cb.checked) next.add(cb.dataset.path);
-      else next.delete(cb.dataset.path);
-      try {
-        afterSelection(await postSelection(g, next));
-      } catch (error) {
-        cb.checked = !cb.checked;
-        toast(error.message, "error");
-      }
     });
   });
 

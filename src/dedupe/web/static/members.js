@@ -2,7 +2,7 @@
 
 import { api } from "./api.js";
 import { renderExactReview } from "./exact.js";
-import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
+import { applyResultControls, ensureGroupVisible, loadGroups, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
 import { renderSwipeReview, swipeActive } from "./swipe.js";
@@ -227,7 +227,20 @@ async function selectGroup(id, { silent = false } = {}) {
   }
   ensureGroupVisible(id);
   markGroupListActive(id);
-  const g = await api(`/api/groups/${id}`);
+  let g;
+  try {
+    g = await api(`/api/groups/${id}`);
+  } catch (error) {
+    if (state.selectToken !== myToken) return;
+    if (error.status !== 404) throw error;
+    // Auto-trash can dissolve a streamed group between listing and opening
+    // it. Refresh instead of placing a stale-group error ahead of Undo.
+    state.currentId = null;
+    $("detailBody").hidden = true;
+    $("detailEmpty").hidden = false;
+    await loadGroups();
+    return;
+  }
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
   if (state.selectToken !== myToken || g.id !== state.currentId) return;

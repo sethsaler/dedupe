@@ -6,7 +6,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 ## Features
 
-- **Exact duplicates** — size → partial hash → SHA-256
+- **Exact duplicates** — size → partial hash → SHA-256; web scans automatically move extra copies to Trash, keeping one copy per group. A toast reports the deleted count and offers Undo.
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
@@ -19,7 +19,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
 - **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, a lightbox with metadata, keeper overlay/flicker comparison, full-resolution zoom, and in-place selection, keyboard navigation, native picker, dependency-gated scan options, light and dark themes (follows the OS), and isolate
-- **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
+- **Verified actions** — exact auto-trash rechecks file identity, hashes, and keepers; manual bulk Trash and quarantine use a confirmation sheet showing counts, affected bytes, and preview validity
 - **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
 
 ## Requirements
@@ -92,6 +92,7 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
+   With Exact detection enabled (the default), extra byte-identical copies move to Trash automatically when scanning finishes. The toast reports successful deletions and any failures, and offers **Undo**. Exact groups are read-only; protected or unavailable files remain for inspection or a later rescan. Loading or resuming saved results does not trigger auto-deletion. CLI scans are unchanged.
 3. Review the **Low-res** and **Random 50** tabs one item at a time with `←` Delete and `→` Keep, or compare duplicate groups and Similar images with the lightbox overlay
 4. Narrow the list with **Advanced filters** (size range in MB, minimum pixel width/height, path substring or glob); a group matches when any of its files match
 5. Use **Bulk selection** to select all / none / invert, or apply one rule (smaller than keeper, larger than … MB, smaller than … MB, path contains …) to every group currently shown
@@ -123,11 +124,11 @@ Keyboard:
 | `←` / `→` on tabs | Switch result category (tabs also take `Home` / `End`) |
 | `u` | Use the suggested selection for this group |
 | `s` | Apply the selection rule to this group |
-| `a` / `A` | Open the action review sheet (preview trash) for exact / similar selections |
-| `Space` | Toggle remove on the focused card; in the lightbox, toggle removal for exact/similar files |
+| `A` | Open the action review sheet (preview trash) for similar selections |
+| `Space` | Toggle remove on the focused card; in the lightbox, toggle removal for similar files (exact matches are read-only) |
 | `Enter` | Open the lightbox |
 | `←` / `→` | Delete / Keep in Low-res and Random 50 review; otherwise focus previous / next card or navigate the lightbox |
-| `d` | Trash the focused Non-Human/Faces file; in an exact/similar lightbox, toggle removal |
+| `d` | Trash the focused Non-Human/Faces file; in a similar lightbox, toggle removal |
 | `z` | Full-resolution zoom in the lightbox (drag pans) |
 | `Esc` | Close the lightbox, help, or overlay |
 | `?` | Shortcut help |
@@ -357,7 +358,7 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 - Quarantine receipts can restore files with `dedupe undo <receipt-id|path>`; Trash is restored through Finder
 - `dedupe receipts list / show / prune` browses and trims that history without touching the files themselves
 - Mutating localhost API calls require a per-launch session token and current scan generation
-- Trash and quarantine execute only after a fresh preview and confirmation in the UI
+- Exact duplicates move to Trash automatically after successful web scans, with safety revalidation and Undo; manual bulk actions still require a fresh preview and confirmation
 - Photos.app `.photoslibrary` packages are never entered or accepted as scan roots; export media from Photos to a normal folder first
 
 ### Photos.app libraries
