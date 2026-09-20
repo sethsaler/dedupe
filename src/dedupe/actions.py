@@ -27,7 +27,6 @@ from .parallel import map_parallel, resolve_workers
 from .receipts import receipt_filename, resolve_log_dir, resolve_receipt_path
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import (
-    DHASH_THRESHOLD,
     compute_image_hashes,
     compute_image_hashes_with_tiles,
     decode_tile_phashes,

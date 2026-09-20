@@ -2030,12 +2030,20 @@ def test_card_media_stays_inside_preview(
     pane = wrap.bounding_box()
     assert bounds and pane
     assert bounds["width"] > 0 and bounds["height"] > 0
-    # Videos without a decoded frame can report a sub-pixel inset; the media
-    # must still sit inside the clipped pane and fill it.
-    assert bounds["x"] >= pane["x"] - 2
-    assert bounds["y"] >= pane["y"] - 2
-    assert bounds["x"] + bounds["width"] <= pane["x"] + pane["width"] + 2
-    assert bounds["y"] + bounds["height"] <= pane["y"] + pane["height"] + 2
+    # Chromium can round an absolutely positioned media edge by nearly three
+    # CSS pixels when its parent starts at a fractional coordinate. The pane
+    # clips that sub-pixel overflow; the media must still fill the pane.
+    edge_tolerance = 3
+    assert bounds["x"] >= pane["x"] - edge_tolerance
+    assert bounds["y"] >= pane["y"] - edge_tolerance
+    assert (
+        bounds["x"] + bounds["width"]
+        <= pane["x"] + pane["width"] + edge_tolerance
+    )
+    assert (
+        bounds["y"] + bounds["height"]
+        <= pane["y"] + pane["height"] + edge_tolerance
+    )
     assert bounds["width"] == pytest.approx(pane["width"], abs=2)
     assert bounds["height"] == pytest.approx(pane["height"], abs=2)
     expect(image).to_have_css("object-fit", "contain")
