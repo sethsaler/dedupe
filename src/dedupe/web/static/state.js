@@ -4,7 +4,7 @@
 const CSRF_TOKEN =
   document.querySelector('meta[name="dedupe-token"]')?.getAttribute("content") || "";
 // Sidebar renders at most this many rows initially (state.groupListLimit).
-const GROUP_RENDER_CHUNK = 60;
+const GROUP_RENDER_CHUNK = 50;
 
 const state = {
   kind: "all",
@@ -15,6 +15,7 @@ const state = {
   eventSource: null,
   eventFailures: 0,
   memberFocus: 0,
+  // Last loaded 50-card batch, or the candidate index in decision review.
   memberPage: 0,
   // Per-kind member ordering; the default entry is each kind's server order.
   memberSortByKind: { faces: "faces-desc", all_files: "path" },

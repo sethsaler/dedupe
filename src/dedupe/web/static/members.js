@@ -75,16 +75,18 @@ function applyModifiedFilter(members) {
   );
 }
 
-function syncMemberPagination(pageCount, summaryText) {
+function syncMemberPagination(pageCount, summaryText, decisionReview) {
   const bars = [
     $("memberPagination"),
     $("memberPaginationBottom"),
   ].filter(Boolean);
   for (const bar of bars) {
-    bar.hidden = pageCount <= 1;
+    bar.hidden = !decisionReview && bar.id === "memberPaginationBottom";
     const prev = bar.querySelector(".member-prev");
     const next = bar.querySelector(".member-next");
     const summary = bar.querySelector(".member-page-summary");
+    if (prev) prev.hidden = !decisionReview;
+    if (next) next.hidden = !decisionReview;
     if (prev) prev.disabled = state.memberPage === 0;
     if (next) next.disabled = state.memberPage >= pageCount - 1;
     if (summary) summary.textContent = summaryText;
@@ -214,6 +216,7 @@ function updateDetailMeta(g) {
 }
 
 async function selectGroup(id, { silent = false } = {}) {
+  memberObserver.disconnect();
   const myToken = ++state.selectToken;
   const selectionStartFocus = document.activeElement;
   const preserveMemberFocus = silent && state.currentId === id;
@@ -340,8 +343,9 @@ async function selectGroup(id, { silent = false } = {}) {
   }
 }
 
-function renderMembers(g) {
-  stopInlineVideo();
+function renderMembers(g, { append = false } = {}) {
+  memberObserver.disconnect();
+  if (!append) stopInlineVideo();
   const box = $("members");
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
@@ -401,18 +405,25 @@ function renderMembers(g) {
     state.memberFocus = Math.max(0, Math.min(allMembers.length - 1, state.memberFocus));
     state.memberPage = state.memberFocus;
   }
-  const pageStart = decisionReview ? state.memberFocus : state.memberPage * MEMBER_PAGE_SIZE;
+  const pageStart = decisionReview ? state.memberFocus : 0;
   const members = decisionReview
     ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
     : gridPaged
-    ? allMembers.slice(pageStart, pageStart + MEMBER_PAGE_SIZE)
+    ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
     : allMembers;
   const summaryText = allMembers.length
     ? decisionReview
       ? `${pageStart + 1} of ${allMembers.length}`
       : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
     : "0 results";
-  syncMemberPagination(pageCount, summaryText);
+  syncMemberPagination(pageCount, summaryText, decisionReview);
+  if (gridPaged && members.length < allMembers.length) {
+    const bottom = $("memberPaginationBottom");
+    bottom.hidden = false;
+    bottom.querySelector(".member-page-summary").textContent =
+      `Scroll for ${Math.min(MEMBER_PAGE_SIZE, allMembers.length - members.length)} more results`;
+    memberObserver.observe(bottom);
+  }
   const sortSelect = $("memberSort");
   if (sortSelect) {
     const options = MEMBER_SORT_OPTIONS[g.kind] || null;
@@ -435,14 +446,10 @@ function renderMembers(g) {
         : "any";
     }
   }
-  // The sort select lives in the top pagination bar, so sortable kinds keep
-  // that bar visible even when the group fits on one page.
-  if (MEMBER_SORT_OPTIONS[g.kind] && $("memberPagination")) $("memberPagination").hidden = false;
   if (gridPaged) {
     prefetchThumbnails(allMembers.slice(pageStart + members.length, pageStart + members.length + 8));
   }
-  // Paged groups sift through the whole group in the lightbox, not
-  // just the 50-card page: the page slice is only a grid-rendering concern.
+  // The lightbox includes the whole group, even cards not yet loaded.
   const lightboxSource = gridPaged ? allMembers : members;
   state.lightboxItems = lightboxSource
     .filter((member) => !deletedPaths.has(member.path))
@@ -462,8 +469,11 @@ function renderMembers(g) {
     return;
   }
 
-  box.innerHTML = members
+  const offset = append ? box.querySelectorAll(".card").length : 0;
+  const rendered = document.createElement("div");
+  rendered.innerHTML = members.slice(offset)
     .map((m, i) => {
+      i += offset;
       const isSel = selected.has(m.path);
       const reviewed = reviewedPaths.has(m.path);
       const isKeep = (m.path === g.suggested_keep || (decisionReview && reviewed)) && !isSel;
@@ -563,7 +573,7 @@ function renderMembers(g) {
     })
     .join("");
 
-  box.querySelectorAll(".thumb-wrap").forEach((preview) => {
+  rendered.querySelectorAll(".thumb-wrap").forEach((preview) => {
     setPreviewAspectRatio(
       preview,
       preview.dataset.previewWidth,
@@ -571,7 +581,7 @@ function renderMembers(g) {
     );
   });
 
-  box.querySelectorAll(".thumb-image").forEach((image) => {
+  rendered.querySelectorAll(".thumb-image").forEach((image) => {
     const syncAspectRatio = () => {
       setPreviewAspectRatio(image.closest(".thumb-wrap"), image.naturalWidth, image.naturalHeight);
     };
@@ -585,7 +595,7 @@ function renderMembers(g) {
     if (image.complete) syncAspectRatio();
   });
 
-  box.querySelectorAll(".hover-video").forEach((video) => {
+  rendered.querySelectorAll(".hover-video").forEach((video) => {
     const wrap = video.closest(".thumb-wrap");
     video.addEventListener("loadedmetadata", () => {
       setPreviewAspectRatio(wrap, video.videoWidth, video.videoHeight);
@@ -604,7 +614,7 @@ function renderMembers(g) {
     });
   });
 
-  box.querySelectorAll(".hover-gif").forEach((image) => {
+  rendered.querySelectorAll(".hover-gif").forEach((image) => {
     const wrap = image.closest(".thumb-wrap");
     wrap.addEventListener("pointerenter", () => {
       image.src = image.dataset.src;
@@ -614,15 +624,13 @@ function renderMembers(g) {
     });
   });
 
-  box.querySelectorAll(".sel-cb").forEach((cb) => {
+  rendered.querySelectorAll(".sel-cb").forEach((cb) => {
     cb.addEventListener("change", async () => {
+      g = currentGroup();
       const changedPath = cb.dataset.path;
       const checks = [...box.querySelectorAll(".sel-cb")];
       const pagePaths = new Set(checks.map((c) => c.dataset.path));
-      // Paged keep-one groups render one 50-card page at a time: keep the
-      // off-page picks and only add/drop the visible page's checkboxes.
-      // (Single-page groups render every card, so this matches the old
-      // visible-only list exactly.)
+      // Preserve picks in unloaded batches while updating loaded checkboxes.
       const offPageKept = (g.selected_for_removal || []).filter((path) => !pagePaths.has(path));
       const selectedPaths = [
         ...offPageKept,
@@ -675,14 +683,14 @@ function renderMembers(g) {
     });
   });
 
-  box.querySelectorAll(".candidate-delete").forEach((btn) => {
+  rendered.querySelectorAll(".candidate-delete").forEach((btn) => {
     btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, true));
   });
-  box.querySelectorAll(".candidate-keep").forEach((btn) => {
+  rendered.querySelectorAll(".candidate-keep").forEach((btn) => {
     btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, false));
   });
 
-  box.querySelectorAll(".reveal").forEach((btn) => {
+  rendered.querySelectorAll(".reveal").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
@@ -693,21 +701,21 @@ function renderMembers(g) {
     });
   });
 
-  box.querySelectorAll(".delete-candidate").forEach((btn) => {
+  rendered.querySelectorAll(".delete-candidate").forEach((btn) => {
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       trashReviewCandidate(g, btn.dataset.path);
     });
   });
 
-  box.querySelectorAll(".undo-delete").forEach((btn) => {
+  rendered.querySelectorAll(".undo-delete").forEach((btn) => {
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       undoReviewCandidate(g, btn.dataset.path);
     });
   });
 
-  box.querySelectorAll("button.thumb-wrap").forEach((el) => {
+  rendered.querySelectorAll("button.thumb-wrap").forEach((el) => {
     el.addEventListener("click", () => {
       const i = Number(el.dataset.index);
       state.memberFocus = Number(el.closest(".card")?.dataset.index || 0);
@@ -715,7 +723,7 @@ function renderMembers(g) {
     });
   });
 
-  box.querySelectorAll(".card").forEach((card) => {
+  rendered.querySelectorAll(".card").forEach((card) => {
     card.addEventListener("click", (e) => {
       if (e.target.closest("input, button, label, a")) return;
       state.memberFocus = Number(card.dataset.index);
@@ -723,6 +731,9 @@ function renderMembers(g) {
       card.classList.add("focused");
     });
   });
+
+  if (!append) box.replaceChildren();
+  box.append(...rendered.childNodes);
 
   if (decisionReview) {
     // Keep the candidate's media pinned to the vertical center of the screen:
@@ -983,24 +994,16 @@ function changeMemberPage(delta) {
     renderMembers(current);
     return;
   }
-  if (!current || !isGridPagedGroup(current)) return;
-  // Mirror renderMembers: only the triage reviews hide trashed members.
-  let visible = isPagedIndependentReview(current) && !state.showDeleted
-    ? (current.members || []).filter((member) => !(current.deleted_paths || []).includes(member.path))
-    : (current.members || []);
-  // Mirror renderMembers: the Files tab's modified-time filter applies too.
-  if (current?.kind === "all_files") visible = applyModifiedFilter(visible);
-  const pageCount = Math.max(1, Math.ceil(visible.length / MEMBER_PAGE_SIZE));
-  const nextPage = Math.max(0, Math.min(pageCount - 1, state.memberPage + delta));
-  if (nextPage === state.memberPage) return;
-  state.memberPage = nextPage;
-  state.memberFocus = 0;
-  state.trashedInPlace.clear();
-  renderMembers(current);
-  // Jump to the top pager so the next page of results is immediately visible.
-  const topPager = $("memberPagination");
-  if (topPager) topPager.scrollIntoView({ block: "start", behavior: "instant" });
 }
+
+// The footer follows the loaded cards, so reaching it extends the same list.
+const memberObserver = new IntersectionObserver((entries) => {
+  if (!entries.some((entry) => entry.isIntersecting)) return;
+  const current = currentGroup();
+  if (!current || !isGridPagedGroup(current) || swipeActive()) return;
+  state.memberPage += 1;
+  renderMembers(current, { append: true });
+}, { rootMargin: "0px 0px 240px 0px" });
 
 // Similar groups default to the swipe deck; the header toggle flips to the
 // classic card list (which keeps checkboxes, bulk selection, and the

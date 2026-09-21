@@ -884,13 +884,14 @@ def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
 
 
 @pytest.mark.e2e
-def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -> None:
-    """The Files pager advances past 50 entries; sidebar Next stays put alone."""
+@pytest.mark.parametrize("kind", ["all_files", "faces", "no_humans", "similar"])
+def test_results_scroll_batches_and_single_group_next(page, tmp_path: Path, kind: str) -> None:
+    """Scrolling appends 50 without replacing cards; sorting resets the batch."""
     media = tmp_path / "media"
     media.mkdir()
     records = []
-    for index in range(55):
-        path = media / f"file-{index:02d}.png"
+    for index in range(105):
+        path = media / f"file-{index:03d}.png"
         Image.new("RGB", (16, 16), (index % 256, 100, 150)).save(path)
         stat = path.stat()
         records.append(
@@ -905,7 +906,11 @@ def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -
                 mtime_ns=stat.st_mtime_ns,
             )
         )
-    result = ScanResult(roots=[str(media)], files=records, groups=[])
+    groups = [] if kind == "all_files" else [ReviewGroup(
+        id="scroll-review", kind=GroupKind(kind), media_type=MediaType.IMAGE,
+        members=records, suggested_keep=records[0].path if kind == "similar" else None,
+    )]
+    result = ScanResult(roots=[str(media)], files=records, groups=groups)
     app = create_app(result, review_session_path=tmp_path / "review.json")
     app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
 
@@ -915,43 +920,62 @@ def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -
     with _serve_app(app) as url:
         page.goto(url, wait_until="domcontentloaded")
         page.locator("#results").wait_for(state="visible", timeout=10_000)
-        page.get_by_role("tab", name="Files 55").click()
+        page.locator(f'.tab[data-kind="{kind}"]').click()
         page.locator(".group-item").first.click()
-        page.locator("#members .triage-card").first.wait_for(state="visible")
+        if kind == "similar":
+            page.locator("#btnSimilarView").click()
+        page.locator("#members .card").first.wait_for(state="visible")
         expect(page.locator("#members .card")).to_have_count(50)
         expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "1–50 of 55"
+            "1–50 of 105"
         )
 
-        # The top pager's Next shows the last five files…
-        page.locator("#memberPagination .member-next").click()
+        expect(page.locator(".member-next:visible")).to_have_count(0)
+        expect(page.locator(".member-prev:visible")).to_have_count(0)
+        page.evaluate("window.firstCard = document.querySelector('#members .card')")
+        page.locator("#memberPaginationBottom").scroll_into_view_if_needed()
+        expect(page.locator("#members .card")).to_have_count(100)
         expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "51–55 of 55"
+            "1–100 of 105"
         )
-        expect(page.locator("#members .card")).to_have_count(5)
-        expect(page.locator("#members .card .name").first).to_have_text("file-50.png")
+        assert page.evaluate("window.firstCard === document.querySelector('#members .card')")
+        page.locator("#memberPaginationBottom").scroll_into_view_if_needed()
+        expect(page.locator("#members .card")).to_have_count(105)
+        expect(page.locator("#members .card .name").last).to_have_text("file-104.png")
+        expect(page.locator("#memberPaginationBottom")).to_be_hidden()
+        assert len(set(page.locator("#members .card").evaluate_all(
+            "cards => cards.map(card => card.dataset.path)"
+        ))) == 105
 
-        # …and the bottom pager's Previous returns to the first page.
-        page.locator("#memberPaginationBottom .member-prev").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "1–50 of 55"
-        )
-        expect(page.locator("#members .card")).to_have_count(50)
+        # Newly appended previews use the full list's indices.
+        page.locator("#members .thumb-wrap").nth(100).click()
+        expect(page.locator("#lbCounter")).to_have_text("101 / 105")
+        page.keyboard.press("Escape")
+        if kind == "similar":
+            # Old and new batches share the latest selection, not stale closures.
+            checks = page.locator("#members .sel-cb")
+            checks.nth(1).check()
+            checks.nth(99).check()
+            checks.nth(1).uncheck()
+            expect(checks.nth(99)).to_be_checked()
 
-        # With a single group needing attention, the sidebar Next explains
-        # instead of reselecting the open group (which used to reset the page).
-        page.locator("#memberPagination .member-next").click()
-        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "51–55 of 55"
-        )
+        # With a single group needing attention, Next leaves loaded cards alone.
         page.locator("#btnNextReview").click()
         page.locator("#toast").filter(
             has_text="Already showing the only group that needs attention"
         ).wait_for(state="visible")
+        expect(page.locator("#members .card")).to_have_count(105)
+
+        if kind in ("all_files", "faces"):
+            page.locator("#memberSort").select_option("newest")
+            expect(page.locator("#members .card .name").first).to_have_text("file-104.png")
+        else:
+            # Reopening the group starts a fresh 50-card list.
+            page.locator(".group-item").first.click()
         expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
-            "51–55 of 55"
+            "1–50 of 105"
         )
-        expect(page.locator("#members .card")).to_have_count(5)
+        expect(page.locator("#members .card")).to_have_count(50)
 
     assert page_errors == []
 
