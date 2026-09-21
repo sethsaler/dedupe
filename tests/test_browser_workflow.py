@@ -118,8 +118,8 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#resultSearch").fill(next(duplicate_images.iterdir()).name)
     expect(page.locator(".group-item")).to_have_count(3)
-    page.get_by_role("tab", name="Exact 0").click()
-    expect(page.locator(".group-item")).to_have_count(0)
+    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
+    expect(page.locator(".group-item .badge.exact")).to_have_count(0)
     expect(page.locator("#btnTrashExact")).to_have_count(0)
     expect(page.locator("#btnTrashAllExact")).to_have_count(0)
     assert page_errors == []
@@ -361,7 +361,54 @@ def test_executed_trash_can_be_undone_from_the_result_toast(
     assert len(list(duplicate_images.iterdir())) == 2
 
     # The review is not re-populated by the restore.
-    expect(page.locator('.tab[data-kind="exact"]')).to_contain_text("0")
+    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_exact_recovery_survives_toast_dismissal_reload_and_new_scan(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    for name in ("extra.png", "last.png"):
+        shutil.copyfile(duplicate_images / "keeper.png", duplicate_images / name)
+    originals = {path.name: path.read_bytes() for path in duplicate_images.iterdir()}
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    expect(page.locator("#toast")).to_contain_text("3 exact duplicates auto-deleted", timeout=20_000)
+    page.locator("#toastDismiss").click()
+    assert len(list(duplicate_images.iterdir())) == 1
+
+    # A scan with no new removals cannot replace the earlier recovery record.
+    page.locator("#scanCollapse").click()
+    page.locator("#btnScan").click()
+    expect(page.locator("#toast")).to_contain_text("0 exact duplicates auto-deleted", timeout=20_000)
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#exactRecovery > summary").click()
+    recover = page.get_by_role("button", name="Recover 3 files", exact=True)
+    expect(recover).to_be_visible()
+    expect(page.locator("#exactRecoveryList .exact-recovery-row")).to_have_count(1)
+    page.locator("#exactRecoveryList summary").click()
+    expect(page.locator("#exactRecoveryList li")).to_have_count(3)
+
+    recover.click()
+    expect(page.locator("#modalTitle")).to_have_text("Restore 3 files?")
+    page.locator("#modalCancel").click()
+    assert len(list(duplicate_images.iterdir())) == 1
+    recover.click()
+    expect(page.locator("#modalTitle")).to_have_text("Restore 3 files?")
+    page.locator("#modalConfirm").click()
+    expect(page.locator("#exactRecoveryList")).to_contain_text("Recovered")
+    assert {path.name: path.read_bytes() for path in duplicate_images.iterdir()} == originals
+    expect(recover).to_have_count(0)
+
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#exactRecovery > summary").click()
+    expect(page.locator("#exactRecoveryList")).to_contain_text("Recovered")
+    expect(recover).to_have_count(0)
+    expect(page.locator('.tab[data-kind="exact"], .badge.exact')).to_have_count(0)
     assert page_errors == []
 
 
@@ -910,8 +957,8 @@ def test_files_pager_next_previous_and_single_group_next(page, tmp_path: Path) -
 
 
 @pytest.mark.e2e
-def test_exact_copy_list_is_read_only_and_lightbox_has_no_selection(page, tmp_path: Path) -> None:
-    """Initial exact groups remain inspectable but cannot be manually changed."""
+def test_exact_groups_never_enter_manual_review(page, tmp_path: Path) -> None:
+    """Loaded and streamed exact groups cannot surface selection or delete UI."""
     media = tmp_path / "media"
     media.mkdir()
     first = media / "file-00.png"
@@ -952,27 +999,24 @@ def test_exact_copy_list_is_read_only_and_lightbox_has_no_selection(page, tmp_pa
     with _serve_app(app) as url:
         page.goto(url, wait_until="domcontentloaded")
         page.locator("#results").wait_for(state="visible", timeout=10_000)
-        page.get_by_role("tab", name="Exact 1").click()
-        page.locator(".group-item").first.click()
-        page.locator("#members .copy-row").first.wait_for(state="visible")
-        expect(page.locator("#members .copy-row")).to_have_count(55)
-        expect(page.locator("#memberPagination")).to_be_hidden()
-        # The suggested keeper stays; every other copy is marked for removal.
-        expect(page.locator("#members .copy-row.keep")).to_have_count(1)
-        expect(page.locator("#members .copy-row.selected")).to_have_count(54)
-        expect(page.locator("#members .copy-row .sel-cb")).to_have_count(0)
-        expect(page.locator("#members .copy-row .copy-keep")).to_have_count(0)
+        expect(page.locator("#countAll")).to_have_text("1")  # Files only
+        expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
+        expect(page.locator(".badge.exact, .copy-row")).to_have_count(0)
+        page.locator("#exactRecovery > summary").click()
+        expect(page.locator("#exactRecoveryStatus")).to_contain_text("1 exact-match group remains")
+        expect(page.locator("#exactRecoveryList")).to_contain_text("No automatic exact-match removals")
 
-        # The lightbox sifts the whole group.
-        page.locator("#members .thumb-wrap").first.click()
-        page.locator("#lightbox").wait_for(state="visible")
-        expect(page.locator("#lbCounter")).to_have_text("1 / 55")
-        expect(page.locator("#lbSelectWrap")).to_be_hidden()
-        for _ in range(50):
-            page.keyboard.press("ArrowRight")
-        expect(page.locator("#lbCounter")).to_have_text("51 / 55")
-        page.keyboard.press("Escape")
-        page.locator("#lightbox").wait_for(state="hidden")
+        # Sidebar bulk selection no longer reaches hidden exact groups.
+        page.locator("#bulkPanel > summary").click()
+        page.locator("#btnBulkNone").click()
+        expect(page.locator("#toast")).to_contain_text("Select none: 0 groups updated")
+        assert group.selected_for_removal == [record.path for record in records[1:]]
+        page.evaluate("""async () => {
+            const {addStreamedGroup} = await import('/static/groups.js');
+            addStreamedGroup({id: 'streamed-exact', kind: 'exact', members: [], member_count: 2});
+        }""")
+        expect(page.locator("#countAll")).to_have_text("1")
+        expect(page.locator(".badge.exact")).to_have_count(0)
 
     assert page_errors == []
 
@@ -1245,11 +1289,8 @@ def test_tabs_and_group_list_are_keyboard_navigable(
     # written synchronously inside that reload, so it is the settle signal.
     page.locator('.tab[data-kind="all"]').focus()
     page.keyboard.press("ArrowRight")
-    assert page.evaluate("document.activeElement.dataset.kind") == "exact"
-    expect(page.locator('.tab[data-kind="exact"]')).to_have_attribute("aria-selected", "true")
-    expect(page.locator("#filteredCount")).to_have_text("0 of 0 groups shown")
-    page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "similar"
+    expect(page.locator('.tab[data-kind="similar"]')).to_have_attribute("aria-selected", "true")
     expect(page.locator("#filteredCount")).to_have_text("0 of 0 groups shown")
     page.keyboard.press("Home")
     assert page.evaluate("document.activeElement.dataset.kind") == "all"
@@ -1661,7 +1702,7 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
     # Parallel streams (the default): one progress line per folder, and no
     # cross-folder exact group is found.
     expect(page.locator("#streamProgress .stream-row")).to_have_count(2)
-    expect(page.locator("#countExact")).to_have_text("0")
+    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
     expect(page.locator("#countAll")).not_to_have_text("0")
     status = page.request.get(f"{live_dedupe_server}/api/status").json()
     assert status["auto_deleted_exact"]["success_count"] == 0
@@ -1676,11 +1717,11 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
     page.locator("#toast").filter(has_text="auto-deleted").wait_for(
         state="visible", timeout=20_000
     )
-    expect(page.locator("#countExact")).to_have_text("0")
+    expect(page.locator(".badge.exact")).to_have_count(0)
     # One-pool scans have no per-folder stream panel.
     expect(page.locator("#streamProgress")).to_be_hidden()
-    page.locator('.tab[data-kind="exact"]').click()
-    expect(page.locator(".group-item")).to_have_count(0)
+    page.locator("#exactRecovery > summary").click()
+    expect(page.get_by_role("button", name="Recover 1 file", exact=True)).to_be_visible()
     assert page_errors == []
 
 
@@ -1725,7 +1766,7 @@ def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
         expect(page.locator("#results")).to_be_visible()
         page.locator(".group-item").first.wait_for(state="attached")
         # The exact group lost a member below its two-file minimum.
-        expect(page.locator("#countExact")).to_have_text("0")
+        expect(page.locator(".badge.exact")).to_have_count(0)
         expect(page.locator("#countAll")).to_have_text("3")
         expect(page.locator("#sessionStatusText")).to_contain_text("Resumed review")
         expect(page.locator("#sessionStatusText")).to_contain_text("1 stale file pruned")
@@ -1908,10 +1949,12 @@ def test_random_review_decision_mechanics(
 
 @pytest.mark.e2e
 def test_scan_streams_groups_and_cancel_restores_previous(
-    page, live_dedupe_server: str, duplicate_images: Path, tmp_path: Path
+    page, live_dedupe_server: str, duplicate_images: Path, tmp_path: Path, monkeypatch
 ) -> None:
     import os
     import time
+
+    from dedupe.web import app as web_app
 
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
@@ -1923,19 +1966,41 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
     page.locator("#toast").filter(has_text="auto-deleted").wait_for(state="visible")
     page.locator("#toastDismiss").click()
-    expect(page.locator("#countExact")).to_have_text("0")
+    expect(page.locator(".badge.exact")).to_have_count(0)
 
-    # A bigger fixture: exact-duplicate pairs of random-noise PNGs, so groups
-    # keep streaming in while the similar-image stage is still hashing.
+    # Exact groups are hidden now; pause after publishing a manual-review
+    # group so Cancel is deterministic rather than racing the final stages.
     big = tmp_path / "big"
     big.mkdir()
-    for index in range(125):
+    for index in range(2):
         image_path = big / f"noise-{index:03d}-a.png"
         Image.frombytes("RGB", (96, 96), os.urandom(96 * 96 * 3)).save(image_path)
-        shutil.copyfile(image_path, big / f"noise-{index:03d}-b.png")
+        # Same pixels but different bytes: these are Similar review groups,
+        # not the hidden Exact groups used by the old version of this test.
+        with Image.open(image_path) as image:
+            image.save(big / f"noise-{index:03d}-b.png", compress_level=0)
+
+    run_scan = web_app.run_scan
+
+    def pause_after_review_group(paths, **kwargs):
+        publish = kwargs["on_group"]
+
+        def on_group(group):
+            publish(group)
+            if group.kind != GroupKind.EXACT:
+                deadline = time.monotonic() + 10
+                while not kwargs["cancelled"]() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+        kwargs["on_group"] = on_group
+        return run_scan(paths, **kwargs)
+
+    monkeypatch.setattr(web_app, "run_scan", pause_after_review_group)
 
     # Start the second scan from the collapsed setup bar.
     page.locator("#scanCollapse").click()
+    page.locator("#optsToggle").click()
+    page.locator("#optParallel").uncheck(force=True)
     page.locator("#paths").fill(str(big))
     page.locator("#btnScan").click()
 
@@ -1973,7 +2038,7 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     page.locator("#btnCancelScan").click()
     # The scan stops and the previous (duplicate_images) results come back.
     expect(page.locator("#btnCancelScan")).to_be_hidden(timeout=30_000)
-    expect(page.locator("#countExact")).to_have_text("0", timeout=30_000)
+    expect(page.locator(".badge.exact")).to_have_count(0)
     expect(page.locator(".group-item")).to_have_count(3, timeout=30_000)
     toast_log = page.evaluate("window.__toastLog")
     assert any("Cancelling" in text for text in toast_log)
@@ -1981,7 +2046,7 @@ def test_scan_streams_groups_and_cancel_restores_previous(
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("kind", ["exact", "all_files", "random_review"])
+@pytest.mark.parametrize("kind", ["all_files", "random_review"])
 @pytest.mark.parametrize("dimensions", [(400, 2400), (2400, 400)])
 @pytest.mark.parametrize("media_type", ["image", "video"])
 def test_card_media_stays_inside_preview(

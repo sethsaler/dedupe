@@ -1,6 +1,7 @@
 // Selection rules, bulk selection, and the Trash action flow.
 
 import { api } from "./api.js";
+import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { renderMembers, selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
@@ -11,17 +12,15 @@ import { refreshStatus } from "./status.js";
 import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
 const SCOPE_KINDS = {
-  exact: ["exact"],
   similar: ["similar"],
   review_suggestions: ["low_resolution", "random_review"],
 };
 
 function scopeKinds(scope) {
-  return SCOPE_KINDS[scope] || [scope];
+  return SCOPE_KINDS[scope] || [];
 }
 
 function scopeLabelFor(scope) {
-  if (scope === "exact") return "Exact matches";
   if (scope === "similar") return "Similar matches";
   return "Low-res + Random review files";
 }
@@ -131,7 +130,11 @@ $("btnSmartAll").addEventListener("click", async () => {
   try {
     await api("/api/smart-select", {
       method: "POST",
-      body: JSON.stringify({ rule: $("smartRule").value, scan_id: state.scanId }),
+      body: JSON.stringify({
+        rule: $("smartRule").value,
+        group_ids: state.allGroups.map((group) => group.id),
+        scan_id: state.scanId,
+      }),
     });
     state.allGroups.forEach((group) => markGroupTouched(group.id));
     await loadGroups();
@@ -171,7 +174,7 @@ async function runBulkSelection(operation, criteria = null, label = "") {
     scheduleRender({ groupList: true, selection: true });
     const noun = result.changed_count === 1 ? "group" : "groups";
     toast(
-      `${label || operation}: ${result.changed_count} ${noun} updated · ${result.selected_count} files selected`,
+      `${label || operation}: ${result.changed_count} ${noun} updated`,
       "ok",
     );
   } catch (e) {
@@ -289,6 +292,7 @@ function previewNoticeHtml(notice) {
 // and after the scan there is no polling to notice the server's acting flag.
 function setActionBusy(busy, label = "") {
   state.actionBusy = busy;
+  syncExactRecoveryBusy();
   document.querySelectorAll("#actionBar button").forEach((button) => {
     button.disabled = busy;
   });
@@ -358,6 +362,7 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
       res.fail_count ? "error" : "ok",
     );
     setActionBusy(false);
+    await refreshExactRecovery();
   } catch (e) {
     const stale = e.data?.preview_stale
       || /preview expired|selection changed|fresh preview/i.test(e.message);
@@ -426,11 +431,7 @@ async function runDelete(scope, options = {}) {
     ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
     : "";
   const reviewScope = scope === "review_suggestions";
-  const titleScope = scope === "exact"
-    ? "exact matches"
-    : scope === "similar"
-      ? "similar matches"
-      : "Low-res + Random review files";
+  const titleScope = scope === "similar" ? "similar matches" : "Low-res + Random review files";
   // Duplicate groups always retain a keeper; independent review candidates
   // can all be selected, and they quarantine instead of going to system Trash.
   const destinationNote = reviewScope

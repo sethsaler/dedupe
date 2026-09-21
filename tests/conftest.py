@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from dedupe import receipts
+
 
 @pytest.fixture(autouse=True)
 def isolate_user_state(tmp_path: Path, monkeypatch) -> None:
@@ -13,3 +15,4 @@ def isolate_user_state(tmp_path: Path, monkeypatch) -> None:
     both of which resolve their default location through XDG_STATE_HOME.
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    monkeypatch.setattr(receipts, "default_log_dir", lambda: tmp_path / "receipts")

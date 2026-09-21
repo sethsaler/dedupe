@@ -45,6 +45,7 @@ from ..models import (
     SmartRule,
     effective_selected_paths,
 )
+from ..receipts import ReceiptError, list_receipts, load_receipt
 from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
@@ -59,7 +60,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 24
+WEB_API_VERSION = 25
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Flows whose members support direct per-file Trash + undo. The independent
@@ -1196,6 +1197,7 @@ def create_app(
                 auto_result = apply_actions(
                     result.groups, action="trash", dry_run=False,
                     roots=result.roots, kinds={"exact"}, safety_groups=result.groups,
+                    source="auto_exact",
                 )
                 with lock:
                     # Streamed groups share these objects: change membership
@@ -2285,6 +2287,34 @@ def create_app(
         finally:
             with lock:
                 state["acting"] = False
+
+    @app.get("/api/exact-trash")
+    def api_exact_trash():
+        """Durable recovery history, independent of the current review session."""
+        receipts = []
+        restored = set()
+        for summary in list_receipts(include_previews=False, actions={"trash", "undo:trash"}):
+            try:
+                receipt = load_receipt(summary.log_path)
+            except (ReceiptError, OSError, ValueError):
+                continue
+            moved = [item for item in receipt.get("items", []) if item.get("ok")]
+            if receipt["action"] == "undo:trash":
+                restored.update((receipt.get("undo_of"), item["destination"]) for item in moved)
+            elif receipt.get("source") == "auto_exact" and moved:
+                receipts.append((summary, moved))
+        return jsonify({"receipts": [
+            {
+                "log_path": summary.log_path,
+                "completed_at": summary.completed_at,
+                "success_count": summary.success_count,
+                "restored_count": sum(
+                    (summary.session_id, item["path"]) in restored for item in moved
+                ),
+                "paths": [item["path"] for item in moved],
+            }
+            for summary, moved in receipts
+        ]})
 
     @app.post("/api/action/undo")
     def api_action_undo():

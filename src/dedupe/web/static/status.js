@@ -2,6 +2,7 @@
 
 import { api } from "./api.js";
 import { undoAction } from "./actions.js";
+import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { addStreamedGroup, loadGroups } from "./groups.js";
 import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
 import { state } from "./state.js";
@@ -196,6 +197,13 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   state.scanning = !!s.scanning;
   state.acting = !!s.acting;
   state.scanId = s.scan_id || state.scanId;
+  syncExactRecoveryBusy();
+  const exactRemaining = s.summary?.exact_groups || 0;
+  $("exactRecoveryStatus").textContent = s.scanning
+    ? "Scanning — exact duplicates will move to Trash automatically when the scan finishes."
+    : exactRemaining
+      ? `${exactRemaining} exact-match group${exactRemaining === 1 ? " remains" : "s remain"} on disk (protected, unavailable, or from an older scan). Scan again to retry automatic cleanup.`
+      : "";
   renderSession(s.review_session, s.progress?.message === "Resumed saved review");
   document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
     element.disabled = state.scanning || state.acting;
@@ -276,9 +284,10 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (s.summary) {
     renderDiagnostics(s.summary);
     const scanningNote = s.scanning ? " · live" : "";
+    const reviewCount = s.summary.group_count - (s.summary.exact_groups || 0);
     top.innerHTML = `
-      <span class="stat-chip"><span class="dot"></span><strong>${s.summary.group_count}</strong> groups${scanningNote}</span>
-      <span class="stat-chip">${s.summary.exact_groups} exact · ${s.summary.similar_groups} similar · ${s.summary.low_resolution_files || 0} low-res · ${s.summary.random_review_files || 0} random · ${s.summary.no_human_files || 0} non-human</span>
+      <span class="stat-chip"><span class="dot"></span><strong>${reviewCount}</strong> groups${scanningNote}</span>
+      <span class="stat-chip">${s.summary.similar_groups} similar · ${s.summary.low_resolution_files || 0} low-res · ${s.summary.random_review_files || 0} random · ${s.summary.no_human_files || 0} non-human</span>
       <span class="stat-chip reclaim"><span class="dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
       ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
     `;
@@ -290,8 +299,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
       // Actions only when scan finished (groups still changing mid-scan)
       $("actionBar").hidden = !!s.scanning;
     }
-    $("countAll").textContent = s.summary.group_count;
-    $("countExact").textContent = s.summary.exact_groups;
+    $("countAll").textContent = reviewCount;
     $("countSimilar").textContent = s.summary.similar_groups;
     $("countLowResolution").textContent = s.summary.low_resolution_files || 0;
     $("countRandomReview").textContent = s.summary.random_review_files || 0;
@@ -328,6 +336,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   const autoDeleted = s.auto_deleted_exact;
   if (!s.scanning && autoDeleted && state.autoDeleteNotified !== s.scan_id) {
     state.autoDeleteNotified = s.scan_id;
+    await refreshExactRecovery();
     const count = autoDeleted.success_count;
     let message = `${count} exact duplicate${count === 1 ? "" : "s"} auto-deleted (moved to Trash)`;
     if (autoDeleted.fail_count) message += ` · ${autoDeleted.fail_count} could not be deleted; scan again to retry`;

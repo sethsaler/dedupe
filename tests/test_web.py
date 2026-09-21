@@ -134,6 +134,8 @@ def test_bulk_action_ui_separates_exact_matches_from_similars(tmp_path: Path) ->
 
     assert 'id="btnTrashExact"' not in page
     assert 'id="btnTrashAllExact"' not in page
+    assert 'data-kind="exact"' not in page
+    assert 'id="exactRecovery"' in page
     assert "exact duplicates move to Trash automatically" in page
     assert 'id="btnTrashSimilar"' in page
     assert "Delete All Selected Similar Matches" in page
@@ -266,10 +268,8 @@ def _trash_exact_pair(client, headers: dict, scan_id: str) -> dict:
     return executed.get_json()
 
 
-def test_auto_delete_exact_reselects_every_non_keeper(tmp_path: Path) -> None:
-    """The Delete All Exact Duplicates button = smart-select Automatic over every
-    exact group, then the standard exact Trash preview/confirm flow — even if the
-    user cleared selections first."""
+def test_exact_action_api_preserves_explicit_smart_selection(tmp_path: Path) -> None:
+    """Legacy API callers can still select exact matches; there is no UI control."""
     result = _result(tmp_path)
     group = result.groups[0]
     app = create_app(result)
@@ -508,9 +508,68 @@ def test_scan_auto_trash_counts_only_successes_and_preserves_survivors(
     assert all(path not in json.dumps(payload) for path in removed)
     receipt = json.loads(Path(outcome["log_path"]).read_text())
     assert {item["path"] for item in receipt["items"] if item["ok"]} == removed
+    history = client.get("/api/exact-trash").get_json()["receipts"]
+    assert len(history) == 1
+    assert set(history[0]["paths"]) == removed
+    assert history[0]["success_count"] == len(removed)
+    assert history[0]["restored_count"] == 0
     # Status reads/reconnections never repeat the destructive action.
     assert client.get("/api/status").get_json()["auto_deleted_exact"] == outcome
     assert len(list(trash.iterdir())) == len(removed)
+
+
+def test_exact_recovery_history_survives_scans_restarts_and_retrash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    monkeypatch.setattr(actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash"))
+    monkeypatch.setattr(web_app, "run_scan", lambda *args, **kwargs: _result(media))
+    app = create_app(review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    assert client.get("/api/exact-trash").get_json() == {"receipts": []}
+    client.post("/api/scan", json={"paths": [str(media)]}, headers=headers)
+    status = _wait_idle(client)
+    receipt = status["auto_deleted_exact"]["log_path"]
+    original = client.get("/api/exact-trash").get_json()["receipts"][0]["paths"][0]
+
+    # A new process starts with no active result, but recovery remains usable.
+    app = create_app(review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    status = client.get("/api/status").get_json()
+    assert status["has_result"] is False
+    assert client.get("/api/exact-trash").get_json()["receipts"][0]["log_path"] == receipt
+    body = {"receipts": [receipt], "scan_id": status["scan_id"], "dry_run": True}
+
+    # Previews never count as restored, and an occupied path is never overwritten.
+    Path(original).write_bytes(b"new occupant")
+    preview = client.post("/api/action/undo", json=body, headers=headers).get_json()
+    assert preview["fail_count"] == 1
+    refused = client.post("/api/action/undo", headers=headers, json={
+        **body, "dry_run": False, "preview_token": preview["preview_token"],
+    })
+    assert refused.status_code == 400
+    assert Path(original).read_bytes() == b"new occupant"
+    assert client.get("/api/exact-trash").get_json()["receipts"][0]["restored_count"] == 0
+    Path(original).unlink()
+    preview = client.post("/api/action/undo", json=body, headers=headers).get_json()
+    restored = client.post("/api/action/undo", headers=headers, json={
+        **body, "dry_run": False, "preview_token": preview["preview_token"],
+    })
+    assert restored.get_json()["success_count"] == 1
+    assert Path(original).read_bytes() == b"same duplicate"
+    assert client.get("/api/exact-trash").get_json()["receipts"][0]["restored_count"] == 1
+
+    # Reusing both the original and Trash paths must not mark a later removal
+    # recovered just because an older receipt restored the same path pair.
+    client.post("/api/scan", json={"paths": [str(media)]}, headers=headers)
+    _wait_idle(client)
+    history = client.get("/api/exact-trash").get_json()["receipts"]
+    assert len(history) == 2
+    assert [entry["restored_count"] for entry in history] == [0, 1]
+    assert history[1]["log_path"] == receipt
 
 
 def test_scan_endpoint_forwards_low_resolution_media_types(

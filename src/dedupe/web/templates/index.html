@@ -53,7 +53,7 @@
             </button>
           </div>
           <div class="recent-paths" id="recentPaths" hidden></div>
-          <p class="thresh-hint">When Exact detection is enabled, exact duplicates move to Trash automatically after scanning, keeping one copy per group. The result toast offers Undo.</p>
+          <p class="thresh-hint">When Exact detection is enabled, exact duplicates move to Trash automatically after scanning, keeping one copy per group. Use Exact duplicates · Recovery to restore them later.</p>
           <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
             Multiple folders scan as parallel streams: duplicates <em>across</em> folders are not found.
             Scan their common parent folder — or turn off Parallel streams in Options — to catch those.
@@ -188,6 +188,14 @@
       </details>
     </section>
 
+    <details class="exact-recovery" id="exactRecovery">
+      <summary>Exact duplicates · Recovery</summary>
+      <p class="muted small">Exact duplicates move to Trash automatically after scanning, keeping one copy. There is nothing to select or delete here.</p>
+      <p class="muted small" id="exactRecoveryStatus" role="status"></p>
+      <div id="exactRecoveryList"></div>
+      <p class="muted small">Recovery history stays available across scans and restarts. Older removals without recovery history can be restored from system Trash. Emptying Trash removes those files permanently.</p>
+    </details>
+
     <section class="empty-state" id="emptyState">
       <div class="empty-card">
         <div class="empty-icon" aria-hidden="true">
@@ -214,7 +222,6 @@
       <aside class="sidebar">
         <div class="filter-tabs" role="tablist" aria-label="Result categories">
           <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
-          <button class="tab" data-kind="exact" type="button" role="tab" aria-selected="false" tabindex="-1">Exact <span class="tab-count" id="countExact">0</span></button>
           <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
           <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false" tabindex="-1">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
           <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>

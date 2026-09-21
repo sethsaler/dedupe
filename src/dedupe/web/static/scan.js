@@ -66,7 +66,6 @@ async function startScan() {
         `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
       $("groupMore").innerHTML = "";
     $("countAll").textContent = "0";
-    $("countExact").textContent = "0";
     $("countSimilar").textContent = "0";
     $("countLowResolution").textContent = "0";
     $("countRandomReview").textContent = "0";

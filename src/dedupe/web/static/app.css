@@ -74,7 +74,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   outline-offset: 2px;
 }
 
-.session-status, .scan-quality {
+.session-status, .scan-quality, .exact-recovery {
   margin-top: 10px;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -84,7 +84,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   font-size: .82rem;
 }
 .session-status { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.scan-quality summary { cursor: pointer; color: var(--text); font-weight: 650; }
+.scan-quality summary, .exact-recovery > summary { cursor: pointer; color: var(--text); font-weight: 650; }
+.exact-recovery { margin: 0 0 16px; }
+.exact-recovery-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+.exact-recovery-row details { flex: 1 1 260px; min-width: 0; }
+.exact-recovery-row summary { cursor: pointer; color: var(--text); }
+.exact-recovery-row ul { overflow-wrap: anywhere; padding-left: 20px; }
 .quality-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
 .quality-stage { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 9px; background: var(--panel); border-radius: 7px; text-transform: capitalize; }
 .quality-stage small { grid-column: 1 / -1; color: var(--muted); text-transform: none; }

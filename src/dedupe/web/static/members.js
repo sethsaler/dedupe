@@ -1,7 +1,6 @@
 // The detail pane: member cards, review flows, per-candidate trash/undo.
 
 import { api } from "./api.js";
-import { renderExactReview } from "./exact.js";
 import { applyResultControls, ensureGroupVisible, loadGroups, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
@@ -351,7 +350,8 @@ function renderMembers(g) {
     return;
   }
   if (g.kind === "exact") {
-    renderExactReview(g);
+    box.replaceChildren();
+    state.lightboxItems = [];
     return;
   }
   const selected = new Set(g.selected_for_removal || []);
