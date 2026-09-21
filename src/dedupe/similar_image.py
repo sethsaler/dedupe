@@ -47,7 +47,11 @@ DENSE_THUMB_SIZE = 128
 DENSE_GRID = 8
 DEFAULT_DENSE_LOCAL_MAX = 3.0
 DEFAULT_DENSE_CONCENTRATION = 8.0
-# Thumbnails are 16 KB each; this caps the run-local cache around 16 MB.
+# Grayscale hashes ignore hue and largely ignore uniform brightness. Bound
+# each RGB channel's mean absolute difference (0–255) as well: a loose 32-level
+# allowance retains re-exports/moderate exposure edits, not different colors.
+DEFAULT_DENSE_COLOR_MEAN_MAX = 32.0
+# RGB thumbnails use up to 64 KB each in Pillow's storage; cap near 64 MB.
 DENSE_CACHE_SIZE = 1024
 
 # pHash/dHash only need ~32×32 DCT input; anything larger is wasted decode/RAM.
@@ -317,7 +321,7 @@ def is_near_identical(
 
 @lru_cache(maxsize=DENSE_CACHE_SIZE)
 def _dense_thumb_for_path(path: str):
-    """Run-cached grayscale thumbnail for the dense detail check.
+    """Run-cached RGB thumbnail for color and dense detail verification.
 
     Same decode ladder as the tile path so stills and animation first frames
     compare under identical normalization. Resizing (not letterboxing) keeps
@@ -339,7 +343,7 @@ def _dense_thumb_for_path(path: str):
                 frame = _hash_frames(img)[0]
             else:
                 frame = _downscale_for_hash(img)
-            return frame.convert("L").resize(
+            return frame.resize(
                 (DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR
             )
     except Exception:
@@ -357,7 +361,7 @@ def dense_difference(path_a: str, path_b: str) -> tuple[float, float] | None:
     tb = _dense_thumb_for_path(path_b)
     if ta is None or tb is None:
         return None
-    diff = ImageChops.difference(ta, tb)
+    diff = ImageChops.difference(ta.convert("L"), tb.convert("L"))
     width, height = diff.size
     total = 0.0
     worst = 0.0
@@ -386,15 +390,25 @@ def is_dense_match(
     local_max: float = DEFAULT_DENSE_LOCAL_MAX,
     concentration: float = DEFAULT_DENSE_CONCENTRATION,
 ) -> bool:
-    """True unless one image region differs in a concentrated, burst-like way.
+    """Require similar colors and no concentrated, burst-like local change.
 
-    Only rejects when the worst block exceeds local_max AND dominates the
-    overall mean by concentration. Unreadable thumbnails fail open, preserving
-    the tile check's verdict.
+    The local check rejects when the worst block exceeds local_max AND
+    dominates the overall mean by concentration. The color check also rejects
+    large, spread-out differences invisible to grayscale hashes. Missing
+    thumbnails cannot verify a match, even when cached tile hashes agree.
     """
+    from PIL import ImageChops, ImageStat
+
+    ta = _dense_thumb_for_path(path_a)
+    tb = _dense_thumb_for_path(path_b)
+    if ta is None or tb is None:
+        return False
+    color_means = ImageStat.Stat(ImageChops.difference(ta, tb)).mean
+    if max(color_means) > DEFAULT_DENSE_COLOR_MEAN_MAX:
+        return False
     result = dense_difference(path_a, path_b)
     if result is None:
-        return True
+        return False
     mean, worst = result
     if worst <= local_max or mean <= 0:
         return True

@@ -53,6 +53,34 @@ def test_run_scan_finds_exact_and_similar(tmp_path: Path) -> None:
     assert len(result.groups) >= 1
 
 
+def test_exact_and_similar_membership_is_stable_across_cached_scans(tmp_path):
+    media = tmp_path / "media"
+    media.mkdir()
+    original, copy, download = (media / name for name in ("original.jpg", "copy.jpg", "small.jpg"))
+    with Image.open(Path(__file__).parent / "fixtures" / "astronaut.png") as image:
+        image.save(original, quality=95)
+        image.resize((128, 128)).save(download, quality=75)
+    copy.write_bytes(original.read_bytes())
+    # An unrelated pair with identical grayscale hashes must not leak into results.
+    Image.new("RGB", (256, 256), (200, 40, 40)).save(media / "red.png")
+    Image.new("RGB", (256, 256), (40, 121, 40)).save(media / "green.png")
+
+    for cached in (False, True):
+        streamed = []
+        result = run_scan(
+            [media], cache_path=tmp_path / "cache.sqlite3", workers=2,
+            find_low_resolution=False, random_review_count=0, on_group=streamed.append,
+        )
+        assert len(result.groups) == 2
+        assert {g.kind: {m.path for m in g.members} for g in result.groups} == {
+            GroupKind.EXACT: {str(original), str(copy)},
+            GroupKind.SIMILAR: {str(original), str(copy), str(download)},
+        }
+        assert [g.kind for g in streamed] == [GroupKind.EXACT, GroupKind.SIMILAR]
+        assert all(g.suggested_keep != str(download) for g in result.groups)
+        assert result.diagnostics.cache_hits == (5 if cached else 0)
+
+
 def test_run_scan_cancel_midway_raises_promptly(tmp_path: Path) -> None:
     """Cancelling while stages overlap must not deadlock the stage pool.
 

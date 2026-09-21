@@ -79,6 +79,41 @@ def test_execute_refuses_when_selected_file_changed_after_scan(tmp_path: Path) -
     assert result.log_path and Path(result.log_path).exists()
 
 
+@pytest.mark.parametrize("changed_member", ["selected", "keeper"])
+def test_small_exact_hash_reuse_does_not_bypass_action_revalidation(tmp_path, changed_member):
+    from dedupe.exact import find_exact_groups
+    from dedupe.scanner import inventory
+
+    paths = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
+    for path in paths:
+        path.write_bytes(b"same bytes")
+    records = inventory(paths)
+    groups = build_groups(find_exact_groups(records, workers=1), [])
+    assert len(groups) == 1
+    assert all(record.sha256 == record.partial_hash for record in records)
+    group = groups[0]
+    changed_path = Path(
+        group.selected_for_removal[0] if changed_member == "selected" else group.suggested_keep
+    )
+    before = changed_path.stat()
+    changed_path.write_bytes(b"evil bytes")
+    os.utime(changed_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    # Size, inode, and mtime still match. Only a real content check can refuse.
+    assert changed_path.stat().st_size == before.st_size
+    assert changed_path.stat().st_ino == before.st_ino
+    result = apply_actions(
+        groups, action="quarantine", quarantine_dir=tmp_path / "q", dry_run=False,
+        roots=[str(tmp_path)], log_dir=tmp_path / "logs",
+    )
+
+    assert result.success_count == 0
+    assert result.fail_count == 1
+    assert all(path.exists() for path in paths)
+    assert "scan hash" in (result.items[0].error or "") or "no longer an exact duplicate" in (
+        result.items[0].error or ""
+    )
+
+
 def test_quarantine_receipt_can_restore_file(tmp_path: Path) -> None:
     a = _rec(tmp_path / "a.jpg", b"same-bytes")
     b = _rec(tmp_path / "b.jpg", b"same-bytes")

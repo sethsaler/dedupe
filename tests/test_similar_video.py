@@ -219,6 +219,65 @@ def test_video_fingerprint_rejects_incomplete_seek_frame(tmp_path: Path, monkeyp
     assert (width, height, duration) == (640, 480, 10.0)
 
 
+@pytest.mark.parametrize("failure", ["exception", "incomplete"])
+def test_failed_video_rehash_cannot_reuse_legacy_fingerprint(monkeypatch, failure):
+    import dedupe.similar_video as module
+
+    records = [
+        FileRecord(
+            path=f"/{name}.mp4", size=1, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint="v2:" + ",".join(["0123456789abcdef"] * 8),
+        )
+        for name in ("a", "b")
+    ]
+
+    def failed_fingerprint(_path, **_kwargs):
+        if failure == "exception":
+            raise OSError("unreadable video")
+        return None, 640, 480, 10.0
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(module, "compute_video_fingerprint", failed_fingerprint)
+
+    assert find_similar_video_groups(records, workers=1) == []
+    assert all(record.video_fingerprint is None for record in records)
+    assert all(record.error.startswith("video fingerprint failed:") for record in records)
+
+
+def test_video_similarity_reports_corruption_and_keeps_reencoded_match(tmp_path):
+    """Exercise extraction and diagnostics on actual files, not supplied hashes."""
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    original, reexport, corrupt = (tmp_path / name for name in ("a.mp4", "b.mp4", "bad.mp4"))
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+            "testsrc2=size=160x120:rate=12:duration=3", "-threads", "1", str(original),
+        ],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(original),
+            "-vf", "scale=320:240", "-crf", "28", "-threads", "1", str(reexport),
+        ],
+        capture_output=True, check=True,
+    )
+    corrupt.write_bytes(b"not a video")
+    records = inventory([original, reexport, corrupt])
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    assert [{record.path for record in group} for group in groups] == [
+        {str(original), str(reexport)}
+    ]
+    failed = next(record for record in records if record.path == str(corrupt))
+    assert failed.video_fingerprint is None
+    assert failed.error.startswith("video fingerprint failed:")
+
+
 def test_video_clustering_uses_duration_without_changing_matches(monkeypatch) -> None:
     fingerprint = "v3:" + ",".join(["0123456789abcdef"] * 8)
 

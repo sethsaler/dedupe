@@ -44,9 +44,9 @@ After the last stage, everything the scan learned is written back to the hash ca
 
 ## How each detection works
 
-**Exact duplicates.** Files are bucketed by size; a file whose size is unique cannot be an exact duplicate and is skipped. Within a bucket, the first 64 KB of each file is hashed; only files whose partial hashes match go on to a full SHA-256 of the whole file. Files with matching full hashes form an exact group. The three-step funnel means most files are never fully read.
+**Exact duplicates.** Files are bucketed by size; a file whose size is unique cannot be an exact duplicate and is skipped. Within a bucket, the first 64 KiB of each file is hashed; only files whose partial hashes match go on to a full SHA-256 of the whole file. For files at or below 64 KiB, the first pass already covers every byte, so its digest is reused without reading the file again. Files with matching full hashes form an exact group. Larger files that share a prefix but differ later do not match.
 
-**Similar images and GIFs.** Each image is downscaled to at most 512 px per side and hashed twice (pHash and dHash). Candidate pairs whose global hashes are close enough are then checked with a *regional tile* comparison: the image is divided into tiles and each tile hashed, which rejects photos that differ only by pose or composition. A pair is similar when the Hamming distance is within the thresholds:
+**Similar images and GIFs.** Each image is downscaled to at most 512 px per side and hashed twice (pHash and dHash). Candidate pairs whose global hashes are close enough are then checked with a *regional tile* comparison: the image is divided into tiles and each tile hashed, which rejects many photos that differ by pose or composition. A final color and detail comparison rejects differences the grayscale hashes miss. A pair must pass every check:
 
 | Check | Default |
 | --- | --- |
@@ -55,16 +55,16 @@ After the last stage, everything the scan learned is written back to the hash ca
 | Aspect-ratio agreement | ≥ 95% |
 | Tile pHash, worst tile | ≤ 8 |
 | Tile pHash, mean | ≤ 5.0 |
-| Dense detail, worst 16×16 block of a 128 px thumbnail | ≤ 3.0 mean abs difference, unless the spike dominates (worst/mean > 8×) |
-| Dense detail, global spread | always passes (recompression, rescaling, rotation, exposure shifts differ everywhere, not in one spot) |
+| Color, each RGB channel of a 128 px thumbnail | Mean absolute difference ≤ 32 on a 0–255 scale |
+| Dense detail, worst 16×16 grayscale block of a 128 px thumbnail | Reject when the block's mean absolute difference > 3.0 **and** worst/mean > 8× |
 
-Pairs that pass the tile check get one final dense comparison: both images are reduced to 128 px grayscale thumbnails and differenced block by block over an 8×8 grid. A pair is rejected only when a single block differs strongly *and* that spike dominates the overall difference — the signature of a burst shot (a blink, a shifted hand) on top of an otherwise identical frame. Global resampling spreads small differences across every block, so true re-exports still match. An unreadable thumbnail never rejects on its own; the tile verdict stands.
+Pairs that pass the tile check get one final comparison using 128 px thumbnails. A large average difference in any color channel rejects the pair, even when its grayscale hashes are identical. This catches different-colored images and large global changes; it still allows the tested re-exports and moderate exposure edits. The grayscale detail check compares an 8×8 grid and rejects a pair when a single block differs strongly *and* that spike dominates the overall difference — the signature of a burst shot (a blink, a shifted hand) on top of an otherwise identical frame. If either thumbnail cannot be read, the pair is not grouped, even when cached hashes agree. This verification also runs on cached scans.
 
-Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: animations with the same opening frame but different later content are rejected. The dense check compares first frames only. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
+Animations use the first frame to find candidates, then compare regional detail at eight positions in playback time. Frame order matters: differences at those sampled positions can reject animations with the same opening frame. The color and dense checks compare first frames only. Equivalent exports can still match when their frame counts differ. Old animation fingerprints are refreshed on the next scan.
 
 Groups are built around the best-ranked member (see [Duplicate group](duplicate-group.md)), never by chaining fuzzy matches transitively. Pairs the user previously marked *distinct* are never regrouped while the decision is current — the matcher and the clustering pass both consult the recorded pairs, which follow the files through renames and metadata-only drift via their perceptual content identity and lapse only on a real content change.
 
-**Similar videos.** Each video is fingerprinted by sampling up to 16 positions along its timeline and hashing one small frame per position, extracted with direct ffmpeg seeks (the file is opened once, not decoded end to end). Two videos are similar when their fingerprints agree at normalized positions within a mean Hamming distance of **8**. Videos require ffmpeg; without it the stage is skipped with a warning in the diagnostics.
+**Similar videos.** Each video is fingerprinted by sampling up to **8** positions along its timeline and hashing one small grayscale frame per position, extracted with direct ffmpeg seeks rather than decoding the whole timeline. Two videos are similar when their fingerprints agree at normalized positions within a mean Hamming distance of **8**, no aligned frame distance exceeds **16** at the default threshold, and the shorter duration is at least **90%** of the longer when both are known. Audio is not compared. A failed fingerprint extraction is reported in diagnostics, and a failed refresh cannot reuse an older fingerprint to form a group. Videos require ffmpeg; without it the stage is skipped with a warning in the diagnostics.
 
 **Low resolution.** A file is a low-resolution candidate when its display dimensions are below a megapixel bound — **1,000,000 pixels** by default, configurable per media type. Candidates are unselected until reviewed; reviewing one and leaving it unselected stores a durable [Keep decision](../glossary.md) so future scans stop resurfacing it.
 
@@ -105,12 +105,12 @@ A single corrupt or unreadable file never aborts the scan; this is deliberate, b
 
 **macOS specifics.** Photos.app libraries are detected and refused at root validation. HEIC/HEIF are first-class image types.
 
-**Configuration and defaults.** Every threshold above is overridable per scan (CLI flags, UI scan options); the values in this document are the defaults and the ones the rest of the documentation refers to.
+**Configuration and defaults.** The global image and video hash thresholds and the low-resolution pixel bounds are configurable per scan. The secondary dHash, tile, color, and dense-detail checks use internal defaults; they are not separate scan controls. The values in this document are the defaults and the ones the rest of the documentation refers to.
 
 ## Edge cases
 
 - Scanning the same folder twice reuses the cache: unchanged files are not re-hashed, so the second scan is dominated by the inventory walk.
-- A file whose size matches another but whose content differs exits the exact funnel after the 64 KB partial hash; only genuinely identical content reaches full SHA-256.
+- A same-size file with a different prefix exits the exact funnel after the 64 KiB partial hash. Matching prefixes on larger files still require a full SHA-256; a matching prefix alone never proves an exact duplicate.
 - Zero-byte files are excluded from exact candidacy (`size > 0` is required).
 - Similarity requires at least two eligible files of a kind; a single image or video is never compared against itself.
 - In parallel-stream mode a duplicate that exists once in each of two folders is not reported; users wanting cross-folder deduplication must scan the parent folder as one pool.
@@ -122,5 +122,7 @@ A single corrupt or unreadable file never aborts the scan; this is deliberate, b
 - The exact worker caps and auto formula are read from `parallel.py`, not confirmed by measuring a real scan's core usage.
 - Whether the UI exposes the one-pool mode at all, or always uses parallel streams for multiple folders, is confirmed in `ui/scan-setup.md` when written.
 - The dHash pairing threshold (10) is internal to candidate generation; users only ever set the global threshold (6/8). Whether the UI should surface the distinction is a product question.
+- The color limit is verified against generated color collisions, the checked-in photo fixture's re-exports, and moderate exposure changes, not a labeled sample of a user's full library. Strong edits can intentionally stop matching.
+- Video fingerprints ignore color and normalize frames to a square. An aspect-ratio gate would first need display dimensions that account for rotation and non-square pixels. Differences between sampled frames, and later color-only changes in animations, can still be missed.
 
 Verified against the post-improvement working tree (pinned at `2a6cede` plus the 2026-09 improvement phases; see the repository README for the commit).

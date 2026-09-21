@@ -69,7 +69,8 @@ def find_exact_groups(
     """
     n_workers = resolve_workers(workers, cap=DEFAULT_EXACT_WORKERS_CAP)
     # Custom hash fns (tests) force sequential — worker jobs call the defaults.
-    use_pool = n_workers > 1 and hash_fn is None and partial_fn is None
+    default_hashes = hash_fn is None and partial_fn is None
+    use_pool = n_workers > 1 and default_hashes
     hash_fn = hash_fn or file_sha256
     partial_fn = partial_fn or file_partial_hash
 
@@ -140,7 +141,12 @@ def find_exact_groups(
     for group in full_candidates:
         for rec in group:
             if not rec.sha256:
-                full_targets.append(rec)
+                if default_hashes and rec.size <= PARTIAL_SIZE:
+                    # The prefix pass already read the entire file. Its SHA-256
+                    # is the full digest, including when hydrated from cache.
+                    rec.sha256 = rec.partial_hash
+                else:
+                    full_targets.append(rec)
 
     if full_targets:
         if use_pool:

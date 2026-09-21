@@ -368,16 +368,18 @@ def test_similarity_chain_does_not_create_transitive_group(monkeypatch) -> None:
             extension=".jpg",
             phash=phash,
             dhash="0000000000000000",
+            tile_phashes=module.encode_tile_phashes(("0000000000000000",) * 5),
         )
 
     a = record("/tmp/a.jpg", "0000000000000000")
     b = record("/tmp/b.jpg", "000000000000003f")
     c = record("/tmp/c.jpg", "0000000000000fff")
     monkeypatch.setattr(module, "is_near_identical", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(module, "is_dense_match", lambda *_args, **_kwargs: True)
 
     groups = find_similar_image_groups([a, b, c], threshold=6, workers=1)
 
-    assert all(len(group) == 2 for group in groups)
+    assert len(groups) == 1 and len(groups[0]) == 2
     assert not any({a.path, c.path} <= {member.path for member in group} for group in groups)
 
 
@@ -510,6 +512,7 @@ def test_aspect_ratio_check_is_proportional_in_both_search_paths(monkeypatch):
         )
 
     monkeypatch.setattr(module, "is_near_identical", lambda *_a, **_kw: True)
+    monkeypatch.setattr(module, "is_dense_match", lambda *_a, **_kw: True)
     for records, expected in [
         ([record("/a", 40, 100), record("/b", 54, 100)], False),
         ([record("/a", 600, 100), record("/b", 620, 100)], True),
@@ -583,12 +586,76 @@ def test_dense_match_tolerates_global_resampling(tmp_path: Path) -> None:
     assert is_dense_match(str(a.resolve()), str(rotated.resolve()))
 
 
-def test_dense_match_fails_open_on_unreadable(tmp_path: Path) -> None:
-    """A thumbnail that cannot load preserves the tile check's verdict."""
+def test_dense_match_rejects_unreadable_even_with_cached_hashes(tmp_path: Path) -> None:
+    """Cached hashes alone cannot verify a file that is no longer readable."""
     a, _b = _astronaut_burst_pair(tmp_path)
     missing = tmp_path / "gone.jpg"
+    missing.write_bytes(a.read_bytes())
+    records = [_rec_for(a), _rec_for(missing)]
+    assert len(find_similar_image_groups(records, workers=1)) == 1
+    missing.unlink()
     assert dense_difference(str(a.resolve()), str(missing)) is None
-    assert is_dense_match(str(a.resolve()), str(missing))
+    assert not is_dense_match(str(a.resolve()), str(missing))
+    assert find_similar_image_groups(records, workers=1) == []
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("flat", [False, True])
+def test_same_luminance_different_colors_do_not_match(tmp_path, monkeypatch, fallback, flat):
+    """All grayscale hashes collide, but the visible colors differ strongly."""
+    import sys
+
+    from dedupe.cache import HashCache
+    from dedupe.scanner import inventory
+
+    if fallback:
+        monkeypatch.setitem(sys.modules, "pybktree", None)
+    for name, color in [("red", (200, 40, 40)), ("green", (40, 121, 40))]:
+        image = Image.new("RGB", (256, 256), color)
+        if not flat:
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((20, 30, 150, 170), fill="white")
+            draw.rectangle((160, 80, 210, 250), fill="black")
+        image.save(tmp_path / f"{name}.png")
+
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    try:
+        for cached in (False, True):
+            records = inventory([tmp_path])
+            if cached:
+                assert cache.hydrate(records) == 2
+                records.reverse()
+            assert find_similar_image_groups(records, workers=1) == []
+            assert records[0].phash == records[1].phash
+            assert records[0].dhash == records[1].dhash
+            cache.store_all(records)
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("red,expected", [(64, True), (65, False)])
+def test_color_limit_applies_to_each_channel_at_boundary(tmp_path, red, expected):
+    # A 32-level change in just red is allowed; 33 is not. Averaging across
+    # RGB channels would dilute the difference and incorrectly accept both.
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    Image.new("RGB", (128, 128), (32, 32, 32)).save(a)
+    Image.new("RGB", (128, 128), (red, 32, 32)).save(b)
+    assert is_dense_match(str(a), str(b)) is expected
+
+
+@pytest.mark.parametrize("brightness", [0.8, 1.2])
+def test_color_check_preserves_moderate_exposure_changes(tmp_path, brightness):
+    from PIL import ImageEnhance
+
+    fixture = Path(__file__).parent / "fixtures" / "astronaut.png"
+    with Image.open(fixture) as image:
+        base = image.convert("RGB")
+    original, adjusted = tmp_path / "original.jpg", tmp_path / "adjusted.jpg"
+    base.save(original, quality=95)
+    ImageEnhance.Brightness(base).enhance(brightness).save(adjusted, quality=80)
+
+    groups = find_similar_image_groups([_rec_for(original), _rec_for(adjusted)], workers=1)
+    assert len(groups) == 1 and len(groups[0]) == 2
 
 
 def test_bruteforce_path_applies_dense_check(tmp_path: Path) -> None:

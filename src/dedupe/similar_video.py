@@ -25,7 +25,7 @@ from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
 
 ProgressCb = Callable[[str, int, int, str | None], None]
 
-DEFAULT_THRESHOLD = 8  # Hamming on combined 64-bit fingerprint
+DEFAULT_THRESHOLD = 8  # Mean Hamming distance across aligned 64-bit frame hashes
 
 # Error-kind prefix; engine diagnostics classify on it.
 ERROR_VIDEO_FINGERPRINT_FAILED = "video fingerprint failed"
@@ -524,6 +524,8 @@ def _video_fingerprint_job(
     """Worker: (path, fingerprint, width, height, duration, error)."""
     try:
         fp, w, h, dur = compute_video_fingerprint(path, on_frame=on_frame)
+        if not fp:
+            return path, None, w, h, dur, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: incomplete frames"
         return path, fp, w, h, dur, None
     except Exception as exc:
         return path, None, None, None, None, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: {exc}"
@@ -565,6 +567,10 @@ def find_similar_video_groups(
 
     if need:
         by_path = {r.path: r for r in need}
+        for record in need:
+            # A failed upgrade must never leave a legacy fingerprint eligible
+            # for clustering or persistence back into the cache.
+            record.video_fingerprint = None
 
         def on_frame(frame: int, n_frames: int) -> None:
             with progress_lock:

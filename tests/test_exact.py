@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dedupe.exact import file_sha256, find_exact_groups
 from dedupe.models import FileRecord, MediaType, classify_media
 from dedupe.scanner import inventory
@@ -39,6 +41,74 @@ def test_exact_different_size_never_grouped(tmp_path: Path) -> None:
     b = _write(tmp_path / "b.jpg", b"a much longer payload that differs in size")
     groups = find_exact_groups([a, b])
     assert groups == []
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("size", [65535, 65536, 65537])
+def test_exact_only_rereads_files_larger_than_prefix(tmp_path, monkeypatch, workers, size):
+    import hashlib
+
+    import dedupe.exact as module
+
+    payload = b"x" * (size - 1) + b"a"
+    a = _write(tmp_path / "a.jpg", payload)
+    b = _write(tmp_path / "b.jpg", payload)
+    different_tail = _write(tmp_path / "tail.jpg", b"x" * (size - 1) + b"b")
+    different_prefix = _write(tmp_path / "prefix.jpg", b"y" * size)
+    reads = []
+
+    def full_hash(path):
+        reads.append(str(path))
+        return file_sha256(path)
+
+    monkeypatch.setattr(module, "file_sha256", full_hash)
+    groups = find_exact_groups([a, b, different_tail, different_prefix], workers=workers)
+
+    assert [{rec.path for rec in group} for group in groups] == [{a.path, b.path}]
+    assert a.sha256 == b.sha256 == hashlib.sha256(payload).hexdigest()
+    assert set(reads) == ({a.path, b.path, different_tail.path} if size > 65536 else set())
+
+
+def test_exact_custom_partial_hash_is_not_treated_as_full_hash(tmp_path):
+    a = _write(tmp_path / "a.jpg", b"same-prefix-A")
+    b = _write(tmp_path / "b.jpg", b"same-prefix-B")
+
+    assert find_exact_groups([a, b], partial_fn=lambda _path: "same-prefix") == []
+    assert a.sha256 != b.sha256
+
+
+def test_exact_reuses_cached_complete_prefix_without_reading_files(tmp_path, monkeypatch):
+    import hashlib
+
+    import dedupe.exact as module
+    from dedupe.cache import HashCache
+
+    payload = b"complete small file"
+    paths = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
+    for path in paths:
+        path.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    records = inventory(paths)
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    try:
+        for record in records:
+            record.partial_hash = expected
+        cache.store_all(records)
+        fresh = inventory(paths)
+        assert cache.hydrate(fresh) == 2
+        assert all(record.sha256 is None for record in fresh)
+
+        def unexpected_read(_path):
+            pytest.fail("an unchanged small file with a complete cached prefix was re-read")
+
+        monkeypatch.setattr(module, "file_partial_hash", unexpected_read)
+        monkeypatch.setattr(module, "file_sha256", unexpected_read)
+        groups = find_exact_groups(fresh, workers=2)
+
+        assert [{record.path for record in group} for group in groups] == [set(map(str, paths))]
+        assert all(record.sha256 == expected for record in fresh)
+    finally:
+        cache.close()
 
 
 def test_inventory_classifies(tmp_path: Path) -> None:
