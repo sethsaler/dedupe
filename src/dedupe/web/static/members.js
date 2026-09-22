@@ -10,6 +10,23 @@ import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast } from "./util.js";
 
 const MEMBER_PAGE_SIZE = 50;
+let renderedGroupSnapshot = "";
+
+// Fit the stage and its actual controls above the action bar. This responds to
+// open guides, wrapped captions, and short laptop screens, not a guessed vh.
+function fitReviewStage() {
+  const box = $("members");
+  const media = box.querySelector(".swipe-media, .focus-card .thumb-wrap");
+  if (!media || $("detailBody").hidden) return;
+  const bounds = box.getBoundingClientRect();
+  const controls = bounds.height - media.getBoundingClientRect().height;
+  const footer = $("actionBar").getBoundingClientRect().height;
+  const height = Math.max(180, Math.min(680, window.innerHeight - bounds.top - controls - footer - 28));
+  box.style.setProperty("--review-stage-height", `${Math.floor(height)}px`);
+}
+const stageObserver = new ResizeObserver(() => requestAnimationFrame(fitReviewStage));
+for (const id of ["main", "scanPanel", "exactRecovery", "actionBar"]) stageObserver.observe($(id));
+window.addEventListener("resize", fitReviewStage);
 
 let activeVideo = null;
 function stopInlineVideo() {
@@ -20,9 +37,14 @@ function stopInlineVideo() {
   activeVideo = null;
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopInlineVideo();
+  if (document.hidden) {
+    stopInlineVideo();
+    $("members").querySelectorAll("video").forEach((video) => video.pause());
+  }
 });
-$("members").addEventListener("click", stopInlineVideo, true);
+$("members").addEventListener("click", (event) => {
+  if (!event.target.closest("video")) stopInlineVideo();
+}, true);
 
 // The member sort select is kind-aware: each listed kind gets its own option
 // set, and its first option is the server order (no client re-sort).
@@ -181,21 +203,21 @@ function updateDetailMeta(g) {
     const reviewed = new Set(g.reviewed_paths || []);
     const deleted = (g.deleted_paths || []).length;
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${deleted} in Trash · every scanned media file in this folder, whether or not it matched a category · Trash is one click and undoable`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${deleted} in Trash · deletions are undoable`;
     return;
   }
   if (g.kind === "no_humans") {
     const reviewed = new Set(g.reviewed_paths || []);
     const selected = new Set(g.selected_for_removal || []);
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · Trash is one click and undoable · detector output is not a guarantee`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · detection can miss people`;
     return;
   }
   if (g.kind === "faces") {
     const reviewed = new Set(g.reviewed_paths || []);
     const selected = new Set(g.selected_for_removal || []);
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected for removal · Trash is one click and undoable · face counts are heuristic`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · face counts are estimates`;
     return;
   }
   if (isDecisionReview(g)) {
@@ -203,7 +225,7 @@ function updateDetailMeta(g) {
     const selected = new Set(g.selected_for_removal || []);
     const remaining = Math.max(0, g.member_count - reviewed.size);
     $("detailMeta").textContent =
-      `${reviewed.size} reviewed · ${selected.size} marked Delete · ${remaining} remaining · staged deletions confirm with the Low-res + Random button below`;
+      `${reviewed.size} reviewed · ${selected.size} marked Delete · ${remaining} remaining · confirm staged removals below`;
     return;
   }
 
@@ -215,7 +237,7 @@ function updateDetailMeta(g) {
     `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
 }
 
-async function selectGroup(id, { silent = false } = {}) {
+async function selectGroup(id, { silent = false, preservePlayback = false } = {}) {
   memberObserver.disconnect();
   const myToken = ++state.selectToken;
   const selectionStartFocus = document.activeElement;
@@ -246,6 +268,11 @@ async function selectGroup(id, { silent = false } = {}) {
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
   if (state.selectToken !== myToken || g.id !== state.currentId) return;
+  // Keep native video nodes on unchanged passive refreshes, even while paused
+  // or starting playback. Replacing them loses the playhead and can race Play.
+  // Changed data and explicit view changes still repaint.
+  if (preservePlayback && preserveMemberFocus && JSON.stringify(g) === renderedGroupSnapshot
+    && $("members").querySelector(".review-video, .swipe-media video")) return;
   // A scan-completion refresh can finish while the user is moving through
   // member cards. Preserve the latest position and real DOM focus instead of
   // replacing the focused button underneath the next keystroke.
@@ -274,9 +301,10 @@ async function selectGroup(id, { silent = false } = {}) {
   $("detailBody").hidden = false;
   const kindLabel = {
     no_humans: "Non-Human · no person detected",
-    low_resolution: "Low resolution · under 1 megapixel",
-    random_review: "Random review · fresh sample",
-    faces: "Faces · OpenCV face counts",
+    low_resolution: "Low resolution",
+    random_review: "Random review",
+    faces: "Faces",
+    similar: "Similar",
     all_files: `All files${g.root ? ` · ${basename(g.root)}` : ""}`,
   }[g.kind] || g.kind;
   $("detailTitle").textContent = isIndependentReview(g)
@@ -345,12 +373,29 @@ async function selectGroup(id, { silent = false } = {}) {
 
 function renderMembers(g, { append = false } = {}) {
   memberObserver.disconnect();
-  if (!append) stopInlineVideo();
+  renderedGroupSnapshot = JSON.stringify(g);
   const box = $("members");
+  if (!append) {
+    stopInlineVideo();
+    box.querySelectorAll("video").forEach((video) => {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    });
+  }
+  const focusReview = isPagedIndependentReview(g) && state.reviewView === "focus";
+  const singleReview = isDecisionReview(g) || focusReview;
+  $("reviewViewSwitch").hidden = !isPagedIndependentReview(g);
+  $("btnGalleryView").setAttribute("aria-pressed", String(!focusReview));
+  $("btnFocusView").setAttribute("aria-pressed", String(focusReview));
+  $("previewSizeWrap").hidden = singleReview || swipeActive();
+  $("reviewToolbar").hidden = isDecisionReview(g) || swipeActive();
+  box.classList.toggle("focus-review", singleReview);
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
   if (g.kind === "similar" && state.similarView === "swipe") {
     renderSwipeReview(g);
+    requestAnimationFrame(fitReviewStage);
     return;
   }
   if (g.kind === "exact") {
@@ -389,35 +434,36 @@ function renderMembers(g, { append = false } = {}) {
   box.classList.toggle("triage-grid", triage);
   if (triage && !state.showDeleted) {
     allMembers = allMembers.filter(
-      (member) => !deletedPaths.has(member.path) || state.trashedInPlace.has(member.path),
+      (member) => !deletedPaths.has(member.path) || (!focusReview && state.trashedInPlace.has(member.path)),
     );
   }
   syncDeletedToggle(g);
   const decisionReview = isDecisionReview(g);
   const gridPaged = isGridPagedGroup(g);
-  const pageCount = decisionReview
+  const pageCount = singleReview
     ? Math.max(1, allMembers.length)
     : gridPaged
       ? Math.max(1, Math.ceil(allMembers.length / MEMBER_PAGE_SIZE))
       : 1;
   state.memberPage = Math.max(0, Math.min(pageCount - 1, state.memberPage));
-  if (decisionReview) {
+  if (singleReview) {
     state.memberFocus = Math.max(0, Math.min(allMembers.length - 1, state.memberFocus));
     state.memberPage = state.memberFocus;
   }
-  const pageStart = decisionReview ? state.memberFocus : 0;
-  const members = decisionReview
+  const pageStart = singleReview ? state.memberFocus : 0;
+  const members = singleReview
     ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
     : gridPaged
     ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
     : allMembers;
   const summaryText = allMembers.length
-    ? decisionReview
+    ? singleReview
       ? `${pageStart + 1} of ${allMembers.length}`
       : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
     : "0 results";
-  syncMemberPagination(pageCount, summaryText, decisionReview);
-  if (gridPaged && members.length < allMembers.length) {
+  syncMemberPagination(pageCount, summaryText, singleReview);
+  $("memberPaginationBottom").hidden = true;
+  if (gridPaged && !focusReview && members.length < allMembers.length) {
     const bottom = $("memberPaginationBottom");
     bottom.hidden = false;
     bottom.querySelector(".member-page-summary").textContent =
@@ -486,9 +532,9 @@ function renderMembers(g, { append = false } = {}) {
       const previewDimensions = hasDimensions
         ? ` data-preview-width="${mediaWidth}" data-preview-height="${mediaHeight}"`
         : "";
-      const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}`;
-      const memberIndex = decisionReview ? state.memberFocus : i;
-      const focused = decisionReview || i === state.memberFocus ? "focused" : "";
+      const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`;
+      const memberIndex = singleReview ? state.memberFocus : i;
+      const focused = singleReview || i === state.memberFocus ? "focused" : "";
       const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);
       const fileName = basename(m.path);
       const badge = isSel
@@ -520,20 +566,20 @@ function renderMembers(g, { append = false } = {}) {
         ? "Click to keep this file"
         : (isPagedIndependentReview(g) ? "Click to review and remove" : "Click to remove this file");
       const mediaPreview = m.media_type === "video"
-        ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="none"></video>`
-        : `<img class="thumb-image ${m.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${m.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
+        ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${thumb}" ${singleReview ? 'controls src' : 'data-src'}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
+        : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
       const overlayDelete = isPagedIndependentReview(g) && !deleted
         ? `<button class="thumb-delete delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click, undo from the toast" aria-label="Move ${escapeHtml(fileName)} to Trash">Trash</button>`
         : "";
       const preview = deleted
         ? `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
         : `<div class="thumb-stack">
-            <button class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} type="button" aria-label="Open preview for ${escapeHtml(fileName)}">
+            <${singleReview && m.media_type === "video" ? "div" : 'button type="button"'} class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} aria-label="Open preview for ${escapeHtml(fileName)}">
               ${badge}
               ${mediaPreview}
-              ${["video", "gif"].includes(m.media_type) ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
-            </button>
-            ${overlayDelete}
+              ${["video", "gif"].includes(m.media_type) && !singleReview ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
+            </${singleReview && m.media_type === "video" ? "div" : "button"}>
+            ${singleReview ? "" : overlayDelete}
           </div>`;
       const actions = decisionReview
         ? `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
@@ -551,7 +597,7 @@ function renderMembers(g, { append = false } = {}) {
               </label>
               <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
       return `
-        <article class="card ${decisionReview ? "decision-card" : ""} ${isPagedIndependentReview(g) ? "triage-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
+        <article class="card ${singleReview ? "focus-card" : ""} ${decisionReview ? "decision-card" : ""} ${isPagedIndependentReview(g) ? "triage-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
           ${preview}
           <div class="card-body">
             <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
@@ -559,13 +605,15 @@ function renderMembers(g, { append = false } = {}) {
             <div class="card-meta">
               <span>${formatBytes(m.size)}</span>
               <span>${dims}</span>
-              <span title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
+              <span class="file-extra" title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
+              <span class="media-kind">${escapeHtml(m.media_type)}</span>
               ${m.face_count != null ? `<span class="face-count ${m.face_count > 1 ? "multi" : ""}" title="Faces detected by OpenCV (heuristic)">${m.face_count === 0 ? "No faces" : `${m.face_count} face${m.face_count === 1 ? "" : "s"}`}</span>` : ""}
               ${(m.male_face_count || 0) > 0 ? `<span class="face-count multi" title="Male faces estimated by InsightFace genderage (heuristic)">${m.male_face_count} male${m.male_face_count === 1 ? "" : "s"}</span>` : ""}
             </div>
             <div class="evidence">${escapeHtml(evidence)}</div>
             <div class="card-actions">
               ${actions}
+              ${singleReview && !deleted ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}
             </div>
           </div>
         </article>
@@ -722,6 +770,9 @@ function renderMembers(g, { append = false } = {}) {
       openLightbox(i);
     });
   });
+  rendered.querySelectorAll(".inspect-media").forEach((button) => {
+    button.addEventListener("click", () => openLightbox(Number(button.dataset.index)));
+  });
 
   rendered.querySelectorAll(".card").forEach((card) => {
     card.addEventListener("click", (e) => {
@@ -735,15 +786,8 @@ function renderMembers(g, { append = false } = {}) {
   if (!append) box.replaceChildren();
   box.append(...rendered.childNodes);
 
-  if (decisionReview) {
-    // Keep the candidate's media pinned to the vertical center of the screen:
-    // each ← / → decision re-renders the card, and without this the scroll
-    // position drifts until part of the image sits off-screen. The wrap's
-    // aspect ratio is already set from the scan dimensions, so centering is
-    // correct even before the thumbnail finishes loading.
-    box.querySelector(".decision-card .thumb-wrap")
-      ?.scrollIntoView({ block: "center", behavior: "instant" });
-  }
+  // The single-file stage has a stable height; decisions never move the page.
+  requestAnimationFrame(fitReviewStage);
 }
 
 async function reviewCandidate(group, path, remove) {
@@ -814,6 +858,10 @@ async function reviewCandidate(group, path, remove) {
     }
     state.memberFocus = nextIndex;
     renderMembers(updated);
+    if (!$("lightbox").hidden) {
+      state.lightboxIndex = 0;
+      updateLightbox();
+    }
     if (pileJustCompleted) {
       toast("Review complete — every file in this group has a decision", "ok");
     }
@@ -981,16 +1029,15 @@ async function setMemberSelected(group, path, wantSelected) {
 
 function changeMemberPage(delta) {
   const current = currentGroup();
-  if (isDecisionReview(current)) {
+  if (isDecisionReview(current) || (isPagedIndependentReview(current) && state.reviewView === "focus")) {
     const nextIndex = Math.max(
       0,
-      Math.min((current.members || []).length - 1, state.memberFocus + delta),
+      state.memberFocus + delta,
     );
     if (nextIndex === state.memberFocus) return;
     state.memberFocus = nextIndex;
     state.memberPage = nextIndex;
-    // renderMembers centers the candidate's media; no pager scroll here, or
-    // it would yank the view back to the top of the pane.
+    // renderMembers clamps to the filtered list and preserves page scroll.
     renderMembers(current);
     return;
   }
@@ -1000,7 +1047,8 @@ function changeMemberPage(delta) {
 const memberObserver = new IntersectionObserver((entries) => {
   if (!entries.some((entry) => entry.isIntersecting)) return;
   const current = currentGroup();
-  if (!current || !isGridPagedGroup(current) || swipeActive()) return;
+  if (!current || !isGridPagedGroup(current) || swipeActive()
+    || (isPagedIndependentReview(current) && state.reviewView === "focus")) return;
   state.memberPage += 1;
   renderMembers(current, { append: true });
 }, { rootMargin: "0px 0px 240px 0px" });
@@ -1065,6 +1113,35 @@ $("memberModified")?.addEventListener("change", (event) => {
   state.trashedInPlace.clear();
   const current = currentGroup();
   if (current) renderMembers(current);
+});
+
+const REVIEW_VIEW_KEY = "dedupe.reviewView";
+const PREVIEW_SIZE_KEY = "dedupe.previewSize";
+try {
+  if (localStorage.getItem(REVIEW_VIEW_KEY) === "focus") state.reviewView = "focus";
+  const size = Number(localStorage.getItem(PREVIEW_SIZE_KEY));
+  if (size >= 240 && size <= 520 && (size - 240) % 40 === 0) {
+    $("previewSize").value = String(size);
+    $("members").style.setProperty("--tile-size", `${size}px`);
+  }
+} catch { /* Storage may be unavailable in private browsing. */ }
+
+for (const [id, view] of [["btnGalleryView", "gallery"], ["btnFocusView", "focus"]]) {
+  $(id).addEventListener("click", () => {
+    state.reviewView = view;
+    try { localStorage.setItem(REVIEW_VIEW_KEY, view); } catch { /* ignore */ }
+    state.memberPage = view === "gallery" ? Math.floor(state.memberFocus / MEMBER_PAGE_SIZE) : state.memberFocus;
+    const group = currentGroup();
+    if (group) renderMembers(group);
+  });
+}
+$("previewSize").addEventListener("input", (event) => {
+  $("members").style.setProperty("--tile-size", `${event.target.value}px`);
+  try { localStorage.setItem(PREVIEW_SIZE_KEY, event.target.value); } catch { /* ignore */ }
+});
+$("btnMediaDetails").addEventListener("click", () => {
+  const show = $("detailBody").classList.toggle("show-file-details");
+  $("btnMediaDetails").setAttribute("aria-pressed", String(show));
 });
 
 export { selectGroup, renderMembers, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage, setMemberSelected };

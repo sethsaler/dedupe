@@ -95,15 +95,15 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     assert len(list(duplicate_images.iterdir())) == 1
     assert page.locator("#members .card").count() == 1
 
-    # selectGroup replaces the member DOM after the first paint. Measure in
-    # this wait so a mid-wait re-render retries instead of returning None.
+    # Focused reviews letterbox within a viewport-sized stage rather than
+    # resizing the stage to each original's aspect ratio.
     page.wait_for_function(
         """() => {
           const wrap = document.querySelector("#members .thumb-wrap");
           if (!wrap) return false;
           const box = wrap.getBoundingClientRect();
           return box.width > 0 && box.height > 0
-            && Math.abs(box.width / box.height - 48 / 32) < 0.02;
+            && getComputedStyle(wrap.querySelector('img')).objectFit === 'contain';
         }"""
     )
 
@@ -177,6 +177,7 @@ def test_empty_results_offer_recovery_without_changing_selections(
     review_tab.click()
     page.locator(".group-item").first.click()
     expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
+    page.locator("#reviewFilters > summary").click()
     page.locator("#resultSort").select_option("date")
 
     page.locator("#resultSearch").fill("not-a-file")
@@ -222,6 +223,7 @@ def test_lingering_hover_shows_a_full_image_preview(
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator('.tab[data-kind="all_files"]').click()
     page.locator(".group-item").first.click()
     thumb = page.locator("#members .thumb-wrap").first
     thumb.wait_for(state="visible")
@@ -431,6 +433,7 @@ def test_bulk_selection_and_advanced_filters(
 
     # A path glob narrows the sidebar and Clear filters resets every result-display filter.
     # (Text filters are debounced; to_have_count auto-retries until they apply.)
+    page.locator("#reviewFilters > summary").click()
     page.locator("#advancedFilters summary").click()
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     expect(page.locator(".group-item")).to_have_count(0)
@@ -1031,6 +1034,7 @@ def test_exact_groups_never_enter_manual_review(page, tmp_path: Path) -> None:
         expect(page.locator("#exactRecoveryList")).to_contain_text("No automatic exact-match removals")
 
         # Sidebar bulk selection no longer reaches hidden exact groups.
+        page.locator("#reviewFilters > summary").click()
         page.locator("#bulkPanel > summary").click()
         page.locator("#btnBulkNone").click()
         expect(page.locator("#toast")).to_contain_text("Select none: 0 groups updated")
@@ -2112,7 +2116,7 @@ def test_card_media_stays_inside_preview(
     }""", {"kind": kind, "dimensions": dimensions, "media_type": media_type})
     wrap = page.locator("#members .thumb-wrap")
     expect(wrap).to_be_visible()
-    image = page.locator("#members .thumb-image, #members .hover-video")
+    image = page.locator("#members .thumb-image, #members video")
     if media_type == "image":
         page.wait_for_function("() => document.querySelector('#members .thumb-image').naturalWidth > 0")
     bounds = image.bounding_box()
@@ -2141,12 +2145,15 @@ def test_card_media_stays_inside_preview(
     else:
         assert pane["height"] <= 600 * 0.58 + 1
 
-    if media_type == "video":
+    if media_type == "video" and kind == "all_files":
         page.route("**/api/media?*", lambda route: route.abort())
         page.locator("#members .thumb-wrap").hover()
         expect(image).to_have_attribute("src", re.compile(r"/api/media"))
         page.mouse.move(0, 0)
         expect(image).not_to_have_attribute("src", re.compile(r".+"))
+    elif media_type == "video":
+        expect(image).to_have_attribute("controls", "")
+        expect(image).to_have_attribute("src", re.compile(r"/api/media"))
     elif kind == "all_files":
         page.locator("#members .thumb-wrap").hover()
         expect(page.locator("#hoverPreview")).to_be_visible(timeout=5000)
@@ -2154,3 +2161,163 @@ def test_card_media_stays_inside_preview(
         assert preview and preview["x"] >= 0 and preview["y"] >= 0
         assert preview["x"] + preview["width"] <= 1000
         assert preview["y"] + preview["height"] <= 600
+
+
+@pytest.fixture
+def review_media(tmp_path):
+    """Different shapes, times, sizes, and motion to expose ordering/preview bugs."""
+    records = []
+    for index, (name, dimensions) in enumerate([
+        ("portrait.png", (180, 420)), ("landscape.png", (680, 240)),
+        ("animated.gif", (320, 180)),
+    ]):
+        path = tmp_path / name
+        image = Image.new("RGB", dimensions, (35 + index * 60, 100, 160))
+        if name.endswith("gif"):
+            image.save(path, save_all=True, append_images=[Image.new("RGB", dimensions, "gold")],
+                       duration=150, loop=0)
+        else:
+            image.save(path)
+        stat = path.stat()
+        records.append(FileRecord(
+            str(path), stat.st_size, stat.st_mtime, MediaType.GIF if index == 2 else MediaType.IMAGE,
+            path.suffix, device=stat.st_dev, inode=stat.st_ino, mtime_ns=stat.st_mtime_ns,
+            width=dimensions[0], height=dimensions[1], face_count=index,
+        ))
+    return records
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("kind", [GroupKind.NO_HUMANS, GroupKind.FACES, GroupKind.ALL_FILES])
+def test_focus_gallery_navigation_and_recovery(page, tmp_path, review_media, kind):
+    records = review_media
+    if kind == GroupKind.NO_HUMANS:
+        for record in records:
+            record.face_count = 0
+            record.human_detection_status = "no_person_detected"
+            record.human_detection_signature = human_detection_signature()
+    group = ReviewGroup("focus-test", kind, MediaType.MIXED, records, root=str(tmp_path))
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=records, groups=[group]),
+                     review_session_path=tmp_path / "review.json")
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": 1440, "height": 900})
+    with _serve_app(app) as url:
+        page.goto(url)
+        page.locator(f'.tab[data-kind="{kind.value}"]').click()
+        page.locator("#members .card").first.wait_for()
+        # Details are opt-in, while dimensions and faces stay immediately visible.
+        expect(page.locator("#members .path").first).to_be_hidden()
+        page.locator("#btnMediaDetails").click()
+        expect(page.locator("#members .path").first).to_be_visible()
+        page.locator("#btnMediaDetails").click()
+        page.locator("#previewSize").fill("520")
+        expect(page.locator("#members")).to_have_css("--tile-size", "520px")
+        paths = page.locator("#members .card").evaluate_all("cards => cards.map(c => c.dataset.path)")
+        page.locator("#btnFocusView").click()
+        expect(page.locator("#members .card")).to_have_count(1)
+        expect(page.locator("#members .card")).to_have_attribute("data-path", paths[0])
+        page.locator("#memberPagination .member-next").click()
+        expect(page.locator("#members .card")).to_have_attribute("data-path", paths[1])
+        page.locator("#btnFocusView").focus()
+        page.keyboard.press("ArrowRight")
+        expect(page.locator("#members .card")).to_have_attribute("data-path", paths[2])
+        expect(page.locator("#memberPagination .member-next")).to_be_disabled()
+        # Navigation never silently marks something reviewed or selected.
+        assert group.reviewed_paths == [] and group.selected_for_removal == []
+        page.keyboard.press("ArrowLeft")
+        expect(page.locator("#members .card")).to_have_attribute("data-path", paths[1])
+        page.locator("#members .delete-candidate").click()
+        expect(page.locator("#toast")).to_contain_text("Moved")
+        assert not Path(paths[1]).exists()
+        expect(page.locator("#members .card")).to_have_attribute("data-path", paths[2])
+        page.locator("#toastAction").click()
+        expect(page.locator("#toast")).to_contain_text("restored")
+        assert Path(paths[1]).exists()
+        page.locator("#btnGalleryView").click()
+        expect(page.locator("#members .card:not(.deleted)")).to_have_count(3)
+        assert page.locator("#members .card").evaluate_all(
+            "cards => cards.map(c => c.dataset.path)"
+        ) == paths
+        assert errors == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("kind", [GroupKind.LOW_RESOLUTION, GroupKind.RANDOM_REVIEW])
+def test_decisions_from_expanded_review_keep_stage_and_animate(page, tmp_path, review_media, kind):
+    group = ReviewGroup("decision-test", kind, MediaType.MIXED, review_media)
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=review_media, groups=[group]),
+                     review_session_path=tmp_path / "review.json")
+    with _serve_app(app) as url:
+        page.goto(url)
+        page.locator(f'.tab[data-kind="{kind.value}"]').click()
+        page.locator("#members .inspect-media").click()
+        page.locator("#lbKeep").click()
+        expect(page.locator("#lbMeta")).to_have_text(review_media[1].path)
+        page.keyboard.press("ArrowLeft")
+        expect(page.locator("#lbMeta")).to_have_text(review_media[2].path)
+        expect(page.locator("#lbImage")).to_have_attribute("src", re.compile(r"/api/media\?"))
+        expect(page.locator("#lbZoom")).to_be_hidden()
+        assert group.reviewed_paths == [review_media[0].path, review_media[1].path]
+        assert group.selected_for_removal == [review_media[1].path]
+        assert all(Path(member.path).exists() for member in review_media)
+        page.locator("#lbClose").click()
+        expect(page.locator("#members .card")).to_have_attribute("data-path", review_media[2].path)
+        expect(page.locator("#members .thumb-image")).to_have_attribute("src", re.compile(r"/api/media\?"))
+
+
+@pytest.mark.e2e
+def test_similar_native_video_controls_never_commit_a_swipe(page, tmp_path):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg required for playback fixture")
+    video = tmp_path / "first.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "testsrc=size=320x180:rate=12", "-t", "3", "-pix_fmt", "yuv420p", str(video),
+    ], check=True)
+    other = tmp_path / "second.mp4"
+    shutil.copyfile(video, other)
+    records = []
+    for path in [video, other]:
+        stat = path.stat()
+        records.append(FileRecord(str(path), stat.st_size, stat.st_mtime, MediaType.VIDEO,
+                                  ".mp4", width=320, height=180))
+    group = ReviewGroup("video-pair", GroupKind.SIMILAR, MediaType.VIDEO, records,
+                        suggested_keep=str(video), selected_for_removal=[str(other)])
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=records, groups=[group]),
+                     review_session_path=tmp_path / "review.json")
+    page.set_viewport_size({"width": 1280, "height": 800})
+    with _serve_app(app) as url:
+        page.goto(url)
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator("#members video[controls]")).to_have_count(2)
+        candidate = page.locator(".swipe-top video")
+        # Playback promises can stay pending if the media node is detached.
+        # Assert progress with Playwright's bounded wait instead of hanging.
+        candidate.evaluate("v => { v.play().catch(() => {}); }")
+        page.wait_for_function("() => document.querySelector('.swipe-top video').currentTime > 0.2")
+        assert page.evaluate("""async () => {
+            const video = document.querySelector('.swipe-top video');
+            await (await import('/static/groups.js')).loadGroups();
+            return video.isConnected && !video.paused && video.currentTime > 0;
+        }""")
+        candidate.focus()
+        page.keyboard.press("ArrowLeft")
+        page.keyboard.press("ArrowRight")
+        page.keyboard.press("Delete")
+        assert video.exists() and other.exists()
+        assert len(group.members) == 2
+        page.wait_for_function("""() => {
+            const action = document.querySelector('#swipeSame').getBoundingClientRect();
+            const footer = document.querySelector('#actionBar').getBoundingClientRect();
+            return action.top > 0 && action.bottom < footer.top;
+        }""")
+        page.locator(".swipe-top .swipe-expand").click()
+        expect(page.locator("#lbVideo")).to_be_visible()
+        assert candidate.evaluate("v => v.paused")
+        page.locator("#lbClose").click()
+        candidate.evaluate("v => { v.play().catch(() => {}); }")
+        page.wait_for_function("() => !document.querySelector('.swipe-top video').paused")
+        page.locator('.tab[data-kind="faces"]').click()
+        expect(page.locator("#detailBody")).to_be_hidden()
+        assert candidate.evaluate("v => v.paused")

@@ -15,6 +15,8 @@ let timer = null;
 // Only cards whose thumb is a still image (GIFs included) can preview; video
 // cards play inline on hover, and Trash placeholders have nothing to show.
 function previewableImage(wrap) {
+  // Focus/decision review already shows the full-size preview in place.
+  if (wrap?.closest(".focus-card")) return null;
   return wrap?.querySelector?.(".thumb-image") || null;
 }
 

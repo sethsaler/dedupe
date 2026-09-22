@@ -949,8 +949,8 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     script = "\n".join(
         path.read_text() for path in sorted(static_dir.glob("*.js"))
     )
-    assert 'class="hover-video"' in script
-    assert 'class="thumb-image ${m.media_type === "gif" ? "hover-gif"' in script
+    assert '"review-video" : "hover-video"' in script
+    assert 'class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif"' in script
     assert 'data-preview-width="${mediaWidth}"' in script
     assert 'setPreviewAspectRatio(image.closest(".thumb-wrap")' in script
     assert 'video.muted = true' in script
@@ -965,9 +965,10 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert 'await reviewCandidate(current, member.path, e.key === "ArrowLeft")' in script
     assert 'scrollIntoView({ block: "start", behavior: "instant" })' not in script
     assert 'scrollIntoView({ block: "start", behavior: "smooth" })' not in script
-    # Decision reviews (← Delete / → Keep) re-center the candidate's media on
-    # every render so the full image stays on screen while arrowing through.
-    assert 'scrollIntoView({ block: "center", behavior: "instant" })' in script
+    # Decision reviews fit the stage to the viewport without moving the page.
+    assert 'id="btnFocusView"' in html
+    assert 'id="previewSize"' in html
+    assert 'id="lbStageDelete"' in html
     # In a decision review, ↑ / ↓ step between candidates without deciding.
     assert 'e.key === "ArrowUp" && isDecisionReview(currentGroup())' in script
     assert 'e.key === "ArrowDown" && isDecisionReview(currentGroup())' in script

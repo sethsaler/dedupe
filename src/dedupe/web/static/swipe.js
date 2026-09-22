@@ -90,10 +90,11 @@ function memberMeta(member) {
 
 function mediaHtml(member) {
   const fileName = basename(member.path);
-  const playBadge = ["video", "gif"].includes(member.media_type)
-    ? '<span class="swipe-play" aria-hidden="true">▶</span>'
-    : "";
-  return `<img src="${previewUrl(member.path)}" alt="Preview of ${escapeHtml(fileName)}" draggable="false" decoding="async" />${playBadge}`;
+  const mediaUrl = `/api/media?path=${encodeURIComponent(member.path)}`;
+  if (member.media_type === "video") {
+    return `<video src="${mediaUrl}" poster="${previewUrl(member.path)}" controls muted loop playsinline preload="metadata" aria-label="Play ${escapeHtml(fileName)}"></video>`;
+  }
+  return `<img src="${member.media_type === "gif" ? mediaUrl : previewUrl(member.path)}" alt="Preview of ${escapeHtml(fileName)}" draggable="false" decoding="async" />`;
 }
 
 // Similarity is computed against the suggested keeper; after a re-anchor the
@@ -114,15 +115,16 @@ function similarityChip(member, g, anchor) {
 // also the draggable .swipe-card; the keeper side is static.
 function sideHtml(member, { tag, tagClass = "", card = false, meta = "", extraClass = "" }) {
   const fileName = basename(member.path);
+  const video = member.media_type === "video";
   return `
     <figure class="swipe-side ${extraClass}${card ? " swipe-card swipe-top" : ""}"${card ? ` data-path="${escapeHtml(member.path)}"` : ""}>
-      <button class="swipe-media${card ? "" : " swipe-keeper-media"}" type="button" aria-label="Open ${escapeHtml(fileName)} in the comparison view">
+      <${video ? "div" : 'button type="button"'} class="swipe-media${card ? "" : " swipe-keeper-media"}" aria-label="Open ${escapeHtml(fileName)} in the comparison view">
         ${mediaHtml(member)}
         ${tag ? `<span class="swipe-tag ${tagClass}">${tag}</span>` : ""}
         ${card ? `
         <span class="swipe-flag same" aria-hidden="true">← Same — Trash copy</span>
         <span class="swipe-flag diff" aria-hidden="true">Different — keep both →</span>` : ""}
-      </button>
+      </${video ? "div" : "button"}>
       <figcaption class="swipe-info">
         <div class="swipe-name-row">
           <span class="name" title="${escapeHtml(member.path)}">${escapeHtml(fileName)}</span>
@@ -130,17 +132,22 @@ function sideHtml(member, { tag, tagClass = "", card = false, meta = "", extraCl
         </div>
         <div class="path" title="${escapeHtml(member.path)}">${escapeHtml(member.path)}</div>
         <div class="card-meta">${memberMeta(member)}</div>
-        ${card ? `
         <div class="swipe-card-tools">
-          <button class="linkish swipe-reanchor" type="button" title="Make this copy the reference the rest of the queue is compared against">Use as reference</button>
+          <button class="linkish swipe-expand" data-index="${card ? 1 : 0}" type="button">Expand ↗</button>
+          ${card ? '<button class="linkish swipe-reanchor" type="button" title="Make this copy the reference the rest of the queue is compared against">Use as reference</button>' : ""}
           <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
-        </div>` : ""}
+        </div>
       </figcaption>
     </figure>`;
 }
 
 function renderSwipeReview(g) {
   const box = $("members");
+  box.querySelectorAll("video").forEach((video) => {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  });
   box.classList.remove("triage-grid");
   for (const id of ["memberPagination", "memberPaginationBottom", "memberSort", "memberModified"]) {
     const el = $(id);
@@ -204,12 +211,12 @@ function renderSwipeReview(g) {
         <div class="swipe-vs">
           <button class="swipe-btn swipe-same" id="swipeSame" type="button"
                   title="Same photo — this copy moves to Trash (undoable)">
-            <kbd>←</kbd><strong>Same</strong>
+            <kbd>←</kbd><strong>Same · Trash copy</strong>
           </button>
           <span class="swipe-vs-badge" aria-hidden="true">vs</span>
           <button class="swipe-btn swipe-diff" id="swipeDiff" type="button"
                   title="Different — keep both, the pair never re-matches">
-            <strong>Different</strong><kbd>→</kbd>
+            <strong>Different · Keep both</strong><kbd>→</kbd>
           </button>
         </div>
         ${sideHtml(candidate, { card: true, meta: similarityChip(candidate, g, anchor) })}
@@ -227,7 +234,10 @@ function renderSwipeReview(g) {
 
 function wireSwipeDom(g) {
   const box = $("members");
-  box.querySelector(".swipe-keeper-media")?.addEventListener("click", () => openLightbox(0));
+  box.querySelector("button.swipe-keeper-media")?.addEventListener("click", () => openLightbox(0));
+  box.querySelectorAll(".swipe-expand").forEach((button) => {
+    button.addEventListener("click", () => openLightbox(Number(button.dataset.index)));
+  });
   box.querySelector("#swipeSame")?.addEventListener("click", () => decideSwipe("same"));
   box.querySelector("#swipeDiff")?.addEventListener("click", () => decideSwipe("distinct"));
   box.querySelector("#swipeSkip")?.addEventListener("click", skipSwipe);
@@ -248,10 +258,11 @@ function wireSwipeDom(g) {
   const top = box.querySelector(".swipe-top");
   if (top) {
     // A drag that committed suppresses the click that follows pointerup.
-    top.querySelector(".swipe-media")?.addEventListener("click", () => {
+    top.querySelector("button.swipe-media")?.addEventListener("click", () => {
       if (!top.dataset.dragged) openLightbox(1); // index 0 is the reference
     });
-    wireDrag(g, top);
+    // Native video scrubbing must never be interpreted as a destructive swipe.
+    if (!top.querySelector("video")) wireDrag(g, top);
   }
 }
 

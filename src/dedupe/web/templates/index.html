@@ -219,7 +219,6 @@
     </section>
 
     <section class="results" id="results" hidden>
-      <aside class="sidebar">
         <div class="filter-tabs" role="tablist" aria-label="Result categories">
           <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
           <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
@@ -227,8 +226,9 @@
           <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
           <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
           <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
-          <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">Files <span class="tab-count" id="countAllFiles">0</span></button>
+          <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">All files <span class="tab-count" id="countAllFiles">0</span></button>
         </div>
+      <aside class="sidebar">
         <div class="result-controls" aria-label="Find and organize results">
           <div class="result-controls-heading">
             <span>Results</span>
@@ -238,6 +238,8 @@
             <span class="sr-only">Search files</span>
             <input id="resultSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
           </label>
+          <details class="review-filters" id="reviewFilters">
+            <summary>Filter &amp; organize</summary>
           <div class="result-control-grid">
             <label class="control-field" for="resultSort">
               <span>Sort</span>
@@ -315,6 +317,7 @@
             <button class="btn primary-soft" id="btnBulkCriteria" type="button">Apply rule to shown groups</button>
             <span class="thresh-hint">Duplicate groups always keep their suggested keeper; the server re-checks that.</span>
           </details>
+          </details>
           <button class="btn primary-soft" id="btnNextReview" type="button">Next unreviewed / needs attention</button>
           <span class="muted small" id="filteredCount" aria-live="polite"></span>
         </div>
@@ -334,6 +337,7 @@
               <h2 id="detailTitle">Group</h2>
               <p class="muted" id="detailMeta"></p>
             </div>
+            <button class="btn ghost" id="btnMediaDetails" type="button" aria-pressed="false">File details</button>
             <button class="btn ghost" id="btnSimilarView" type="button" hidden aria-pressed="true">☰ List view</button>
             <button class="btn ghost" id="btnToggleDeleted" type="button" hidden>0 in Trash</button>
             <button class="btn primary-soft" id="btnMarkRemainingHuman" type="button" hidden>
@@ -343,7 +347,8 @@
               Mark as distinct
             </button>
           </div>
-          <div class="non-human-banner" id="nonHumanBanner" hidden role="note">
+          <details class="non-human-banner" id="nonHumanBanner" hidden>
+            <summary>About Non-Human review</summary>
             <div>
               <strong>Independent Non-Human candidates</strong>
               <span>One click — or <kbd>d</kbd> / <kbd>⌫</kbd> — moves a file to Trash. Undo from the toast or the card. Detection can miss people.</span>
@@ -352,8 +357,9 @@
               <span class="delete-key"><kbd>d</kbd> Trash</span>
               <span class="keep-key">Lightbox <kbd>Enter</kbd></span>
             </div>
-          </div>
-          <div class="candidate-review-banner" id="candidateReviewBanner" hidden role="note">
+          </details>
+          <details class="candidate-review-banner" id="candidateReviewBanner" hidden>
+            <summary>Review guide &amp; shortcuts</summary>
             <div>
               <strong id="candidateReviewTitle">Quick review</strong>
               <span id="candidateReviewDescription"></span>
@@ -368,7 +374,7 @@
               <span><kbd>⌫</kbd> Undo</span>
               <span class="keep-key">Different <kbd>→</kbd></span>
             </div>
-          </div>
+          </details>
           <div class="selection-toolbar" aria-label="Group selection controls">
             <div class="group-selection-summary">
               <span>Group selection</span>
@@ -395,6 +401,15 @@
               <button class="btn" id="btnSmartGroup" type="button">Apply to this group</button>
               <button class="btn ghost" id="btnSmartAll" type="button">Apply to every group</button>
             </div>
+          </div>
+          <div class="review-toolbar" id="reviewToolbar">
+            <div class="view-switch" id="reviewViewSwitch" role="group" aria-label="Review layout" hidden>
+              <button class="btn ghost" id="btnGalleryView" type="button" aria-pressed="true">Gallery</button>
+              <button class="btn ghost" id="btnFocusView" type="button" aria-pressed="false">Focus</button>
+            </div>
+            <label class="preview-size" id="previewSizeWrap" for="previewSize">Preview size
+              <input id="previewSize" type="range" min="240" max="520" step="40" value="360" />
+            </label>
           </div>
           <nav class="member-pagination" id="memberPagination" aria-label="Review results" hidden>
             <button class="btn ghost member-prev" type="button">Previous</button>
@@ -424,10 +439,10 @@
     </section>
 
     <footer class="actionbar" id="actionBar" hidden aria-label="Delete selected matches">
-      <button class="btn danger" id="btnTrashSimilar" type="button">
+      <button class="btn ghost" id="btnTrashSimilar" type="button">
         Delete All Selected Similar Matches
       </button>
-      <button class="btn danger" id="btnTrashReview" type="button">
+      <button class="btn primary-soft" id="btnTrashReview" type="button">
         Delete All Selected Low-res + Random
       </button>
       <span class="action-busy-note" id="actionBusyNote" role="status" hidden></span>
@@ -483,6 +498,11 @@
       <div class="lb-actions" id="lbActions" hidden>
         <button class="btn danger" id="lbDelete" type="button">Move to Trash</button>
         <span class="lb-action-hint">One click · recoverable from Trash · <kbd>d</kbd> or <kbd>⌫</kbd></span>
+      </div>
+      <div class="lb-actions" id="lbDecisions" hidden>
+        <button class="btn danger" id="lbStageDelete" type="button">← Stage for removal</button>
+        <button class="btn primary-soft" id="lbKeep" type="button">Keep →</button>
+        <span class="lb-action-hint">Nothing moves until you confirm staged removals.</span>
       </div>
       <div class="lb-actions lb-reveal">
         <button class="btn ghost" id="lbReveal" type="button" title="Reveal in Finder (r)">Reveal in Finder</button>

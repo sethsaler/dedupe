@@ -21,6 +21,7 @@ const state = {
   memberSortByKind: { faces: "faces-desc", all_files: "path" },
   // Modified-time window for the Files tab's member list ("any" = no filtering).
   memberModified: "any",
+  reviewView: "gallery",
   lightboxItems: [],
   lightboxIndex: 0,
   scanning: false,

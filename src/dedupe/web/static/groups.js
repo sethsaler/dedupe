@@ -103,16 +103,20 @@ async function loadGroups({ preserveSelection = false } = {}) {
       // Mid-scan: keep list fresh but don't thrash an open detail view
       // (member set for a group is fixed once published).
       if (!preserveSelection) {
-        await selectGroup(state.currentId, { silent: true });
+        await selectGroup(state.currentId, { silent: true, preservePlayback: true });
       }
     } else {
+      // Empty categories leave the old DOM hidden rather than replacing it.
+      $("members").querySelectorAll("video").forEach((video) => video.pause());
       state.currentId = null;
       $("detailBody").hidden = true;
       $("detailEmpty").hidden = false;
     }
-  } else if (state.groups.length && !$("results").hidden) {
+  }
+  if (!state.currentId && state.groups.length && !$("results").hidden) {
     // Auto-select when nothing is selected: the group the user was looking at
-    // before a reload, if it still exists, otherwise the first group.
+    // before a reload, if it still exists, otherwise the first group. This
+    // includes category changes: do not leave a populated category blank.
     if (!$("detailEmpty").hidden) {
       let targetId = state.groups[0].id;
       if (focusRestorePending) {

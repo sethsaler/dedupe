@@ -1,8 +1,8 @@
 // The full-screen comparison overlay.
 
 import { api } from "./api.js";
-import { setMemberSelected, trashReviewCandidate } from "./members.js";
-import { currentGroup, isIndependentReview, isPagedIndependentReview } from "./model.js";
+import { reviewCandidate, setMemberSelected, trashReviewCandidate } from "./members.js";
+import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
 import { $, formatBytes, formatMtime, toast } from "./util.js";
 
@@ -28,6 +28,7 @@ function fullUrl(path) {
 
 function openLightbox(index) {
   if (!state.lightboxItems.length) return;
+  document.querySelectorAll("#members video").forEach((video) => video.pause());
   previousFocus = document.activeElement;
   previousFocusPath = (
     previousFocus?.closest?.("#members .card")
@@ -102,7 +103,7 @@ function lightboxDetails(item) {
 // detail, so the compare tools hide while zoomed.
 function syncCompareTools(item, isVideo) {
   const canCompare = !zoomed && !isVideo && item
-    && item.kind === "similar" && item.keeper && item.keeper !== item.path;
+    && item.mediaType !== "gif" && item.kind === "similar" && item.keeper && item.keeper !== item.path;
   const keeperImage = $("lbKeeperImage");
   $("lbCompareTools").hidden = !canCompare;
   keeperImage.hidden = !canCompare;
@@ -116,7 +117,7 @@ function syncCompareTools(item, isVideo) {
 
 function setZoom(on) {
   const item = state.lightboxItems[state.lightboxIndex];
-  const next = Boolean(on) && item && item.mediaType !== "video";
+  const next = Boolean(on) && item && item.mediaType === "image";
   if (zoomed === next) return;
   zoomed = next;
   const stack = $("lbImageStack");
@@ -171,7 +172,7 @@ function updateLightbox() {
   video.pause();
   video.hidden = !isVideo;
   $("lbVideoTools").hidden = !isVideo;
-  $("lbStageTools").hidden = isVideo;
+  $("lbStageTools").hidden = isVideo || item.mediaType === "gif";
   $("lbImageStack").hidden = isVideo;
   image.hidden = isVideo;
   if (isVideo) {
@@ -183,7 +184,9 @@ function updateLightbox() {
     video.removeAttribute("src");
     video.load();
     // While zoomed the full-resolution variant stays; navigation resets zoom.
-    if (!zoomed) image.src = previewUrl(item.path);
+    if (!zoomed) image.src = item.mediaType === "gif"
+      ? `/api/media?path=${encodeURIComponent(item.path)}`
+      : previewUrl(item.path);
     syncCompareTools(item, false);
   }
   const count = state.lightboxItems.length;
@@ -196,6 +199,7 @@ function updateLightbox() {
   const canTrash = isPagedIndependentReview(item) || isPagedIndependentReview(currentGroup());
   $("lbActions").hidden = !canTrash;
   $("lbDelete").disabled = state.deleteBusy.has(item.path);
+  $("lbDecisions").hidden = !isDecisionReview(currentGroup());
   syncLightboxSelect(item);
   prefetchLightboxNeighbors();
 }
@@ -243,6 +247,13 @@ $("lbDelete").addEventListener("click", () => {
   if (!item || !isPagedIndependentReview(group)) return;
   trashReviewCandidate(group, item.path, { fromLightbox: true });
 });
+
+for (const [id, remove] of [["lbStageDelete", true], ["lbKeep", false]]) {
+  $(id).addEventListener("click", () => {
+    const item = state.lightboxItems[state.lightboxIndex];
+    if (item) reviewCandidate(currentGroup(), item.path, remove);
+  });
+}
 
 // Reveal works for every kind — it answers "what is this file?" mid-sift.
 $("lbReveal").addEventListener("click", () => {

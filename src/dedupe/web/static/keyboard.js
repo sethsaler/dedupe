@@ -50,6 +50,11 @@ document.addEventListener("keydown", async (e) => {
         return;
       }
       if (typing || e.target === $("lbVideo")) return;
+    if (isDecisionReview(currentGroup()) && ["ArrowLeft", "ArrowRight"].includes(e.key)) {
+      $(e.key === "ArrowLeft" ? "lbStageDelete" : "lbKeep").click();
+      e.preventDefault();
+      return;
+    }
     // A focused button handles Space/Enter natively (e.g. hold-to-flicker).
     const onButton = e.target?.tagName === "BUTTON";
     if (swipeActive()) {
@@ -97,7 +102,7 @@ document.addEventListener("keydown", async (e) => {
     return;
   }
 
-  if (typing || $("results").hidden) return;
+  if (typing || tag === "VIDEO" || $("results").hidden) return;
 
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -210,6 +215,11 @@ document.addEventListener("keydown", async (e) => {
     if (isDecisionReview(current)) {
       const member = (current.members || [])[state.memberFocus];
       if (member) await reviewCandidate(current, member.path, e.key === "ArrowLeft");
+      e.preventDefault();
+      return;
+    }
+    if (isPagedIndependentReview(current) && state.reviewView === "focus") {
+      changeMemberPage(e.key === "ArrowLeft" ? -1 : 1);
       e.preventDefault();
       return;
     }
