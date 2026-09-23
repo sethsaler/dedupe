@@ -95,6 +95,7 @@ function lightboxDetails(item) {
         ? `${similarity.toFixed(1).replace(/\.0$/, "")}% similar to keeper`
         : "similarity score unavailable",
     );
+    if (item.orientationLabel) parts.push(`${item.orientationLabel} copy`);
   }
   return parts.join(" · ");
 }

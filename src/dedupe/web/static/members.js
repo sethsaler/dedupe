@@ -170,6 +170,7 @@ function lightboxItemFor(member, group) {
     height: member.height,
     mtime: member.mtime,
     similarityPercent: member.similarity_percent,
+    orientationLabel: member.orientation_label,
   };
 }
 
@@ -543,9 +544,11 @@ function renderMembers(g, { append = false } = {}) {
           ? `<span class="thumb-badge keep">Keep</span>`
           : "";
       const similarity = m.similarity_percent == null ? null : Number(m.similarity_percent);
+      // A rotated or mirrored copy is named so the turned thumbnail reads as intended.
+      const turnedEvidence = m.orientation_label ? ` · ${m.orientation_label} copy` : "";
       const similarityEvidence = Number.isFinite(similarity)
-        ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper · fingerprint agreement, not a probability`
-        : "Perceptual match to suggested keeper · similarity score unavailable";
+        ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
+        : `Perceptual match to suggested keeper${turnedEvidence} · similarity score unavailable`;
       const evidence = g.kind === "exact"
         ? "Byte-identical SHA-256 match"
         : g.kind === "similar"

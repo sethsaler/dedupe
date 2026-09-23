@@ -53,7 +53,11 @@ from ..review_session import (
     peek_review_session,
     save_review_session,
 )
-from ..similar_image import TILE_HASH_VERSION
+from ..similar_image import (
+    ORIENTATIONS,
+    TILE_HASH_VERSION,
+    decode_orientation_phashes,
+)
 from ..similar_video import aligned_position_indexes
 from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
@@ -123,10 +127,51 @@ def _stored_hashes(value: str | None, versions: tuple[str, ...]) -> list[str]:
     return [part for part in value.split(":", 1)[1].split(",") if part]
 
 
+ORIENTATION_LABELS = {
+    "ROTATE_90": "rotated 90°",
+    "ROTATE_270": "rotated 90°",
+    "ROTATE_180": "rotated 180°",
+    "FLIP_LEFT_RIGHT": "mirrored",
+    "FLIP_TOP_BOTTOM": "flipped upside down",
+    "TRANSPOSE": "rotated and mirrored",
+    "TRANSVERSE": "rotated and mirrored",
+}
+
+
+def match_orientation(member, keeper) -> str | None:
+    """The turn that makes a rotated or mirrored member line up with its keeper.
+
+    None when the member already lines up as decoded (or cannot be judged).
+    A turn only counts when it agrees better than the unturned file does.
+    """
+    turned = decode_orientation_phashes(member.orientation_phashes)
+    upright = _hash_difference(member.phash, keeper.phash)
+    if not turned or upright is None:
+        return None
+    best: tuple[int, str] | None = None
+    for name, value in zip(ORIENTATIONS, turned, strict=True):
+        result = _hash_difference(value, keeper.phash)
+        if result is not None and (best is None or result[0] < best[0]):
+            best = (result[0], name)
+    if best is None or best[0] >= upright[0]:
+        return None
+    return best[1]
+
+
 def similarity_percent(member, keeper) -> float | None:
     """Return perceptual-fingerprint bit agreement with a group's keeper."""
     comparisons: list[tuple[int, int]] = []
-    if member.media_type.value == "video":
+    orientation = (
+        match_orientation(member, keeper) if member.media_type.value == "image" else None
+    )
+    if orientation is not None:
+        # Only the global pHash is stored per orientation; dHash and tiles
+        # describe the unturned file and would understate the agreement.
+        turned = decode_orientation_phashes(member.orientation_phashes) or ()
+        result = _hash_difference(turned[ORIENTATIONS.index(orientation)], keeper.phash)
+        if result is not None:
+            comparisons.append(result)
+    elif member.media_type.value == "video":
         left = _stored_hashes(member.video_fingerprint, ("v2", "v3"))
         right = _stored_hashes(keeper.video_fingerprint, ("v2", "v3"))
         left_indexes, right_indexes = aligned_position_indexes(len(left), len(right))
@@ -326,6 +371,7 @@ def drop_marked_distinct_groups(result: ScanResult, cache_path: str | Path | Non
                         phash=None,
                         dhash=None,
                         tile_phashes=None,
+                        orientation_phashes=None,
                         video_fingerprint=None,
                     )
         fresh_records = [rec for rec in current.values() if rec is not None]
@@ -547,6 +593,12 @@ def create_app(
                     group.members, payload["members"], strict=True
                 ):
                     member_payload["similarity_percent"] = similarity_percent(member, keeper)
+                    orientation = (
+                        match_orientation(member, keeper) if member is not keeper else None
+                    )
+                    member_payload["orientation_label"] = (
+                        ORIENTATION_LABELS[orientation] if orientation else None
+                    )
         deleted = state["deleted_files"]
         payload["deleted_paths"] = [
             member.path for member in group.members if member.path in deleted

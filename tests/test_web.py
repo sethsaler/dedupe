@@ -3644,3 +3644,24 @@ def test_similarity_percentage_includes_animation_tiles():
     keeper.tile_phashes = encode_tile_phashes(("0000000000000000",) * 40)
     member.tile_phashes = encode_tile_phashes(("00000000000000ff",) * 40)
     assert similarity_percent(member, keeper) == 88.1
+
+
+def test_similarity_percentage_measures_turned_copy_in_its_orientation():
+    from dedupe.similar_image import ORIENTATIONS, encode_orientation_phashes
+    from dedupe.web.app import ORIENTATION_LABELS, match_orientation, similarity_percent
+
+    common = {"size": 1, "mtime": 1, "media_type": MediaType.IMAGE, "extension": ".jpg"}
+    keeper = FileRecord(path="/keeper.jpg", **common)
+    member = FileRecord(path="/turned.jpg", **common)
+    keeper.phash = "00000000000000ff"
+    member.phash = "ffffffff00000000"
+    turned = ["ffffffffffffffff"] * len(ORIENTATIONS)
+    turned[ORIENTATIONS.index("ROTATE_90")] = "00000000000000fe"
+    member.orientation_phashes = encode_orientation_phashes(tuple(turned))
+
+    assert match_orientation(member, keeper) == "ROTATE_90"
+    assert ORIENTATION_LABELS["ROTATE_90"] == "rotated 90°"
+    assert similarity_percent(member, keeper) == 98.4
+    # An upright copy is never labelled turned, even with orientation hashes.
+    member.phash = keeper.phash
+    assert match_orientation(member, keeper) is None

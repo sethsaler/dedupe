@@ -683,3 +683,91 @@ def test_failed_legacy_gif_rehash_discards_old_fingerprint(tmp_path):
         record.phash = record.dhash = "0000000000000000"
     assert find_similar_image_groups(records, workers=1) == []
     assert all(record.phash is None and record.error for record in records)
+
+
+def _astronaut_landscape() -> Image.Image:
+    """The fixture cropped to 4:3 so quarter turns also swap the aspect ratio."""
+    fixture = Path(__file__).parent / "fixtures" / "astronaut.png"
+    return Image.open(fixture).convert("RGB").crop((0, 64, 512, 448))
+
+
+@pytest.mark.parametrize(
+    "turn",
+    ["ROTATE_90", "ROTATE_180", "ROTATE_270", "FLIP_LEFT_RIGHT", "FLIP_TOP_BOTTOM", "TRANSPOSE"],
+)
+def test_rotated_or_mirrored_copy_groups_with_source(tmp_path: Path, turn: str) -> None:
+    """Pixels turned without an EXIF tag are still the same photo."""
+    base = _astronaut_landscape()
+    source = tmp_path / "source.jpg"
+    turned = tmp_path / "turned.jpg"
+    base.save(source, format="JPEG", quality=92)
+    copy = base.transpose(Image.Transpose[turn])
+    copy.resize((copy.width // 2, copy.height // 2), Image.Resampling.LANCZOS).save(
+        turned, format="JPEG", quality=80
+    )
+    groups = find_similar_image_groups([_rec_for(source), _rec_for(turned)], workers=1)
+    assert [sorted(Path(m.path).name for m in group) for group in groups] == [
+        ["source.jpg", "turned.jpg"]
+    ]
+
+
+def test_turned_burst_frame_is_still_rejected(tmp_path: Path) -> None:
+    """Orientation lookup finds the pair; the dense check still rejects it."""
+    a, b = _astronaut_burst_pair(tmp_path)
+    turned = tmp_path / "frame2-turned.jpg"
+    Image.open(b).transpose(Image.Transpose.ROTATE_90).save(turned, format="JPEG", quality=92)
+    b.unlink()
+    assert find_similar_image_groups([_rec_for(a), _rec_for(turned)], workers=1) == []
+
+
+def test_animations_have_no_orientation_hashes(tmp_path: Path) -> None:
+    from dedupe.similar_image import compute_image_fingerprint
+
+    path = tmp_path / "anim.gif"
+    frames = [Image.new("RGB", (64, 64), color) for color in ("red", "blue")]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100)
+    still = tmp_path / "still.jpg"
+    _astronaut_landscape().save(still, format="JPEG")
+    assert compute_image_fingerprint(path)[5] is None
+    assert len(compute_image_fingerprint(still)[5]) == 7
+
+
+def test_orientation_backfill_keeps_cached_hashes_when_file_is_unreadable(tmp_path: Path) -> None:
+    """A still cached before orientation lookup keeps its hashes if the re-read fails."""
+    import dedupe.similar_image as module
+
+    present = tmp_path / "present.jpg"
+    _astronaut_landscape().save(present, format="JPEG")
+    fresh = _rec_for(present)
+    ghost = FileRecord(
+        path=str(tmp_path / "gone.jpg"),
+        size=1,
+        mtime=1,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        phash="0000000000000000",
+        dhash="0000000000000000",
+        tile_phashes=module.encode_tile_phashes(("0000000000000000",) * 5),
+    )
+    find_similar_image_groups([fresh, ghost], workers=1)
+    assert module.decode_orientation_phashes(fresh.orientation_phashes)
+    assert ghost.phash == "0000000000000000" and ghost.error is None
+    assert ghost.orientation_phashes is None
+
+
+@pytest.mark.parametrize("radius", [0, 6, 20])
+def test_hamming_index_matches_brute_force(radius: int) -> None:
+    import random
+
+    from dedupe.similar_image import HammingIndex
+
+    rng = random.Random(radius)
+    hashes = [rng.getrandbits(64) for _ in range(2000)]
+    hashes += [h ^ (1 << rng.randrange(64)) ^ (1 << rng.randrange(64)) for h in hashes[:300]]
+    hashes = list(dict.fromkeys(hashes))
+    index = HammingIndex(hashes, radius)
+    for query in hashes[:150] + [rng.getrandbits(64) for _ in range(50)]:
+        expected = sorted(
+            ((query ^ h).bit_count(), h) for h in hashes if (query ^ h).bit_count() <= radius
+        )
+        assert sorted(index.find(query, radius)) == expected

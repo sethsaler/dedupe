@@ -412,3 +412,15 @@ def test_hydrate_batches_identity_fallback(tmp_path: Path, monkeypatch) -> None:
     # 1 path batch (misses) + 1 identity fallback batch.
     assert len(selects) == 2
     cache.close()
+
+
+def test_cache_round_trips_orientation_hashes(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    original = _record(tmp_path / "photo.jpg", inode=10)
+    original.orientation_phashes = "o1:" + ",".join(["0" * 16] * 7)
+    cache.store_all([original])
+
+    same = _record(tmp_path / "photo.jpg", inode=10)
+    assert cache.hydrate([same]) == 1
+    assert same.orientation_phashes == original.orientation_phashes
+    cache.close()

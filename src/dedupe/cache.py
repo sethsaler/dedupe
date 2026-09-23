@@ -23,10 +23,11 @@ _UPSERT_SQL = """
     INSERT INTO hashes (
         path, size, mtime, mtime_ns, device, inode, algorithm_version,
         media_type, width, height, sha256, partial_hash, phash, dhash,
-        tile_phashes, video_fingerprint, duration, human_detection_status,
-        human_detector, human_detection_signature, human_frames_analyzed,
-        human_max_confidence, face_count, face_detector, face_detection_signature
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        tile_phashes, orientation_phashes, video_fingerprint, duration,
+        human_detection_status, human_detector, human_detection_signature,
+        human_frames_analyzed, human_max_confidence, face_count, face_detector,
+        face_detection_signature
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
@@ -42,6 +43,7 @@ _UPSERT_SQL = """
         phash=excluded.phash,
         dhash=excluded.dhash,
         tile_phashes=excluded.tile_phashes,
+        orientation_phashes=excluded.orientation_phashes,
         video_fingerprint=excluded.video_fingerprint,
         duration=excluded.duration,
         human_detection_status=excluded.human_detection_status,
@@ -72,6 +74,7 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.phash,
         rec.dhash,
         rec.tile_phashes,
+        rec.orientation_phashes,
         rec.video_fingerprint,
         rec.duration,
         rec.human_detection_status,
@@ -220,6 +223,7 @@ class HashCache:
                 phash TEXT,
                 dhash TEXT,
                 tile_phashes TEXT,
+                orientation_phashes TEXT,
                 video_fingerprint TEXT,
                 duration REAL,
                 human_detection_status TEXT,
@@ -274,6 +278,7 @@ class HashCache:
             "inode": "INTEGER",
             "algorithm_version": "TEXT NOT NULL DEFAULT ''",
             "tile_phashes": "TEXT",
+            "orientation_phashes": "TEXT",
             "human_detection_status": "TEXT",
             "human_detector": "TEXT",
             "human_detection_signature": "TEXT",
@@ -623,6 +628,7 @@ class HashCache:
         rec.phash = row["phash"] or rec.phash
         rec.dhash = row["dhash"] or rec.dhash
         rec.tile_phashes = row["tile_phashes"] or rec.tile_phashes
+        rec.orientation_phashes = row["orientation_phashes"] or rec.orientation_phashes
         rec.video_fingerprint = row["video_fingerprint"] or rec.video_fingerprint
         rec.duration = row["duration"] if row["duration"] is not None else rec.duration
         rec.human_detection_status = (

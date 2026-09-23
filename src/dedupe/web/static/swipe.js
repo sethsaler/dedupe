@@ -105,10 +105,11 @@ function similarityChip(member, g, anchor) {
     return '<span class="swipe-sim" title="Fingerprint scores measure against the suggested keeper, not your chosen reference">vs your reference</span>';
   }
   const value = member.similarity_percent == null ? null : Number(member.similarity_percent);
+  const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   if (!Number.isFinite(value)) {
-    return '<span class="swipe-sim">score unavailable</span>';
+    return `<span class="swipe-sim">score unavailable${turned}</span>`;
   }
-  return `<span class="swipe-sim" title="Fingerprint agreement with the reference copy, not a probability">${value.toFixed(1).replace(/\.0$/, "")}% match</span>`;
+  return `<span class="swipe-sim" title="Fingerprint agreement with the reference copy, not a probability">${value.toFixed(1).replace(/\.0$/, "")}% match${turned}</span>`;
 }
 
 // One side of the pair: a media pane with a caption. The candidate side is
@@ -180,6 +181,7 @@ function renderSwipeReview(g) {
     height: member.height,
     mtime: member.mtime,
     similarityPercent: member.similarity_percent,
+    orientationLabel: member.orientation_label,
   });
   state.lightboxItems = [
     ...(anchorMember ? [lightboxEntry(anchorMember, anchor)] : []),
