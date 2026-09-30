@@ -2,7 +2,15 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    # Keep the full validation matrix on every tag, including release tags.
+    tags: ['**']
   pull_request:
+
+# A new PR commit supersedes its earlier run; main and tag runs stay independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
