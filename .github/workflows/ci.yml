@@ -6,26 +6,44 @@ on:
     # Keep the full validation matrix on every tag, including release tags.
     tags: ['**']
   pull_request:
+  workflow_dispatch:
 
-# A new PR commit supersedes its earlier run; main and tag runs stay independent.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Runs stay independent: new commits do not cancel running or queued checks.
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Determine required checks
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.paths.outputs.required }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 scripts/ci_changes.py
+
   test:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.required != 'false') }}
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11"]
     steps:
       - uses: actions/checkout@v4
       - name: Install ffmpeg
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: sudo apt-get update && sudo apt-get install --yes ffmpeg
       - uses: actions/setup-python@v5
         with:
@@ -34,9 +52,61 @@ jobs:
       - name: Install package and test dependencies
         run: python -m pip install --upgrade pip && python -m pip install --editable '.[dev]'
       - name: Run tests
-        run: pytest -q
+        run: python scripts/verify.py unit
+
+  test-312:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    name: Test (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package and test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install --editable '.[dev]'
+      - name: Run tests
+        run: python scripts/verify.py unit
+
+  test-313:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    name: Test (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install package and test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install --editable '.[dev]'
+      - name: Run tests
+        run: python scripts/verify.py unit
+
+  test-314:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    name: Test (Python 3.14)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install package and test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install --editable '.[dev]'
+      - name: Run tests
+        run: python scripts/verify.py unit
 
   e2e:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     name: Browser workflow (Python 3.11)
     runs-on: ubuntu-latest
     steps:
@@ -58,9 +128,10 @@ jobs:
       - name: Install Chromium and system dependencies
         run: python -m playwright install --with-deps chromium
       - name: Run browser tests
-        run: pytest -q -m e2e
+        run: python scripts/verify.py browser
 
   macos:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     # macOS-specific behavior (Photos-library refusal, Finder reveal, Trash)
     # is only exercised here; Linux never sees it.
     name: macOS (Python 3.13)
@@ -76,9 +147,13 @@ jobs:
       - name: Install package and test dependencies
         run: python -m pip install --upgrade pip && python -m pip install --editable '.[dev,human]'
       - name: Run tests
-        run: pytest -q
+        run: python scripts/verify.py unit
+      - name: Build unsigned macOS launcher
+        run: python scripts/verify.py macos
 
   quality-and-package:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.required != 'false') }}
     name: Lint and package
     runs-on: ubuntu-latest
     steps:
@@ -88,14 +163,9 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install development tools
-        run: python -m pip install --upgrade pip && python -m pip install '.[dev]'
+        run: python -m pip install --upgrade pip && python -m pip install 'ruff>=0.9.0' 'build>=1.2.0'
       - name: Run Ruff
-        run: ruff check src tests
-      - name: Build distributions
-        run: python -m build
-      - name: Validate wheel installation
-        run: |
-          python -m venv /tmp/dedupe-wheel
-          /tmp/dedupe-wheel/bin/python -m pip install dist/*.whl
-          /tmp/dedupe-wheel/bin/python -m pip check
-          /tmp/dedupe-wheel/bin/dedupe --help >/dev/null
+        run: python scripts/verify.py lint
+      - name: Build and validate distributions
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        run: python scripts/verify.py package

@@ -418,8 +418,19 @@ python -m playwright install chromium
 pytest -m e2e
 ```
 
-Normal `pytest` runs exclude the browser test. CI covers Python 3.11–3.14, Ruff,
-wheel installation, and a dedicated Chromium workflow.
+Normal `pytest` runs exclude browser tests. PRs and pushes to `main` run Ruff and
+Python 3.11 non-browser tests. The Python 3.12–3.14 matrix, Chromium, macOS, and
+package validation run on tags or when **CI → Run workflow** is requested.
+
+After installing the full-check prerequisites, run every check for your current
+Python version and operating system with one command:
+
+```bash
+.venv/bin/python scripts/verify.py
+```
+
+See [verification setup and CI policy](docs/verification.md) for prerequisites,
+platform coverage, individual suites, and release behavior.
 
 ## License
 
