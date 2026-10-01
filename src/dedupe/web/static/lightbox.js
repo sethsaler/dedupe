@@ -51,7 +51,10 @@ function closeLightbox() {
       `.card[data-path="${CSS.escape(previousFocusPath)}"] .thumb-wrap`,
     )
     : null;
-  const restoreFocus = refreshedMember || (previousFocus?.isConnected ? previousFocus : null);
+  // A Similar board row repaints on every toggle made in the lightbox, so its
+  // focused tile may be a fresh node by now.
+  const restoreFocus = refreshedMember || (previousFocus?.isConnected ? previousFocus : null)
+    || document.querySelector("#similarBoard:not([hidden]) .board-tile.focused .board-thumb");
   restoreFocus?.focus();
   previousFocus = null;
   previousFocusPath = null;

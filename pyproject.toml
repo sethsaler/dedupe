@@ -45,6 +45,7 @@ pythonpath = ["src"]
 addopts = "-m 'not e2e'"
 markers = [
     "e2e: browser-level end-to-end tests (requires Playwright Chromium)",
+    "similar_board: browser test that keeps the default Similar board view",
 ]
 
 [tool.ruff]

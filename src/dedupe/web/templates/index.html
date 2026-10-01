@@ -338,6 +338,7 @@
               <p class="muted" id="detailMeta"></p>
             </div>
             <button class="btn ghost" id="btnMediaDetails" type="button" aria-pressed="false">File details</button>
+            <button class="btn ghost" id="btnSimilarBoard" type="button" hidden title="Back to every Similar group on one screen">▦ Board</button>
             <button class="btn ghost" id="btnSimilarView" type="button" hidden aria-pressed="true">☰ List view</button>
             <button class="btn ghost" id="btnToggleDeleted" type="button" hidden>0 in Trash</button>
             <button class="btn primary-soft" id="btnMarkRemainingHuman" type="button" hidden>
@@ -436,9 +437,59 @@
           </nav>
         </div>
       </main>
+      <section class="similar-board" id="similarBoard" hidden aria-labelledby="boardTitle">
+        <div class="board-toolbar">
+          <div class="board-heading">
+            <h2 id="boardTitle">Similar board</h2>
+            <p class="muted" id="boardSummary" aria-live="polite"></p>
+          </div>
+          <label class="search-field board-search" for="boardSearch">
+            <span class="sr-only">Search files</span>
+            <input id="boardSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
+          </label>
+          <label class="control-field board-filter" for="boardFilter">
+            <span>Show</span>
+            <select id="boardFilter">
+              <option value="all">All groups</option>
+              <option value="uncertain">Needs a look (&lt; 95% match)</option>
+            </select>
+          </label>
+          <label class="preview-size" for="boardTileSize">Thumbnails
+            <input id="boardTileSize" type="range" min="120" max="280" step="20" value="180" />
+          </label>
+          <div class="view-switch" role="group" aria-label="Similar review layout">
+            <button class="btn ghost" type="button" data-similar-view="board" aria-pressed="true">Board</button>
+            <button class="btn ghost" type="button" data-similar-view="swipe" aria-pressed="false">Swipe</button>
+            <button class="btn ghost" type="button" data-similar-view="grid" aria-pressed="false">List</button>
+          </div>
+        </div>
+        <p class="board-filtered muted small" id="boardFiltered" hidden>
+          <span id="boardFilteredText"></span>
+          <button class="linkish" id="boardClearFilters" type="button">Clear filters</button>
+        </p>
+        <details class="candidate-review-banner board-guide">
+          <summary>How the board works</summary>
+          <div>
+            <strong>Every Similar group, one row each</strong>
+            <span>Each copy starts marked for removal and the suggested keeper stays. Click a photo to switch it between Keep and Remove; nothing moves until you press the Trash button at the bottom, and that one batch can be undone. “Not duplicates” keeps every file in a group and stops it from matching again.</span>
+          </div>
+          <div class="candidate-key-guide" aria-label="Board shortcuts">
+            <span><kbd>j</kbd>/<kbd>k</kbd> rows</span>
+            <span><kbd>←</kbd>/<kbd>→</kbd> files</span>
+            <span><kbd>Space</kbd> keep/remove</span>
+            <span><kbd>⇧K</kbd> keep only this</span>
+            <span><kbd>u</kbd> suggested</span>
+            <span><kbd>n</kbd> not duplicates</span>
+            <span><kbd>Enter</kbd> compare</span>
+            <span><kbd>A</kbd> Trash marked</span>
+          </div>
+        </details>
+        <div class="board-rows" id="boardRows" aria-label="Similar groups"></div>
+      </section>
     </section>
 
     <footer class="actionbar" id="actionBar" hidden aria-label="Delete selected matches">
+      <span class="board-keys-hint muted small" id="boardKeysHint" hidden><kbd>j</kbd>/<kbd>k</kbd> rows · <kbd>←</kbd>/<kbd>→</kbd> files · <kbd>Space</kbd> keep/remove · <kbd>⇧K</kbd> keep only this · <kbd>n</kbd> not duplicates · <kbd>Enter</kbd> compare</span>
       <button class="btn ghost" id="btnTrashSimilar" type="button">
         Delete All Selected Similar Matches
       </button>
@@ -541,6 +592,7 @@
         <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, or Files file to Trash (one click, undo from the toast) · ⌫ undoes the last Similar swipe · in the lightbox, toggles removal for similar files</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>Reveal the focused card's file in Finder · in the lightbox: reveal the current file</dd></div>
         <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
+        <div><dt>Similar board</dt><dd><kbd>j</kbd>/<kbd>k</kbd> rows · <kbd>←</kbd>/<kbd>→</kbd> files · <kbd>Space</kbd> keep/remove · <kbd>⇧K</kbd> keep only this file · <kbd>u</kbd> suggested selection · <kbd>n</kbd> not duplicates · <kbd>Enter</kbd> lightbox · <kbd>c</kbd> swipe compare · <kbd>A</kbd> Trash every marked copy</dd></div>
         <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>

@@ -54,25 +54,27 @@ function showPreview(wrap) {
   loader.src = fullSrc;
 }
 
-const members = $("members");
+// Member cards and the Similar board's tiles share the same thumbnail markup.
+for (const root of [$("members"), $("similarBoard")]) {
+  root.addEventListener("pointerover", (event) => {
+    const wrap = event.target.closest?.(".thumb-wrap");
+    if (!wrap || wrap === pendingWrap || !previewableImage(wrap)) return;
+    clearTimeout(timer);
+    pendingWrap = wrap;
+    timer = setTimeout(() => showPreview(wrap), LINGER_MS);
+  });
 
-members.addEventListener("pointerover", (event) => {
-  const wrap = event.target.closest?.(".thumb-wrap");
-  if (!wrap || wrap === pendingWrap || !previewableImage(wrap)) return;
-  clearTimeout(timer);
-  pendingWrap = wrap;
-  timer = setTimeout(() => showPreview(wrap), LINGER_MS);
-});
+  root.addEventListener("pointerout", (event) => {
+    const wrap = event.target.closest?.(".thumb-wrap");
+    // Moving between children of the same thumbnail keeps the linger going.
+    if (!wrap || wrap.contains(event.relatedTarget)) return;
+    if (wrap === pendingWrap) hidePreview();
+  });
 
-members.addEventListener("pointerout", (event) => {
-  const wrap = event.target.closest?.(".thumb-wrap");
-  // Moving between children of the same thumbnail keeps the linger going.
-  if (!wrap || wrap.contains(event.relatedTarget)) return;
-  if (wrap === pendingWrap) hidePreview();
-});
-
-// A click opens the lightbox; the quick-look must not linger above it.
-members.addEventListener("pointerdown", hidePreview);
+  // A click opens the lightbox (or toggles a board tile); the quick-look must
+  // not linger above it.
+  root.addEventListener("pointerdown", hidePreview);
+}
 
 // Scrolling moves thumbnails under a stationary cursor; the preview would end
 // up hovering over the wrong image. Only cancel when the cursor is no longer

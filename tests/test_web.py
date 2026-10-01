@@ -2070,6 +2070,100 @@ def test_unmark_distinct_restores_the_member(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_restore_group_undoes_a_whole_group_distinct_review(tmp_path: Path) -> None:
+    """The board's "Not duplicates" → Undo: the group returns to its place
+    with its selection, and only the pairs that review created are dropped."""
+    result = _similar_result(
+        tmp_path, names=("sim-a.jpg", "sim-b.jpg", "sim-c.jpg", "sim-d.jpg")
+    )
+    group = result.groups[0]
+    keeper = group.suggested_keep
+    others = [member.path for member in group.members if member.path != keeper]
+    app = create_app(result)
+    cache_path = tmp_path / "hashes.sqlite3"
+    app.config["DEDUPE_CACHE_PATH"] = str(cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    selection_before = list(group.selected_for_removal)
+
+    # An earlier pair-level decision (swipe "Different") must survive the undo.
+    client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "path": others[0], "scan_id": scan_id},
+        headers=headers,
+    )
+    whole = client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert whole.get_json()["dissolved"] is True
+
+    restored = client.post(
+        "/api/similar/restore-group",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert restored.status_code == 200
+    payload = restored.get_json()
+    assert {m["path"] for m in payload["group"]["members"]} == {keeper, *others[1:]}
+    assert set(payload["group"]["selected_for_removal"]) == set(selection_before) - {others[0]}
+    groups = client.get("/api/groups?kind=similar").get_json()["groups"]
+    assert [g["id"] for g in groups] == [group.id]
+    cache = HashCache(cache_path)
+    assert cache.distinct_pairs(result.files) == {tuple(sorted((keeper, others[0])))}
+    cache.close()
+
+    # The undo is one-shot.
+    again = client.post(
+        "/api/similar/restore-group",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert again.status_code == 404
+
+
+def test_restore_group_refuses_when_files_left_the_scan(tmp_path: Path) -> None:
+    result = _similar_result(tmp_path, names=("sim-a.jpg", "sim-b.jpg"))
+    group = result.groups[0]
+    app = create_app(result)
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hashes.sqlite3")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    client.post(
+        "/api/similar/mark-distinct",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+    state = app.extensions["dedupe_state"]
+    state["result"].files = state["result"].files[:1]
+
+    refused = client.post(
+        "/api/similar/restore-group",
+        json={"group_id": group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+
+    assert refused.status_code == 409
+    assert client.get("/api/groups?kind=similar").get_json()["groups"] == []
+
+
+def test_restore_group_without_a_dissolved_review_is_not_found(tmp_path: Path) -> None:
+    app = create_app(_similar_result(tmp_path))
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    missing = client.post(
+        "/api/similar/restore-group",
+        json={"group_id": "nope", "scan_id": scan_id},
+        headers=headers,
+    )
+    assert missing.status_code == 404
+
+
 def test_mark_distinct_pair_rejects_a_non_member(tmp_path: Path) -> None:
     result = _similar_result(tmp_path)
     group = result.groups[0]

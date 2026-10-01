@@ -1,6 +1,7 @@
 // Selection rules, bulk selection, and the Trash action flow.
 
 import { api } from "./api.js";
+import { boardActive } from "./board.js";
 import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { renderMembers, selectGroup } from "./members.js";
@@ -61,7 +62,23 @@ function effectiveSelection(scope) {
   return [...selected.values()];
 }
 
+const SIMILAR_BUTTON_LABEL = "Delete All Selected Similar Matches";
+
 function updateSelectionSummary() {
+  // On the Similar board the footer is the board's one commit: it names what
+  // will move, and the unrelated Low-res + Random button steps aside.
+  const board = boardActive();
+  const similar = effectiveSelection("similar");
+  const similarBytes = similar.reduce((sum, member) => sum + (member.size || 0), 0);
+  $("btnTrashSimilar").textContent = !board
+    ? SIMILAR_BUTTON_LABEL
+    : similar.length
+      ? `Move ${similar.length} ${similar.length === 1 ? "copy" : "copies"} to Trash · ${formatBytes(similarBytes)}`
+      : "No copies marked for Trash";
+  $("btnTrashSimilar").classList.toggle("danger", board);
+  $("btnTrashSimilar").classList.toggle("ghost", !board);
+  $("btnTrashReview").hidden = board;
+  $("boardKeysHint").hidden = !board;
   for (const [id, scope] of [
     ["btnTrashSimilar", "similar"],
     ["btnTrashReview", "review_suggestions"],
@@ -521,4 +538,4 @@ async function runDelete(scope, options = {}) {
 $("btnTrashSimilar").addEventListener("click", () => runDelete("similar"));
 $("btnTrashReview").addEventListener("click", () => runDelete("review_suggestions"));
 
-export { updateSelectionSummary, applyRuleToCurrentGroup, runDelete, undoAction };
+export { effectiveSelection, updateSelectionSummary, applyRuleToCurrentGroup, runDelete, undoAction };

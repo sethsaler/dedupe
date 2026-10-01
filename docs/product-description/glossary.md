@@ -62,6 +62,8 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Task.** One user activity in the web UI that has a beginning, a possibly long middle, and an end — configuring and running a scan, reviewing a category, confirming an action. The unit of interaction for `ui/` documents. Its phases are *start*, *end without changing anything*, *become extended*, *while extended*, and *complete*.
 
+**Similar board.** The default view of the Similar tab: every similar group as one row, the suggested keeper first and each copy marked Keep or Remove. Changes on the board are selection changes only; one footer button moves every marked copy to the Trash as a single action. *Not duplicates* on a row marks the whole group distinct, like *Mark as distinct*, with an in-place Undo for the rest of the scan session. See [The Similar board](ui/similar-board.md).
+
 **Action.** A confirmed, executed operation on the selection: *Trash*, *Quarantine*, or *Isolate*. Actions are previewed in the action sheet before they run, and trash and quarantine actions write a receipt.
 
 **Trash.** Moving selected files to the macOS Trash via the system mechanism, where the user can still recover them until the Trash is emptied.

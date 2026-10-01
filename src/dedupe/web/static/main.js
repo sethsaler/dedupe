@@ -1,6 +1,7 @@
 // Entry point: wire modules, open the event stream, shut down on tab close.
 
 import "./actions.js";
+import "./board.js";
 import "./groups.js";
 import "./help.js";
 import "./hoverpreview.js";

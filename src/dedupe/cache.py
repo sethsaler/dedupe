@@ -463,6 +463,23 @@ class HashCache:
         self._conn.commit()
         return removed
 
+    def recorded_pairs_among(self, paths: set[str] | list[str]) -> set[tuple[str, str]]:
+        """Path-keyed distinct rows whose two files are both in ``paths``.
+
+        Used to tell the pairs a whole-group review is about to create apart
+        from pairs decided earlier, so undoing that review drops only its own.
+        """
+        wanted = sorted(set(paths))
+        if len(wanted) < 2:
+            return set()
+        marks = ",".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            "SELECT path_a, path_b FROM distinct_similar_pairs "
+            f"WHERE path_a IN ({marks}) AND path_b IN ({marks})",
+            (*wanted, *wanted),
+        )
+        return {(row["path_a"], row["path_b"]) for row in rows}
+
     def list_distinct_pairs(
         self,
         *,

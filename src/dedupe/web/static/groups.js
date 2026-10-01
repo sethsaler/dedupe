@@ -1,6 +1,7 @@
 // The group review list: fetch, filter, sort, windowed rendering.
 
 import { api } from "./api.js";
+import { renderBoard } from "./board.js";
 import { groupComplete, groupNeedsAttention, groupSelectedCount, isIndependentReview } from "./model.js";
 import { scheduleRender } from "./render.js";
 import { selectGroup } from "./members.js";
@@ -271,8 +272,11 @@ function groupItemHtml(g) {
     : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
   // Status is never colour-only: the glyph and its label carry the same meaning.
   const attention = groupNeedsAttention(g);
-  const stateLabel = attention ? "Needs review" : "Reviewed";
-  const stateGlyph = attention ? "●" : "✔";
+  // Duplicate groups arrive with the suggested selection already complete;
+  // until the user changes it, say so rather than claim it was reviewed.
+  const suggestedOnly = !attention && !isIndependentReview(g) && !state.touchedGroups.has(g.id);
+  const stateLabel = attention ? "Needs review" : suggestedOnly ? "Suggested selection" : "Reviewed";
+  const stateGlyph = attention ? "●" : suggestedOnly ? "◐" : "✔";
   return `
         <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" aria-current="${active ? "true" : "false"}">
           <div class="g-top">
@@ -393,6 +397,8 @@ function shrinkGroupListWindow() {
 
 function renderGroupList() {
   applyResultControls();
+  // On the Similar tab the board stands in for this list (board.js).
+  renderBoard();
   const list = wireGroupList();
   if (!state.groups.length) {
     state.groupListStart = 0;

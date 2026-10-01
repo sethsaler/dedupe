@@ -6,6 +6,7 @@
 // decision cycles the next pair in until every copy has been addressed.
 
 import { api } from "./api.js";
+import { boardActive } from "./board.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { openLightbox, updateLightbox } from "./lightbox.js";
 import { selectGroup } from "./members.js";
@@ -21,9 +22,11 @@ const FLICK_VELOCITY = 500; // px/s fast enough to commit without full travel
 const reducedMotion = () =>
   typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// The deck is the single-group Similar view unless the list is chosen; on the
+// Similar tab a "board" preference shows the board instead of any one group.
 function swipeActive() {
   const g = currentGroup();
-  return Boolean(g && g.kind === "similar" && state.similarView === "swipe");
+  return Boolean(g && g.kind === "similar" && state.similarView !== "grid" && !boardActive());
 }
 
 // The reference copy the deck is compared against — the suggested keeper until

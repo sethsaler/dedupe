@@ -112,6 +112,7 @@ ui/
   scan-setup.md                  choosing folders, exclusions, starting a scan, watching progress
   group-list.md                  the review list: cards, keyboard navigation, advanced filters, bulk selection
   lightbox.md                    the full-screen overlay for comparing similar media
+  similar-board.md               every Similar group on one screen; batch Trash and Not duplicates
   action-sheet.md                the preview-and-confirm sheet, its countdown, and re-verification
   low-res-review.md              the item-at-a-time low-resolution review
   random-review.md               the Random 50 sample review
@@ -149,6 +150,7 @@ Status is one of `not started`, `drafted`, or `verified`.
 | ui/scan-setup.md | drafted |
 | ui/group-list.md | drafted |
 | ui/lightbox.md | verified |
+| ui/similar-board.md | drafted |
 | ui/action-sheet.md | drafted |
 | ui/low-res-review.md | verified |
 | ui/random-review.md | verified |

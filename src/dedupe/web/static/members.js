@@ -4,6 +4,7 @@ import { api } from "./api.js";
 import { applyResultControls, ensureGroupVisible, loadGroups, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
+import { boardActive, refreshBoardRow } from "./board.js";
 import { renderSwipeReview, swipeActive } from "./swipe.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
@@ -312,7 +313,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     ? `${kindLabel} · ${g.member_count} files`
     : `${kindLabel} · ${g.media_type} · ${g.member_count} files`;
   const deletedPaths = new Set(g.deleted_paths || []);
-  const swipeMode = g.kind === "similar" && state.similarView === "swipe";
+  const swipeMode = g.kind === "similar" && state.similarView !== "grid";
   $("btnMarkRemainingHuman").hidden =
     g.kind !== "no_humans" || !(g.members || []).some((member) => !deletedPaths.has(member.path));
   // In swipe mode the deck decides one pair at a time; the whole-group
@@ -374,6 +375,8 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
 
 function renderMembers(g, { append = false } = {}) {
   memberObserver.disconnect();
+  // The Similar board owns the screen; the hidden detail pane stays as is.
+  if (boardActive()) return;
   renderedGroupSnapshot = JSON.stringify(g);
   const box = $("members");
   if (!append) {
@@ -394,7 +397,7 @@ function renderMembers(g, { append = false } = {}) {
   box.classList.toggle("focus-review", singleReview);
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
-  if (g.kind === "similar" && state.similarView === "swipe") {
+  if (g.kind === "similar" && state.similarView !== "grid") {
     renderSwipeReview(g);
     requestAnimationFrame(fitReviewStage);
     return;
@@ -1021,6 +1024,7 @@ async function setMemberSelected(group, path, wantSelected) {
     syncCardSelection(card, updated, card.dataset.path);
   });
   updateGroupSelectionText(updated);
+  refreshBoardRow(updated);
   if (selectionFiltersActive() || !updateGroupListItem(updated)) {
     scheduleRender({ groupList: true });
   } else {
@@ -1056,13 +1060,14 @@ const memberObserver = new IntersectionObserver((entries) => {
   renderMembers(current, { append: true });
 }, { rootMargin: "0px 0px 240px 0px" });
 
-// Similar groups default to the swipe deck; the header toggle flips to the
-// classic card list (which keeps checkboxes, bulk selection, and the
-// whole-group "Mark as distinct" button).
+// The Similar tab defaults to the board (board.js); a single Similar group
+// opens in the swipe deck, and the header toggle flips it to the classic card
+// list (which keeps checkboxes, bulk selection, and the whole-group "Mark as
+// distinct" button). "Board" in the header returns to the board.
 const SIMILAR_VIEW_KEY = "dedupe.similarView";
 try {
   const savedView = localStorage.getItem(SIMILAR_VIEW_KEY);
-  if (savedView === "grid" || savedView === "swipe") state.similarView = savedView;
+  if (["board", "grid", "swipe"].includes(savedView)) state.similarView = savedView;
 } catch {
   /* private mode */
 }
@@ -1072,14 +1077,15 @@ function updateSimilarViewToggle(g) {
   if (!btn) return;
   const show = g?.kind === "similar";
   btn.hidden = !show;
+  $("btnSimilarBoard").hidden = !show;
   if (!show) return;
-  const swipe = state.similarView === "swipe";
+  const swipe = state.similarView !== "grid";
   btn.setAttribute("aria-pressed", swipe ? "true" : "false");
   btn.textContent = swipe ? "☰ List view" : "⇄ Swipe review";
 }
 
 $("btnSimilarView")?.addEventListener("click", () => {
-  state.similarView = state.similarView === "swipe" ? "grid" : "swipe";
+  state.similarView = state.similarView === "grid" ? "swipe" : "grid";
   try {
     localStorage.setItem(SIMILAR_VIEW_KEY, state.similarView);
   } catch {

@@ -1,5 +1,6 @@
 // Global keyboard map.
 
+import { boardActive, handleBoardKey } from "./board.js";
 import { openHelp, closeHelp } from "./help.js";
 import { closeLightbox, openLightbox } from "./lightbox.js";
 import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
@@ -105,6 +106,20 @@ document.addEventListener("keydown", async (e) => {
   if (typing || tag === "VIDEO" || $("results").hidden) return;
 
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (boardActive()) {
+    // Space/Enter on the board's other buttons activate them natively; on a
+    // tile they mean toggle / compare and are handled by the board.
+    const onButton = e.target?.tagName === "BUTTON" && !e.target.classList.contains("board-thumb");
+    if ((e.key === " " || e.key === "Enter") && onButton) return;
+    if (e.key === "A") {
+      $("btnTrashSimilar").click();
+      e.preventDefault();
+    } else if (handleBoardKey(e)) {
+      e.preventDefault();
+    }
+    return;
+  }
 
   // Enter/Space on a focused button activate it natively; don't also run the
   // global meaning. Member thumbnails are the exception: Space/Enter there

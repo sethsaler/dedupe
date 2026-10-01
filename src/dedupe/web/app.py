@@ -64,8 +64,12 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 25
+WEB_API_VERSION = 26
 PREVIEW_TOKEN_TTL_SECONDS = 600
+
+#: Whole-group "not duplicates" reviews this server can still undo. The undo
+#: history is in memory and scoped to one scan session.
+DISSOLVED_SIMILAR_UNDO_LIMIT = 200
 
 #: Flows whose members support direct per-file Trash + undo. The independent
 #: review piles work one candidate at a time; similar groups use it for the
@@ -489,6 +493,9 @@ def create_app(
         # Per-candidate Trash undo entries dropped by the latest scan start;
         # surfaced once so the user knows in-app undo has ended for them.
         "trash_undo_cleared": 0,
+        # Similar groups dissolved by a whole-group distinct review, keyed by
+        # group id, so /api/similar/restore-group can undo the review.
+        "dissolved_similar": {},
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -1927,11 +1934,18 @@ def create_app(
             if member is not None and anchor.path == member.path:
                 return jsonify({"error": "a file cannot be distinct from itself"}), 400
             records = [anchor, member] if member is not None else list(group.members)
+            # Whole-group reviews can be undone (the Similar board's "Not
+            # duplicates" → Undo); remember the group and where it sat.
+            group_index = result.groups.index(group)
+            review_paths = {m.path for m in group.members} | set(group.distinct_participants)
             state["acting"] = True
 
         cache = None
         try:
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            pairs_before = (
+                cache.recorded_pairs_among(review_paths) if member is None else set()
+            )
             pair_count = cache.mark_distinct(records)
             backfill: list = []
             with lock:
@@ -1981,6 +1995,19 @@ def create_app(
                         ]
             if len(backfill) > 2:
                 pair_count = cache.mark_distinct(backfill)
+            if member is None and dissolved:
+                new_pairs = cache.recorded_pairs_among(review_paths) - pairs_before
+                with lock:
+                    dissolved_groups = state["dissolved_similar"]
+                    dissolved_groups[group_id] = {
+                        "group": group,
+                        "index": group_index,
+                        "new_pairs": sorted(new_pairs),
+                        "scan_id": state["scan_id"],
+                    }
+                    # In-memory undo history only; keep it bounded.
+                    while len(dissolved_groups) > DISSOLVED_SIMILAR_UNDO_LIMIT:
+                        dissolved_groups.pop(next(iter(dissolved_groups)))
             persist_result()
             return jsonify({
                 "ok": True,
@@ -2072,6 +2099,81 @@ def create_app(
                 "removed_pairs": removed,
                 "group": payload,
             })
+        except (OSError, sqlite3.Error) as exc:
+            return jsonify({"error": f"could not undo distinct review: {exc}"}), 400
+        finally:
+            if cache is not None:
+                cache.close()
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/similar/restore-group")
+    def api_restore_similar_group():
+        """Undo a whole-group distinct review: the group returns to review.
+
+        Drops only the distinct pairs that review created (pairs decided
+        earlier stay recorded) and re-inserts the group where it sat. Members
+        that left the scan since (moved to Trash, quarantined) stay out; the
+        undo is refused when fewer than two remain.
+        """
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "reviews are locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            entry = state["dissolved_similar"].get(group_id)
+            if result is None or entry is None or entry["scan_id"] != state["scan_id"]:
+                return jsonify({"error": "this review can no longer be undone"}), 404
+            if any(candidate.id == group_id for candidate in result.groups):
+                state["dissolved_similar"].pop(group_id, None)
+                return jsonify({"error": "this group is already under review"}), 409
+            group = entry["group"]
+            current = {file.path: file for file in result.files}
+            deleted = state["deleted_files"]
+            members = [
+                current[member.path]
+                for member in group.members
+                if member.path in current and member.path not in deleted
+            ]
+            if len(members) < 2:
+                state["dissolved_similar"].pop(group_id, None)
+                return jsonify(
+                    {"error": "too few of this group's files are still in the scan to restore it"}
+                ), 409
+            state["acting"] = True
+
+        cache = None
+        try:
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            removed = 0
+            for path_a, path_b in entry["new_pairs"]:
+                removed += cache.unmark_distinct_pair(path_a, path_b, result.files)
+            with lock:
+                member_paths = {member.path for member in members}
+                group.members = members
+                group.selected_for_removal = [
+                    path for path in group.selected_for_removal if path in member_paths
+                ]
+                if group.suggested_keep not in member_paths:
+                    group.suggested_keep = members[0].path
+                if len(group.selected_for_removal) >= len(members):
+                    # Keep-one groups always retain their keeper.
+                    group.selected_for_removal = [
+                        path for path in group.selected_for_removal
+                        if path != group.suggested_keep
+                    ]
+                result.groups.insert(min(entry["index"], len(result.groups)), group)
+                state["dissolved_similar"].pop(group_id, None)
+                result.recompute_stats()
+                refresh_selected_count_locked()
+                state["groups_version"] = state.get("groups_version", 0) + 1
+                state["paths_version"] += 1
+                payload = group_payload(group)
+            persist_result()
+            return jsonify({"ok": True, "removed_pairs": removed, "group": payload})
         except (OSError, sqlite3.Error) as exc:
             return jsonify({"error": f"could not undo distinct review: {exc}"}), 400
         finally:

@@ -135,6 +135,9 @@ async function activateTab(tab) {
   state.kind = tab.dataset.kind;
   updateSelectionSummary();
   resetGroupListWindow();
+  // Switch layouts now (the Similar board or the sidebar) rather than after
+  // the refetch below.
+  renderGroupList();
   try {
     await loadGroups();
   } catch (e) {

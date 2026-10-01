@@ -21,6 +21,20 @@ from dedupe.models import FileRecord, GroupKind, MediaType, ReviewGroup, ScanRes
 from dedupe.web.app import create_app
 
 
+@pytest.fixture(autouse=True)
+def _pin_single_group_similar_view(request) -> None:
+    """The Similar tab opens on the board by default. Workflows written for
+    the sidebar + single-group detail pin the swipe deck (a test may still
+    switch to the list, which persists as usual); board tests opt out with
+    ``@pytest.mark.similar_board``."""
+    if "page" not in request.fixturenames or request.node.get_closest_marker("similar_board"):
+        return
+    request.getfixturevalue("page").add_init_script(
+        "try { if (!localStorage.getItem('dedupe.similarView'))"
+        " localStorage.setItem('dedupe.similarView', 'swipe'); } catch (e) {}"
+    )
+
+
 @pytest.fixture
 def live_dedupe_server(tmp_path: Path):
     """Serve an isolated review session and always stop its server thread."""
@@ -614,6 +628,154 @@ def test_similar_swipe_deck_decides_pairs_with_undo(page, tmp_path: Path) -> Non
         page.locator("#toast").filter(has_text="restored").wait_for(state="visible")
         assert (media / "second.png").exists()
         expect(page.locator("#members .swipe-top")).to_be_visible()
+
+
+def _similar_board_app(tmp_path: Path, group_count: int = 2):
+    """Similar groups of three PNGs each (keeper + two copies)."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records_by_group = []
+    files = []
+    for group_index in range(group_count):
+        records = []
+        for name, phash in (("keeper", "0000000000000000"), ("copy-a", "0000000000000001"),
+                            ("copy-b", "0000000000000002")):
+            path = media / f"g{group_index}-{name}.png"
+            Image.new("RGB", (48, 32), (25 + 40 * group_index, 100, 180)).save(path)
+            stat = path.stat()
+            records.append(FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                width=48,
+                height=32,
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                phash=phash,
+                dhash="0000000000000000",
+                tile_phashes="t2:" + ",".join(["0000000000000000"] * 5),
+            ))
+        records_by_group.append(records)
+        files.extend(records)
+    groups = build_groups([], records_by_group)
+    for group, records in zip(groups, records_by_group, strict=True):
+        group.suggested_keep = records[0].path
+        group.selected_for_removal = [record.path for record in records[1:]]
+    app = create_app(
+        ScanResult(roots=[str(media)], files=files, groups=groups),
+        review_session_path=tmp_path / "review.json",
+    )
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    return app, media
+
+
+@pytest.mark.e2e
+@pytest.mark.similar_board
+def test_similar_board_reviews_every_group_and_trashes_in_one_batch(page, tmp_path: Path) -> None:
+    """The board shows every Similar group at once; clicks and keys change
+    selections only, and one confirmed batch moves every marked copy."""
+    app, media = _similar_board_app(tmp_path)
+    page.set_viewport_size({"width": 1400, "height": 900})
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="similar"]').click()
+
+        # The board replaces the sidebar and the single-group pane.
+        expect(page.locator("#similarBoard")).to_be_visible()
+        expect(page.locator(".sidebar")).to_be_hidden()
+        expect(page.locator(".board-row")).to_have_count(2)
+        expect(page.locator(".board-row").first.locator(".board-tile")).to_have_count(3)
+        expect(page.locator("#btnTrashSimilar")).to_have_text(re.compile(r"^Move 4 copies to Trash"))
+        expect(page.locator("#btnTrashReview")).to_be_hidden()
+
+        # Clicking a copy keeps it; nothing moves on disk.
+        first_row = page.locator(".board-row").first
+        first_row.locator(".board-tile").nth(1).locator(".board-thumb").click()
+        expect(first_row.locator(".board-tile").nth(1)).to_have_class(re.compile(r"\bkeep\b"))
+        expect(page.locator("#btnTrashSimilar")).to_have_text(re.compile(r"^Move 3 copies to Trash"))
+        assert (media / "g0-copy-a.png").exists()
+
+        # Shift+K keeps only the focused copy: the old keeper is now marked.
+        page.keyboard.press("Shift+K")
+        expect(first_row.locator(".board-tile").nth(0)).to_have_class(re.compile(r"\bremove\b"))
+        expect(first_row.locator(".board-tile").nth(1)).to_have_class(re.compile(r"\bkeep\b"))
+        expect(first_row.locator(".board-tile").nth(2)).to_have_class(re.compile(r"\bremove\b"))
+
+        # The last kept file of a group cannot be marked.
+        page.keyboard.press("Space")
+        page.locator("#toast").filter(has_text="keeps at least one file").wait_for(state="visible")
+        expect(first_row.locator(".board-tile").nth(1)).to_have_class(re.compile(r"\bkeep\b"))
+
+        # j moves to the next row; n marks it not duplicates and leaves an
+        # Undo in place.
+        page.keyboard.press("j")
+        expect(page.locator(".board-row").nth(1)).to_have_class(re.compile(r"\bfocused\b"))
+        page.keyboard.press("n")
+        expect(page.locator(".board-row.dismissed")).to_have_count(1)
+        expect(page.locator("#countSimilar")).to_have_text("1")
+        expect(page.locator("#btnTrashSimilar")).to_have_text(re.compile(r"^Move 2 copies to Trash"))
+        page.locator(".board-undo-distinct").click()
+        expect(page.locator(".board-row.dismissed")).to_have_count(0)
+        expect(page.locator(".board-row")).to_have_count(2)
+        expect(page.locator("#btnTrashSimilar")).to_have_text(re.compile(r"^Move 4 copies to Trash"))
+
+        # One confirmed batch moves every marked copy, and one Undo restores it.
+        page.keyboard.press("A")
+        expect(page.locator("#modalTitle")).to_have_text("Delete all selected similar matches?")
+        page.locator("#modalConfirm").click()
+        page.locator("#toast").filter(has_text="Done: 4 ok").wait_for(state="visible")
+        assert sorted(path.name for path in media.iterdir()) == ["g0-copy-a.png", "g1-keeper.png"]
+        expect(page.locator(".board-empty")).to_be_visible()
+        page.locator("#toastAction").click()
+        expect(page.locator("#modalTitle")).to_have_text("Restore 4 files?")
+        page.locator("#modalConfirm").click()
+        page.locator("#toast").filter(has_text="Restored 4 files").wait_for(state="visible")
+        assert len(list(media.iterdir())) == 6
+
+
+@pytest.mark.e2e
+@pytest.mark.similar_board
+def test_similar_board_hands_off_to_compare_and_back(page, tmp_path: Path) -> None:
+    app, _media = _similar_board_app(tmp_path)
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator(".board-row")).to_have_count(2)
+
+        # Enter opens the focused row in the lightbox; its remove toggle
+        # repaints the row underneath.
+        page.locator(".board-row").first.locator(".board-thumb").first.focus()
+        page.keyboard.press("ArrowRight")
+        page.keyboard.press("Enter")
+        expect(page.locator("#lightbox")).to_be_visible()
+        expect(page.locator("#lbCounter")).to_have_text("2 / 3")
+        page.locator("#lbSelect").click()
+        expect(page.locator("#lbSelect")).to_have_text("Mark for removal")
+        page.keyboard.press("Escape")
+        expect(
+            page.locator(".board-row").first.locator(".board-tile").nth(1)
+        ).to_have_class(re.compile(r"\bkeep\b"))
+
+        # Compare opens the swipe deck for the row; Board comes back to it.
+        page.locator(".board-row").nth(1).locator(".board-compare").click()
+        expect(page.locator("#similarBoard")).to_be_hidden()
+        expect(page.locator("#members .swipe-review")).to_be_visible()
+        page.locator("#btnSimilarBoard").click()
+        expect(page.locator("#similarBoard")).to_be_visible()
+        expect(page.locator(".board-row").nth(1)).to_have_class(re.compile(r"\bfocused\b"))
+
+        # The choice persists across reloads.
+        page.reload(wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator("#similarBoard")).to_be_visible()
 
 
 @contextmanager

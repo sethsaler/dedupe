@@ -93,7 +93,7 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
    With Exact detection enabled (the default), extra byte-identical copies move to Trash automatically when scanning finishes. The toast reports successful deletions and any failures, and offers **Undo**. Exact groups never enter manual review or bulk selection; **Exact duplicates · Recovery** offers restore controls only. Protected or unavailable files remain on disk for a later rescan. Loading or resuming saved results does not trigger auto-deletion. CLI scans are unchanged.
-3. Choose a category across the top. **Similar** compares two large, uncropped previews with **Same · Trash copy**, **Different · Keep both**, Skip, and Undo. Videos play and scrub in either pane; GIFs animate.
+3. Choose a category across the top. **Similar** opens on the **Similar board**: every similar group as one row, the suggested keeper first and each copy already marked Remove. Click a photo (or press `Space`) to keep it, press `n` on a row that isn't really a duplicate (undo from the row), then move every marked copy to Trash with one confirmed batch that a single Undo restores. **Compare ↗** opens any group in the side-by-side swipe review — **Same · Trash copy**, **Different · Keep both**, Skip, and Undo, with videos playing and scrubbing in either pane — and **▦ Board** comes back.
 4. In **Non-Human**, **Faces**, and **All files**, switch between a resizable **Gallery** and single-file **Focus**. `←` / `→` navigate Focus without making a decision; Trash is immediate and undoable. Layout and preview size are remembered. **File details** reveals full paths, dates, and detection evidence.
 5. Review **Low-res** and **Random** one item at a time with `←` Delete and `→` Keep, including in the expanded lightbox. These decisions only stage removals; confirm with the Low-res + Random action to move selected files to `_Dedupe Quarantine`.
 6. Open **Filter & organize** for advanced filters (size, dimensions, path, faces) and bulk selection. A group matches when any of its files match. Bulk selection applies only to the groups currently shown.
@@ -136,6 +136,8 @@ Keyboard:
 | `z` | Full-resolution zoom in the lightbox (drag pans) |
 | `Esc` | Close the lightbox, help, or overlay |
 | `?` | Shortcut help |
+
+On the Similar board, `j` / `k` move between rows, `←` / `→` between files, `Space` keeps or removes, `Shift+K` keeps only the focused file, `u` restores the suggestion, `n` marks the row not duplicates, `Enter` opens the lightbox, `c` opens the swipe compare, and `A` moves every marked copy to Trash.
 
 ### CLI
 
