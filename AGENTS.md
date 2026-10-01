@@ -8,7 +8,7 @@ Verification commands for this repository (run from the repo root, using the
 checked-in virtualenv at `.venv/`):
 
 ```bash
-.venv/bin/pytest                 # full suite
+.venv/bin/pytest                 # non-browser suite
 .venv/bin/ruff check src tests   # lint
 ```
 
@@ -26,3 +26,8 @@ Other `pyproject.toml` settings that matter:
 - `[tool.pytest.ini_options]` sets `pythonpath = ["src"]`, so tests import
   `dedupe` from the working tree without installing it.
 - `[tool.ruff]` sets `line-length = 100` and `target-version = "py311"`.
+
+The complete local verification command is `.venv/bin/python scripts/verify.py`.
+See `docs/verification.md` for ffmpeg, OpenCV, and Chromium prerequisites. It runs
+lint, non-browser tests, browser tests, wheel validation, and the unsigned app
+bundle on macOS. It does not sign, notarize, or publish a release.
