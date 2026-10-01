@@ -42,6 +42,10 @@ const state = {
   groupListLimit: GROUP_RENDER_CHUNK, // how many sidebar rows are in the DOM
   groupsLoadToken: 0,
   selectToken: 0,
+  // An explicit (non-silent) group selection's intent to move focus onto its
+  // sidebar row. It outlives a superseded fetch, so a silent refresh of the
+  // same group that lands later still delivers the focus.
+  pendingGroupFocus: null, // { id, from: Element|null }
   pollFailures: 0,
   reviewingCandidate: false,
   pendingReviewDecision: null,

@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { boardActive } from "./board.js";
 import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
-import { renderMembers, selectGroup } from "./members.js";
+import { renderMembers, restartMemberList, selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
 import { currentGroup, isIndependentReview, isPagedIndependentReview, markGroupTouched } from "./model.js";
 import { scheduleRender } from "./render.js";
@@ -62,7 +62,16 @@ function effectiveSelection(scope) {
   return [...selected.values()];
 }
 
-const SIMILAR_BUTTON_LABEL = "Delete All Selected Similar Matches";
+// The footer only offers the batch actions that belong to the open tab:
+// Similar and Low-res + Random on All, one of them on their own tabs, and
+// none on the one-click Non-Human, Faces, and Files reviews. The A / D
+// shortcuts keep working on every tab.
+const SIMILAR_ACTION_TABS = new Set(["all", "similar"]);
+const REVIEW_ACTION_TABS = new Set(["all", "low_resolution", "random_review"]);
+
+function plural(count, one, many) {
+  return count === 1 ? one : many;
+}
 
 function updateSelectionSummary() {
   // On the Similar board the footer is the board's one commit: it names what
@@ -70,22 +79,33 @@ function updateSelectionSummary() {
   const board = boardActive();
   const similar = effectiveSelection("similar");
   const similarBytes = similar.reduce((sum, member) => sum + (member.size || 0), 0);
-  $("btnTrashSimilar").textContent = !board
-    ? SIMILAR_BUTTON_LABEL
+  const review = effectiveSelection("review_suggestions");
+  const reviewBytes = review.reduce((sum, member) => sum + (member.size || 0), 0);
+  $("btnTrashSimilar").textContent = board
+    ? similar.length
+      ? `Move ${similar.length} ${plural(similar.length, "copy", "copies")} to Trash · ${formatBytes(similarBytes)}`
+      : "No copies marked for Trash"
     : similar.length
-      ? `Move ${similar.length} ${similar.length === 1 ? "copy" : "copies"} to Trash · ${formatBytes(similarBytes)}`
-      : "No copies marked for Trash";
+      ? `Delete ${similar.length} similar ${plural(similar.length, "match", "matches")} · ${formatBytes(similarBytes)}`
+      : "No similar matches selected";
+  $("btnTrashReview").textContent = review.length
+    ? `Delete ${review.length} low-res + random ${plural(review.length, "file", "files")} · ${formatBytes(reviewBytes)}`
+    : "No low-res or random files staged";
   $("btnTrashSimilar").classList.toggle("danger", board);
   $("btnTrashSimilar").classList.toggle("ghost", !board);
-  $("btnTrashReview").hidden = board;
+  $("btnTrashSimilar").hidden = !SIMILAR_ACTION_TABS.has(state.kind);
+  $("btnTrashReview").hidden = board || !REVIEW_ACTION_TABS.has(state.kind);
+  $("actionBar").classList.toggle(
+    "no-actions",
+    $("btnTrashSimilar").hidden && $("btnTrashReview").hidden,
+  );
   $("boardKeysHint").hidden = !board;
-  for (const [id, scope] of [
-    ["btnTrashSimilar", "similar"],
-    ["btnTrashReview", "review_suggestions"],
+  for (const [id, count, scope] of [
+    ["btnTrashSimilar", similar.length, "similar"],
+    ["btnTrashReview", review.length, "review_suggestions"],
   ]) {
-      const button = $(id);
-      const count = effectiveSelection(scope).length;
-      button.disabled = state.actionBusy || count === 0;
+    const button = $(id);
+    button.disabled = state.actionBusy || count === 0;
     button.title = count
       ? `${count} selected ${scopeLabelFor(scope).toLowerCase()}`
       : `No ${scopeLabelFor(scope).toLowerCase()} selected`;
@@ -241,9 +261,7 @@ $("btnToggleDeleted").addEventListener("click", () => {
   const current = currentGroup();
   if (!isPagedIndependentReview(current)) return;
   state.showDeleted = !state.showDeleted;
-  state.memberPage = 0;
-  state.memberFocus = 0;
-  state.trashedInPlace.clear();
+  restartMemberList();
   renderMembers(current);
 });
 

@@ -26,6 +26,15 @@
       <div class="top-stats" id="topStats">
         <span class="stat-chip muted-chip">No scan yet</span>
       </div>
+      <details class="exact-recovery popover" id="exactRecovery">
+        <summary title="Restore exact duplicates that moved to Trash automatically">Exact recovery</summary>
+        <div class="popover-body">
+          <p class="muted small">Exact duplicates move to Trash automatically after scanning, keeping one copy. There is nothing to select or delete here.</p>
+          <p class="muted small" id="exactRecoveryStatus" role="status"></p>
+          <div id="exactRecoveryList"></div>
+          <p class="muted small">Recovery history stays available across scans and restarts. Older removals without recovery history can be restored from system Trash. Emptying Trash removes those files permanently.</p>
+        </div>
+      </details>
     </header>
 
     <section class="scan-panel" id="scanPanel" tabindex="-1">
@@ -53,7 +62,7 @@
             </button>
           </div>
           <div class="recent-paths" id="recentPaths" hidden></div>
-          <p class="thresh-hint">When Exact detection is enabled, exact duplicates move to Trash automatically after scanning, keeping one copy per group. Use Exact duplicates · Recovery to restore them later.</p>
+          <p class="thresh-hint">When Exact detection is enabled, exact duplicates move to Trash automatically after scanning, keeping one copy per group. Use Exact recovery at the top right to restore them later.</p>
           <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
             Multiple folders scan as parallel streams: duplicates <em>across</em> folders are not found.
             Scan their common parent folder — or turn off Parallel streams in Options — to catch those.
@@ -188,14 +197,6 @@
       </details>
     </section>
 
-    <details class="exact-recovery" id="exactRecovery">
-      <summary>Exact duplicates · Recovery</summary>
-      <p class="muted small">Exact duplicates move to Trash automatically after scanning, keeping one copy. There is nothing to select or delete here.</p>
-      <p class="muted small" id="exactRecoveryStatus" role="status"></p>
-      <div id="exactRecoveryList"></div>
-      <p class="muted small">Recovery history stays available across scans and restarts. Older removals without recovery history can be restored from system Trash. Emptying Trash removes those files permanently.</p>
-    </details>
-
     <section class="empty-state" id="emptyState">
       <div class="empty-card">
         <div class="empty-icon" aria-hidden="true">
@@ -231,8 +232,8 @@
       <aside class="sidebar">
         <div class="result-controls" aria-label="Find and organize results">
           <div class="result-controls-heading">
-            <span>Results</span>
-            <button class="btn text-button" id="btnClearFilters" type="button">Clear filters</button>
+            <span class="muted small" id="filteredCount" aria-live="polite"></span>
+            <button class="btn text-button" id="btnClearFilters" type="button" hidden>Clear filters</button>
           </div>
           <label class="search-field" for="resultSearch">
             <span class="sr-only">Search files</span>
@@ -318,8 +319,7 @@
             <span class="thresh-hint">Duplicate groups always keep their suggested keeper; the server re-checks that.</span>
           </details>
           </details>
-          <button class="btn primary-soft" id="btnNextReview" type="button">Next unreviewed / needs attention</button>
-          <span class="muted small" id="filteredCount" aria-live="polite"></span>
+          <button class="btn primary-soft" id="btnNextReview" type="button" title="Next unreviewed group or group that needs attention (])">Next to review <kbd>]</kbd></button>
         </div>
         <div class="group-more-slot" id="groupEarlier"></div>
         <div class="group-list" id="groupList" aria-label="Duplicate groups"></div>
@@ -347,35 +347,39 @@
             <button class="btn primary-soft" id="btnMarkDistinct" type="button" hidden>
               Mark as distinct
             </button>
+            <details class="non-human-banner popover guide-popover" id="nonHumanBanner" hidden>
+              <summary title="About Non-Human review">? Guide</summary>
+              <div class="popover-body">
+                <div>
+                  <strong>Independent Non-Human candidates</strong>
+                  <span>One click — or <kbd>d</kbd> / <kbd>⌫</kbd> — moves a file to Trash. Undo from the toast or the card. Detection can miss people.</span>
+                </div>
+                <div class="triage-guide" aria-label="Triage shortcuts">
+                  <span class="delete-key"><kbd>d</kbd> Trash</span>
+                  <span class="keep-key">Lightbox <kbd>Enter</kbd></span>
+                </div>
+              </div>
+            </details>
+            <details class="candidate-review-banner popover guide-popover" id="candidateReviewBanner" hidden>
+              <summary title="Review guide &amp; shortcuts">? Guide</summary>
+              <div class="popover-body">
+                <div>
+                  <strong id="candidateReviewTitle">Quick review</strong>
+                  <span id="candidateReviewDescription"></span>
+                </div>
+                <div class="candidate-key-guide" id="candidateKeys" aria-label="Review shortcuts">
+                  <span class="delete-key"><kbd>←</kbd> Delete</span>
+                  <span><kbd>↑</kbd> Back</span>
+                  <span class="keep-key">Keep <kbd>→</kbd></span>
+                </div>
+                <div class="candidate-key-guide" id="swipeKeys" hidden aria-label="Swipe shortcuts">
+                  <span class="delete-key"><kbd>←</kbd> Same — Trash</span>
+                  <span><kbd>⌫</kbd> Undo</span>
+                  <span class="keep-key">Different <kbd>→</kbd></span>
+                </div>
+              </div>
+            </details>
           </div>
-          <details class="non-human-banner" id="nonHumanBanner" hidden>
-            <summary>About Non-Human review</summary>
-            <div>
-              <strong>Independent Non-Human candidates</strong>
-              <span>One click — or <kbd>d</kbd> / <kbd>⌫</kbd> — moves a file to Trash. Undo from the toast or the card. Detection can miss people.</span>
-            </div>
-            <div class="triage-guide" aria-label="Triage shortcuts">
-              <span class="delete-key"><kbd>d</kbd> Trash</span>
-              <span class="keep-key">Lightbox <kbd>Enter</kbd></span>
-            </div>
-          </details>
-          <details class="candidate-review-banner" id="candidateReviewBanner" hidden>
-            <summary>Review guide &amp; shortcuts</summary>
-            <div>
-              <strong id="candidateReviewTitle">Quick review</strong>
-              <span id="candidateReviewDescription"></span>
-            </div>
-            <div class="candidate-key-guide" id="candidateKeys" aria-label="Review shortcuts">
-              <span class="delete-key"><kbd>←</kbd> Delete</span>
-              <span><kbd>↑</kbd> Back</span>
-              <span class="keep-key">Keep <kbd>→</kbd></span>
-            </div>
-            <div class="candidate-key-guide" id="swipeKeys" hidden aria-label="Swipe shortcuts">
-              <span class="delete-key"><kbd>←</kbd> Same — Trash</span>
-              <span><kbd>⌫</kbd> Undo</span>
-              <span class="keep-key">Different <kbd>→</kbd></span>
-            </div>
-          </details>
           <div class="selection-toolbar" aria-label="Group selection controls">
             <div class="group-selection-summary">
               <span>Group selection</span>
@@ -462,28 +466,30 @@
             <button class="btn ghost" type="button" data-similar-view="swipe" aria-pressed="false">Swipe</button>
             <button class="btn ghost" type="button" data-similar-view="grid" aria-pressed="false">List</button>
           </div>
+          <details class="candidate-review-banner popover guide-popover board-guide">
+            <summary title="How the board works">? How it works</summary>
+            <div class="popover-body">
+              <div>
+                <strong>Every Similar group, one row each</strong>
+                <span>Each copy starts marked for removal and the suggested keeper stays. Click a photo to switch it between Keep and Remove; nothing moves until you press the Trash button at the bottom, and that one batch can be undone. “Not duplicates” keeps every file in a group and stops it from matching again.</span>
+              </div>
+              <div class="candidate-key-guide" aria-label="Board shortcuts">
+                <span><kbd>j</kbd>/<kbd>k</kbd> rows</span>
+                <span><kbd>←</kbd>/<kbd>→</kbd> files</span>
+                <span><kbd>Space</kbd> keep/remove</span>
+                <span><kbd>⇧K</kbd> keep only this</span>
+                <span><kbd>u</kbd> suggested</span>
+                <span><kbd>n</kbd> not duplicates</span>
+                <span><kbd>Enter</kbd> compare</span>
+                <span><kbd>A</kbd> Trash marked</span>
+              </div>
+            </div>
+          </details>
         </div>
         <p class="board-filtered muted small" id="boardFiltered" hidden>
           <span id="boardFilteredText"></span>
           <button class="linkish" id="boardClearFilters" type="button">Clear filters</button>
         </p>
-        <details class="candidate-review-banner board-guide">
-          <summary>How the board works</summary>
-          <div>
-            <strong>Every Similar group, one row each</strong>
-            <span>Each copy starts marked for removal and the suggested keeper stays. Click a photo to switch it between Keep and Remove; nothing moves until you press the Trash button at the bottom, and that one batch can be undone. “Not duplicates” keeps every file in a group and stops it from matching again.</span>
-          </div>
-          <div class="candidate-key-guide" aria-label="Board shortcuts">
-            <span><kbd>j</kbd>/<kbd>k</kbd> rows</span>
-            <span><kbd>←</kbd>/<kbd>→</kbd> files</span>
-            <span><kbd>Space</kbd> keep/remove</span>
-            <span><kbd>⇧K</kbd> keep only this</span>
-            <span><kbd>u</kbd> suggested</span>
-            <span><kbd>n</kbd> not duplicates</span>
-            <span><kbd>Enter</kbd> compare</span>
-            <span><kbd>A</kbd> Trash marked</span>
-          </div>
-        </details>
         <div class="board-rows" id="boardRows" aria-label="Similar groups"></div>
       </section>
     </section>

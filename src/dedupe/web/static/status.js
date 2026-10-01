@@ -3,7 +3,7 @@
 import { api } from "./api.js";
 import { undoAction } from "./actions.js";
 import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
-import { addStreamedGroup, loadGroups } from "./groups.js";
+import { addStreamedGroup, loadGroups, markEmptyTabs } from "./groups.js";
 import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatDuration, toast } from "./util.js";
@@ -196,6 +196,9 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
 
   state.scanning = !!s.scanning;
   state.acting = !!s.acting;
+  // The folded scan bar shows the full progress bar and per-folder streams
+  // only while a scan runs; afterwards the one-line summary is enough.
+  $("scanPanel").classList.toggle("scanning", state.scanning);
   state.scanId = s.scan_id || state.scanId;
   syncExactRecoveryBusy();
   const exactRemaining = s.summary?.exact_groups || 0;
@@ -285,10 +288,9 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     renderDiagnostics(s.summary);
     const scanningNote = s.scanning ? " · live" : "";
     const reviewCount = s.summary.group_count - (s.summary.exact_groups || 0);
+    // One compact chip: the per-category counts live on the tabs below.
     top.innerHTML = `
-      <span class="stat-chip"><span class="dot"></span><strong>${reviewCount}</strong> groups${scanningNote}</span>
-      <span class="stat-chip">${s.summary.similar_groups} similar · ${s.summary.low_resolution_files || 0} low-res · ${s.summary.random_review_files || 0} random · ${s.summary.no_human_files || 0} non-human</span>
-      <span class="stat-chip reclaim"><span class="dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
+      <span class="stat-chip"><span class="dot"></span><strong>${reviewCount}</strong> groups${scanningNote}<span class="stat-sep" aria-hidden="true">·</span><span class="reclaim-dot dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
       ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
     `;
     // Show results as soon as we have a result shell (even 0 groups) while scanning,
@@ -307,6 +309,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     $("countFaces").textContent = s.summary.faces_files || 0;
     // All-Files groups hold every scanned file; file_count is the same number.
     $("countAllFiles").textContent = s.summary.file_count || 0;
+    markEmptyTabs();
   } else {
     $("scanQuality").hidden = true;
     top.innerHTML = s.error

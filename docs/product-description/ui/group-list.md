@@ -25,6 +25,10 @@ The list loads whatever the current result holds — a fresh scan streams groups
 
 The list controls above it: a text search over member paths; a selection filter (all / has selection / no selection); **Issues only** (needs-attention groups); **Hide completed**; **Advanced filters** (size range in MB, minimum width/height in pixels, path substring or glob) — a group stays visible when *any* of its members matches; and a sort (reclaimable, size, date, media type). Filtering is local and instant; it narrows what is shown, never what exists.
 
+**Layout.** Once results exist, a desktop-sized window (at least 901 px wide and 600 px tall) holds the review as a fixed screen: the header (brand, one chip with the group count and reclaimable size, and **Exact recovery**), the folded scan bar, and the category tabs stay put; the sidebar's group list and the detail pane — or [the Similar board](similar-board.md) — scroll on their own; and the action bar is the bottom row rather than floating over the cards. Smaller windows keep an ordinary scrolling page with the action bar pinned to the bottom. The tabs sit left-aligned and categories with a count of 0 are dimmed but stay clickable. The sidebar opens with the "N of M groups shown" line; **Clear filters** beside it appears only while a search or filter is active. **Next to review** (`]`) jumps to the next unreviewed or needs-attention group. The per-category review guide and shortcut list sit behind a **? Guide** button in the detail header and open as a panel over the cards.
+
+**Action bar per category.** The bar offers only the batch actions that belong to the open tab, each labelled with what it would move: **Delete N similar matches · size** on All and Similar, **Delete N low-res + random files · size** on All, Low-res, and Random, each reading "No similar matches selected" / "No low-res or random files staged" (disabled) when empty. Non-Human, Faces, and Files trash one candidate at a time, so the bar is hidden there. The `A` and `D` shortcuts keep working from every tab.
+
 ### End without changing anything
 
 Browsing without changing selections records nothing beyond what was already saved. Leaving the page and returning restores the same list, and the user's place in it: the focused group is remembered in the browser's session storage and re-selected after a reload when it still exists in the list; if it is gone, the first group is selected as before. Starting a new scan or discarding the saved review clears the memory.
@@ -104,10 +108,12 @@ The list itself does not "complete"; the session does, when the user opens the [
 - Bulk criteria never select files without a trusted face count when a minimum-face rule is used; unanalyzed media is skipped rather than guessed at.
 - Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button and for `D` and the Low-res + Random button.
 - A filter that hides every group leaves the sidebar showing a plain "No groups in this filter." message — plain text, not a status announcement.
+- Focus on a group survives re-renders of the sidebar: when streamed groups, a refetch, or a tab switch redraw the list, the focused group's new row takes the focus. Pressing `]` or `j` right after switching tabs therefore lands on the group even though the tab's own refresh selects the same group a moment later.
 
 ## Open questions and verification
 
 - Toast wording for "No shown groups need attention" observed in code only.
+- The app-shell breakpoint (901 × 600 px) and the per-tab action bar were watched in Chromium at 1440 × 900, 1024 × 768, and 420 × 860, light and dark; not yet in Safari.
 - Whether the Similar videos tab is a separate sidebar entry or merged under Similar images depends on `kind` handling in the tab rendering; to confirm visually.
 
 Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).

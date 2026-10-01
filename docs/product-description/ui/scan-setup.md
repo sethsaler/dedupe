@@ -46,13 +46,13 @@ Several folders default to **parallel streams**: each folder scans as its own co
 
 ### While extended
 
-The progress panel shows the current phase and message — walking folders, cache hits, then the merged hashing progress with per-stage text ("Exact hash 12/340 · Images hashing: 5/200 · Videos hashing: 1/40"), then low-resolution probes, person and face detection if enabled. Counts, elapsed time, and an ETA update live. In parallel-streams mode, each folder shows its own line and fill bar plus one aggregate line.
+The progress panel shows the current phase and message — walking folders, cache hits, then the merged hashing progress with per-stage text ("Exact hash 12/340 · Images hashing: 5/200 · Videos hashing: 1/40"), then low-resolution probes, person and face detection if enabled. Counts, elapsed time, and an ETA update live. In parallel-streams mode, each folder shows its own line and fill bar plus one aggregate line. Once results exist the setup form folds into a slim scan bar (the scanned paths and a **Scan setup** toggle that reopens the form); while the scan runs the bar keeps the full progress bar and per-folder lines.
 
 Groups stream into the sidebar as they are finalized, kept sorted most-reclaimable-first. The user can already browse and open groups while the scan runs, but selections and actions are locked: selection changes and action requests get a "locked during active work" refusal.
 
 ### Complete
 
-The progress line becomes the final summary; the result — files, groups, diagnostics — is installed and saved to the review session file at once. The action bar appears with its buttons enabled, keyed to the selection. If the scan found zero valid folders, the error message is shown instead and the *previous* results (if any) are restored unchanged.
+The progress line becomes the final summary — the folded scan bar drops the finished progress bar and per-folder lines and keeps just that one line, next to the saved-review banner and the scan-quality summary; the result — files, groups, diagnostics — is installed and saved to the review session file at once. The action bar appears with its buttons enabled, keyed to the selection and to the open tab ([Group list](group-list.md#start)). If the scan found zero valid folders, the error message is shown instead and the *previous* results (if any) are restored unchanged.
 
 ## Modifiers
 

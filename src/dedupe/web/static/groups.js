@@ -61,6 +61,14 @@ function renderTabCounts() {
   $("countFaces").textContent = memberCount("faces");
   const countAllFiles = $("countAllFiles");
   if (countAllFiles) countAllFiles.textContent = memberCount("all_files");
+  markEmptyTabs();
+}
+
+// Empty categories stay clickable but recede.
+function markEmptyTabs() {
+  document.querySelectorAll(".filter-tabs .tab").forEach((tab) => {
+    tab.classList.toggle("empty", tab.querySelector(".tab-count")?.textContent === "0");
+  });
 }
 
 // The focused group survives a page reload: remembered in sessionStorage and
@@ -252,6 +260,9 @@ function applyResultControls() {
   });
   state.groups = groups;
   $("filteredCount").textContent = `${groups.length} of ${categoryCount} groups shown`;
+  // Clear filters only appears when there is something to clear.
+  $("btnClearFilters").hidden = !(query || selection !== "all" || filters.active
+    || $("issuesOnly").checked || $("hideCompleted").checked);
 }
 
 function groupItemHtml(g) {
@@ -432,6 +443,9 @@ function renderGroupList() {
     ),
   );
   const scrollTop = list.scrollTop;
+  // Replacing the rows would drop keyboard focus to <body>; hand it to the
+  // same group's fresh row (streamed groups and refetches re-render often).
+  const focusedId = document.activeElement?.closest?.("#groupList .group-item")?.dataset.id;
   list.innerHTML = state.groups
     .slice(state.groupListStart, state.groupListStart + state.groupListLimit)
     .map(groupItemHtml)
@@ -439,6 +453,10 @@ function renderGroupList() {
   $("groupMore").innerHTML = groupMoreHtml();
   syncEarlierSlot();
   list.scrollTop = Math.min(scrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
+  if (focusedId) {
+    list.querySelector(`.group-item[data-id="${CSS.escape(focusedId)}"]`)
+      ?.focus({ preventScroll: true });
+  }
 }
 
 function updateGroupListItem(g) {
@@ -496,4 +514,4 @@ function ensureGroupVisible(id) {
   renderGroupList();
 }
 
-export { loadGroups, addStreamedGroup, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, rememberFocusedGroup };
+export { loadGroups, addStreamedGroup, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, markEmptyTabs, rememberFocusedGroup };

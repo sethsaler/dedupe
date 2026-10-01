@@ -74,7 +74,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   outline-offset: 2px;
 }
 
-.session-status, .scan-quality, .exact-recovery {
+.session-status, .scan-quality {
   margin-top: 10px;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -84,8 +84,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   font-size: .82rem;
 }
 .session-status { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.scan-quality summary, .exact-recovery > summary { cursor: pointer; color: var(--text); font-weight: 650; }
-.exact-recovery { margin: 0; }
+.scan-quality summary { cursor: pointer; color: var(--text); font-weight: 650; }
 .exact-recovery-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
 .exact-recovery-row details { flex: 1 1 260px; min-width: 0; }
 .exact-recovery-row summary { cursor: pointer; color: var(--text); }
@@ -101,11 +100,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .advanced-options summary { cursor: pointer; }
 .advanced-options .thresh { margin-top: 8px; }
 
-.result-controls { padding: 12px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; font-size: .78rem; }
+.result-controls { padding: 10px 12px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; font-size: .78rem; }
 .result-controls > input, .result-controls select { width: 100%; min-width: 0; }
 .result-control-row { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; }
 .inline-check { display: flex; align-items: center; gap: 7px; }
-.result-controls-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text); font-size: .82rem; font-weight: 650; }
+.result-controls-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 18px; }
+.result-controls-heading .small { font-size: .74rem; }
+#btnNextReview { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 7px 12px; font-size: .8rem; }
+#btnNextReview kbd { font-size: .66rem; }
 .text-button { padding: 0; min-height: auto; border: 0; color: var(--accent); font-size: .75rem; }
 .text-button:hover { background: transparent; color: var(--text); }
 .search-field input { width: 100%; }
@@ -117,40 +119,79 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .toggle-option:hover { border-color: var(--border); color: var(--text); }
 .toggle-option:has(input:checked) { border-color: var(--accent); background: rgba(91, 157, 255, .2); box-shadow: inset 0 0 0 1px rgba(91, 157, 255, .25); color: var(--text); }
 .toggle-option input { margin: 0; accent-color: var(--accent); }
-.non-human-banner {
-  margin-bottom: 10px;
-  padding: 8px 12px;
-  border: 1px solid rgba(224,160,58,.45);
-  border-radius: var(--radius-sm);
-  background: rgba(224,160,58,.1);
-  color: #f1cc8e;
+/* —— Popovers ——
+   A <details> whose summary is a compact header button and whose body floats
+   over the page: Exact recovery in the top bar and the review guides. */
+.popover { position: relative; flex-shrink: 0; }
+.popover > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: .8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+  transition: border-color .15s, background .15s;
 }
-.non-human-banner > div:first-child { display: grid; gap: 3px; min-width: 0; }
-.triage-guide { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.popover > summary::-webkit-details-marker { display: none; }
+.popover > summary:hover { border-color: var(--accent); }
+.popover[open] > summary { border-color: var(--accent); background: var(--accent-soft); }
+.popover-body {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  width: min(460px, calc(100vw - 32px));
+  max-height: min(70vh, 560px);
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-panel);
+  color: var(--muted);
+  font-size: .82rem;
+  text-align: left;
+}
+.popover-body p { margin: 0; }
+/* Guides anchor to their whole header row, so they stay on screen however the
+   row wraps. */
+.guide-popover { position: static; }
+.detail-header, .board-toolbar { position: relative; }
+.guide-popover > .popover-body { top: calc(100% + 4px); }
+.popover-body > div:first-child { display: grid; gap: 4px; min-width: 0; }
+.popover-body strong { color: var(--text); }
+.popover-body span { line-height: 1.45; }
+.guide-popover > summary {
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: .76rem;
+  color: var(--muted);
+}
+.guide-popover > summary:hover { color: var(--text); }
+.non-human-banner > summary { border-color: rgba(224,160,58,.45); color: #f1cc8e; }
+.triage-guide { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .triage-guide > span {
   padding: 7px 9px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: rgba(8, 11, 16, .62);
+  background: var(--panel-2);
   font-weight: 650;
   color: var(--text);
 }
 .triage-guide .delete-key { color: #ff9b9b; }
 .triage-guide .keep-key { color: #9ec4ff; }
-.candidate-review-banner {
-  margin-bottom: 10px;
-  padding: 8px 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--bg-elev);
-}
-.candidate-review-banner summary, .non-human-banner summary { cursor: pointer; font-size: .76rem; color: var(--muted); }
-.candidate-review-banner[open] > div, .non-human-banner[open] > div { margin-top: 10px; }
-.candidate-review-banner > div:first-child { display: grid; gap: 4px; }
-.candidate-review-banner strong { color: var(--text); }
-.candidate-review-banner span { color: var(--muted); font-size: .8rem; line-height: 1.45; }
-.candidate-key-guide { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.candidate-key-guide > span { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: rgba(8, 11, 16, .62); font-weight: 650; }
+.candidate-key-guide { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.candidate-key-guide > span { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); color: var(--text); font-weight: 650; }
 .candidate-key-guide .delete-key { color: #ff9b9b; }
 .candidate-key-guide .keep-key { color: #78dcac; }
 .review-sheet p { line-height: 1.45; }
@@ -202,7 +243,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .bulk-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .bulk-row .btn { flex: 1 1 auto; }
 
-.g-state { display: flex; align-items: center; gap: 5px; margin-top: 5px; color: var(--muted); font-size: .72rem; }
+.g-state { display: flex; align-items: center; gap: 5px; margin-top: 2px; color: var(--muted); font-size: .72rem; }
 .g-state-glyph { font-size: .62rem; }
 .group-item.attention .g-state-glyph { color: var(--warn); }
 .group-item.done .g-state { color: var(--faint); }
@@ -281,6 +322,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 
 /* —— Top bar —— */
 .topbar {
+  /* Above the scan bar and results, so the Exact recovery popover overlays them. */
+  position: relative;
+  z-index: 25;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -295,9 +339,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 }
 
 .logo {
-  width: 42px;
-  height: 42px;
-  border-radius: 12px;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
   display: grid;
   place-items: center;
   color: #0a1220;
@@ -309,7 +353,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 
 .brand h1 {
   margin: 0;
-  font-size: 1.28rem;
+  font-size: 1.15rem;
   font-weight: 700;
   letter-spacing: -0.03em;
 }
@@ -325,7 +369,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+  margin-left: auto;
 }
+.stat-sep { color: var(--faint); margin: 0 2px; }
 
 .stat-chip {
   display: inline-flex;
@@ -347,7 +393,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   border-radius: 50%;
   background: var(--accent);
 }
-.stat-chip.reclaim .dot { background: var(--ok); }
+.stat-chip .reclaim-dot { background: var(--ok); }
 .stat-chip.muted-chip {
   color: var(--muted);
   border-color: var(--border-soft);
@@ -366,10 +412,41 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .scan-main { display: flex; flex-direction: column; gap: 12px; }
 
 .scan-panel.collapsed .scan-main { display: none; }
-.scan-panel.collapsed { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 9px 14px; }
-.scan-panel.collapsed .scan-collapse { flex: 1; width: auto; min-width: 150px; }
-.scan-panel.collapsed .session-status { margin: 0; padding: 5px 8px; font-size: .72rem; }
-.scan-panel.collapsed :is(.scan-quality, .progress-wrap, .stream-progress) { flex-basis: 100%; }
+.scan-panel.collapsed { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 7px 12px; }
+.scan-panel.collapsed .scan-collapse { flex: 0 1 auto; width: auto; min-width: 0; max-width: 45%; }
+.scan-panel.collapsed .session-status {
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  min-width: 0;
+  margin: 0;
+  padding: 3px 8px;
+  gap: 10px;
+  font-size: .72rem;
+}
+.scan-panel.collapsed .session-status:has(.session-pruned[open]) { flex: 1 1 100%; flex-wrap: wrap; }
+.scan-panel.collapsed .session-status-main { min-width: 0; }
+.scan-panel.collapsed #sessionStatusText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scan-panel.collapsed .session-status .linkish { white-space: nowrap; }
+.scan-panel.collapsed .session-dismiss { margin-left: 0; align-self: center; }
+.scan-panel.collapsed .scan-quality { margin: 0; padding: 3px 8px; font-size: .72rem; }
+.scan-panel.collapsed .scan-quality[open] { flex-basis: 100%; }
+/* While a scan runs the bar keeps its full-width progress and streams. */
+.scan-panel.collapsed.scanning .progress-wrap { flex-basis: 100%; margin-top: 4px; padding-top: 8px; }
+/* Afterwards only the summary line stays, inline. */
+.scan-panel.collapsed:not(.scanning) .progress-wrap {
+  flex: 1 1 220px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.scan-panel.collapsed:not(.scanning) :is(.progress-bar, .stream-progress) { display: none; }
+.scan-panel.collapsed:not(.scanning) .progress-msg {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .74rem;
+}
 
 /* Slim bar the scan panel folds into once a scan starts, so results get the
    screen. Mirrors .opts-toggle; the paths summary only shows when collapsed. */
@@ -387,6 +464,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   width: 100%;
   padding: 2px 4px 10px;
   text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .scan-panel.collapsed .scan-collapse { padding-bottom: 2px; }
@@ -1010,9 +1089,9 @@ kbd {
 /* —— Results —— */
 .results {
   display: grid;
-  grid-template-columns: 230px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   grid-template-rows: auto 1fr;
-  gap: 12px;
+  gap: 10px 12px;
   min-height: 480px;
   flex: 1;
   animation: fade-up 0.4s var(--ease-out) both;
@@ -1036,24 +1115,26 @@ kbd {
   grid-column: 1 / -1;
   display: flex;
   overflow-x: auto;
-  gap: 5px;
-  padding: 5px;
+  gap: 2px;
+  padding: 4px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-elev);
+  scrollbar-width: none;
 }
-.filter-tabs .tab { flex: 1 0 auto; white-space: nowrap; }
-.review-filters summary { cursor: pointer; padding: 8px 0; color: var(--muted); }
+.filter-tabs .tab { flex: 0 0 auto; white-space: nowrap; }
+.filter-tabs .tab.empty:not(.active) { opacity: .5; }
+.review-filters summary { cursor: pointer; padding: 2px 0; color: var(--muted); }
 .review-filters[open] > :not(summary) { margin-top: 10px; }
-.search-field input { border: 1px solid var(--border); border-radius: 7px; padding: 10px; background: var(--bg-elev); color: var(--text); }
+.search-field input { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--bg-elev); color: var(--text); }
 
 .tab {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--muted);
-  min-height: 42px;
-  padding: 9px 10px;
+  min-height: 34px;
+  padding: 6px 12px;
   cursor: pointer;
   font-size: 0.82rem;
   font-weight: 550;
@@ -1110,12 +1191,12 @@ kbd {
   border: none;
   border-bottom: 1px solid var(--border-soft);
   color: var(--text);
-  min-height: 66px;
-  padding: 14px 16px;
+  min-height: 60px;
+  padding: 10px 14px;
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
   transition: background 0.12s var(--ease-out);
 }
 
@@ -1142,8 +1223,10 @@ kbd {
   font-size: 0.76rem;
   color: var(--muted);
   display: flex;
+  justify-content: space-between;
   gap: 8px;
   align-items: center;
+  white-space: nowrap;
 }
 
 .group-item .g-sub .sel-mark {
@@ -1821,8 +1904,11 @@ kbd {
 }
 
 .actionbar .btn {
-  min-width: 280px;
+  min-width: 240px;
 }
+/* Non-Human, Faces, and Files trash one file at a time: no batch footer.
+   A running action (an Exact recovery restore, say) still shows its note. */
+.actionbar.no-actions:not([aria-busy="true"]) { display: none; }
 
 /* —— Toast —— */
 .toast {
@@ -2627,11 +2713,12 @@ kbd {
   gap: 10px;
 }
 .board-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; }
-.board-heading { flex: 1 1 260px; min-width: 0; }
+.board-heading { flex: 1 1 300px; min-width: 0; }
 .board-heading h2 { margin: 0; font-size: 1.1rem; }
 .board-heading p { margin: 2px 0 0; font-size: .82rem; }
-.board-search input { width: 220px; }
-.board-filter { grid-auto-flow: column; align-items: center; gap: 6px; }
+.board-search input { width: 190px; }
+.board-filter select { width: auto; min-width: 0; min-height: 0; padding: 7px 10px; font-size: .8rem; }
+.board-filter { display: flex; align-items: center; gap: 6px; }
 .board-filtered { margin: 0; display: flex; gap: 8px; align-items: center; }
 .board-guide .candidate-key-guide { flex-wrap: wrap; }
 
@@ -2745,7 +2832,7 @@ kbd {
   .board-row-head { grid-auto-flow: column; justify-content: start; gap: 10px; }
   .board-row-actions { flex-direction: row; }
   .board-keys-hint { display: none; }
-  .results { grid-template-columns: 180px minmax(0, 1fr); }
+  .results { grid-template-columns: 220px minmax(0, 1fr); }
   .swipe-media { height: var(--review-stage-height, 34vh); }
   .swipe-vs { flex-direction: row; }
   .swipe-btn { min-width: 0; flex: 1; padding: 10px; }
@@ -2782,8 +2869,12 @@ kbd {
   .swipe-btn strong { font-size: .72rem; }
   .focus-card .card-actions { flex-wrap: wrap; }
   .path-input-wrap { flex-direction: column; }
-  .topbar { flex-direction: column; align-items: flex-start; }
-  .session-status { flex-direction: column; align-items: flex-start; }
+  .topbar { flex-wrap: wrap; gap: 8px; }
+  .tagline { display: none; }
+  .topbar .exact-recovery { margin-left: auto; }
+  .top-stats { order: 3; flex-basis: 100%; justify-content: flex-start; margin-left: 0; }
+  .scan-panel:not(.collapsed) .session-status { flex-direction: column; align-items: flex-start; }
+  .scan-panel.collapsed .scan-collapse { max-width: 100%; }
   .range-pair { grid-template-columns: 1fr; }
   .result-control-grid { grid-template-columns: 1fr; }
   .display-toggles { display: grid; grid-template-columns: 1fr; }
@@ -2889,4 +2980,60 @@ kbd {
   .toast.error { background: #fdf1f1; }
   .toast.ok { background: #ecf8f2; }
   .toast-action { color: #1f5cc9; }
+}
+
+/* —— App shell ——
+   Once results exist on a desktop-sized window, the page stops scrolling as a
+   whole: the header, scan bar, and tabs stay put, the sidebar list and the
+   detail pane (or the Similar board) scroll on their own, and the action bar
+   is the last row instead of floating over the content. Small windows keep
+   the ordinary scrolling page. */
+@media (min-width: 901px) and (min-height: 600px) {
+  .app:has(> .results:not([hidden])) {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    padding-bottom: 0;
+    gap: 10px;
+    overflow: hidden;
+  }
+  .app:has(> .results:not([hidden])) > :is(.topbar, .scan-panel) { flex-shrink: 0; }
+  /* An expanded scan form must not squeeze the results to nothing. */
+  .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) {
+    max-height: 55vh;
+    overflow-y: auto;
+  }
+  .app:has(> .results:not([hidden])) > .results {
+    flex: 1 1 0;
+    min-height: 0;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .app:has(> .results:not([hidden])) .sidebar { min-height: 0; }
+  .app:has(> .results:not([hidden])) .result-controls {
+    flex-shrink: 0;
+    max-height: 55%;
+    overflow-y: auto;
+  }
+  .app:has(> .results:not([hidden])) .group-list { max-height: none; min-height: 0; }
+  .app:has(> .results:not([hidden])) .detail { min-height: 0; overflow-y: auto; }
+  .app:has(> .results:not([hidden])) .detail-empty { min-height: 0; }
+  .app:has(> .results:not([hidden])) .similar-board { min-height: 0; overflow-y: auto; }
+  .app:has(> .results:not([hidden])) .board-toolbar {
+    position: sticky;
+    top: -16px;
+    z-index: 3;
+    margin: -16px -16px 0;
+    padding: 12px 16px 10px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .app:has(> .results:not([hidden])) > .actionbar {
+    position: static;
+    flex-shrink: 0;
+    margin: 0 -20px;
+    animation: none;
+  }
+  /* The footer is in flow now; rows only need a small scroll margin. */
+  .app:has(> .results:not([hidden])) .board-row { scroll-margin: 12px 0; }
+  .app:has(> .results:not([hidden])) .tagline { display: none; }
 }

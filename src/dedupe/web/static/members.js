@@ -21,8 +21,14 @@ function fitReviewStage() {
   if (!media || $("detailBody").hidden) return;
   const bounds = box.getBoundingClientRect();
   const controls = bounds.height - media.getBoundingClientRect().height;
-  const footer = $("actionBar").getBoundingClientRect().height;
-  const height = Math.max(180, Math.min(680, window.innerHeight - bounds.top - controls - footer - 28));
+  // In the app-shell layout the detail pane scrolls on its own and the footer
+  // sits below it, so the pane's bottom edge is the limit; otherwise the page
+  // scrolls and the fixed footer covers the bottom of the viewport.
+  const detail = $("main");
+  const bottom = getComputedStyle(detail).overflowY === "auto"
+    ? detail.getBoundingClientRect().bottom - 16
+    : window.innerHeight - $("actionBar").getBoundingClientRect().height - 28;
+  const height = Math.max(180, Math.min(680, bottom - bounds.top - controls));
   box.style.setProperty("--review-stage-height", `${Math.floor(height)}px`);
 }
 const stageObserver = new ResizeObserver(() => requestAnimationFrame(fitReviewStage));
@@ -239,18 +245,25 @@ function updateDetailMeta(g) {
     `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
 }
 
+// A fresh member list (another group, sort, or filter) starts on its first
+// page with the detail pane scrolled to the top. In the app-shell layout the
+// pane keeps its scroll offset across re-renders, so a restarted list would
+// otherwise open at the bottom with its "load more" footer already in view.
+function restartMemberList() {
+  state.memberPage = 0;
+  state.memberFocus = 0;
+  state.trashedInPlace.clear();
+  $("main").scrollTop = 0;
+}
+
 async function selectGroup(id, { silent = false, preservePlayback = false } = {}) {
   memberObserver.disconnect();
   const myToken = ++state.selectToken;
-  const selectionStartFocus = document.activeElement;
+  if (!silent) state.pendingGroupFocus = { id, from: document.activeElement };
   const preserveMemberFocus = silent && state.currentId === id;
   state.currentId = id;
   rememberFocusedGroup(id);
-  if (!preserveMemberFocus) {
-    state.memberFocus = 0;
-    state.memberPage = 0;
-    state.trashedInPlace.clear();
-  }
+  if (!preserveMemberFocus) restartMemberList();
   ensureGroupVisible(id);
   markGroupListActive(id);
   let g;
@@ -274,7 +287,10 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // or starting playback. Replacing them loses the playhead and can race Play.
   // Changed data and explicit view changes still repaint.
   if (preservePlayback && preserveMemberFocus && JSON.stringify(g) === renderedGroupSnapshot
-    && $("members").querySelector(".review-video, .swipe-media video")) return;
+    && $("members").querySelector(".review-video, .swipe-media video")) {
+    applyPendingGroupFocus(id);
+    return;
+  }
   // A scan-completion refresh can finish while the user is moving through
   // member cards. Preserve the latest position and real DOM focus instead of
   // replacing the focused button underneath the next keystroke.
@@ -363,14 +379,23 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
       focusedCard.querySelector(".thumb-wrap")?.focus({ preventScroll: true });
     }
   }
-  // keep list item in view; explicit (non-silent) selection moves focus too,
-  // so j/k navigation gives screen readers the group's announcement. Do not
-  // steal focus back if the user reached a member or overlay while we fetched.
+  applyPendingGroupFocus(id);
+}
+
+// Keep the list item in view; an explicit (non-silent) selection moves focus
+// too, so j/k navigation gives screen readers the group's announcement. The
+// intent survives a superseded fetch (a tab switch's silent refresh of the
+// same group can overtake it), and is dropped if the user moved focus
+// elsewhere — a member card or an overlay — while the fetch ran.
+function applyPendingGroupFocus(id) {
+  const pending = state.pendingGroupFocus;
+  if (!pending || pending.id !== id) return;
+  state.pendingGroupFocus = null;
+  if (document.activeElement !== pending.from) return;
   const active = document.querySelector(`.group-item[data-id="${id}"]`);
-  if (active && !silent && document.activeElement === selectionStartFocus) {
-    active.scrollIntoView({ block: "nearest" });
-    active.focus({ preventScroll: true });
-  }
+  if (!active) return;
+  active.scrollIntoView({ block: "nearest" });
+  active.focus({ preventScroll: true });
 }
 
 function renderMembers(g, { append = false } = {}) {
@@ -1107,9 +1132,7 @@ $("memberSort")?.addEventListener("change", (event) => {
   if (current && MEMBER_SORT_OPTIONS[current.kind]) {
     state.memberSortByKind[current.kind] = event.target.value;
   }
-  state.memberPage = 0;
-  state.memberFocus = 0;
-  state.trashedInPlace.clear();
+  restartMemberList();
   if (current) renderMembers(current);
 });
 
@@ -1117,9 +1140,7 @@ $("memberSort")?.addEventListener("change", (event) => {
 // immediately, starting back on the first page.
 $("memberModified")?.addEventListener("change", (event) => {
   state.memberModified = event.target.value;
-  state.memberPage = 0;
-  state.memberFocus = 0;
-  state.trashedInPlace.clear();
+  restartMemberList();
   const current = currentGroup();
   if (current) renderMembers(current);
 });
@@ -1153,4 +1174,4 @@ $("btnMediaDetails").addEventListener("click", () => {
   $("btnMediaDetails").setAttribute("aria-pressed", String(show));
 });
 
-export { selectGroup, renderMembers, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage, setMemberSelected };
+export { selectGroup, renderMembers, restartMemberList, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage, setMemberSelected };

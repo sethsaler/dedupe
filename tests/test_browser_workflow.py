@@ -525,13 +525,24 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
         page.locator("#results").wait_for(state="visible", timeout=10_000)
 
         expect(page.locator("#btnTrashExact")).to_have_count(0)
+        # The footer names what each batch action would move.
         expect(page.locator("#btnTrashSimilar")).to_have_text(
-            "Delete All Selected Similar Matches"
+            re.compile(r"^Delete 1 similar match · ")
         )
         expect(page.locator("#btnTrashReview")).to_have_text(
-            "Delete All Selected Low-res + Random"
+            "No low-res or random files staged"
         )
+        expect(page.locator("#btnTrashReview")).to_be_disabled()
+        # Each tab offers only its own batch action; the one-click reviews
+        # (Files here) have none, so the footer steps aside.
+        page.locator('.tab[data-kind="low_resolution"]').click()
+        expect(page.locator("#btnTrashSimilar")).to_be_hidden()
+        expect(page.locator("#btnTrashReview")).to_be_visible()
+        page.locator('.tab[data-kind="all_files"]').click()
+        expect(page.locator("#actionBar")).to_be_hidden()
         page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator("#actionBar")).to_be_visible()
+        expect(page.locator("#btnTrashReview")).to_be_hidden()
         # Let the tab filter settle; the default All view also lists the
         # All-Files browse group, so an unsettled list has more than one row.
         expect(page.locator(".group-item")).to_have_count(1)
@@ -1702,6 +1713,41 @@ def test_attention_navigation_and_space_u_shortcuts(
         ) == "true"
         # innerText is CSS-uppercased; textContent carries the raw badge text.
         assert "low-res" in page.evaluate("document.activeElement.textContent")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_results_fill_the_window_with_independently_scrolling_panes(
+    page, live_dedupe_server: str, duplicate_images: Path
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.set_viewport_size({"width": 1280, "height": 720})
+
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    _disable_exact_detection(page)
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    # Desktop window: the page itself never scrolls; the sidebar list and the
+    # detail pane scroll on their own and the footer is the last row.
+    assert page.evaluate("document.documentElement.scrollHeight <= innerHeight + 1")
+    assert page.evaluate("getComputedStyle(document.getElementById('main')).overflowY") == "auto"
+    assert page.evaluate("getComputedStyle(document.getElementById('groupList')).overflowY") == "auto"
+    assert page.evaluate("getComputedStyle(document.getElementById('actionBar')).position") == "static"
+    # The folded scan bar keeps the one-line summary, not the finished bar.
+    expect(page.locator("#scanPanel")).to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(page.locator("#progressMsg")).to_be_visible()
+    expect(page.locator("#progressBar")).to_be_hidden()
+    # Exact recovery opens over the page from the header.
+    page.locator("#exactRecovery > summary").click()
+    expect(page.locator("#exactRecoveryList")).to_be_visible()
+    page.locator("#exactRecovery > summary").click()
+
+    # A small window keeps the ordinary scrolling page and floating footer.
+    page.set_viewport_size({"width": 800, "height": 720})
+    assert page.evaluate("getComputedStyle(document.getElementById('main')).overflowY") != "auto"
     assert page_errors == []
 
 
