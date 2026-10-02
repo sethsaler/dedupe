@@ -234,6 +234,8 @@ function memberMatchesFilters(member, filters) {
 function applyResultControls() {
   const query = ($("resultSearch").value || "").trim().toLowerCase();
   const selection = $("selectionFilter").value;
+  const issuesOnly = $("issuesOnly").checked;
+  const hideCompleted = $("hideCompleted").checked;
   const filters = advancedFilters();
   $("advancedFilterFlag").hidden = !filters.active;
   let groups = state.allGroups.filter((g) => state.kind === "all" || g.kind === state.kind);
@@ -243,8 +245,8 @@ function applyResultControls() {
     if (query && !(g.members || []).some((member) => member.path.toLowerCase().includes(query))) return false;
     if (selection === "selected" && !selected) return false;
     if (selection === "unselected" && selected) return false;
-    if ($("issuesOnly").checked && !groupNeedsAttention(g)) return false;
-    if ($("hideCompleted").checked && groupComplete(g)) return false;
+    if (issuesOnly && !groupNeedsAttention(g)) return false;
+    if (hideCompleted && groupComplete(g)) return false;
     // Advanced filters keep a group when any one of its files qualifies.
     if (filters.active && !(g.members || []).some((member) => memberMatchesFilters(member, filters))) {
       return false;
@@ -252,9 +254,14 @@ function applyResultControls() {
     return true;
   });
   const sort = $("resultSort").value;
+  // Compute each group's date once, not on every sort comparison. Avoid
+  // spreading large inventories into Math.max (which exceeds argument limits).
+  const newestDates = sort === "date" ? new Map(groups.map((g) => [
+    g, (g.members || []).reduce((latest, m) => Math.max(latest, m.mtime || 0), 0),
+  ])) : null;
   groups.sort((a, b) => {
     if (sort === "size") return (b.member_count || 0) - (a.member_count || 0);
-    if (sort === "date") return Math.max(...(b.members || []).map((m) => m.mtime || 0), 0) - Math.max(...(a.members || []).map((m) => m.mtime || 0), 0);
+    if (sort === "date") return newestDates.get(b) - newestDates.get(a);
     if (sort === "media") return String(a.media_type).localeCompare(String(b.media_type));
     return (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
   });
@@ -290,6 +297,7 @@ function groupItemHtml(g) {
   const stateGlyph = attention ? "●" : suggestedOnly ? "◐" : "✔";
   return `
         <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" aria-current="${active ? "true" : "false"}">
+          ${!folderLabel && g.members?.[0]?.path ? `<div class="g-name">${escapeHtml(basename(g.members[0].path))}</div>` : ""}
           <div class="g-top">
             <span>${folderLabel ? `${escapeHtml(folderLabel)} · ` : ""}${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
             <span class="badge ${g.kind}">${badgeLabel}</span>
@@ -381,28 +389,31 @@ function rowGapPx(list) {
 
 function shiftGroupListWindow(newStart) {
   const list = wireGroupList();
+  const scrollTop = list.scrollTop;
+  newStart = Math.max(
+    0,
+    Math.min(newStart, Math.max(0, state.groups.length - state.groupListLimit)),
+  );
   const evictedCount = Math.max(0, newStart - state.groupListStart);
   const rows = [...list.querySelectorAll(".group-item")].slice(0, evictedCount);
   const evictedHeight = rows.reduce((sum, node) => sum + node.offsetHeight, 0)
     + rowGapPx(list) * rows.length;
-  state.groupListStart = Math.max(
-    0,
-    Math.min(newStart, Math.max(0, state.groups.length - state.groupListLimit)),
-  );
+  state.groupListStart = newStart;
   renderGroupList();
-  if (evictedHeight) list.scrollTop = Math.max(0, list.scrollTop - evictedHeight);
+  if (evictedHeight) list.scrollTop = Math.max(0, scrollTop - evictedHeight);
 }
 
 function shrinkGroupListWindow() {
   if (!state.groupListStart) return;
   const list = wireGroupList();
+  const scrollTop = list.scrollTop;
   const previousStart = state.groupListStart;
   state.groupListStart = Math.max(0, previousStart - GROUP_RENDER_CHUNK);
   renderGroupList();
   // Keep the viewport on the same rows: scroll past the newly added top chunk.
   const addedCount = previousStart - state.groupListStart;
   const rows = [...list.querySelectorAll(".group-item")].slice(0, addedCount);
-  list.scrollTop = rows.reduce((sum, node) => sum + node.offsetHeight, 0)
+  list.scrollTop = scrollTop + rows.reduce((sum, node) => sum + node.offsetHeight, 0)
     + rowGapPx(list) * rows.length;
 }
 
