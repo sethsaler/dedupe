@@ -131,7 +131,13 @@ def map_parallel(
         while inflight:
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
-            finished, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            # Poll cancellation even when every running job is blocked in a
+            # decoder or subprocess. Without a timeout Cancel waits for a job.
+            finished, _ = wait(
+                inflight.keys(),
+                timeout=0.1 if cancelled else None,
+                return_when=FIRST_COMPLETED,
+            )
             for fut in finished:
                 idx = inflight.pop(fut)
                 ordered[idx] = fut.result()

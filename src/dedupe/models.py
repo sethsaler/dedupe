@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -142,7 +142,9 @@ class FileRecord:
         return int(self.mtime * 1_000_000_000)
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
+        # Inventory records contain only immutable scalars. Avoid asdict's
+        # recursive copying on every API response and review-session save.
+        d = {f.name: getattr(self, f.name) for f in fields(self)}
         d["media_type"] = self.media_type.value
         return d
 

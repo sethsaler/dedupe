@@ -59,3 +59,22 @@ def test_web_video_table_mirrors_the_scanner() -> None:
     from dedupe.web.media import VIDEO_EXTENSIONS
 
     assert VIDEO_EXTENSIONS == VIDEO_EXTS
+
+
+def test_file_record_serialization_preserves_fields_and_round_trips() -> None:
+    from dataclasses import asdict
+
+    from dedupe.models import FileRecord
+
+    record = FileRecord(
+        path="/photos/image.jpg", size=1234, mtime=123.5,
+        media_type=MediaType.IMAGE, extension=".jpg", width=1920,
+        mtime_ns=123500000000, face_count=0, phash="abcdef", error="unreadable",
+    )
+    expected = asdict(record)
+    expected["media_type"] = "image"
+    payload = record.to_dict()
+    assert payload == expected
+    assert FileRecord.from_dict(payload) == record
+    payload["path"] = "/another.jpg"
+    assert record.path == "/photos/image.jpg"

@@ -183,3 +183,45 @@ def test_similar_image_groups_workers_equivalent(tmp_path: Path) -> None:
 
     assert norm(g1) == norm(g2)
     assert len(g1) >= 1
+
+
+def test_cancel_while_all_workers_are_blocked(monkeypatch) -> None:
+    """Cancel after entering wait, without relying on a worker finishing."""
+    import threading
+
+    from dedupe import parallel
+
+    entered_wait = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    returned = threading.Event()
+    errors = []
+    real_wait = parallel.wait
+
+    def observed_wait(*args, **kwargs):
+        entered_wait.set()
+        return real_wait(*args, **kwargs)
+
+    def blocked(item):
+        release.wait(10)
+        return item
+
+    def run():
+        try:
+            map_parallel(blocked, list(range(8)), workers=2, cancelled=cancelled.is_set)
+        except InterruptedError:
+            errors.append("cancelled")
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(parallel, "wait", observed_wait)
+    caller = threading.Thread(target=run)
+    caller.start()
+    try:
+        assert entered_wait.wait(2)
+        cancelled.set()
+        assert returned.wait(2), "Cancellation waited for a blocked worker"
+        assert errors == ["cancelled"]
+    finally:
+        release.set()
+        caller.join(5)

@@ -2321,3 +2321,53 @@ def test_similar_native_video_controls_never_commit_a_swipe(page, tmp_path):
         page.locator('.tab[data-kind="faces"]').click()
         expect(page.locator("#detailBody")).to_be_hidden()
         assert candidate.evaluate("v => v.paused")
+
+
+@pytest.mark.e2e
+def test_date_sort_handles_large_inventory(page, live_dedupe_server: str) -> None:
+    page.goto(live_dedupe_server)
+    result = page.evaluate("""async () => {
+      const {state} = await import('/static/state.js');
+      const {applyResultControls} = await import('/static/groups.js');
+      const members = Array.from({length: 150000}, (_, i) => ({mtime: i, path: `/p/${i}`}));
+      state.allGroups = [
+        {id: 'older', kind: 'all_files', members: [{mtime: 2}]},
+        {id: 'newest', kind: 'all_files', members},
+      ];
+      document.querySelector('#resultSort').value = 'date';
+      const start = performance.now();
+      applyResultControls();
+      return {ids: state.groups.map(g => g.id), elapsed: performance.now() - start};
+    }""")
+    assert result["ids"] == ["newest", "older"]
+
+
+@pytest.mark.e2e
+def test_sidebar_partial_window_shift_keeps_scroll_anchor(page, live_dedupe_server: str) -> None:
+    page.goto(live_dedupe_server)
+    offsets = page.evaluate("""async () => {
+      const {state} = await import('/static/state.js');
+      const {renderGroupList} = await import('/static/groups.js');
+      state.allGroups = Array.from({length: 275}, (_, i) => ({
+        id: `test-${i}`, kind: 'similar', media_type: 'image', member_count: 2,
+        members: [], selected_for_removal: [], reclaimable_bytes: 275 - i,
+      }));
+      state.groupListLimit = 250;
+      document.querySelector('#results').hidden = false;
+      renderGroupList();
+      const list = document.querySelector('#groupList');
+      list.scrollTop = 7000;
+      const anchor = () => document.querySelector('[data-id="test-100"]')
+        .getBoundingClientRect().top - list.getBoundingClientRect().top;
+      const before = anchor();
+      document.querySelector('.group-more').click();
+      const afterDown = anchor();
+      const start = state.groupListStart;
+      document.querySelector('.group-earlier').click();
+      return {before, afterDown, afterUp: anchor(), start,
+        count: list.querySelectorAll('.group-item').length};
+    }""")
+    assert offsets["start"] == 25
+    assert offsets["count"] == 250
+    assert offsets["afterDown"] == pytest.approx(offsets["before"], abs=1)
+    assert offsets["afterUp"] == pytest.approx(offsets["before"], abs=1)
