@@ -27,11 +27,15 @@ The parser accepts `--port N` (default 8765), `--no-browser`, and `--load JSON` 
 
 ### Exit immediately
 
-`--help` prints the subcommand help. A port already in use is reported before anything else prints: `error: port 8765 is not available (Address already in use) — is another Dedupe UI already running?` on stderr, exit 2. (Until 2026-09-03 this surfaced as werkzeug's two-line notice and an uncaught `SystemExit` — see [bug-triage](../bug-triage.md) B-07.) One subtlety: the probe and the server bind `127.0.0.1` specifically, so a process listening on the *wildcard* address (e.g. `python3 -m http.server 8765` at defaults) does not count as "in use" — the loopback-specific bind still succeeds and the UI works.
+`--help` prints the subcommand help. A start is refused in exactly one case: the port is in use by **another Dedupe UI** — two UIs cannot run at once, because the second would strand the first's review session on a different URL — so the process prints `error: port 8765 is in use by another Dedupe UI — two UIs cannot run at once; reuse it in the browser or stop the other process first` on stderr, exit 2, before anything else prints. (Two earlier behaviors on a busy port: until 2026-09-03 werkzeug's two-line notice and an uncaught `SystemExit` surfaced — see [bug-triage](../bug-triage.md) B-07; from 2026-09-03 to 2026-09-19 the probe failed with `error: port N is not available …` for any blocker. The refusal is now scoped to Dedupe-UI blockers only.) One subtlety survives from both: the probe and the server bind `127.0.0.1` specifically, so a process listening on the *wildcard* address (e.g. `python3 -m http.server 8765` at defaults) does not count as "in use" — the loopback-specific bind still succeeds and the UI works.
+
+### Busy port: reroute
+
+Anything else on the designated port does not fail the start: the server moves to the next free port (walking up from the designated one; if the whole range is taken, the OS picks a free port). The reroute is announced on stderr — `note: port 8765 is in use by another program — serving on 8766 instead` — and the URL line prints the port actually bound: `Dedupe UI: http://127.0.0.1:8766/`. The browser opens to the rerouted URL. The blocker is identified as a Dedupe UI by asking it: the UI answers `/api/status` with its API version; a program that does not (e.g. a plain `http.server`) is treated as foreign, and rerouting proceeds. A start is refused outright only if no port can be bound at all.
 
 ### Begin running
 
-The server binds to `127.0.0.1` only — the loopback address; nothing on the network can reach it. The browser is opened by a timer 0.8 seconds after startup so the server is ready when the page arrives. The terminal shows the two lines above and then nothing unless the request log is enabled.
+The server binds to `127.0.0.1` only — the loopback address; nothing on the network can reach it. The bind and the probe are one operation (the listening socket is bound first and handed to the server), so a port can never pass the probe and then fail to serve. The browser is opened by a timer 0.8 seconds after startup so the server is ready when the page arrives. The terminal shows the two lines above and then nothing unless the request log is enabled.
 
 ### While running
 
@@ -51,7 +55,7 @@ The exit is clean: the launcher's Terminal window closes with the process.
 
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
-| `--port N` | Which local port serves; nothing else changes. | Fixed. |
+| `--port N` | Which local port to ask for; a busy port reroutes to the next free one (announced on stderr), unless the blocker is another Dedupe UI. | Fixed. |
 | `--no-browser` | The URL prints but no browser opens; the user navigates there themselves. | Fixed. |
 | `--load JSON` | Installs a previous scan result as the starting state. | Fixed. |
 | stdout is a pipe | The two startup lines still print; nothing is colorized or interactive. | No effect. |
@@ -63,7 +67,7 @@ The exit is clean: the launcher's Terminal window closes with the process.
 | The user aborts explicitly (Ctrl+C) | The process dies before binding. | The server stops at once; in-flight requests die; state not saved to the session file is lost. |
 | The user does something else mid-way | Not applicable. | The server exists to be used from the browser; multiple tabs share one server and one state, and the shutdown waits for the *last* tab. |
 | A clean complete happens elsewhere | Not applicable. | A completed action or scan is state the server holds; nothing else runs alongside. |
-| The environment fails | A busy port prints `error: port … is not available …` and exits 2 before the URL line prints. | Server-side errors surface in the browser as error payloads; the process keeps serving. |
+| The environment fails | A port held by another Dedupe UI prints `error: port … is in use by another Dedupe UI — …` and exits 2 before the URL line prints; a port held by anything else reroutes to the next free port (see [Busy port: reroute](#busy-port-reroute)). | Server-side errors surface in the browser as error payloads; the process keeps serving. |
 | The page or process goes away | No effect. | Closing the last tab triggers the graceful self-shutdown described above; killing the process loses in-memory state (preview tokens, an unsaved scan, any change in flight). |
 | Something else changes the target | No effect. | File changes are handled by revalidation at action time, not by the server itself. |
 | The input channel changes | stdin is never read. Closing the terminal sends SIGHUP and the process dies. | Same. |
@@ -81,21 +85,21 @@ The exit is clean: the launcher's Terminal window closes with the process.
 
 **Concurrency and resource limits.** The server is threaded; one global lock serializes scans and actions against each other. Several open tabs are supported and share the same state — including shutting the server down when the last one closes.
 
-**macOS specifics.** `Dedupe.command` (repo root or `launchers/`) double-clicks into the same `ui` startup inside a Terminal window, opens the browser, and the window closes itself when the tab does.
+**macOS specifics.** `Dedupe.command` (repo root or `launchers/`) double-clicks into the same `ui` startup inside a Terminal window, opens the browser, and the window closes itself when the tab does. The launcher reads the URL from the server's own output line, so the browser follows a reroute too; a foreign program on the port no longer aborts the launch.
 
-**Configuration and defaults.** Port 8765, loopback only, browser auto-open on. The API carries a version number the launcher uses to avoid pairing stale processes with new static files.
+**Configuration and defaults.** Port 8765 (designated; reroutes off a busy port), loopback only, browser auto-open on. The API carries a version number the launcher uses to avoid pairing stale processes with new static files.
 
 ## Edge cases
 
 - Closing the tab and reopening within 1.5 s continues the same session seamlessly; the shutdown timer is cancelled by the first request of the reloaded page.
-- Two `dedupe ui` processes cannot share the port; the second fails to bind.
+- Two `dedupe ui` processes cannot share the port: the second refuses the start (exit 2) rather than rerouting, because the first owns the review session.
+- A foreign program on the port reroutes: the URL line and the browser both use the port actually bound, and the terminal notes the move on stderr.
 - With `--load` and a saved session both present, the loaded JSON wins the startup state; the session file is then overwritten with it on the first save.
 - The browser-opening timer can race a very slow browser; the page simply retries against an already-listening server.
 - Requests from other machines are impossible by binding (loopback), and cross-origin requests from other local pages are rejected by the token and origin checks.
 
 ## Open questions and verification
 
-- The busy-port failure mode (traceback vs message) was read from the make_server path, not reproduced.
 - What the Terminal window shows between startup and shutdown when launched via `Dedupe.command` (request log visibility) was not observed by hand.
 - Whether a second tab closing before the first ever existed still schedules shutdown (it should — the notice fires per pagehide) is to confirm during verification.
 

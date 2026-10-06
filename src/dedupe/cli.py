@@ -11,7 +11,6 @@ import os
 import platform
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -585,7 +584,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         from .web.app import create_app, run_app
 
         app = create_app(initial_result=result)
-        run_app(app, port=args.port, open_browser=True)
+        return run_app(app, port=args.port, open_browser=True)
 
     return 0
 
@@ -599,24 +598,9 @@ def cmd_ui(args: argparse.Namespace) -> int:
         data = json.loads(Path(args.load).read_text(encoding="utf-8"))
         initial = ScanResult.from_dict(data)
     app = create_app(initial_result=initial)
-    # Probe the port first: on a busy port werkzeug prints its own two-liner
-    # and raises SystemExit, which read as a crash. A plain bind (with the
-    # same SO_REUSEADDR werkzeug uses) lets us say it cleanly.
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        probe.bind(("127.0.0.1", args.port))
-    except OSError as exc:
-        print(
-            f"error: port {args.port} is not available ({exc.strerror or exc}) — "
-            "is another Dedupe UI already running?",
-            file=sys.stderr,
-        )
-        return 2
-    finally:
-        probe.close()
-    run_app(app, port=args.port, open_browser=not args.no_browser)
-    return 0
+    # run_app binds with reroute: a busy port moves the UI to the next free
+    # port (announcing it), and only a blocking Dedupe UI refuses the start.
+    return run_app(app, port=args.port, open_browser=not args.no_browser)
 
 
 def cmd_isolate(args: argparse.Namespace) -> int:

@@ -23,7 +23,7 @@ stateDiagram-v2
 
 ### Start
 
-Three of the four action-bar buttons are scoped by selection: one covers exact-match selections, one similar-match selections, and one the staged low-resolution and random-review selections; each is disabled with an explanatory tooltip while its scope has no selections. All three have keyboard shortcuts: `a` previews the exact matches, `A` (Shift+`a`) the similar matches, `D` (Shift+`d`) the Low-res + Random review selections, and the `?` help sheet lists them together — "a / A / D — Preview Trash for selected exact / similar / Low-res + Random review files". The fourth button, **Delete All Exact Duplicates**, answers to the exact category rather than the selection: it is enabled whenever at least one exact group exists — its tooltip names the group count — and pressing it first applies the automatic rule to every exact group (each group's keeper stays; every other copy is marked, overriding any per-copy Remove adjustments in the [exact copy list](group-list.md)), then starts the exact-scope dry run like any other press of `a`. It has no keyboard shortcut. Pressing any of them starts a dry run of the Trash action against the resulting selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
+Three of the four action-bar buttons are scoped by selection: one covers exact-match selections, one similar-match selections, and one the staged low-resolution and random-review selections; each is disabled with an explanatory tooltip while its scope has no selections. All three have keyboard shortcuts: `a` previews the exact matches, `A` (Shift+`a`) the similar matches, `D` (Shift+`d`) the Low-res + Random review selections, and the `?` help sheet lists them together — "a / A / D — Preview Trash for selected exact / similar / Low-res + Random review files". The fourth button, **Delete All Exact Duplicates**, answers to the exact category rather than the selection: it is enabled whenever at least one exact group exists — its tooltip names the group count — and pressing it first applies the automatic rule to every exact group (each group's keeper stays; every other copy is marked, overriding any per-copy Remove toggles in the exact group's copy list), then starts the exact-scope dry run like any other press of `a`. It has no keyboard shortcut. Pressing any of them starts a dry run of the Trash action against the resulting selection. The server computes the effective selection, runs the full batch preflight — every file checked against the disk, exact groups re-hashed, keepers validated — and returns the itemized outcome plus a **preview token**: a one-use authorization bound to this exact preview (this scan, this action, this scope, this destination, this set of eligible files). The token lives **10 minutes** (600 seconds). The sheet shows the numbers and the countdown.
 
 While the dry run and any execute are in flight, the action bar is disabled and a status note ("Verifying the selection against the files on disk…", then "Moving files to Trash…") says what is happening; there is no silent wait.
 
@@ -57,7 +57,7 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
-| Button choice (Exact / Similar / Low-res + Random) | Selects which selections the Trash action covers; the review scope's sheet leads with the `_Dedupe Quarantine` destination. `a` / `A` open the exact / similar sheets from the keyboard; the review scope is button-only. | Fixed per sheet; another scope needs its own preview. |
+| Button choice (Exact / Similar / Low-res + Random / All exact duplicates) | Selects which selections the Trash action covers; the review scope's sheet leads with the `_Dedupe Quarantine` destination. `a` / `A` open the exact / similar sheets from the keyboard; the review scope is button-only. **Delete All Exact Duplicates** re-derives the exact selection with the automatic rule before previewing, so its sheet always covers every exact group. | Fixed per sheet; another scope needs its own preview. |
 | Selection state | Defines the preview's numbers. | Any change invalidates the token; re-preview on Confirm. |
 
 ## Cancel and interrupt
@@ -91,7 +91,8 @@ Executing consumes the token and runs the action with per-file immediate revalid
 
 ## Edge cases
 
-- Confirming a preview of zero eligible files is allowed and reports nothing moved — useful as a sanity check, harmless. (Every button is disabled while its scope has no selections at all.)
+- Confirming a preview of zero eligible files is allowed and reports nothing moved — useful as a sanity check, harmless. (The three scoped buttons are disabled while their scope has no selections at all; **Delete All Exact Duplicates** is disabled only when there are no exact groups.)
+- **Delete All Exact Duplicates** always re-derives the exact selection before previewing: per-copy Remove toggles cleared by hand are marked again, while a keeper settled earlier through a selection rule survives — the automatic rule respects an existing suggested keeper ([Duplicate group](../foundations/duplicate-group.md) owns the rule).
 - The two-part Trash action (system trash + review quarantine) can partially fail: one part's receipt exists, the other's files stayed. The result reports per-file outcomes.
 - A preview taken during a scan cannot happen — actions refuse while scanning — so the token's scan id is always the live one.
 
@@ -100,4 +101,4 @@ Executing consumes the token and runs the action with per-file immediate revalid
 - The automatic re-preview on a stale token is read from the client's stale-response handling; the visible sequence (sheet numbers refresh without closing) should be confirmed by hand.
 - The review-quarantine split leads the Low-res + Random preview (restored after the "simplify duplicate deletion actions" change dropped the scope from the action bar entirely — see [bug-triage](../bug-triage.md) B-06); confirm the wording by hand on a scan with low-res candidates.
 
-Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).
+Verified against the post-improvement working tree (2026-09 UX phase + the Delete All Exact Duplicates button, commit `a3f94a8`; pinned at `2a6cede` plus later improvement commits).

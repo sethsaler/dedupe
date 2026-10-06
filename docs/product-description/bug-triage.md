@@ -108,7 +108,7 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 - **Severity:** `low`. Nothing damaged; an ugly failure on a routine condition.
 - **Decision needed:** `fix` (done). `cmd_ui` now probes the port with a plain bind (same `SO_REUSEADDR` semantics) before starting and prints `error: port N is not available (Address already in use) — is another Dedupe UI already running?`, exit 2; `run_app` also binds before printing the URL line so the URL never prints for a server that failed to start.
 - **Raised by:** checklist UICMD-03, scripted pass 2026-09-03.
-- **Status:** Fixed in the working tree on 2026-09-03; covered by `test_ui_on_a_busy_port_exits_cleanly`.
+- **Status:** Fixed in the working tree on 2026-09-03; covered by `test_ui_on_a_busy_port_exits_cleanly`. Superseded 2026-09-19: the busy-port behavior is now a reroute (see the goal.md fact and [ui-command.md](cli/ui-command.md#busy-port-reroute)) — a foreign blocker moves the UI to the next free port (announced), and only a blocking Dedupe UI still refuses; covered by `test_ui_reroutes_when_port_is_taken_by_a_foreign_process` and `test_ui_refuses_start_when_port_is_taken_by_another_dedupe_ui`.
 - **Issue:** none filed (found and fixed in the same pass).
 
 ### B-08: `isolate` printed no per-item failure reasons on an all-or-nothing cancel

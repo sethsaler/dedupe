@@ -30,7 +30,7 @@ Priorities: **P1** is an established fact, a claim many documents depend on, or 
 - **TTY vs pipe.** CLI progress and the `\r` behavior differ; items that mention the progress line need a real terminal.
 - **Two tabs, one browser.** Enough for shutdown-grace and shared-state items. A second *browser* is not needed — the product is single-user, local-only.
 - **Photos.app library.** For the refusal item: `~/Pictures/Photos Library.photoslibrary` (any macOS machine with Photos).
-- **Busy port.** For `ui` port items: `python3 -m http.server 8765` first.
+- **Busy port.** For `ui` port items: a foreign blocker is `python3 -m http.server --bind 127.0.0.1 8765` (must bind 127.0.0.1); a second Dedupe UI is another `dedupe ui`.
 - **ffmpeg/OpenCV present.** The drafting machine has both (`dedupe doctor` says ready); degraded-mode items need them removed and are marked accordingly.
 
 ## Driving the product from a console or script

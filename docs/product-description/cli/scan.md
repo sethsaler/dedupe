@@ -112,4 +112,4 @@ Selections in the CLI are made by the `--smart` rule alone — there is no inter
 - The summary format comes from `summarize_scan` in `actions.py`; its exact lines were not reproduced here verbatim.
 - `--ui` after an executed action serves the post-action result; the interplay with the review session save on UI startup was not exercised.
 
-Verified against the post-improvement working tree (2026-09 improvement phases + the `--kinds` auto-delete-exact work; pinned at `2a6cede` plus later improvement commits and uncommitted working-tree changes).
+Verified against the post-improvement working tree (2026-09 improvement phases + `--kinds` auto-delete-exact, commit `021efcb`; pinned at `2a6cede` plus later improvement commits).

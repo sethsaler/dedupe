@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -285,20 +289,92 @@ def test_isolate_prints_per_item_failure_reasons(tmp_path: Path, capsys) -> None
     assert "isolate cancelled because another file failed preflight" in out
 
 
-def test_ui_on_a_busy_port_exits_cleanly(capsys) -> None:
-    import socket
+def _serve_ui_in_thread(port: int) -> dict:
+    """Start a real UI server thread on ``port``; return a result holder.
 
+    The holder's "code" key receives run_app's exit code when the server
+    stops. Uses run_app (not a bare make_server) so the tests exercise the
+    exact bind-and-announce path the CLI uses.
+    """
+    from dedupe.web.app import create_app, run_app
+
+    holder: dict = {"app": create_app(), "code": None}
+
+    def serve() -> None:
+        holder["code"] = run_app(holder["app"], port=port, open_browser=False)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return holder
+
+
+def _wait_for_line(capsys, needle: str, seconds: float = 5.0):
+    """Poll captures until ``needle`` appears; return the (out, err) pair."""
+    import pytest
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        captured = capsys.readouterr()
+        if needle in captured.out or needle in captured.err:
+            return captured
+        time.sleep(0.05)
+    captured = capsys.readouterr()
+    pytest.fail(
+        f"{needle!r} not printed within {seconds}s; got {captured.out!r} / {captured.err!r}"
+    )
+
+
+def test_ui_reroutes_when_port_is_taken_by_a_foreign_process(capsys) -> None:
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    port = blocker.getsockname()[1]
+    try:
+        _serve_ui_in_thread(port)
+        # A busy foreign port is announced and rerouted to the next free port…
+        captured = _wait_for_line(capsys, "Dedupe UI:")
+        assert f"serving on {port + 1} instead" in captured.err
+        url = captured.out.split("Dedupe UI: ")[1].splitlines()[0]
+        assert url == f"http://127.0.0.1:{port + 1}/"
+        # …and the rerouted server actually serves.
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert response.status == 200
+    finally:
+        blocker.close()
+
+
+def test_ui_refuses_start_when_port_is_taken_by_another_dedupe_ui(capsys) -> None:
+    # Find a free port for the first UI, then release it for the bind.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    _serve_ui_in_thread(port)
+    _wait_for_line(capsys, "Dedupe UI:")
+
+    # A second UI on the same port must refuse — not reroute — with a
+    # deliberate message and exit 2, because the first UI owns the session.
+    from dedupe.web.app import create_app, run_app
+
+    assert run_app(create_app(), port=port, open_browser=False) == 2
+    err = capsys.readouterr().err
+    assert f"port {port} is in use by another Dedupe UI" in err
+    assert "Traceback" not in err
+def test_ui_on_a_busy_port_exits_cleanly(capsys) -> None:
+    """The CLI path through main() reroutes a busy port and still serves."""
     blocker = socket.socket()
     blocker.bind(("127.0.0.1", 0))
     blocker.listen()
     port = blocker.getsockname()[1]
     try:
-        assert cli.main(["ui", "--no-browser", "--port", str(port)]) == 2
+        _serve_ui_in_thread(port)
+        captured = _wait_for_line(capsys, "Dedupe UI:")
+        url = captured.out.split("Dedupe UI: ")[1].splitlines()[0]
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert response.status == 200
     finally:
         blocker.close()
-    err = capsys.readouterr().err
-    assert f"port {port}" in err
-    assert "Traceback" not in err
 
 
 def test_receipts_list_warns_about_unreadable_receipts(tmp_path: Path, capsys) -> None:

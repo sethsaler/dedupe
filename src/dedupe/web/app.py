@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
+import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from dataclasses import replace
 from itertools import combinations
@@ -2701,16 +2705,65 @@ def run_app(
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
-) -> None:
+) -> int:
+    """Start the UI server on ``host``/``port``, rerouting if the port is busy.
+
+    Binds before announcing anything, so the URL line is only ever printed
+    for a server that actually started. When the designated port is taken
+    the server moves to the next free port instead of failing — unless the
+    blocker is itself a Dedupe UI, in which case starting a second UI would
+    strand the blocker's review session on a different URL, so the start is
+    refused with a deliberate message. Returns an exit code: 0 after a
+    clean shutdown, 2 if the start was refused. KeyboardInterrupt (Ctrl+C)
+    propagates to the caller.
+    """
     from werkzeug.serving import make_server
 
-    url = f"http://{host}:{port}/"
-    # Bind before announcing anything: on a genuinely busy port make_server
-    # raises OSError, and the URL line must never print for a server that did
-    # not start. (make_server rather than app.run so /api/shutdown can stop
-    # the loop via server.shutdown() when the tab closes.)
-    server = make_server(host, port, app, threaded=True)
+    # Bind candidate ports ourselves (same SO_REUSEADDR semantics as
+    # werkzeug) and hand the pre-bound socket fd to make_server, so the
+    # probe and the server share a single bind — no race between a probe
+    # and a second listener, and no werkzeug SystemExit on a busy port.
+    # (make_server rather than app.run so /api/shutdown can stop the loop
+    # via server.shutdown() when the tab closes.)
+    bound: socket.socket | None = None
+    refused_reason: str | None = None
+    actual_port: int | None = None
+    try:
+        for candidate in _candidate_ports(port):
+            bound = _bind_socket(host, candidate)
+            if bound is not None:
+                actual_port = bound.getsockname()[1]
+                break
+        if bound is None:
+            refused_reason = f"no port available for the UI on {host}"
+        elif actual_port != port and _is_dedupe_ui_running(host, port):
+            refused_reason = (
+                f"port {port} is in use by another Dedupe UI — "
+                "two UIs cannot run at once; reuse it in the browser or "
+                "stop the other process first"
+            )
+        if refused_reason is not None:
+            print(f"error: {refused_reason}", file=sys.stderr)
+            return 2
+        assert actual_port is not None
+        if actual_port != port:
+            print(
+                f"note: port {port} is in use by another program — "
+                f"serving on {actual_port} instead",
+                file=sys.stderr,
+            )
+        server = make_server(host, actual_port, app, threaded=True, fd=bound.fileno())
+    except OSError as exc:
+        print(
+            f"error: could not start the UI server ({exc.strerror or exc})",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        if bound is not None:
+            bound.close()
     app.extensions["dedupe_server"] = server
+    url = f"http://{host}:{actual_port}/"
     print(f"Dedupe UI: {url}", flush=True)
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
@@ -2720,3 +2773,49 @@ def run_app(
     finally:
         app.extensions.pop("dedupe_server", None)
         server.server_close()
+    return 0
+
+
+def _candidate_ports(port: int) -> list[int | None]:
+    """Designated port first, then walking up until one binds; None = OS-chosen.
+
+    The walk-up stops at the top of the range: beyond it the OS is asked for
+    a free port, which cannot collide. A designated port at or above the top
+    falls straight to the OS-chosen candidate.
+    """
+    if port >= 65535:
+        return [65535, None]
+    return list(range(port, 65535)) + [None]
+
+
+def _bind_socket(host: str, port: int | None) -> socket.socket | None:
+    """Return a listening socket bound to host:port, or None if it is taken.
+
+    ``None`` port asks the OS for a free port (binds as port 0). SO_REUSEADDR
+    matches werkzeug's serving socket so a wildcard-bound listener coexists
+    with this loopback bind on macOS (and a TIME_WAIT socket does not block it).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port if port is not None else 0))
+        sock.listen()
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def _is_dedupe_ui_running(host: str, port: int) -> bool:
+    """Say whether the process listening on host:port is a Dedupe UI.
+
+    The UI reports its API version on /api/status; a foreign blocker (e.g.
+    ``python -m http.server``) does not. Network errors count as "not a
+    Dedupe UI" so a degraded blocker never blocks a reroute.
+    """
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/status", timeout=2) as response:
+            body = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(body, dict) and "web_api_version" in body

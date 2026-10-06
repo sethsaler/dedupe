@@ -106,7 +106,7 @@ The list itself does not "complete"; the session does, when the user opens the [
 - Invert on a group whose keeper is unselected selects everything else; on a fully selected group it deselects everything except what the server's keeper rule restores.
 - A group hidden by filters keeps its selection, and bulk operations do not reach it — bulk applies to shown groups only, by design.
 - Bulk criteria never select files without a trusted face count when a minimum-face rule is used; unanalyzed media is skipped rather than guessed at.
-- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button and for `D` and the Low-res + Random button.
+- Pressing `a` with no exact-match selection does nothing: the button it drives is disabled until its scope has selections (its tooltip says so). The same holds for `A` and the similar-matches button and for `D` and the Low-res + Random button. The fourth action-bar button, **Delete All Exact Duplicates**, is the exception: it answers to the exact category rather than the selection, so it stays enabled — tooltip naming the group count — whenever exact groups exist, even with nothing selected ([The action sheet](action-sheet.md)).
 - A filter that hides every group leaves the sidebar showing a plain "No groups in this filter." message — plain text, not a status announcement.
 - Focus on a group survives re-renders of the sidebar: when streamed groups, a refetch, or a tab switch redraw the list, the focused group's new row takes the focus. Pressing `]` or `j` right after switching tabs therefore lands on the group even though the tab's own refresh selects the same group a moment later.
 
@@ -116,4 +116,4 @@ The list itself does not "complete"; the session does, when the user opens the [
 - The app-shell breakpoint (901 × 600 px) and the per-tab action bar were watched in Chromium at 1440 × 900, 1024 × 768, and 420 × 860, light and dark; not yet in Safari.
 - Whether the Similar videos tab is a separate sidebar entry or merged under Similar images depends on `kind` handling in the tab rendering; to confirm visually.
 
-Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).
+Verified against the post-improvement working tree (2026-09 UX phase + the Delete All Exact Duplicates button, commit `a3f94a8`; pinned at `2a6cede` plus later improvement commits).

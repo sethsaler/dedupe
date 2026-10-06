@@ -52,7 +52,7 @@ Groups stream into the sidebar as they are finalized, kept sorted most-reclaimab
 
 ### Complete
 
-The progress line becomes the final summary — the folded scan bar drops the finished progress bar and per-folder lines and keeps just that one line, next to the saved-review banner and the scan-quality summary; the result — files, groups, diagnostics — is installed and saved to the review session file at once. The action bar appears with its buttons enabled, keyed to the selection and to the open tab ([Group list](group-list.md#start)). If the scan found zero valid folders, the error message is shown instead and the *previous* results (if any) are restored unchanged.
+The progress line becomes the final summary — the folded scan bar drops the finished progress bar and per-folder lines and keeps just that one line, next to the saved-review banner and the scan-quality summary; the result — files, groups, diagnostics — is installed and saved to the review session file at once. The action bar appears with its buttons enabled, keyed to the selection and to the open tab ([Group list](group-list.md#start)) — except **Delete All Exact Duplicates**, which is keyed to the presence of exact groups ([The action sheet](action-sheet.md)). If the scan found zero valid folders, the error message is shown instead and the *previous* results (if any) are restored unchanged.
 
 ## Modifiers
 
@@ -105,4 +105,4 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 - The exact behavior of the workers slider at the cap (label text, enforcement) was read from `updateWorkersUI` in `settings.js`, not watched by hand.
 - The dependency gating (disabled chips, tooltips, the "Not installed: …" line) was read from `applyCapabilities` in `settings.js` and `detect_capabilities` in `app.py`; the drafting machine has every optional dependency installed, so the disabled state was not watched live. The cross-folder hint and the exclusion check are covered in a real browser by the e2e test `test_scan_setup_hints_and_exclusion_check`.
 
-Verified against the post-improvement working tree (2026-09 UX phase; pinned at `2a6cede` plus later improvement commits).
+Verified against the post-improvement working tree (2026-09 UX phase + the Delete All Exact Duplicates button, commit `a3f94a8`; pinned at `2a6cede` plus later improvement commits).

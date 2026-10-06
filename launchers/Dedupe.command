@@ -85,39 +85,41 @@ if command -v lsof >/dev/null 2>&1; then
       if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
         die "The outdated Dedupe server did not stop. Close it and try again."
       fi
-    else
-      die "Port $PORT is being used by another application. Close it or set DEDUPE_PORT to another port."
     fi
+    # A foreign program on the port is not fatal: dedupe ui reroutes to the
+    # next free port and prints the URL it actually bound, and the server
+    # line below is re-read from that output.
   fi
 fi
 
 banner
 echo "Project:  $ROOT"
 echo "Python:   $PYTHON"
-echo "URL:      $URL"
+echo "URL:      $URL (moves to the next free port if taken)"
 echo ""
 echo "Starting… (close this window or press Ctrl+C to stop)"
 echo "──────────────────────────────────────────────────────"
 
-# Open browser shortly after server binds
+# The server prints the URL it actually bound (it reroutes off a busy port).
+# Capture its output line by line so the window shows it and the browser can
+# follow a rerouted URL.
+UIOUTPUT="$(mktemp)"
+trap 'rm -f "$UIOUTPUT"' EXIT
+
 (
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.4
-    if command -v curl >/dev/null 2>&1; then
-      if curl -sf -o /dev/null "$URL" 2>/dev/null; then
-        open "$URL" 2>/dev/null || true
-        exit 0
-      fi
-    else
-      open "$URL" 2>/dev/null || true
+  # Poll for the URL line and open the browser as soon as it appears.
+  for _ in $(seq 1 50); do
+    BOUND="$(sed -n 's/^Dedupe UI: //p' "$UIOUTPUT" 2>/dev/null | head -n 1)"
+    if [[ -n "$BOUND" ]]; then
+      open "$BOUND" 2>/dev/null || true
       exit 0
     fi
+    sleep 0.2
   done
-  open "$URL" 2>/dev/null || true
 ) &
 
 STATUS=0
-"$PYTHON" -m dedupe.cli ui --port "$PORT" --no-browser || STATUS=$?
+"$PYTHON" -m dedupe.cli ui --port "$PORT" --no-browser 2>&1 | tee "$UIOUTPUT" || STATUS=$?
 
 # On a clean exit (browser tab closed, or Ctrl+C) close this Terminal window
 # so nothing lingers. After an error, leave the window open so the output is
