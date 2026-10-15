@@ -1,0 +1,1099 @@
+/* Scoped theme (review): group rail, detail header, similar compare + board, action bar.
+   Loads after app.css, design.css and theme.css. Selectors are scoped to the
+   results/similar/action-bar contexts so the decision review, triage grids,
+   modals and lightbox keep their own step's rules. Red (--lt-pencil) marks only
+   things that will leave; keepers are ink. */
+
+/* ---------- Results shell: flat index rail + one sleeve rule ---------- */
+.results {
+  gap: 12px 0;
+  grid-template-columns: 300px minmax(0, 1fr);
+}
+
+.results .sidebar,
+.results .detail {
+  background: var(--lt-table);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.results .sidebar {
+  border-right: 1px solid var(--lt-sleeve);
+  padding-right: 0;
+}
+
+.results .detail {
+  padding: 4px 0 16px 28px;
+}
+
+/* Filter controls: quiet, sleeve-bordered, mono labels. */
+.results .result-controls {
+  padding: 16px;
+  gap: 10px;
+  border-bottom: 1px solid var(--lt-sleeve);
+  background: var(--lt-table);
+}
+
+.results #filteredCount {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--lt-graphite);
+}
+
+.results #btnClearFilters {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--lt-graphite);
+  padding: 2px 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+}
+
+.results #btnClearFilters:hover { color: var(--lt-ink); }
+
+.results .search-field input,
+.results .search-field input[type="search"] {
+  min-height: 36px;
+  padding: 8px 10px;
+  font-size: 13px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+}
+
+.results .search-field input:focus-visible {
+  border-color: var(--lt-ink);
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+.results .review-filters summary,
+.results .sidebar-panel summary {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--lt-graphite);
+  padding: 2px 0;
+}
+
+.results .review-filters summary:hover,
+.results .sidebar-panel summary:hover { color: var(--lt-ink); }
+
+.results .sidebar-panel {
+  border: 0;
+  border-top: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  padding: 10px 0 0;
+  background: transparent;
+}
+
+.results .sidebar-panel[open] { background: transparent; }
+.results .sidebar-panel > p { font-size: 12px; color: var(--lt-graphite); }
+
+.results .sidebar-panel .btn,
+.results .sidebar-panel select,
+.results .sidebar-panel input {
+  font-size: 13px;
+}
+
+/* "Next to review" is a secondary action, not a brand button. */
+.results #btnNextReview {
+  min-height: 36px;
+  font-size: 13px;
+  font-weight: 500;
+  background: transparent;
+  color: var(--lt-ink);
+  border: 1px solid var(--lt-sleeve);
+  box-shadow: none;
+}
+
+.results #btnNextReview:hover {
+  filter: none;
+  border-color: var(--lt-ink);
+  background: transparent;
+}
+
+.results #btnNextReview kbd {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-graphite);
+  background: var(--lt-table);
+  border-color: var(--lt-sleeve);
+}
+
+/* ---------- Group rail rows ---------- */
+.results .group-list { background: var(--lt-table); }
+
+.results .group-item {
+  gap: 4px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--lt-sleeve);
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+.results .group-item:hover { background: var(--lt-loupe); }
+
+.results .group-item:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: -2px;
+  background: var(--lt-loupe);
+}
+
+/* Active row: loupe mat plus a 3px ink bar. No accent tint. */
+.results .group-item.active,
+.results .group-item.active:hover {
+  background: var(--lt-loupe);
+  box-shadow: inset 3px 0 0 var(--lt-ink);
+}
+
+.results .group-item .g-name {
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--lt-ink);
+}
+
+.results .group-item .g-top {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--lt-graphite);
+  gap: 10px;
+}
+
+.results .group-item .g-top > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.results .group-item .g-state {
+  font-family: var(--lt-ui);
+  font-size: 12px;
+  margin-top: 0;
+  color: var(--lt-graphite);
+}
+
+.results .group-item.attention .g-state { color: var(--lt-ink); }
+.results .group-item.attention .g-state-glyph { color: var(--lt-pencil); }
+.results .group-item.done .g-state { color: var(--lt-faint); }
+.results .group-item.done .g-state-glyph { color: var(--lt-faint); }
+
+.results .group-item .g-sub {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+/* Selection count: files that will leave, so pencil. */
+.results .group-item .g-sub .sel-mark {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-pencil);
+}
+
+/* Badges: mono uppercase text, no fill. */
+.badge,
+.results .group-item .badge,
+.results .group-item .badge.exact,
+.results .group-item .badge.similar,
+.results .group-item .badge.no_humans,
+.results .group-item .badge.low_resolution,
+.results .group-item .badge.random_review,
+.results .group-item .badge.faces,
+.results .group-item .badge.all_files {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.results .group-more-wrap .group-more,
+.results .group-more-wrap .btn {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--lt-graphite);
+  border-color: var(--lt-sleeve);
+}
+
+.results .group-more-wrap .btn:hover { color: var(--lt-ink); border-color: var(--lt-ink); }
+
+/* ---------- Detail header ---------- */
+.results .detail-body { display: flex; flex-direction: column; gap: 0; }
+
+.results .detail-header {
+  align-items: flex-end;
+  gap: 8px 20px;
+  margin-bottom: 18px;
+}
+
+.results .detail-heading {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 320px;
+}
+
+/* Meta is the kicker above the title, mono and graphite. */
+.results .detail-heading #detailMeta {
+  order: -1;
+  margin: 0 0 8px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  color: var(--lt-graphite);
+}
+
+.results .detail-header h2 {
+  margin: 0;
+  font-family: var(--lt-display);
+  font-size: 30px;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  color: var(--lt-ink);
+}
+
+/* Header tools: quiet text buttons, ink on hover. */
+.results .detail-header > .btn,
+.results .detail-header > .btn.ghost,
+.results .detail-header > .btn.primary-soft {
+  min-height: 0;
+  padding: 6px 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: none;
+  align-self: flex-end;
+}
+
+.results .detail-header > .btn:hover {
+  color: var(--lt-ink);
+  border-color: transparent;
+  background: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.results #btnMediaDetails[aria-pressed="true"] {
+  color: var(--lt-ink);
+  background: transparent;
+  border-color: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Guide keeps a hairline box; it is the one boxed header control. */
+.results .detail-header .guide-popover {
+  align-self: flex-end;
+}
+
+.results .detail-header .guide-popover > summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 6px;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  list-style: none;
+}
+
+.results .detail-header .guide-popover > summary:hover {
+  color: var(--lt-ink);
+  border-color: var(--lt-ink);
+}
+
+/* Progress / helper line under the header keeps the table quiet. */
+.results .detail-heading .muted,
+.results .detail-body > .muted {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+/* ---------- Similar compare (swipe deck) ---------- */
+.results .swipe-review { gap: 14px; }
+
+.results .swipe-pair {
+  gap: 28px;
+  padding: 8px 8px 0;
+}
+
+.results .swipe-side {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+  gap: 0;
+  /* Keeps the 4px-offset outlines of the media from being clipped. */
+  overflow: visible;
+}
+
+.results .swipe-media {
+  background: var(--lt-loupe);
+  border-radius: 4px;
+  background-image: none;
+}
+
+/* Keeper / reference: 3px ink outline, offset 4px, on the media only. */
+.results .swipe-keeper .swipe-media,
+.results .swipe-keeper-media {
+  outline: 3px solid var(--lt-ink);
+  outline-offset: 4px;
+}
+
+/* Candidate that will be trashed: 3px pencil outline. */
+.results .swipe-card .swipe-media {
+  outline: 3px solid var(--lt-pencil);
+  outline-offset: 4px;
+}
+
+.results .swipe-card,
+.results .swipe-keeper,
+.results .swipe-top.dragging {
+  box-shadow: none;
+}
+
+.results .swipe-media img,
+.results .swipe-media video {
+  object-fit: contain;
+}
+
+/* Reference tag: ink fill, white text (table token: white in light). */
+.results .swipe-keeper .swipe-tag {
+  top: 14px;
+  left: 14px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--lt-ink);
+  color: var(--lt-table);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+/* File info: no card border around it. */
+.results .swipe-info {
+  padding: 12px 2px 0;
+  gap: 4px;
+  border-top: 0;
+  background: transparent;
+  font-size: 12px;
+}
+
+.results .swipe-name-row {
+  gap: 12px;
+}
+
+.results .swipe-name-row .name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--lt-ink);
+}
+
+.results .swipe-sim {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.results .swipe-info .path,
+.results .swipe-info .card-meta {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--lt-graphite);
+}
+
+.results .swipe-card-tools {
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.results .swipe-card-tools .linkish,
+.results .swipe-info .linkish {
+  color: var(--lt-ink);
+  font-size: 12px;
+  font-weight: 550;
+  text-decoration: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+
+.results .swipe-card-tools .linkish:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Decisions: Same = pencil filled; Different = secondary. */
+.results .swipe-btn {
+  min-height: 46px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: 13px;
+  transform: none;
+}
+
+.results .swipe-btn:hover { transform: none; }
+
+.results .swipe-btn strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.results .swipe-btn kbd {
+  min-width: 0;
+  padding: 2px 6px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  border-radius: 4px;
+  line-height: 1.3;
+}
+
+.results .swipe-same {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+}
+
+.results .swipe-same:hover {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  filter: brightness(0.92);
+}
+
+.results .swipe-same kbd {
+  background: rgba(255, 255, 255, 0.2);
+  border: 0;
+  color: #FFFFFF;
+}
+
+.results .swipe-diff {
+  background: var(--lt-table);
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+}
+
+.results .swipe-diff:hover {
+  background: var(--lt-table);
+  border-color: var(--lt-ink);
+}
+
+.results .swipe-diff kbd {
+  background: var(--lt-loupe);
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-graphite);
+}
+
+.results .swipe-mid {
+  gap: 14px;
+  padding: 2px 0;
+  justify-content: flex-start;
+}
+
+.results .swipe-progress {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--lt-graphite);
+}
+
+.results .swipe-mid .linkish {
+  color: var(--lt-ink);
+  font-size: 12px;
+  font-weight: 550;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--lt-sleeve);
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.results .swipe-mid .linkish:hover { text-decoration-color: var(--lt-ink); }
+
+.results .swipe-mid .linkish:disabled {
+  color: var(--lt-faint);
+  text-decoration: none;
+  cursor: default;
+}
+
+.results .swipe-hint {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--lt-graphite);
+  text-align: left;
+}
+
+.results .swipe-hint kbd {
+  font-size: 11px;
+  padding: 0 5px;
+  border-color: var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+}
+
+/* ---------- Similar board ---------- */
+.results .similar-board {
+  background: var(--lt-table);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 4px 0 0;
+  gap: 8px;
+}
+
+.results .board-toolbar {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--lt-sleeve);
+  background: var(--lt-table);
+}
+
+.results .board-heading h2 {
+  font-family: var(--lt-display);
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.results .board-heading p,
+.results .board-filtered {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.results .board-search input,
+.results .board-filter select {
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  background: var(--lt-table);
+}
+
+.results .board-rows { gap: 0; }
+
+.results .board-row {
+  padding: 16px 0;
+  border-top: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  gap: 18px;
+}
+
+.results .board-row:first-child { border-top-color: transparent; }
+
+.results .board-row.focused {
+  background: var(--lt-loupe);
+  box-shadow: inset 3px 0 0 var(--lt-ink);
+  padding-left: 14px;
+}
+
+.results .board-row-head { gap: 4px; }
+.results .board-row-head strong { font-size: 13px; font-weight: 600; color: var(--lt-ink); }
+.results .board-row-head .muted { font-family: var(--lt-mono); font-size: 12px; color: var(--lt-graphite); }
+.results .board-row-num,
+.results .board-row-reclaim {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.results .board-row-actions .btn {
+  min-height: 0;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 12px;
+  font-family: var(--lt-mono);
+  letter-spacing: 0.04em;
+}
+
+.results .board-row-actions .btn:hover { color: var(--lt-ink); text-decoration: underline; text-underline-offset: 3px; }
+
+.results .board-tiles { gap: 14px; }
+
+/* Tiles sit on the loupe mat. Keeper = ink outline; removal = pencil outline. */
+.results .board-tile { gap: 6px; padding: 7px 7px 11px; }
+
+.results .board-thumb {
+  border: 0;
+  border-radius: 4px;
+  background: var(--lt-loupe);
+  outline: 3px solid var(--lt-ink);
+  outline-offset: 4px;
+  /* Outline reaches 7px below the thumb; the meta line starts after that plus 6px. */
+  margin-bottom: 7px;
+  transition: outline-color 0.12s var(--ease-out), opacity 0.12s var(--ease-out);
+}
+
+.results .board-tile.remove .board-thumb {
+  outline-color: var(--lt-pencil);
+}
+
+.results .board-tile.remove .board-thumb img { opacity: 0.72; }
+
+.results .board-tile.focused .board-thumb {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 8px;
+}
+
+.results .board-thumb:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 8px;
+}
+
+.results .board-tile .thumb-badge.keep {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+  border: 0;
+  border-radius: 3px;
+  font-family: var(--lt-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.results .board-tile .thumb-badge.remove {
+  background: var(--lt-pencil);
+  color: #FFFFFF;
+  border: 0;
+  border-radius: 3px;
+  font-family: var(--lt-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.results .board-tile-meta {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-graphite);
+  gap: 2px 8px;
+}
+
+.results .board-tile-name {
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--lt-ink);
+}
+
+.results .board-chip {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.results .board-chip.keeper { color: var(--lt-ink); }
+.results .board-chip.uncertain { color: var(--lt-graphite); }
+
+.results .board-keep-only {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--lt-sleeve);
+}
+
+.results .board-expand {
+  background: rgba(17, 17, 17, 0.72);
+  border-radius: 4px;
+}
+
+.results .board-keys-hint,
+.results .board-keys-hint kbd {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.results .board-keys-hint kbd {
+  font-size: 11px;
+  padding: 0 5px;
+  border-color: var(--lt-sleeve);
+  background: var(--lt-loupe);
+}
+
+.results .board-row.dismissed { opacity: 0.7; }
+
+/* ---------- Action bar ---------- */
+#actionBar.actionbar {
+  background: var(--lt-table);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+  border-top: 1px solid var(--lt-sleeve);
+  padding: 16px 24px;
+  gap: 12px;
+}
+
+#actionBar .btn {
+  min-height: 36px;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: none;
+}
+
+#actionBar .btn:hover {
+  border-color: var(--lt-ink);
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+/* The button that trashes marked files: pencil filled, white text. */
+#actionBar #btnTrashSimilar:not(:disabled),
+#actionBar #btnTrashReview:not(:disabled) {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+}
+
+#actionBar #btnTrashSimilar:not(:disabled):hover,
+#actionBar #btnTrashReview:not(:disabled):hover {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+  filter: brightness(0.92);
+}
+
+#actionBar .btn:disabled {
+  color: var(--lt-faint);
+  border-color: var(--lt-sleeve);
+  background: transparent;
+}
+
+#actionBar .action-busy-note {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+#actionBar .board-keys-hint { font-size: 12px; }
+
+/* ---------- Responsive ---------- */
+@media (max-width: 1100px) {
+  .results { grid-template-columns: 260px minmax(0, 1fr); }
+  .results .detail { padding-left: 22px; }
+  .results .detail-header h2 { font-size: 26px; }
+  .results .swipe-pair { gap: 20px; }
+}
+
+@media (max-width: 760px) {
+  .results { grid-template-columns: 1fr; }
+  .results .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--lt-sleeve);
+  }
+  .results .detail { padding: 14px 0 0; }
+  .results .detail-header h2 { font-size: 24px; }
+  .results .board-heading h2 { font-size: 24px; }
+  #actionBar.actionbar {
+    border: 0;
+    border-top: 1px solid var(--lt-sleeve);
+    border-radius: 0;
+    padding: 14px 16px;
+  }
+}
+
+@media (max-width: 560px) {
+  .results .swipe-pair { gap: 16px; padding: 6px 4px 0; }
+  .results .swipe-name-row .name { font-size: 13px; }
+  .results .swipe-card-tools { gap: 10px; font-size: 11px; flex-wrap: wrap; }
+  .results .swipe-btn kbd { display: inline-block; }
+  .results .swipe-same,
+  .results .swipe-diff { min-width: 0; }
+  .results .detail-header h2 { font-size: 22px; }
+}
+
+/* —— Decision review (Low-res, Random 50) ——
+   One file at a time on a loupe mat. Only the .decision-card stage is scoped
+   here; the Similar views and triage grids keep their own rules. Removal is
+   pencil (it will leave); a keeper is ink. */
+
+/* Stage: the card has no border or shadow; the media sits on the mat. */
+.results .decision-card,
+.results .decision-card.keep,
+.results .decision-card.selected,
+.results .decision-card.focused {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  outline: 0;
+  overflow: visible;
+  transform: none;
+}
+
+.results .decision-card:hover {
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+/* Media letterboxes (object-fit: contain) on the loupe mat, centered. */
+.results .decision-card .thumb-wrap {
+  background: var(--lt-loupe);
+  background-image: none;
+  background-color: var(--lt-loupe);
+  border-radius: 6px;
+  cursor: zoom-in;
+}
+
+/* Decided states on the media: pencil = will leave, ink = kept. */
+.results .decision-card.selected .thumb-wrap {
+  outline: 3px solid var(--lt-pencil);
+  /* Inset: the stage runs to the column edge, so an outer offset clips. */
+  outline-offset: -3px;
+}
+
+.results .decision-card.keep .thumb-wrap {
+  outline: 3px solid var(--lt-ink);
+  /* Inset: the stage runs to the column edge, so an outer offset clips. */
+  outline-offset: -3px;
+}
+
+/* Status tags: mono, square, no uppercase transform (text is dynamic). */
+.results .decision-card .thumb-badge {
+  top: 14px;
+  left: 14px;
+  padding: 5px 9px;
+  border-radius: 4px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: none;
+  backdrop-filter: none;
+}
+
+.results .decision-card .thumb-badge.keep {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+.results .decision-card .thumb-badge.remove {
+  background: var(--lt-pencil);
+  color: #FFFFFF;
+}
+
+/* File info under the mat: name 15px/600, meta and path mono 12px. */
+.results .decision-card .card-body {
+  padding: 16px 0 0;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.results .decision-card .name {
+  font-family: var(--lt-ui);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--lt-ink);
+}
+
+/* Marked for removal: the label carries a pencil-soft tint. */
+.results .decision-card.selected .name {
+  justify-self: start;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--lt-pencil-soft);
+}
+
+.results .decision-card .card-meta,
+.results .decision-card .path {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--lt-graphite);
+}
+
+.results .decision-card .card-meta {
+  gap: 4px 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.results .decision-card .card-meta .media-kind {
+  text-transform: none;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: var(--lt-graphite);
+}
+
+.results .decision-card .card-actions {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+  gap: 16px;
+  align-items: center;
+}
+
+.results .decision-card .inspect-media {
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--lt-ink);
+  text-decoration: none;
+}
+
+.results .decision-card .inspect-media:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Delete / Keep: two large buttons, >= 44px tall. */
+.results .decision-card .candidate-actions {
+  gap: 12px;
+}
+
+.results .decision-card .candidate-decision {
+  min-height: 56px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  font-family: var(--lt-ui);
+  transition: background 0.12s var(--ease-out), color 0.12s var(--ease-out);
+}
+
+.results .decision-card .candidate-decision:hover {
+  transform: none;
+}
+
+.results .decision-card .candidate-decision strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.results .decision-card .candidate-decision small {
+  font-size: 12px;
+  color: inherit;
+  opacity: 0.8;
+}
+
+.results .decision-card .candidate-decision kbd {
+  min-width: 0;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+/* Delete: pencil outline, pencil-soft fill, pencil text. */
+.results .decision-card .candidate-delete {
+  border: 2px solid var(--lt-pencil);
+  background: var(--lt-pencil-soft);
+  color: var(--lt-pencil);
+}
+
+.results .decision-card .candidate-delete:hover {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+}
+
+/* Keep: ink outline, transparent, ink text. */
+.results .decision-card .candidate-keep {
+  border: 2px solid var(--lt-ink);
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+.results .decision-card .candidate-keep:hover {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+/* Previous / Next and the position readout, only for this stage. */
+.results .detail-body:has(> #members > .decision-card) > #memberPagination {
+  gap: 8px;
+  margin: 0 0 16px;
+  justify-content: flex-start;
+}
+
+.results .detail-body:has(> #members > .decision-card) > #memberPagination .btn {
+  min-height: 36px;
+  padding: 6px 10px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--lt-graphite);
+  border-color: transparent;
+}
+
+.results .detail-body:has(> #members > .decision-card) > #memberPagination .btn:hover:not(:disabled) {
+  color: var(--lt-ink);
+  border-color: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.results .detail-body:has(> #members > .decision-card) > #memberPagination .member-page-summary {
+  min-width: 0;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Progress line in the detail header: mono, ink for the counts. */
+.results .detail-body:has(> #members > .decision-card) .detail-heading #detailMeta {
+  font-size: 12px;
+  color: var(--lt-ink);
+}
+
+/* Narrow screens: the two decision buttons share the row. */
+@media (max-width: 560px) {
+  .results .decision-card .candidate-decision {
+    min-height: 52px;
+    padding: 8px 10px;
+  }
+  .results .decision-card .candidate-decision strong { font-size: 14px; }
+}

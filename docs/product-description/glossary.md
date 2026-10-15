@@ -18,7 +18,7 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Member.** One media file inside a duplicate group.
 
-**Keeper.** The one file in a duplicate group the user intends to survive an action. The *suggested keeper* is the member Dedupe recommends keeping; it is highlighted in green in the UI. The suggestion ranks members by more pixels first, then larger file size, then newer modification time, then shorter path. A duplicate group never has its suggested keeper selected for removal by bulk operations, so at least one member always survives.
+**Keeper.** The one file in a duplicate group the user intends to survive an action. The *suggested keeper* is the member Dedupe recommends keeping; it is outlined in the UI (in ink, never red — red marks files that will leave). The suggestion ranks members by more pixels first, then larger file size, then newer modification time, then shorter path. A duplicate group never has its suggested keeper selected for removal by bulk operations, so at least one member always survives.
 
 **Selection.** The set of members in a group currently marked for removal. Members are selected or deselected individually, by bulk operations, or by a selection rule. Only the selection is acted on when an action is confirmed.
 

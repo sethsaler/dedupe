@@ -1,0 +1,510 @@
+/* Light table theme: foundation tokens, shell, buttons, tabs.
+   Loads after app.css and design.css; equal-specificity rules here win by order.
+   Scoped theme files: theme-setup, theme-review, theme-triage, theme-sheet, theme-lightbox. */
+
+/* ---------- Tokens ---------- */
+:root {
+  color-scheme: light;
+
+  /* Light (default). Dark values below. */
+  --lt-table: #FFFFFF;
+  --lt-loupe: #F2F2F0;
+  --lt-sleeve: #E2E2E0;
+  --lt-graphite: #6B6B6B;
+  --lt-faint: #A3A3A3;
+  --lt-ink: #111111;
+  --lt-pencil: #E8361F;
+  --lt-pencil-soft: #FDECE9;
+
+  --lt-display: "Inter Tight", "Inter", -apple-system, "SF Pro Display", system-ui, sans-serif;
+  --lt-ui: "Inter", -apple-system, "SF Pro Text", system-ui, sans-serif;
+  --lt-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --lt-table: #111111;
+    --lt-loupe: #1B1B1B;
+    --lt-sleeve: #2C2C2C;
+    --lt-graphite: #A0A0A0;
+    --lt-faint: #6A6A6A;
+    --lt-ink: #F2F2F0;
+    --lt-pencil: #FF5A43;
+    --lt-pencil-soft: #3A1712;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --lt-table: #111111;
+  --lt-loupe: #1B1B1B;
+  --lt-sleeve: #2C2C2C;
+  --lt-graphite: #A0A0A0;
+  --lt-faint: #6A6A6A;
+  --lt-ink: #F2F2F0;
+  --lt-pencil: #FF5A43;
+  --lt-pencil-soft: #3A1712;
+}
+
+/* Legacy variables used by app.css and design.css, remapped onto the light-table
+   tokens. Defined once here; each resolves against the scheme's --lt-* values. */
+:root {
+  --bg: var(--lt-table);
+  --bg-elev: var(--lt-table);
+  --panel: var(--lt-table);
+  --panel-2: var(--lt-loupe);
+  --panel-hover: var(--lt-loupe);
+  --media-mat: var(--lt-loupe);
+  --border: var(--lt-sleeve);
+  --border-soft: var(--lt-sleeve);
+  --text: var(--lt-ink);
+  --muted: var(--lt-graphite);
+  --faint: var(--lt-faint);
+  --accent: var(--lt-ink);
+  --accent-2: var(--lt-ink);
+  --accent-soft: var(--lt-loupe);
+  --brand: var(--lt-ink);
+  --danger: var(--lt-pencil);
+  --danger-2: var(--lt-pencil);
+  --danger-soft: var(--lt-pencil-soft);
+  --warn: var(--lt-ink);
+  --warn-2: var(--lt-ink);
+  --ok: var(--lt-ink);
+  --ok-soft: var(--lt-loupe);
+  --keep: var(--lt-ink);
+  --radius: 8px;
+  --radius-sm: 6px;
+  --font: var(--lt-ui);
+  --mono: var(--lt-mono);
+  --shadow-panel: none;
+}
+
+/* ---------- Base ---------- */
+body {
+  font-family: var(--lt-ui);
+  font-size: 15px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+}
+
+h1, h2, h3,
+.brand h1 {
+  font-family: var(--lt-display);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--lt-ink);
+}
+
+code, kbd, pre, .mono {
+  font-family: var(--lt-mono);
+}
+
+kbd {
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+}
+
+input[type="text"], select, textarea {
+  background: var(--lt-table);
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  color: var(--lt-ink);
+  box-shadow: none;
+}
+
+input[type="text"]:focus, select:focus, textarea:focus,
+input[type="text"]:focus-visible, select:focus-visible, textarea:focus-visible {
+  border-color: var(--lt-ink);
+  box-shadow: none;
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+/* ---------- Buttons ---------- */
+/* Default .btn is secondary: transparent, sleeve border, ink text. */
+.btn {
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+  min-height: 34px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+  box-shadow: none;
+}
+
+.btn:hover {
+  border-color: var(--lt-ink);
+  background: transparent;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.btn.primary {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.btn.primary:hover {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  filter: none;
+  opacity: 0.88;
+}
+
+.btn.primary-soft {
+  background: var(--lt-loupe);
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-weight: 600;
+}
+
+.btn.primary-soft:hover {
+  background: var(--lt-loupe);
+  border-color: var(--lt-ink);
+}
+
+.btn.secondary {
+  background: transparent;
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-weight: 500;
+}
+
+.btn.secondary:hover {
+  border-color: var(--lt-ink);
+}
+
+.btn.danger {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+.btn.danger:hover {
+  background: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  color: #FFFFFF;
+  opacity: 0.9;
+}
+
+.btn.warn {
+  background: transparent;
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-weight: 500;
+}
+
+.btn.warn:hover {
+  border-color: var(--lt-ink);
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--lt-graphite);
+  font-weight: 500;
+}
+
+.btn.ghost:hover {
+  color: var(--lt-ink);
+  border-color: transparent;
+  background: transparent;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+}
+
+.btn-group {
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 6px;
+}
+
+.btn-group .btn {
+  border-color: var(--lt-sleeve);
+}
+
+/* The review "Next" button is an id-scoped design.css rule; keep it quiet. */
+#btnNextReview {
+  background: transparent;
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-weight: 500;
+}
+
+#btnNextReview:hover {
+  filter: none;
+  border-color: var(--lt-ink);
+  background: transparent;
+}
+
+/* Destructive and warn buttons inside the action bar stay quiet until used. */
+.actionbar .btn.danger,
+.actionbar .btn.warn {
+  background: transparent;
+  color: var(--lt-ink);
+  border-color: var(--lt-sleeve);
+}
+
+.actionbar .btn.danger:hover,
+.actionbar .btn.warn:hover {
+  color: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  background: var(--lt-pencil-soft);
+}
+
+/* ---------- Top bar ---------- */
+.topbar {
+  min-height: 64px;
+  margin: -20px -24px 0;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--lt-sleeve);
+  background: var(--lt-table);
+}
+
+.brand {
+  gap: 10px;
+}
+
+.logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-ink);
+  box-shadow: none;
+}
+
+.logo svg {
+  width: 24px;
+  height: 24px;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.tagline {
+  margin: 0;
+  color: var(--lt-graphite);
+  font-size: 12px;
+}
+
+#topStats {
+  gap: 0;
+  align-items: center;
+}
+
+#topStats .stat-chip {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0 12px;
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  color: var(--lt-graphite);
+}
+
+#topStats .stat-chip + .stat-chip {
+  border-left: 0;
+}
+
+#topStats .stat-chip strong,
+#topStats .stat-chip .mono,
+.stat-chip strong {
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--lt-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+#topStats .stat-chip.reclaim {
+  color: var(--lt-graphite);
+  font-weight: 400;
+}
+
+.topbar .exact-recovery > summary {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--lt-sleeve);
+  text-underline-offset: 4px;
+}
+
+.topbar .exact-recovery > summary:hover,
+.topbar .exact-recovery[open] > summary {
+  color: var(--lt-ink);
+  border: 0;
+  background: transparent;
+  text-decoration-color: var(--lt-ink);
+}
+
+/* ---------- Category tabs: underline row ---------- */
+.filter-tabs {
+  display: flex;
+  gap: 20px;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  background: transparent;
+}
+
+.tab {
+  min-height: 0;
+  padding: 10px 0 9px;
+  margin-bottom: -1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 400;
+  gap: 6px;
+}
+
+.tab:hover {
+  color: var(--lt-ink);
+  background: transparent;
+}
+
+.tab.active {
+  color: var(--lt-ink);
+  font-weight: 600;
+  border-color: transparent;
+  border-bottom-color: var(--lt-ink);
+  background: transparent;
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+.tab-count,
+.tab.active .tab-count {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Generic surfaces ---------- */
+.card,
+.empty-state,
+.popover-body {
+  box-shadow: none;
+}
+
+.popover-body {
+  background: var(--lt-table);
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+}
+
+.popover > summary,
+.popover[open] > summary {
+  background: transparent;
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-weight: 500;
+}
+
+.popover > summary:hover,
+.popover[open] > summary {
+  border-color: var(--lt-ink);
+}
+
+/* Badges lose their per-kind hues: no purple, no tinted blues. */
+.badge,
+.badge.exact,
+.badge.similar,
+.badge.no_humans,
+.badge.low_resolution,
+.badge.random_review,
+.badge.faces,
+.badge.all_files {
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+}
+
+/* Remaining hard-coded blue/purple tints in shared primitives. */
+.toggle-option:has(input:checked) {
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
+  box-shadow: inset 0 0 0 1px var(--lt-ink);
+  color: var(--lt-ink);
+}
+
+/* Leftover blue tints in shared primitives (one accent: ink; pencil only for removal). */
+.chip-check input:checked + span,
+.toast-action,
+.toast-action:hover,
+.group-item.active,
+.triage-guide .keep-key,
+.candidate-key-guide .keep-key,
+.triage-guide .delete-key,
+.candidate-key-guide .delete-key {
+  border-color: var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+}
+
+.triage-guide .delete-key,
+.candidate-key-guide .delete-key {
+  color: var(--lt-pencil);
+  background: var(--lt-pencil-soft);
+  border-color: var(--lt-pencil-soft);
+}
+
+/* ---------- Responsive: match the .app gutters from design.css/app.css ---------- */
+@media (max-width: 900px) {
+  .topbar {
+    margin: -14px -14px 0;
+    padding: 0 14px;
+  }
+}
+
+@media (max-width: 760px) {
+  .filter-tabs {
+    gap: 14px;
+  }
+}

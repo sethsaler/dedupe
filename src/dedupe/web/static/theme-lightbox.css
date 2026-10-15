@@ -1,0 +1,252 @@
+/* Scoped theme (lightbox): the one dark surface, in both schemes, like a loupe.
+   Loads after app.css, design.css and theme.css. Colors are fixed (not tokens)
+   because the lightbox ground never changes with the OS appearance. */
+
+/* ---------- Ground and text ---------- */
+.lightbox {
+  color-scheme: dark;
+  background: #0E0E0E;
+  backdrop-filter: none;
+  color: #F2F2F0;
+}
+
+.lightbox kbd {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border: 1px solid #333333;
+  border-radius: 4px;
+  background: transparent;
+  color: #8A8A8A;
+}
+
+/* Focus rings inherit the light-table ink, which vanishes on this ground. */
+.lightbox button:focus-visible,
+.lightbox input:focus-visible,
+.lightbox select:focus-visible {
+  outline: 2px solid #F2F2F0;
+  outline-offset: 2px;
+}
+
+/* ---------- Media: centered, no frame; a pencil outline when marked ---------- */
+/* Padding keeps the 6px-offset outline inside the grid cell (it still
+   constrains the media size via the container query units). */
+.lightbox .lb-media {
+  padding: 10px;
+}
+
+/* While a keeper overlay is showing, the keeper sits above the copy and is the
+   visible frame, so the ring goes on the keeper instead of the copy under it. */
+.lightbox:has(#lbSelectWrap:not([hidden]) #lbSelect[aria-pressed="true"])
+  :is(#lbVideo, #lbKeeperImage:not([hidden]), #lbImage:not(:has(~ #lbKeeperImage:not([hidden])))) {
+  outline: 2px solid #E8361F;
+  outline-offset: 6px;
+}
+
+/* ---------- Top: counter centered, close at the right ---------- */
+.lightbox .lb-counter {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  font-weight: 400;
+  color: #F2F2F0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-height: 0;
+  z-index: 1;
+}
+
+.lightbox .lb-close {
+  top: 16px;
+  right: 24px;
+  width: 36px;
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid #333333;
+  background: transparent;
+  color: #CFCFCF;
+  font-size: 14px;
+}
+
+.lightbox .lb-close:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #CFCFCF;
+}
+
+/* ---------- Prev / next: 48px outlined circles (grid columns stay in app.css) ---------- */
+.lightbox .lb-nav {
+  width: 48px;
+  height: 48px;
+  border: 1px solid #333333;
+  background: transparent;
+  color: #CFCFCF;
+  font-size: 20px;
+}
+
+.lightbox .lb-nav:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #CFCFCF;
+}
+
+.lightbox .lb-nav:disabled {
+  opacity: 0.3;
+}
+
+/* ---------- Bottom: path, details, then tools ---------- */
+.lightbox .lb-meta {
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  font-weight: 400;
+  color: #F2F2F0;
+  max-width: 90%;
+}
+
+.lightbox .lb-details {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: #9A9A9A;
+}
+
+/* Tool buttons: outlined, quiet. */
+.lightbox .btn {
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+  min-height: 34px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid #333333;
+  color: #E6E6E6;
+  box-shadow: none;
+}
+
+.lightbox .btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #CFCFCF;
+  color: #F2F2F0;
+}
+
+.lightbox .btn:disabled {
+  opacity: 0.4;
+}
+
+.lightbox .btn.ghost {
+  background: transparent;
+  border-color: #333333;
+  color: #E6E6E6;
+  font-weight: 500;
+}
+
+.lightbox .btn.ghost:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #CFCFCF;
+  color: #F2F2F0;
+}
+
+/* Mark for removal: unpressed is outlined; pressed is the pencil fill. */
+.lightbox #lbSelect[aria-pressed="true"],
+.lightbox #lbSelect.danger,
+.lightbox #lbDelete,
+.lightbox #lbDelete.danger {
+  background: #E8361F;
+  border-color: #E8361F;
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+.lightbox #lbSelect[aria-pressed="true"]:hover,
+.lightbox #lbSelect.danger:hover,
+.lightbox #lbDelete:hover {
+  background: #E8361F;
+  border-color: #E8361F;
+  color: #FFFFFF;
+  opacity: 0.9;
+}
+
+/* Decisions (low-res and random): Delete is pencil-outlined, Keep is quiet. */
+.lightbox #lbStageDelete {
+  background: transparent;
+  border-color: #E8361F;
+  color: #E8361F;
+  font-weight: 600;
+}
+
+.lightbox #lbStageDelete:hover {
+  background: rgba(232, 54, 31, 0.12);
+  border-color: #E8361F;
+  color: #E8361F;
+}
+
+.lightbox #lbKeep {
+  background: transparent;
+  border-color: #333333;
+  color: #CFCFCF;
+  font-weight: 500;
+}
+
+.lightbox #lbKeep:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #CFCFCF;
+  color: #F2F2F0;
+}
+
+.lightbox .lb-action-hint {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: #8A8A8A;
+}
+
+.lightbox .lb-action-hint kbd {
+  font-size: 11px;
+}
+
+/* Video: native controls stay; the custom hint text is quiet mono. */
+.lightbox .lb-video-tools {
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 12px;
+  font-family: var(--lt-mono);
+}
+
+.lightbox .lb-video-tools label {
+  color: #CFCFCF;
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.lightbox .lb-video-tools select {
+  background: #0E0E0E;
+  border: 1px solid #333333;
+  border-radius: 6px;
+  color: #E6E6E6;
+  min-height: 32px;
+  font-family: var(--lt-mono);
+  font-size: 13px;
+}
+
+.lightbox .lb-video-tools > span {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.lightbox .lb-compare-tools {
+  color: #CFCFCF;
+  font-size: 12px;
+}
+
+.lightbox .lb-compare-tools label {
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  color: #CFCFCF;
+}
+
+.lightbox .lb-compare-tools input[type="range"] {
+  accent-color: #E6E6E6;
+}
+
+.lightbox select {
+  color-scheme: dark;
+}

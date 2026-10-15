@@ -35,7 +35,7 @@ Priorities: **P1** is an established fact, a claim many documents depend on, or 
 
 ## Driving the product from a console or script
 
-Most CLI items are commands with expected output and exit codes, and were run as a scripted first pass (see Results so far). The web UI items need a real browser: input must be real input (keyboard shortcuts, checkbox toggles, drag-and-drop), and the claims are about what is shown — countdowns, banners, toasts, green keeper highlighting — which no script can see. The browser devtools network tab can confirm preview tokens and dry-run payloads; use it to observe, not to gesture. The e2e test suite (`tests/test_browser_workflow.py`, run with `.venv/bin/pytest -m e2e`) covers some flows mechanically and is a useful adjunct, but passing e2e tests is not a substitute for the checklist.
+Most CLI items are commands with expected output and exit codes, and were run as a scripted first pass (see Results so far). The web UI items need a real browser: input must be real input (keyboard shortcuts, checkbox toggles, drag-and-drop), and the claims are about what is shown — countdowns, banners, toasts, keeper outlining — which no script can see. The browser devtools network tab can confirm preview tokens and dry-run payloads; use it to observe, not to gesture. The e2e test suite (`tests/test_browser_workflow.py`, run with `.venv/bin/pytest -m e2e`) covers some flows mechanically and is a useful adjunct, but passing e2e tests is not a substitute for the checklist.
 
 ## Results so far
 
