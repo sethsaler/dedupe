@@ -6,7 +6,7 @@ The Similar board is the default way to review the Similar category: every simil
 
 ## The simple case
 
-After a scan the user opens the Similar tab and sees every similar group as a row, most reclaimable space first. Each tile has a green Keep or red Remove badge, a match chip (`99.1% match`, fingerprint agreement with the suggested keeper), dimensions, size, and file name. The user scrolls, clicks the occasional copy worth keeping, presses `n` on a row that is really two different photos, and finally presses the red **Move N copies to Trash · X MB** button at the bottom. The sheet confirms the count and size; after confirming, the copies are in the Trash, the finished rows leave the board, and the result toast offers Undo for the whole batch.
+After a scan the user opens the Similar tab and sees every similar group as a row, most reclaimable space first. Each tile has an ink Keep or red Remove badge, a match chip (`99.1% match`, fingerprint agreement with the suggested keeper), dimensions, size, and file name. The user scrolls, clicks the occasional copy worth keeping, presses `n` on a row that is really two different photos, and finally presses the red **Move N copies to Trash · X MB** button at the bottom. The sheet confirms the count and size; after confirming, the copies are in the Trash, the finished rows leave the board, and the result toast offers Undo for the whole batch.
 
 ## The interaction, event by event
 

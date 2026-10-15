@@ -1,0 +1,561 @@
+/* Scoped theme (triage): Non-Human, Faces and Files contact sheets.
+   Loads after app.css, design.css, theme.css and theme-review.css.
+   Card rules are keyed on #members.triage-grid so the decision review
+   (.decision-card) and the Similar views keep their own steps. Focus-mode cards
+   (.focus-card) keep the app layout; only the outline and placeholder change there.
+   Red (--lt-pencil) marks only things that will leave: Trash chips and the trashed
+   placeholder. Keepers and selection stay ink. */
+
+/* ---------- Contact sheet grid ----------
+   --tile-size comes from the Preview size slider (240-520px). Triage cells use half
+   of it so the default 360px lands at five to six columns on a 1440px window. */
+#members.triage-grid:not(.focus-review) {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--tile-size, 360px) * 0.5)), 1fr));
+  gap: 26px 14px;
+}
+
+/* ---------- Borderless prints ----------
+   The card is only the print plus one caption line. Outline draws outside the
+   card, so overflow must stay visible. */
+#members.triage-grid .triage-card {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+  transform: none;
+}
+
+#members.triage-grid .triage-card:hover {
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 10px;
+  row-gap: 3px;
+  align-content: start;
+}
+
+/* card-body dissolves into the card grid so the caption and the chips can sit
+   on their own rows. */
+#members.triage-grid .triage-card:not(.focus-card) .card-body {
+  display: contents;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) > .thumb-stack,
+#members.triage-grid .triage-card:not(.focus-card) > .deleted-preview {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .name {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+  margin-top: 8px;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-meta {
+  grid-column: 2;
+  grid-row: 2;
+  margin-top: 8px;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .path {
+  grid-column: 1 / -1;
+  grid-row: 3;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .evidence {
+  grid-column: 1 / -1;
+  grid-row: 4;
+}
+
+/* Square loupe mat, 4px radius. Media letterboxes inside it. */
+#members.triage-grid .triage-card .thumb-wrap {
+  background: var(--lt-loupe);
+  border-radius: 4px;
+}
+
+#members.triage-grid .triage-card .thumb-wrap:focus-visible {
+  outline: none;
+}
+
+/* The caption: file name left in mono ink, size right in mono graphite. */
+#members.triage-grid .triage-card .name {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--lt-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#members.triage-grid .triage-card .card-meta {
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--lt-graphite);
+  white-space: nowrap;
+}
+
+/* Only the size stays on the caption line; dimensions, modified time and media
+   kind move to File details. Face counts stay, they are the point of Faces. */
+#members.triage-grid .triage-card .card-meta > span:nth-child(n+2):not(.face-count) {
+  display: none;
+}
+
+#members.triage-grid .triage-card .path {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+  line-height: 1.35;
+}
+
+/* Evidence: the detector reason, graphite sentence case, no box. */
+#members.triage-grid .triage-card .evidence {
+  font-family: var(--lt-ui);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--lt-graphite);
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+
+/* ---------- Focus ring on the print ----------
+   The focused card outlines its print, not the caption: 2px ink, 3px offset. */
+#members.triage-grid .triage-card.focused {
+  outline: none;
+}
+
+#members.triage-grid .triage-card.focused > .thumb-stack,
+#members.triage-grid .triage-card.focused > .deleted-preview {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 3px;
+}
+
+/* ---------- Action chips on the print ----------
+   Reveal and Trash float bottom-right of the print. They show on hover, focus
+   and the focused card. Touch has no hover, so they stay visible there. The
+   top-right overlay Trash is replaced by these chips. */
+#members.triage-grid .triage-card .thumb-delete {
+  display: none;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-end;
+  align-self: end;
+  justify-self: end;
+  gap: 6px;
+  margin: 0 8px 8px 0;
+  padding: 0;
+  border: 0;
+  position: relative;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.15s var(--ease-out);
+}
+
+#members.triage-grid .triage-card:not(.focus-card):hover .card-actions,
+#members.triage-grid .triage-card:not(.focus-card).focused .card-actions,
+#members.triage-grid .triage-card:not(.focus-card):focus-within .card-actions {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  #members.triage-grid .triage-card:not(.focus-card) .card-actions {
+    opacity: 1;
+  }
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal {
+  width: auto;
+  min-width: 0;
+  min-height: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+  box-shadow: inset 0 0 0 1px var(--lt-sleeve);
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal:hover {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+  text-decoration: none;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate:hover,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate:focus-visible {
+  background: var(--lt-pencil);
+  color: #FFFFFF;
+  box-shadow: none;
+}
+
+/* ---------- Trashed placeholder ----------
+   Pencil-soft fill, 1.5px dashed pencil border, centered "Moved to Trash" text and
+   an ink underlined Undo link. The name stays, struck through in graphite. */
+#members.triage-grid .triage-card.deleted {
+  opacity: 1;
+}
+
+#members.triage-grid .triage-card .deleted-preview {
+  display: grid;
+  place-items: center;
+  background: var(--lt-pencil-soft);
+  border: 1.5px dashed var(--lt-pencil);
+  border-radius: 4px;
+  cursor: default;
+}
+
+#members.triage-grid .triage-card .deleted-preview .thumb-fallback {
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--lt-pencil);
+  text-align: center;
+  background: none;
+}
+
+#members.triage-grid .triage-card.deleted .card-actions {
+  opacity: 1;
+  justify-self: center;
+  align-self: end;
+  margin: 0 0 18px;
+}
+
+#members.triage-grid .triage-card.deleted .card-actions > .undo-delete {
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--lt-ink);
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+#members.triage-grid .triage-card.deleted .name {
+  color: var(--lt-graphite);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+/* ---------- Toolbar: layout segmented control, quiet selects ---------- */
+.results .detail-body:has(> #members.triage-grid) #reviewToolbar {
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.results .detail-body:has(> #members.triage-grid) #reviewViewSwitch {
+  gap: 2px;
+  padding: 3px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--lt-loupe);
+}
+
+.results .detail-body:has(> #members.triage-grid) #reviewViewSwitch[hidden] {
+  display: none;
+}
+
+.results .detail-body:has(> #members.triage-grid) #reviewViewSwitch > .btn {
+  min-height: 0;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.results .detail-body:has(> #members.triage-grid) #reviewViewSwitch > .btn:hover {
+  color: var(--lt-ink);
+  border-color: transparent;
+}
+
+.results .detail-body:has(> #members.triage-grid) #reviewViewSwitch > .btn[aria-pressed="true"] {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+.results .detail-body:has(> #members.triage-grid) .preview-size {
+  gap: 10px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.results .detail-body:has(> #members.triage-grid) .preview-size input {
+  width: 120px;
+  accent-color: var(--lt-ink);
+}
+
+.results .detail-body:has(> #members.triage-grid) #memberSort,
+.results .detail-body:has(> #members.triage-grid) #memberModified {
+  min-height: 32px;
+  padding: 5px 30px 5px 10px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  background-color: var(--lt-table);
+  color: var(--lt-ink);
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  box-shadow: none;
+}
+
+/* ---------- Pagination: mono count, ‹ › graphite controls ----------
+   The Previous and Next labels stay in the DOM for screen readers and tests; the
+   visible glyph is drawn with ::before so the text itself never changes. */
+.results .detail-body:has(> #members.triage-grid) > #memberPagination,
+.results .detail-body:has(> #members.triage-grid) > #memberPaginationBottom {
+  gap: 6px;
+  margin: 0 0 14px;
+  align-items: center;
+}
+
+.results .detail-body:has(> #members.triage-grid) > #memberPaginationBottom {
+  margin: 18px 0 0;
+  padding-top: 0;
+  justify-content: flex-end;
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .btn {
+  min-height: 0;
+  height: 28px;
+  width: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--lt-graphite);
+  font-size: 0;
+  line-height: 0;
+  text-decoration: none;
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .btn::before {
+  font-family: var(--lt-mono);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .member-prev::before {
+  content: "\2039";
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .member-next::before {
+  content: "\203A";
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .btn:hover:not(:disabled) {
+  color: var(--lt-ink);
+  border-color: transparent;
+  background: transparent;
+  text-decoration: none;
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .btn:disabled {
+  color: var(--lt-faint);
+  opacity: 1;
+}
+
+.results .detail-body:has(> #members.triage-grid) .member-pagination .member-page-summary {
+  min-width: 0;
+  padding: 0 6px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-ink);
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Guide banner: quiet, graphite, no tinted chips ---------- */
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > summary {
+  min-height: 0;
+  padding: 6px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > summary:hover {
+  color: var(--lt-ink);
+  border-color: transparent;
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > .popover-body {
+  background: var(--lt-table);
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  box-shadow: none;
+  color: var(--lt-graphite);
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .popover-body strong {
+  color: var(--lt-ink);
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .triage-guide > span {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .triage-guide kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 4px;
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .triage-guide .delete-key {
+  color: var(--lt-pencil);
+  background: transparent;
+  border: 0;
+}
+
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .triage-guide .keep-key {
+  color: var(--lt-graphite);
+  background: transparent;
+  border: 0;
+}
+
+/* ---------- Toast: ink ground, white text (loupe on dark) ---------- */
+.toast {
+  --toast-bg: var(--lt-ink);
+  --toast-fg: var(--lt-table);
+  --toast-line: transparent;
+  background: var(--toast-bg);
+  color: var(--toast-fg);
+  border: 1px solid var(--toast-line);
+  border-radius: 6px;
+  box-shadow: none;
+  padding: 9px 10px 9px 14px;
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  line-height: 1.4;
+  gap: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .toast {
+    --toast-bg: var(--lt-loupe);
+    --toast-fg: var(--lt-ink);
+    --toast-line: var(--lt-sleeve);
+  }
+}
+
+:root[data-theme="dark"] .toast {
+  --toast-bg: var(--lt-loupe);
+  --toast-fg: var(--lt-ink);
+  --toast-line: var(--lt-sleeve);
+}
+
+.toast.error {
+  background: var(--toast-bg);
+  border-color: var(--toast-line);
+  box-shadow: inset 3px 0 0 var(--lt-pencil);
+  padding-left: 14px;
+}
+
+.toast.ok {
+  background: var(--toast-bg);
+  border-color: var(--toast-line);
+}
+
+.toast .toast-action {
+  min-height: 0;
+  padding: 4px 10px;
+  border: 1px solid #444444;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--toast-fg);
+  font-family: var(--lt-ui);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: none;
+}
+
+.toast .toast-action:hover {
+  background: rgba(128, 128, 128, 0.18);
+  border-color: #666666;
+  color: var(--toast-fg);
+}
+
+.toast .toast-dismiss {
+  opacity: 1;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  padding: 4px 6px;
+  margin: 0 -4px 0 0;
+}
+
+.toast .toast-dismiss:hover {
+  color: var(--toast-fg);
+  background: rgba(128, 128, 128, 0.18);
+}
+
+/* ---------- Narrow windows ---------- */
+@media (max-width: 760px) {
+  #members.triage-grid:not(.focus-review) {
+    gap: 22px 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  #members.triage-grid:not(.focus-review) {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 150px), 1fr));
+    gap: 20px 10px;
+  }
+}

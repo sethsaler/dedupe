@@ -22,7 +22,7 @@ The group's id is stable for its membership: the same kind with the same members
 
 ## The suggested keeper
 
-In a keep-one group the suggested keeper is the member ranked best by, in order: more pixels, larger file size, newer modification time, shallower path, shorter filename. The UI highlights it in green. The intent is that the highest-quality copy in the most canonical location survives.
+In a keep-one group the suggested keeper is the member ranked best by, in order: more pixels, larger file size, newer modification time, shallower path, shorter filename. The UI outlines it in ink; members marked for removal are outlined in red. The intent is that the highest-quality copy in the most canonical location survives.
 
 A rule can change which member is the keeper — see [Selection rules](#selection-rules) — but there is always exactly one suggested keeper in a keep-one group, and the UI and every bulk operation treat it as protected.
 

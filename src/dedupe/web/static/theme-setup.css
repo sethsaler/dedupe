@@ -1,0 +1,714 @@
+/* Scoped theme (setup): scan panel, empty state, scanning progress.
+   Loads after app.css, design.css and theme.css. Presentation only. */
+
+/* ---------- Scan panel, expanded: unboxed, generous whitespace ---------- */
+.scan-panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 24px 0 32px;
+  box-shadow: none;
+}
+
+.scan-panel .scan-main {
+  gap: 24px;
+  max-width: 880px;
+}
+
+.scan-panel .field-row {
+  gap: 12px;
+}
+
+/* Section labels: mono 12px uppercase, graphite. */
+.scan-panel .field-row > label,
+.scan-panel .opt-label {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lt-graphite);
+}
+
+/* Path input: tall, 1.5px ink border, mono 13px. */
+.scan-panel .path-input-wrap {
+  gap: 10px;
+}
+
+.scan-panel .path-input-wrap input[type="text"] {
+  min-height: 48px;
+  padding: 0 14px;
+  border: 1.5px solid var(--lt-ink);
+  border-radius: 8px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.scan-panel .path-input-wrap input[type="text"]::placeholder {
+  color: var(--lt-faint);
+  opacity: 1;
+}
+
+.scan-panel .path-input-wrap.drag-over input {
+  background: var(--lt-loupe);
+  box-shadow: none;
+}
+
+/* Folders… / Files… are secondary buttons sized to the input. */
+.scan-panel .path-pick {
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--lt-sleeve);
+  background: transparent;
+  color: var(--lt-ink);
+  font-size: 14px;
+  font-weight: 500;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.scan-panel .path-pick:hover {
+  border-color: var(--lt-ink);
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+/* Recent paths: a ruled list of mono paths, hairline between rows. */
+.scan-panel .recent-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+}
+
+.scan-panel .recent-chip {
+  display: block;
+  width: 100%;
+  padding: 11px 0;
+  border: 0;
+  border-top: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-ink);
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  text-align: left;
+}
+
+.scan-panel .recent-chip:hover {
+  background: transparent;
+  color: var(--lt-ink);
+  text-decoration: underline;
+  text-decoration-color: var(--lt-sleeve);
+  text-underline-offset: 4px;
+}
+
+.scan-panel .recent-chip:active {
+  transform: none;
+}
+
+/* Explanatory copy under the path input. */
+.scan-panel .thresh-hint {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .cross-folder-hint {
+  margin: 0;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .cross-folder-hint em {
+  font-style: normal;
+  color: var(--lt-ink);
+  text-decoration: underline;
+  text-decoration-color: var(--lt-sleeve);
+  text-underline-offset: 3px;
+}
+
+/* Options disclosure and the Scan action row. */
+.scan-panel .scan-meta-row {
+  padding-top: 20px;
+  border-top: 1px solid var(--lt-sleeve);
+}
+
+.scan-panel .opts-toggle {
+  color: var(--lt-ink);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 0;
+}
+
+.scan-panel .opts-toggle:hover {
+  color: var(--lt-ink);
+  text-decoration: underline;
+  text-decoration-color: var(--lt-sleeve);
+  text-underline-offset: 4px;
+}
+
+.scan-panel .actions-row {
+  gap: 14px;
+}
+
+.scan-panel .actions-row .status {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+.scan-panel #btnScan.btn.primary {
+  min-height: 42px;
+  padding: 0 22px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.scan-panel #btnCancelScan.btn.ghost {
+  min-height: 42px;
+  padding: 0 12px;
+  font-size: 14px;
+}
+
+/* ---------- Options panel: loupe, rounded, checkbox rows ---------- */
+.scan-panel .options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px 40px;
+  align-items: start;
+  padding: 24px 28px;
+  margin-top: 4px;
+  background: var(--lt-loupe);
+  border: 0;
+  border-radius: 12px;
+}
+
+.scan-panel .options > .exclude-field,
+.scan-panel .options > .settings-note,
+.scan-panel .options > .workers-field,
+.scan-panel .options > .advanced-options {
+  grid-column: 1 / -1;
+}
+
+.scan-panel .opt-group,
+.scan-panel .options > .preset-field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.scan-panel .options .thresh-hint {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Checkbox rows: a drawn ink box, label beside it. The native input stays
+   in the DOM (visually hidden) so keyboard and state behave as before. */
+.scan-panel .options .chip-check span {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-ink);
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.scan-panel .options .chip-check span::before {
+  content: "";
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1.5px solid var(--lt-graphite);
+  border-radius: 4px;
+  background: var(--lt-table);
+}
+
+.scan-panel .options .chip-check input:checked + span {
+  border: 0;
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+.scan-panel .options .chip-check input:checked + span::before {
+  border-color: var(--lt-ink);
+  background: var(--lt-ink);
+}
+
+.scan-panel .options .chip-check input:checked + span::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 3px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--lt-table);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.scan-panel .options .chip-check input:focus-visible + span {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.scan-panel .options .chip-check input:disabled + span {
+  opacity: 0.45;
+}
+
+.scan-panel .options input[type="checkbox"],
+.scan-panel .options input[type="radio"] {
+  accent-color: var(--lt-ink);
+}
+
+/* Track-style field for the similarity preset select (native select kept). */
+.scan-panel .options select {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 8px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+  font-size: 14px;
+  min-width: 220px;
+}
+
+.scan-panel .options .advanced-options {
+  color: var(--lt-graphite);
+  font-size: 13px;
+}
+
+.scan-panel .options .advanced-options summary {
+  color: var(--lt-ink);
+  font-weight: 500;
+}
+
+.scan-panel .options .thresh-val {
+  color: var(--lt-ink);
+}
+
+.scan-panel .options .settings-note {
+  margin: 0;
+}
+
+/* ---------- Empty state: left-aligned editorial layout ---------- */
+.empty-state {
+  display: grid;
+  place-items: start stretch;
+  flex: 0 0 auto;
+  align-self: stretch;
+  justify-self: stretch;
+  width: 100%;
+  padding: 0;
+}
+
+/* Landing screen: the empty state's children flow directly into .app so the
+   headline and body sit above the scan form, and the steps and keyboard line
+   sit below it. Only while the empty state is shown; [hidden] wins otherwise. */
+.app > .topbar { order: -3; }
+.app > .results,
+.app > .actionbar { order: 3; }
+
+.empty-state:not([hidden]),
+.empty-state:not([hidden]) > .empty-card {
+  display: contents;
+}
+
+.empty-state:not([hidden]) .empty-icon {
+  display: none;
+}
+
+.empty-state:not([hidden]) .empty-card > h2,
+.empty-state:not([hidden]) .empty-card > p:not(.empty-hint) {
+  order: -1;
+  max-width: 560px;
+}
+
+.empty-state:not([hidden]) .empty-card > h2 {
+  margin: 16px 0 0;
+}
+
+.empty-state:not([hidden]) .empty-card > p:not(.empty-hint) {
+  margin: 4px 0 20px;
+}
+
+.app > .scan-panel {
+  order: 0;
+}
+
+/* Landing: the form ends where the steps begin, so no trailing panel padding. */
+.app:has(> .empty-state:not([hidden])) > .scan-panel {
+  padding-bottom: 0;
+}
+
+.empty-state:not([hidden]) .empty-card > .empty-steps {
+  order: 1;
+  max-width: 560px;
+  margin: 16px 0 0;
+}
+
+.empty-state:not([hidden]) .empty-card > .empty-hint {
+  order: 1;
+  max-width: 560px;
+  margin: 16px 0 0 !important;
+}
+
+.empty-state .empty-card {
+  justify-self: start;
+  width: 100%;
+  max-width: 560px;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+  box-shadow: none;
+}
+
+.empty-state .empty-icon {
+  color: var(--lt-ink);
+  margin-bottom: 28px;
+  opacity: 1;
+}
+
+.empty-state .empty-card h2 {
+  margin: 0 0 20px;
+  font-family: var(--lt-display);
+  font-size: 52px;
+  font-weight: 800;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  color: var(--lt-ink);
+}
+
+.empty-state .empty-card > p {
+  max-width: 560px;
+  margin: 0 0 40px;
+  font-size: 15px;
+  line-height: 24px;
+  color: var(--lt-graphite);
+}
+
+/* Numbered steps as a ruled list. */
+.empty-state .empty-steps {
+  margin: 0 0 40px;
+  gap: 0;
+  max-width: 560px;
+  border-bottom: 1px solid var(--lt-sleeve);
+}
+
+.empty-state .empty-steps li {
+  gap: 20px;
+  padding: 14px 0;
+  border: 0;
+  border-top: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-ink);
+  font-size: 15px;
+  line-height: 24px;
+}
+
+.empty-state .empty-steps span {
+  width: auto;
+  height: auto;
+  min-width: 18px;
+  display: block;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+}
+
+.empty-state .empty-hint {
+  max-width: 560px;
+  margin: 0 !important;
+  font-size: 13px !important;
+  line-height: 2 !important;
+  color: var(--lt-graphite) !important;
+}
+
+.empty-state .empty-hint kbd {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+}
+
+/* ---------- Collapsed / scanning bar: flat, a bottom sleeve rule ---------- */
+.scan-panel.collapsed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 12px 0 14px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+}
+
+.scan-panel .scan-collapse {
+  padding: 2px 0 0;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .scan-collapse:hover {
+  color: var(--lt-ink);
+}
+
+.scan-panel:not(.collapsed) .scan-collapse {
+  margin-bottom: 16px;
+}
+
+.scan-panel.collapsed .scan-collapse-paths {
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--lt-graphite);
+}
+
+/* Progress: 4px loupe track, flat ink fill (no gradient, no glow). */
+.scan-panel .progress-wrap {
+  gap: 10px;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.scan-panel .progress-bar {
+  height: 4px;
+  background: var(--lt-loupe);
+  border-radius: 99px;
+}
+
+.scan-panel .progress-bar .progress-fill {
+  background: var(--lt-ink);
+  box-shadow: none;
+  border-radius: 99px;
+}
+
+.scan-panel .progress-msg {
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-folder stream cards: no box, a left sleeve rule, status above name. */
+.scan-panel .stream-progress {
+  gap: 20px 28px;
+  margin-top: 6px;
+}
+
+.scan-panel .stream-row {
+  gap: 8px;
+  padding: 2px 0 2px 14px;
+  border: 0;
+  border-left: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+  background: transparent;
+  opacity: 1;
+}
+
+.scan-panel .stream-row.active {
+  border-left: 2px solid var(--lt-ink);
+  padding-left: 13px;
+  opacity: 1;
+}
+
+.scan-panel .stream-row:not(.active):not(.done) {
+  opacity: 0.6;
+}
+
+.scan-panel .stream-head {
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.scan-panel .stream-detail {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .stream-row.active .stream-detail {
+  color: var(--lt-ink);
+}
+
+.scan-panel .stream-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--lt-ink);
+}
+
+.scan-panel .stream-bar {
+  height: 2px;
+  background: var(--lt-loupe);
+  border-radius: 0;
+}
+
+.scan-panel .stream-fill,
+.scan-panel .stream-row.done .stream-fill {
+  background: var(--lt-ink);
+  border-radius: 0;
+}
+
+/* Session status: graphite line, ink links. */
+.scan-panel .session-status {
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.scan-panel .session-status-main {
+  gap: 8px;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .session-status .session-flag {
+  color: var(--lt-ink);
+  background: transparent;
+}
+
+.scan-panel .session-status #sessionStatusText {
+  color: var(--lt-graphite);
+}
+
+.scan-panel .session-status .linkish {
+  color: var(--lt-ink);
+  font-size: 13px;
+  text-decoration: underline;
+  text-decoration-color: var(--lt-sleeve);
+  text-underline-offset: 3px;
+}
+
+.scan-panel .session-status .linkish:hover {
+  text-decoration-color: var(--lt-ink);
+}
+
+.scan-panel .session-status .session-dismiss {
+  color: var(--lt-graphite);
+  text-decoration: none;
+}
+
+.scan-panel .session-pruned summary {
+  color: var(--lt-graphite);
+  font-size: 13px;
+}
+
+.scan-panel .session-pruned summary:hover {
+  color: var(--lt-ink);
+}
+
+.scan-panel .pruned-path {
+  color: var(--lt-ink);
+}
+
+.scan-panel .scan-quality {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 13px;
+}
+
+.scan-panel .scan-quality summary {
+  color: var(--lt-graphite);
+  font-weight: 500;
+}
+
+.scan-panel .scan-quality summary:hover {
+  color: var(--lt-ink);
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 1100px) {
+  .scan-panel .scan-main {
+    max-width: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .scan-panel {
+    padding: 18px 0 24px;
+  }
+
+  .empty-state {
+    padding: 24px 0 8px;
+  }
+
+  .scan-panel .options {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 20px;
+  }
+
+  .empty-state .empty-card h2 {
+    font-size: 40px;
+  }
+}
+
+@media (max-width: 560px) {
+  .scan-panel .path-input-wrap {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .scan-panel .path-input-wrap input[type="text"] {
+    flex: 1 1 100%;
+  }
+
+  .scan-panel .path-pick {
+    flex: 1 1 0;
+  }
+
+  .scan-panel .scan-meta-row {
+    align-items: stretch;
+  }
+
+  .scan-panel .actions-row {
+    width: 100%;
+    justify-content: space-between;
+    margin-left: 0;
+  }
+
+  .empty-state .empty-card h2 {
+    font-size: 34px;
+  }
+
+  .empty-state .empty-steps li {
+    font-size: 14px;
+  }
+}
+

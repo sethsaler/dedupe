@@ -1,0 +1,313 @@
+/* Scoped theme (sheet): the confirmation drawer (#modalBackdrop) and the
+   keyboard help dialog (#helpBackdrop). Loads after app.css, design.css and
+   theme.css; every rule is id-scoped so it outranks the generic .modal rules. */
+
+/* ---------- Scrim ---------- */
+#modalBackdrop,
+#helpBackdrop {
+  background: rgba(17, 17, 17, 0.42);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+#modalBackdrop[hidden],
+#helpBackdrop[hidden] {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) #modalBackdrop,
+  :root:not([data-theme="light"]) #helpBackdrop {
+    background: rgba(0, 0, 0, 0.6);
+  }
+}
+
+:root[data-theme="dark"] #modalBackdrop,
+:root[data-theme="dark"] #helpBackdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+/* ---------- Confirm drawer: pinned to the right edge ---------- */
+#modalBackdrop {
+  display: flex;
+  justify-content: flex-end;
+  align-items: stretch;
+  padding: 0;
+}
+
+#modalBackdrop .modal {
+  box-sizing: border-box;
+  width: min(560px, 100vw);
+  max-width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 40px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  border: 0;
+  border-radius: 0;
+  background: var(--lt-table);
+  box-shadow: -16px 0 40px rgba(17, 17, 17, 0.08);
+  animation: lt-sheet-in 0.22s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) #modalBackdrop .modal {
+    box-shadow: -16px 0 40px rgba(0, 0, 0, 0.5);
+  }
+}
+
+:root[data-theme="dark"] #modalBackdrop .modal {
+  box-shadow: -16px 0 40px rgba(0, 0, 0, 0.5);
+}
+
+@keyframes lt-sheet-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #modalBackdrop .modal {
+    animation: none;
+  }
+}
+
+/* Display title: the action in one breath. */
+#modalBackdrop .modal #modalTitle {
+  margin: 0 0 20px;
+  font-family: var(--lt-display);
+  font-size: 40px;
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  color: var(--lt-ink);
+}
+
+/* Body copy: 15px / 23px graphite. */
+#modalBackdrop .modal #modalBody {
+  flex: 0 0 auto;
+}
+
+#modalBackdrop .modal p {
+  margin: 0 0 16px;
+  font-size: 15px;
+  line-height: 23px;
+  color: var(--lt-graphite);
+}
+
+#modalBackdrop .modal p strong {
+  font-weight: 600;
+  color: var(--lt-ink);
+}
+
+/* Summary line under the title ("1 unique files · 12.6 KB"): graphite, not ink. */
+#modalBackdrop .modal .review-sheet > p:first-child,
+#modalBackdrop .modal .review-sheet > p:first-child strong {
+  color: var(--lt-graphite);
+  font-weight: 400;
+}
+
+#modalBackdrop .modal .review-sheet > p:first-child strong {
+  font-weight: 600;
+}
+
+#modalBackdrop .modal code {
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  color: var(--lt-ink);
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+/* Notes and warnings: a rule instead of an amber box. */
+#modalBackdrop .modal .heuristic-warning,
+#modalBackdrop .modal .preview-notice {
+  margin: 0 0 16px;
+  padding: 0 0 0 12px;
+  border: 0;
+  border-left: 2px solid var(--lt-ink);
+  border-radius: 0;
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+/* Lists inside the body: hairline sleeve rules, mono for paths. */
+#modalBackdrop .modal #modalBody ul,
+#modalBackdrop .modal #modalBody ol {
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+#modalBackdrop .modal #modalBody li {
+  padding: 10px 0;
+  border-top: 1px solid var(--lt-sleeve);
+  font-size: 15px;
+  line-height: 23px;
+  color: var(--lt-ink);
+}
+
+#modalBackdrop .modal #modalBody li:last-child {
+  border-bottom: 1px solid var(--lt-sleeve);
+}
+
+/* Validity: mono 12px graphite. It sits under the buttons (order below). */
+#modalBackdrop .modal .modal-validity,
+#modalBackdrop .modal .modal-validity.expiring {
+  order: 1;
+  margin: 12px 0 0;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--lt-graphite);
+}
+
+#modalBackdrop .modal .modal-validity.expiring {
+  color: var(--lt-ink);
+  font-weight: 600;
+}
+
+/* Actions pinned to the bottom of the drawer. The row is visually after the
+   validity line, but the DOM order (Cancel, then Confirm) stays the same. */
+#modalBackdrop .modal .modal-actions {
+  order: 0;
+  margin-top: auto;
+  padding-top: 24px;
+  border-top: 1px solid var(--lt-sleeve);
+  display: flex;
+  justify-content: stretch;
+  gap: 8px;
+}
+
+#modalBackdrop .modal .modal-actions #modalCancel.btn {
+  flex: 0 0 auto;
+  min-height: 48px;
+  padding: 0 20px;
+  font-size: 15px;
+  font-weight: 500;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+#modalBackdrop .modal .modal-actions #modalCancel.btn:hover {
+  border-color: var(--lt-ink);
+  background: transparent;
+  color: var(--lt-ink);
+}
+
+#modalBackdrop .modal .modal-actions #modalConfirm.btn {
+  flex: 1 1 auto;
+  min-height: 48px;
+  padding: 0 20px;
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: 6px;
+}
+
+@media (max-width: 560px) {
+  #modalBackdrop .modal {
+    width: 100vw;
+    padding: 24px 16px 20px;
+  }
+
+  #modalBackdrop .modal #modalTitle {
+    font-size: 32px;
+  }
+}
+
+/* ---------- Keyboard help dialog: centered, restyled ---------- */
+#helpBackdrop .modal.help-modal {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 32px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 12px;
+  background: var(--lt-table);
+  box-shadow: none;
+}
+
+#helpBackdrop .modal #helpTitle {
+  margin: 0 0 20px;
+  font-family: var(--lt-display);
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.035em;
+  color: var(--lt-ink);
+}
+
+/* Only the shortcut list scrolls; the title and "Got it" stay in view. */
+#helpBackdrop .shortcuts {
+  gap: 0;
+  margin: 0 0 24px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  border-top: 1px solid var(--lt-sleeve);
+}
+
+#helpBackdrop .modal #helpTitle,
+#helpBackdrop .modal .modal-actions {
+  flex: 0 0 auto;
+}
+
+#helpBackdrop .shortcuts > div {
+  align-items: baseline;
+  padding: 10px 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  border-radius: 0;
+}
+
+#helpBackdrop .shortcuts dt {
+  flex: 0 0 168px;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--lt-ink);
+}
+
+#helpBackdrop .shortcuts dt kbd {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--lt-loupe);
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+}
+
+#helpBackdrop .shortcuts dd {
+  flex: 1 1 auto;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--lt-graphite);
+}
+
+#helpBackdrop .modal .modal-actions {
+  justify-content: flex-end;
+}
+
+@media (max-width: 560px) {
+  #helpBackdrop .modal.help-modal {
+    padding: 24px 20px;
+  }
+
+  #helpBackdrop .shortcuts > div {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  #helpBackdrop .shortcuts dt {
+    flex: 0 0 auto;
+  }
+}
