@@ -26,6 +26,7 @@ class GroupKind(str, Enum):
     RANDOM_REVIEW = "random_review"
     FACES = "faces"
     ALL_FILES = "all_files"
+    SETS = "sets"
 
 
 class ReviewPolicy(str, Enum):
@@ -202,6 +203,11 @@ class ReviewGroup:
     # reviewed files can never regroup — including member-vs-member pairs the
     # swipe UI never showed side by side.
     distinct_participants: list[str] = field(default_factory=list)
+    # How a Similar group was matched: None for perceptual hashes, "semantic"
+    # for EmbeddingGemma look-alikes. Semantic groups carry each non-keeper
+    # member's cosine similarity with the keeper in match_scores.
+    match_basis: str | None = None
+    match_scores: dict[str, float] = field(default_factory=dict)
 
     @property
     def policy(self) -> ReviewPolicy:
@@ -211,6 +217,7 @@ class ReviewGroup:
             GroupKind.RANDOM_REVIEW,
             GroupKind.FACES,
             GroupKind.ALL_FILES,
+            GroupKind.SETS,
         ):
             return ReviewPolicy.INDEPENDENT_CANDIDATES
         return ReviewPolicy.KEEP_ONE
@@ -254,6 +261,8 @@ class ReviewGroup:
             "member_count": len(self.members),
             "root": self.root,
             "distinct_participants": list(self.distinct_participants),
+            "match_basis": self.match_basis,
+            "match_scores": dict(self.match_scores),
         }
 
     @classmethod
@@ -306,6 +315,12 @@ class ReviewGroup:
             # Participants survive dismissed members: do not filter to
             # member_paths like the selection lists above.
             distinct_participants=list(data.get("distinct_participants", [])),
+            match_basis=data.get("match_basis"),
+            match_scores={
+                path: float(score)
+                for path, score in (data.get("match_scores") or {}).items()
+                if path in member_paths
+            },
         )
 
 

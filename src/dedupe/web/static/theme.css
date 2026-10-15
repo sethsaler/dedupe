@@ -461,7 +461,8 @@ a:focus-visible {
 .badge.low_resolution,
 .badge.random_review,
 .badge.faces,
-.badge.all_files {
+.badge.all_files,
+.badge.sets {
   background: var(--lt-loupe);
   color: var(--lt-graphite);
 }

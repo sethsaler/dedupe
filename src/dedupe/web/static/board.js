@@ -110,7 +110,9 @@ function tileHtml(g, member, index, selected, rowFocused) {
   const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   const chip = member.path === g.suggested_keep
     ? '<span class="board-chip keeper" title="Ranked best by resolution, size, date, and path">Suggested keeper</span>'
-    : Number.isFinite(percent)
+    : member.match_label
+      ? `<span class="board-chip uncertain" title="EmbeddingGemma cosine similarity with the suggested keeper: same subject, not necessarily the same shot">${escapeHtml(member.match_label)}</span>`
+      : Number.isFinite(percent)
       ? `<span class="board-chip${percent < UNCERTAIN_PERCENT ? " uncertain" : ""}" title="Fingerprint agreement with the suggested keeper, not a probability">${percent.toFixed(1).replace(/\.0$/, "")}% match${turned}</span>`
       : `<span class="board-chip uncertain">score unavailable${turned}</span>`;
   const keptOthers = (g.members || []).some((other) => other.path !== member.path && !selected.has(other.path));

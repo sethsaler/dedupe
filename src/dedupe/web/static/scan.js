@@ -67,6 +67,7 @@ async function startScan() {
       $("groupMore").innerHTML = "";
     $("countAll").textContent = "0";
     $("countSimilar").textContent = "0";
+    $("countSets").textContent = "0";
     $("countLowResolution").textContent = "0";
     $("countRandomReview").textContent = "0";
     $("countNoHumans").textContent = "0";
@@ -86,6 +87,9 @@ async function startScan() {
         paths,
         exact: $("optExact").checked,
         similar: $("optSimilar").checked,
+        semantic: $("optSemantic").checked,
+        semantic_threshold: Number($("semanticSetThreshold").value) / 100,
+        semantic_duplicate_threshold: Number($("semanticDuplicateThreshold").value) / 100,
         find_no_humans: $("optNoHumans").checked,
         count_faces: $("optCountFaces").checked,
         find_low_resolution: $("optLowResolution").checked,

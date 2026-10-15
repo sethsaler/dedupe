@@ -118,6 +118,8 @@ def build_one_group(
     members: list[FileRecord],
     *,
     exact_path_sets: list[set[str]] | None = None,
+    match_basis: str | None = None,
+    match_scores: dict[str, float] | None = None,
 ) -> DuplicateGroup | None:
     """Build a single DuplicateGroup, or None if members don't form a valid group."""
     by_path = {m.path: m for m in members}
@@ -136,8 +138,15 @@ def build_one_group(
         media_type=dominant_media_type(members),
         members=sorted(members, key=lambda m: m.path),
         suggested_keep=keep,
+        match_basis=match_basis,
+        match_scores=dict(match_scores or {}),
     )
     apply_smart_select(g, SmartRule.AUTOMATIC)
+    if match_basis == "semantic":
+        # Meaning matches include distinct shots of one subject (burst
+        # frames, slides from one deck), so nothing is preselected for
+        # removal: the reviewer opts each file in.
+        apply_smart_select(g, SmartRule.DESELECT_ALL)
     return g
 
 
@@ -333,6 +342,36 @@ def build_all_files_groups(
     return groups
 
 
+def build_set_group(
+    members: list[FileRecord], scores: dict[str, float]
+) -> DuplicateGroup | None:
+    """A Sets browse group: images of one subject or shoot, anchor first.
+
+    ``scores`` holds each other member's cosine with the anchor. No member is
+    a suggested keeper and nothing is selected; the Sets review trashes one
+    click at a time.
+    """
+    members = list({member.path: member for member in members}.values())
+    if len(members) < 2:
+        return None
+    media_types = {member.media_type for member in members}
+    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
+    anchor, rest = members[0], members[1:]
+    rest.sort(key=lambda member: (-scores.get(member.path, 0.0), member.path))
+    ordered = [anchor, *rest]
+    return DuplicateGroup(
+        id=make_group_id(GroupKind.SETS, ordered),
+        kind=GroupKind.SETS,
+        media_type=media_type,
+        members=ordered,
+        selected_for_removal=[],
+        reviewed_paths=[],
+        suggested_keep=None,
+        match_basis="semantic",
+        match_scores=dict(scores),
+    )
+
+
 def ensure_all_files_groups(result: ScanResult) -> None:
     """Append per-root All-Files browse groups when the result lacks them.
 
@@ -372,9 +411,9 @@ def _build_independent_group(
 
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     """Mutate selected_for_removal. Always keeps at least one file."""
-    if group.kind == GroupKind.ALL_FILES:
-        # All-Files browse groups have no selection semantics: the Files
-        # review trashes one click at a time, so rules must not touch them.
+    if group.kind in (GroupKind.ALL_FILES, GroupKind.SETS):
+        # All-Files and Sets browse groups have no selection semantics: those
+        # reviews trash one click at a time, so rules must not touch them.
         return
     members = group.members
     if not members:
@@ -420,4 +459,7 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
 
 def apply_smart_select_all(groups: list[DuplicateGroup], rule: SmartRule) -> None:
     for g in groups:
+        if g.match_basis == "semantic" and rule != SmartRule.DESELECT_ALL:
+            # Bulk rules never select look-alikes; see build_one_group.
+            continue
         apply_smart_select(g, rule)

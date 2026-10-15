@@ -95,6 +95,7 @@ function collapseScanPanel(pathsText = "") {
 const settingIds = [
   "optExact",
   "optSimilar",
+  "optSemantic",
   "optNoHumans",
   "optCountFaces",
   "humanBackend",
@@ -110,6 +111,8 @@ const settingIds = [
   "optGifs",
   "optVideos",
   "threshold",
+  "semanticDuplicateThreshold",
+  "semanticSetThreshold",
   "exclusions",
 ];
 
@@ -126,6 +129,13 @@ function saveScanSettings() {
   }
 }
 
+function syncSemanticLabels() {
+  $("semanticDuplicateVal").textContent = `${Number($("semanticDuplicateThreshold").value).toFixed(1).replace(/\.0$/, "")}%`;
+  $("semanticSetVal").textContent = `${$("semanticSetThreshold").value}%`;
+}
+$("semanticDuplicateThreshold").addEventListener("input", syncSemanticLabels);
+$("semanticSetThreshold").addEventListener("input", syncSemanticLabels);
+
 function restoreScanSettings() {
   try {
     const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
@@ -136,6 +146,7 @@ function restoreScanSettings() {
       else element.value = settings[id];
     }
     threshVal.textContent = thresh.value;
+    syncSemanticLabels();
   } catch {
     /* ignore */
   }
@@ -152,6 +163,12 @@ function syncHumanBackendVisibility() {
 }
 $("optNoHumans").addEventListener("change", syncHumanBackendVisibility);
 syncHumanBackendVisibility();
+
+function syncSemanticVisibility() {
+  $("semanticFields").hidden = !$("optSemantic").checked;
+}
+$("optSemantic").addEventListener("change", syncSemanticVisibility);
+syncSemanticVisibility();
 
 // —— Recent paths ——
 function loadRecent() {
@@ -314,6 +331,12 @@ function applyCapabilities(caps) {
     "optNoHumansWrap",
     noHumansReady,
     "Non-Human detection needs OpenCV or Photon — run `dedupe doctor` for setup",
+  );
+  gate(
+    "optSemantic",
+    "optSemanticWrap",
+    Boolean(caps.semantic),
+    "Look-alikes need DigUp installed (github.com/ARahim3/DigUp) — it runs EmbeddingGemma 2",
   );
   gate(
     "optCountFaces",

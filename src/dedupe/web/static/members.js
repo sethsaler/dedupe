@@ -207,7 +207,7 @@ function syncCardSelection(card, g, path) {
 }
 
 function updateDetailMeta(g) {
-  if (g.kind === "all_files") {
+  if (g.kind === "all_files" || g.kind === "sets") {
     const reviewed = new Set(g.reviewed_paths || []);
     const deleted = (g.deleted_paths || []).length;
     $("detailMeta").textContent =
@@ -322,6 +322,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     low_resolution: "Low resolution",
     random_review: "Random review",
     faces: "Faces",
+    sets: "Set · same subject or shoot",
     similar: "Similar",
     all_files: `All files${g.root ? ` · ${basename(g.root)}` : ""}`,
   }[g.kind] || g.kind;
@@ -574,9 +575,11 @@ function renderMembers(g, { append = false } = {}) {
       const similarity = m.similarity_percent == null ? null : Number(m.similarity_percent);
       // A rotated or mirrored copy is named so the turned thumbnail reads as intended.
       const turnedEvidence = m.orientation_label ? ` · ${m.orientation_label} copy` : "";
-      const similarityEvidence = Number.isFinite(similarity)
-        ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
-        : `Perceptual match to suggested keeper${turnedEvidence} · similarity score unavailable`;
+      const similarityEvidence = m.match_label
+        ? `${m.match_label} of suggested keeper · EmbeddingGemma meaning match, not a pixel match`
+        : Number.isFinite(similarity)
+          ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
+          : `Perceptual match to suggested keeper${turnedEvidence} · similarity score unavailable`;
       const evidence = g.kind === "exact"
         ? "Byte-identical SHA-256 match"
         : g.kind === "similar"
@@ -589,6 +592,10 @@ function renderMembers(g, { append = false } = {}) {
                 ? `OpenCV face detection found ${m.face_count} face${m.face_count === 1 ? "" : "s"} (heuristic, not a guarantee)`
                 : g.kind === "all_files"
                   ? "Every scanned media file in this folder appears here, category or not"
+                  : g.kind === "sets"
+                    ? (m.match_label
+                      ? `${m.match_label} · EmbeddingGemma meaning match, not a duplicate check`
+                      : "First image of this set · the others are measured against it")
                   : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
       const selectionTitle = isSel
         ? (isPagedIndependentReview(g) ? "Reviewed · selected" : "Selected for removal")

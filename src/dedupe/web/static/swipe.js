@@ -107,6 +107,9 @@ function similarityChip(member, g, anchor) {
   if (anchor !== g.suggested_keep) {
     return '<span class="swipe-sim" title="Fingerprint scores measure against the suggested keeper, not your chosen reference">vs your reference</span>';
   }
+  if (member.match_label) {
+    return `<span class="swipe-sim" title="EmbeddingGemma cosine similarity with the reference: same subject, not necessarily the same shot">${escapeHtml(member.match_label)}</span>`;
+  }
   const value = member.similarity_percent == null ? null : Number(member.similarity_percent);
   const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   if (!Number.isFinite(value)) {

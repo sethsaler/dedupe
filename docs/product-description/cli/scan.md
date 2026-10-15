@@ -57,6 +57,7 @@ Exit code is 0 whenever the command runs to completion — including scans that 
 | --- | --- | --- |
 | Detection toggles: `--no-exact`, `--no-similar`, `--no-images`, `--no-gifs`, `--no-videos`, `--hidden` | Define what the scan looks at; defaults: exact and similar on, all media kinds on, hidden off. | Flags are fixed once running. |
 | Review categories: `--no-low-resolution`, `--low-resolution-types`, `--low-resolution-{image,gif,video}-max-mp`, `--random-review-count N`, `--find-no-person`, `--count-faces` | Enable/disable each category; low-res defaults to 1.0 MP for all three types; random defaults to 50 (0 disables); no-person and faces off. | Fixed once running. |
+| Sets and look-alikes: `--semantic`, `--semantic-threshold COSINE` (Sets, default 0.88), `--semantic-duplicate-threshold COSINE` (Similar look-alikes, default 0.97) | Off by default; needs [DigUp](../cross-cutting/optional-dependencies.md#digup-embeddinggemma-2). The summary adds a Sets line; Sets and look-alike groups are written to `--json` but are never selected, so `--action` leaves them alone. | Fixed. |
 | Thresholds: `--threshold N` (image, default 6), `--video-threshold N` (default 8) | Comparison strictness per [Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works). | Fixed. |
 | Person detection: `--human-backend opencv\|photon\|ensemble`, `--photon-model MODEL` | Backend choice; photon's first use can download ~10 GB of weights. | Fixed. |
 | Exclusions: `--exclude GLOB` (repeatable) | Remove matching paths from the walk. | Fixed. |

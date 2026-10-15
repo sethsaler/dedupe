@@ -55,6 +55,7 @@ function renderTabCounts() {
     .reduce((count, g) => count + (g.member_count || 0), 0);
   $("countAll").textContent = state.allGroups.length;
   $("countSimilar").textContent = state.allGroups.filter((g) => g.kind === "similar").length;
+  $("countSets").textContent = state.allGroups.filter((g) => g.kind === "sets").length;
   $("countLowResolution").textContent = memberCount("low_resolution");
   $("countRandomReview").textContent = memberCount("random_review");
   $("countNoHumans").textContent = memberCount("no_humans");
@@ -280,6 +281,7 @@ function groupItemHtml(g) {
     low_resolution: "low-res",
     random_review: "random",
     faces: "faces",
+    sets: "set",
   }[g.kind] || (g.kind === "all_files" ? "all files" : g.kind);
   // All-Files groups are per scanned folder: name the folder so the sidebar
   // row doubles as the folder picker.

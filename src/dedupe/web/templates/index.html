@@ -95,9 +95,25 @@
             <span class="opt-label">Detect</span>
             <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check" id="optSimilarWrap"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
+            <label class="chip-check" id="optSemanticWrap" title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp"><input type="checkbox" id="optSemantic" /><span>Sets &amp; look-alikes (DigUp)</span></label>
             <label class="chip-check" id="optNoHumansWrap"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
             <span class="thresh-hint" id="depHint" hidden></span>
+          </div>
+          <div class="semantic-fields" id="semanticFields" hidden>
+            <label class="thresh" for="semanticDuplicateThreshold">
+              <span class="opt-label">Look-alike duplicates</span>
+              <input type="range" id="semanticDuplicateThreshold" min="95" max="99.9" step="0.1" value="97" />
+              <span id="semanticDuplicateVal" class="thresh-val">97%</span>
+              <span class="thresh-hint">higher = stricter; 99%+ keeps only resizes, re-saves and recompressions</span>
+            </label>
+            <label class="thresh" for="semanticSetThreshold">
+              <span class="opt-label">Sets</span>
+              <input type="range" id="semanticSetThreshold" min="80" max="98" step="1" value="88" />
+              <span id="semanticSetVal" class="thresh-val">88%</span>
+              <span class="thresh-hint">higher = tighter sets of one shoot; lower = broader subjects</span>
+            </label>
+            <span class="thresh-hint">Rescans reuse cached embeddings, so trying another value is quick.</span>
           </div>
           <label class="preset-field" id="humanBackendField" hidden>
             <span class="opt-label">Person detector</span>
@@ -230,6 +246,7 @@
         <div class="filter-tabs" role="tablist" aria-label="Result categories">
           <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
           <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
+          <button class="tab" data-kind="sets" type="button" role="tab" aria-selected="false" tabindex="-1" title="Look-alike images of one subject or shoot (EmbeddingGemma 2 through DigUp)">Sets <span class="tab-count" id="countSets">0</span></button>
           <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false" tabindex="-1">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
           <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
           <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>

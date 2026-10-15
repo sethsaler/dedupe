@@ -27,7 +27,7 @@ from .actions import (
 from .engine import run_scan, run_scans_parallel
 from .grouping import apply_smart_select_all
 from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
-from .models import SmartRule
+from .models import GroupKind, SmartRule
 
 
 def application_version() -> str:
@@ -59,6 +59,29 @@ def build_parser() -> argparse.ArgumentParser:
         dest="find_no_humans",
         action="store_true",
         help="Surface non-human media: images/videos where OpenCV detects no person",
+    )
+    scan.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "Group images by meaning with EmbeddingGemma 2: Sets of one subject, "
+            "plus near-duplicates the hashes missed "
+            "(needs DigUp: https://github.com/ARahim3/DigUp)"
+        ),
+    )
+    scan.add_argument(
+        "--semantic-threshold",
+        type=float,
+        default=0.88,
+        metavar="COSINE",
+        help="Cosine similarity for --semantic sets (default 0.88)",
+    )
+    scan.add_argument(
+        "--semantic-duplicate-threshold",
+        type=float,
+        default=0.97,
+        metavar="COSINE",
+        help="Cosine similarity for --semantic duplicates added to Similar (default 0.97)",
     )
     scan.add_argument(
         "--count-faces",
@@ -434,6 +457,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     scan_kwargs = {
         "exact": not args.no_exact,
         "similar": not args.no_similar,
+        "semantic": args.semantic,
+        "semantic_threshold": args.semantic_threshold,
+        "semantic_duplicate_threshold": args.semantic_duplicate_threshold,
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,
         "find_low_resolution": not args.no_low_resolution,
@@ -490,6 +516,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(
             f"Faces: {with_faces} file(s) with faces, "
             f"{multi_face} with more than one face ({len(counted)} analyzed)"
+        )
+    if args.semantic:
+        sets = [g for g in result.groups if g.kind == GroupKind.SETS]
+        print(
+            f"Sets: {len(sets)} set(s) of look-alike images "
+            f"({sum(len(g.members) for g in sets)} files; browse them in `dedupe ui`)"
         )
     diagnostics = result.diagnostics
     failed = sum(stage.failed for stage in diagnostics.stages.values())

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import secrets
 import shutil
@@ -57,6 +58,7 @@ from ..review_session import (
     peek_review_session,
     save_review_session,
 )
+from ..semantic import semantic_available
 from ..similar_image import (
     ORIENTATIONS,
     TILE_HASH_VERSION,
@@ -79,7 +81,7 @@ DISSOLVED_SIMILAR_UNDO_LIMIT = 200
 #: review piles work one candidate at a time; similar groups use it for the
 #: swipe review's same-photo (left swipe) decision, with keeper protection
 #: re-derived through apply_actions.
-IMMEDIATE_DELETE_KINDS = {"no_humans", "faces", "all_files", "similar"}
+IMMEDIATE_DELETE_KINDS = {"no_humans", "faces", "all_files", "sets", "similar"}
 REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 
 # How long after the last tab closes before the server exits. Long enough for a
@@ -164,6 +166,17 @@ def match_orientation(member, keeper) -> str | None:
     if best is None or best[0] >= upright[0]:
         return None
     return best[1]
+
+
+def _cosine(raw, default: float) -> float:
+    """A cosine threshold from the scan form, clamped to a sane range."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(value):
+        return default
+    return min(0.999, max(0.5, value))
 
 
 def similarity_percent(member, keeper) -> float | None:
@@ -275,7 +288,7 @@ def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
     """
     # All-Files browse groups have no selection semantics — the view trashes
     # one click at a time — so a bulk mark would only corrupt review progress.
-    if group.kind == GroupKind.ALL_FILES:
+    if group.kind in (GroupKind.ALL_FILES, GroupKind.SETS):
         return list(group.selected_for_removal)
     keep_one = group.policy == ReviewPolicy.KEEP_ONE
     keeper = None
@@ -433,6 +446,7 @@ def detect_capabilities() -> dict:
         "photon": photon,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ffprobe": shutil.which("ffprobe") is not None,
+        "semantic": semantic_available(),
     }
 
 
@@ -594,6 +608,12 @@ def create_app(
 
     def group_payload(group) -> dict:
         payload = group.to_dict()
+        if group.kind == GroupKind.SETS:
+            for member, member_payload in zip(group.members, payload["members"], strict=True):
+                score = group.match_scores.get(member.path)
+                member_payload["match_label"] = (
+                    f"{score * 100:.0f}% like the first image" if score is not None else None
+                )
         if group.kind == GroupKind.SIMILAR:
             keeper = next(
                 (member for member in group.members if member.path == group.suggested_keep),
@@ -603,6 +623,17 @@ def create_app(
                 for member, member_payload in zip(
                     group.members, payload["members"], strict=True
                 ):
+                    if group.match_basis == "semantic":
+                        # Cosine of embeddings is not fingerprint agreement:
+                        # label it apart and leave the percent empty so the
+                        # board files the pair under "needs a look".
+                        score = group.match_scores.get(member.path)
+                        member_payload["similarity_percent"] = None
+                        member_payload["orientation_label"] = None
+                        member_payload["match_label"] = (
+                            f"{score * 100:.0f}% look-alike" if score is not None else None
+                        )
+                        continue
                     member_payload["similarity_percent"] = similarity_percent(member, keeper)
                     orientation = (
                         match_orientation(member, keeper) if member is not keeper else None
@@ -1027,6 +1058,7 @@ def create_app(
                 "random_review",
                 "faces",
                 "all_files",
+                "sets",
             ):
                 groups = [g for g in groups if g.kind.value == kind]
             total = len(groups)
@@ -1196,6 +1228,11 @@ def create_app(
                 scan_kwargs = {
                     "exact": bool(data.get("exact", True)),
                     "similar": bool(data.get("similar", True)),
+                    "semantic": bool(data.get("semantic", False)),
+                    "semantic_threshold": _cosine(data.get("semantic_threshold"), 0.88),
+                    "semantic_duplicate_threshold": _cosine(
+                        data.get("semantic_duplicate_threshold"), 0.97
+                    ),
                     "find_no_humans": bool(data.get("find_no_humans", False)),
                     "count_faces": bool(data.get("count_faces", False)),
                     "find_low_resolution": bool(data.get("find_low_resolution", True)),
@@ -1686,6 +1723,7 @@ def create_app(
                             "no_humans": "Non-Human",
                             "faces": "Faces",
                             "all_files": "Files",
+                            "sets": "Sets",
                         }[veto.kind.value]
                         return jsonify(
                             {

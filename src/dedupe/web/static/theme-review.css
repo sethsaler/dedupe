@@ -210,7 +210,8 @@
 .results .group-item .badge.low_resolution,
 .results .group-item .badge.random_review,
 .results .group-item .badge.faces,
-.results .group-item .badge.all_files {
+.results .group-item .badge.all_files,
+.results .group-item .badge.sets {
   padding: 0;
   border-radius: 0;
   background: transparent;

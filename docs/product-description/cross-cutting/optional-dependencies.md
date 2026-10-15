@@ -38,6 +38,16 @@ Dedupe's core — finding exact and similar images, reviewing groups, moving fil
 
 **How to get it.** Install the optional extra, choose the backend in the scan options (or `--human-backend photon`); the first run acquires the model.
 
+## DigUp (EmbeddingGemma 2)
+
+**What needs it.** The Sets review and semantic look-alike duplicates ([Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works)). Dedupe does not bundle a model runtime: it starts DigUp's `digup worker` helper, a llama.cpp build of EmbeddingGemma 2 that speaks JSON lines on stdin/stdout, and reuses the model files DigUp already downloaded (~865 MB). Dedupe adds no Python packages for this layer.
+
+**Where Dedupe looks.** `$DEDUPE_DIGUP_HELPER` if it is set (only there), then `/Applications/DigUp.app/Contents/Helpers/digup`, `~/Applications/DigUp.app/Contents/Helpers/digup`, then `digup` on `PATH`.
+
+**What happens without it.** The *Sets & look-alikes (DigUp)* scan option is disabled, and its tooltip names the reason. A CLI `--semantic` scan proceeds without the layer and reports `semantic look-alikes skipped: DigUp is not installed` in the diagnostics. If the helper starts but fails, the same diagnostics line carries its error and every other stage is unaffected.
+
+**How to get it.** Install DigUp (https://github.com/ARahim3/DigUp, or `brew install --cask arahim3/tap/digup`) and open it once so it downloads the model.
+
 ## Required Python packages
 
 **What needs them.** Everything: PIL (image decoding), imagehash (perceptual hashes), pybktree (hash candidate lookup), send2trash (system Trash), flask (the web UI).

@@ -23,6 +23,7 @@ from .grouping import (
     build_no_human_groups,
     build_one_group,
     build_random_review_groups,
+    build_set_group,
 )
 from .human_detection import (
     DEFAULT_BACKEND as DEFAULT_HUMAN_BACKEND,
@@ -43,6 +44,9 @@ from .models import (
 )
 from .parallel import map_parallel, resolve_workers, split_cpu_budget
 from .scanner import inventory, is_in_photos_library
+from .semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
+from .semantic import DEFAULT_THRESHOLD as SEMANTIC_THRESHOLD
+from .semantic import SEMANTIC_MEDIA_TYPES, find_semantic_groups, semantic_available
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import (
     ERROR_IMAGE_HASH_FAILED,
@@ -139,6 +143,9 @@ def run_scan(
     *,
     exact: bool = True,
     similar: bool = True,
+    semantic: bool = False,
+    semantic_threshold: float = SEMANTIC_THRESHOLD,
+    semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_low_resolution: bool = True,
@@ -200,6 +207,7 @@ def run_scan(
         "exact": [],
         "similar_image": [],
         "similar_video": [],
+        "semantic": [],
         "human_detection": [],
         "face_detection": [],
         "low_resolution": [],
@@ -329,12 +337,14 @@ def run_scan(
 
     run_exact = exact and bool(records)
     run_similar = similar
+    run_semantic = semantic and bool(records)
     run_dimensions = find_low_resolution and bool(records)
     run_human = find_no_humans and bool(records)
     run_faces = count_faces and bool(records)
     run_any_stage = (
         run_exact
         or run_similar
+        or run_semantic
         or run_dimensions
         or run_human
         or run_faces
@@ -345,7 +355,7 @@ def run_scan(
         check_cancelled()
         distinct = (
             cache.distinct_reviews(records)
-            if (run_similar and cache is not None)
+            if ((run_similar or run_semantic) and cache is not None)
             else DistinctReviews.empty()
         )
         image_count = len(
@@ -396,6 +406,9 @@ def run_scan(
         video_done = threading.Event()
         dims_done = threading.Event()
         human_done = threading.Event()
+        semantic_count = len(
+            [r for r in records if r.media_type in SEMANTIC_MEDIA_TYPES]
+        )
 
         def _emit_stages_locked() -> None:
             processed = sum(done for done, _total in stage_counts.values())
@@ -406,6 +419,7 @@ def run_scan(
                     stage_text.get("exact"),
                     stage_text.get("image"),
                     stage_text.get("video"),
+                    stage_text.get("semantic"),
                     stage_text.get("dims"),
                     stage_text.get("human"),
                     stage_text.get("face"),
@@ -442,6 +456,11 @@ def run_scan(
             if run_similar and video_count:
                 stage_text["video"] = f"Fingerprinting {video_count} videos…"
                 stage_counts["video"] = (0, video_count)
+            if run_semantic and semantic_count:
+                stage_text["semantic"] = (
+                    f"Embedding {semantic_count} images (EmbeddingGemma)…"
+                )
+                stage_counts["semantic"] = (0, semantic_count)
             if run_dimensions:
                 stage_text["dims"] = "Reading media dimensions…"
             if run_human:
@@ -550,6 +569,89 @@ def run_scan(
             finally:
                 # Always unblock dimension probing, even on cancel/error.
                 video_done.set()
+
+        def semantic_progress(phase: str, processed: int, total: int) -> None:
+            label = "clustering" if "cluster" in phase else "embedding"
+            # Clustering reuses the embedded count so combined totals stay put.
+            done = semantic_count if "cluster" in phase else processed
+            _stage_progress(
+                "semantic",
+                f"Look-alikes {label}: {processed}/{total}",
+                done,
+                semantic_count,
+            )
+
+        def _semantic_stage() -> float:
+            # One embedding pass feeds two layers. Sets group every image of
+            # one subject or shoot for browsing. Duplicates add near-identical
+            # pairs the hashes missed to Similar; perceptual Similar groups
+            # claim their files first so a file never lands in two of them.
+            exact_done.wait()
+            image_done.wait()
+            started_at = time.monotonic()
+            with publish_lock:
+                claimed = {
+                    member.path
+                    for group in groups
+                    if group.kind == GroupKind.SIMILAR
+                    for member in group.members
+                }
+                exact_sets = [set(paths) for paths in exact_path_sets]
+            try:
+                set_lists, duplicate_lists, errors = find_semantic_groups(
+                    records,
+                    set_threshold=semantic_threshold,
+                    duplicate_threshold=semantic_duplicate_threshold,
+                    distinct=distinct,
+                    exclude_from_duplicates=claimed,
+                    exact_path_sets=exact_sets,
+                    use_cache=use_cache,
+                    cache_path=cache_path,
+                    workers=cpu_workers,
+                    progress=semantic_progress,
+                    cancelled=cancelled,
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
+                _stage_progress("semantic", "Look-alikes unavailable", 0, 0)
+                return time.monotonic() - started_at
+            stage_errors["semantic"].extend(errors)
+            set_count = duplicate_count = 0
+            with publish_lock:
+                for members, scores in duplicate_lists:
+                    group = build_one_group(
+                        GroupKind.SIMILAR,
+                        members,
+                        exact_path_sets=exact_path_sets or None,
+                        match_basis="semantic",
+                        match_scores=scores,
+                    )
+                    if group is None:
+                        continue
+                    groups.append(group)
+                    duplicate_count += 1
+                    if on_group:
+                        on_group(group)
+                for members, scores in set_lists:
+                    group = build_set_group(members, scores)
+                    if group is None:
+                        continue
+                    groups.append(group)
+                    set_count += 1
+                    if on_group:
+                        on_group(group)
+                groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
+            _stage_progress(
+                "semantic",
+                f"Found {set_count} set{'s' if set_count != 1 else ''} and "
+                f"{duplicate_count} look-alike duplicate group"
+                f"{'s' if duplicate_count != 1 else ''}",
+                0,
+                0,
+            )
+            return time.monotonic() - started_at
 
         def _dimensions_stage() -> float:
             # Image/video hashing fills most dimensions as a side effect, so
@@ -719,6 +821,8 @@ def run_scan(
         else:
             image_done.set()
             video_done.set()
+        if run_semantic:
+            stage_jobs["semantic"] = _semantic_stage
         if run_dimensions:
             stage_jobs["dims"] = _dimensions_stage
         else:
@@ -780,6 +884,8 @@ def run_scan(
                 for record in records
                 if record.error and record.error.startswith(ERROR_VIDEO_FINGERPRINT_FAILED)
             ]
+        if run_semantic:
+            stage_durations["semantic"] = stage_results["semantic"]
         if run_dimensions:
             stage_durations["low_resolution"] = stage_results["dims"]
         if run_human:
@@ -837,6 +943,15 @@ def run_scan(
         if similar and len(video_records) >= 2 and video_dependency
         else 0
     )
+    semantic_failures = stage_errors["semantic"]
+    semantic_ready = (
+        semantic
+        and semantic_available()
+        and not any(error.startswith("semantic look-alikes skipped") for error in semantic_failures)
+    )
+    if semantic and not semantic_available() and not semantic_failures:
+        semantic_failures = ["semantic look-alikes skipped: DigUp is not installed"]
+    semantic_attempted = len(image_records) if semantic_ready and len(image_records) >= 2 else 0
     human_failures = stage_errors["human_detection"]
     face_failures = stage_errors["face_detection"]
     face_records = [
@@ -896,6 +1011,22 @@ def run_scan(
                 else (
                     [f"{len(video_failures)} video fingerprint(s) failed"]
                     if video_failures
+                    else []
+                )
+            ),
+        ),
+        "semantic": StageDiagnostics(
+            attempted=semantic_attempted,
+            succeeded=max(0, semantic_attempted - len(semantic_failures)),
+            failed=len(semantic_failures) if semantic_attempted else 0,
+            skipped=len(records) - semantic_attempted,
+            duration_seconds=stage_durations.get("semantic", 0.0),
+            warnings=(
+                semantic_failures[:1]
+                if semantic and not semantic_attempted and semantic_failures
+                else (
+                    [f"{len(semantic_failures)} image(s) could not be embedded"]
+                    if semantic_failures
                     else []
                 )
             ),
@@ -1014,6 +1145,9 @@ def run_scans_parallel(
     max_streams: int | None = None,
     exact: bool = True,
     similar: bool = True,
+    semantic: bool = False,
+    semantic_threshold: float = SEMANTIC_THRESHOLD,
+    semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_low_resolution: bool = True,
@@ -1134,6 +1268,9 @@ def run_scans_parallel(
             [root],
             exact=exact,
             similar=similar,
+            semantic=semantic,
+            semantic_threshold=semantic_threshold,
+            semantic_duplicate_threshold=semantic_duplicate_threshold,
             find_no_humans=find_no_humans,
             count_faces=count_faces,
             find_low_resolution=find_low_resolution,

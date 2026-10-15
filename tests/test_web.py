@@ -3590,7 +3590,9 @@ def test_mark_distinct_cache_failure_is_a_structured_client_error(
 def test_status_reports_capabilities_and_review_health(tmp_path: Path) -> None:
     status = create_app(_result(tmp_path)).test_client().get("/api/status").get_json()
     capabilities = status["capabilities"]
-    assert set(capabilities) == {"opencv", "yunet_model", "photon", "ffmpeg", "ffprobe"}
+    assert set(capabilities) == {
+        "opencv", "yunet_model", "photon", "ffmpeg", "ffprobe", "semantic"
+    }
     assert all(isinstance(value, bool) for value in capabilities.values())
     assert status["keep_decisions_error"] is None
     assert status["trash_undo_cleared"] == 0

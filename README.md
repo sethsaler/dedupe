@@ -8,6 +8,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256; web scans automatically move extra copies to Trash, keeping one copy per group. A toast reports the deleted count and offers Undo.
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
+- **Sets and semantic look-alikes** — optional layer that embeds images and GIFs with Google DeepMind's EmbeddingGemma 2, run through [DigUp](https://github.com/ARahim3/DigUp)'s installed helper (no extra Python deps). A **Sets** tab groups images of one subject or shoot for browsing and one-click trash, and near-identical crops, flips, and re-saves the hashes missed join Similar with a "% look-alike" score (never preselected): `dedupe scan --semantic`, or *Sets & look-alikes (DigUp)* in the scan options
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected; one click (or `d`) moves a file to Trash, with Undo on the toast

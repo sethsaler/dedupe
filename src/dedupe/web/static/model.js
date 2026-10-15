@@ -11,7 +11,8 @@ function isIndependentReview(g) {
 }
 
 function isPagedIndependentReview(g) {
-  return g?.kind === "no_humans" || g?.kind === "faces" || g?.kind === "all_files";
+  return g?.kind === "no_humans" || g?.kind === "faces" || g?.kind === "all_files"
+    || g?.kind === "sets";
 }
 
 // Keep-one duplicate groups (exact/similar) render the same 50-card grid pages
