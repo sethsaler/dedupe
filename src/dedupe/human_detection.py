@@ -147,8 +147,9 @@ class _OpenCVPersonDetector:
                 "OpenCV YuNet face detection could not start; install OpenCV 4.5.4 "
                 "or newer. No media was classified as non-human."
             ) from exc
-        # OpenCV 5 removed HOGDescriptor. YuNet remains required; body
-        # detectors are extra recall when the build still ships them.
+        # OpenCV 5 keeps HOGDescriptor only in the contrib builds, which is
+        # why the extras depend on opencv-contrib-python-headless. YuNet remains
+        # required; body detectors are extra recall when the build ships them.
         self.hog = None
         self.hog_daimler = None
         if hasattr(cv2, "HOGDescriptor"):
