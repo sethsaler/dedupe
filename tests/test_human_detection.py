@@ -51,6 +51,14 @@ def test_blank_landscape_is_review_candidate(tmp_path: Path) -> None:
     assert record.human_detector == "opencv_yunet_hog"
 
 
+def test_opencv_detector_has_full_body_hog_detectors() -> None:
+    pytest.importorskip("cv2")
+    detector = create_person_detector("opencv")
+
+    assert detector.hog is not None
+    assert detector.hog_daimler is not None
+
+
 def test_opencv_detector_fails_closed_without_face_model(
     tmp_path: Path, monkeypatch
 ) -> None:
