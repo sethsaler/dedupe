@@ -17,7 +17,7 @@ Priorities: **P1** is an established fact, a claim many documents depend on, or 
 ## How to run a pass
 
 1. Bring up the surface. Web UI: `.venv/bin/dedupe ui` in the source repo → `http://127.0.0.1:8765`. CLI: `.venv/bin/dedupe {subcommand}`. For a clean state: discard the saved review (Discard saved review in the UI, or delete `~/.local/state/dedupe/review-session.json`), and point scans at scratch folders under `/tmp` — never a real photo library.
-2. Confirm the commit. Every document says `Verified against dedupe commit 2a6cede`. Run `git rev-parse --short HEAD` in `/Users/sethsaler/Documents/GitHub/dedupe`; if it differs, some failures will be drift, not defects.
+2. Confirm the commit. Every document says `Verified against dedupe commit 2a6cede`. Run `git rev-parse --short HEAD` in `/Users/sethsaler/Developer/GitHub/dedupe`; if it differs, some failures will be drift, not defects.
 3. Keep the documents open beside the product. Read the linked section before each item; the item is a summary, the section is the claim.
 4. Work through P1 first across all files, then P2, then P3.
 5. Record `pass`, `fail`, or `blocked` in the Result column, with a note for anything other than a clean pass. A fail is something the document says that the product does not do; a blocked item could not be run.

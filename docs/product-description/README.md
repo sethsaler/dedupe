@@ -169,7 +169,7 @@ Status is one of `not started`, `drafted`, or `verified`.
 
 ## Reference
 
-The source of truth is the Dedupe repository at `/Users/sethsaler/Documents/GitHub/dedupe`. The set was pinned at commit `2a6cede`; documents touched by the 2026-09 improvement phases describe that later working tree and say so in their verification footers. The relevant locations are:
+The source of truth is the Dedupe repository at `/Users/sethsaler/Developer/GitHub/dedupe`. The set was pinned at commit `2a6cede`; documents touched by the 2026-09 improvement phases describe that later working tree and say so in their verification footers. The relevant locations are:
 
 - `src/dedupe/cli.py`: every command, flag, and default; the entry point for the CLI surface.
 - `src/dedupe/web/app.py`, `src/dedupe/web/static/*.js` (ES modules, entry `main.js`), `templates/index.html`: the UI surface and its state.

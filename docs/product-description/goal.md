@@ -102,7 +102,7 @@ From `ui/scan-setup.md`, `ui/group-list.md`, `ui/action-sheet.md`:
 ## Working rules
 
 - Commit after each document or coherent group of documents with a message of the form `docs: add {path}` or `docs: revise {path}`. No AI attribution lines in commit messages.
-- Do not modify anything in `/Users/sethsaler/Documents/GitHub/dedupe`. It is read-only reference material.
+- Do not modify anything in `/Users/sethsaler/Developer/GitHub/dedupe`. It is read-only reference material.
 - Do not add files outside the README's structure without updating the structure and coverage table to match.
 - When a behavior cannot be determined from code and tests, write down what you could determine, put the rest in "Open questions", and move on. Do not guess and do not block.
 - Depth bar: `cli/doctor.md` is roughly 150–200 lines for a small command. The `ui/` documents will be longer. Completeness matters more than length. Every state, every modifier, every cancel/interrupt row must be accounted for, even if the answer is "No effect."
