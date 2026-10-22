@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Scan folders for duplicates")
+    scan.add_argument("--prefer-folder", action="append", default=[],
+                      help="Prefer keeping files here (repeat in priority order)")
     scan.add_argument("paths", nargs="+", help="Folders or files to scan")
     scan.add_argument("--no-exact", action="store_true", help="Skip exact duplicate detection")
     scan.add_argument("--no-similar", action="store_true", help="Skip similar detection")
@@ -402,6 +404,9 @@ def build_parser() -> argparse.ArgumentParser:
     similarity.add_argument("--threshold", type=int, default=6, help="Image threshold")
     similarity.add_argument("--video-threshold", type=int, default=8, help="Video threshold")
     similarity.add_argument("--workers", type=int, default=None, metavar="N")
+    similarity.add_argument("--semantic", action="store_true",
+                            help="Also benchmark edited-copy discovery (requires DigUp)")
+    similarity.add_argument("--semantic-duplicate-threshold", type=float, default=0.94)
 
     return p
 
@@ -455,6 +460,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, _sigint_handler)
 
     scan_kwargs = {
+        "preferred_folders": args.prefer_folder,
         "exact": not args.no_exact,
         "similar": not args.no_similar,
         "semantic": args.semantic,
@@ -977,6 +983,8 @@ def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
             image_threshold=args.threshold,
             video_threshold=args.video_threshold,
             workers=args.workers,
+            semantic=args.semantic,
+            semantic_duplicate_threshold=args.semantic_duplicate_threshold,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

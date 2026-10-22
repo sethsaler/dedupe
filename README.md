@@ -436,3 +436,11 @@ platform coverage, individual suites, and release behavior.
 ## License
 
 MIT
+
+### Cleanup improvements
+
+Use the **Scan goal** presets, preferred keeper folders, and **Best cleanup
+opportunities** sort to focus review. Similar pairs include image difference/shared
+zoom and synchronized video comparison. The [cleanup workflow](docs/cleanup-workflow.md)
+explains match evidence, optional edited-copy verification, local review-label
+exports, and read-only cold/warm benchmarks.

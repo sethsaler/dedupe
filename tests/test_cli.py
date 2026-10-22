@@ -421,7 +421,9 @@ def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     assert code == 0
     assert text.index("False positives") < text.index("False negatives") < text.index("Precision")
     assert json.loads(output.read_text(encoding="utf-8")) == report
-    assert calls == [("pairs.json", {"image_threshold": 7, "video_threshold": 8, "workers": None})]
+    assert calls == [("pairs.json", {"image_threshold": 7, "video_threshold": 8,
+                                    "workers": None, "semantic": False,
+                                    "semantic_duplicate_threshold": 0.94})]
 
 
 def _quarantine_receipts(tmp_path: Path):

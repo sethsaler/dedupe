@@ -85,6 +85,7 @@ async function startScan() {
       method: "POST",
       body: JSON.stringify({
         paths,
+        preferred_folders: $("preferredFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
         exact: $("optExact").checked,
         similar: $("optSimilar").checked,
         semantic: $("optSemantic").checked,

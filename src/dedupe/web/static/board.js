@@ -109,7 +109,7 @@ function tileHtml(g, member, index, selected, rowFocused) {
   const percent = member.similarity_percent == null ? NaN : Number(member.similarity_percent);
   const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   const chip = member.path === g.suggested_keep
-    ? '<span class="board-chip keeper" title="Ranked best by resolution, size, date, and path">Suggested keeper</span>'
+    ? '<span class="board-chip keeper" title="${escapeHtml(g.cleanup?.keeper_reason || "Ranked by resolution, size, date, and path")}">Suggested keeper</span>'
     : member.match_label
       ? `<span class="board-chip uncertain" title="EmbeddingGemma cosine similarity with the suggested keeper: same subject, not necessarily the same shot">${escapeHtml(member.match_label)}</span>`
       : Number.isFinite(percent)

@@ -93,6 +93,8 @@ function collapseScanPanel(pathsText = "") {
 }
 
 const settingIds = [
+  "preferredFolders",
+  "optParallel",
   "optExact",
   "optSimilar",
   "optSemantic",
@@ -169,6 +171,27 @@ function syncSemanticVisibility() {
 }
 $("optSemantic").addEventListener("change", syncSemanticVisibility);
 syncSemanticVisibility();
+
+$("scanPreset").addEventListener("change", () => {
+  const preset = $("scanPreset").value;
+  if (preset === "custom") return;
+  const deep = preset === "deep";
+  for (const id of ["optExact", "optSimilar"]) $(id).checked = true;
+  for (const id of ["optNoHumans", "optCountFaces", "optLowResolution", "optRandomReview", "optParallel"]) {
+    $(id).checked = false;
+  }
+  $("optSemantic").checked = deep && !$("optSemantic").disabled;
+  if (deep) { $("semanticDuplicateThreshold").value = "94"; syncSemanticLabels(); }
+  $("presetHint").textContent = deep && $("optSemantic").disabled
+    ? "Edited-copy search needs the optional DigUp helper. Standard duplicate detection is ready."
+    : deep ? "Includes edited-copy discovery with DigUp; each look-alike needs review."
+    : "Exact and similar duplicates across all folders; face analysis and unrelated reviews are off.";
+  syncSemanticVisibility();
+  syncHumanBackendVisibility();
+  syncCrossFolderHint();
+  saveScanSettings();
+});
+for (const id of settingIds) $(id).addEventListener("change", () => { $("scanPreset").value = "custom"; });
 
 // —— Recent paths ——
 function loadRecent() {

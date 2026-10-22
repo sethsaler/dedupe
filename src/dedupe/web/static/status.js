@@ -63,7 +63,7 @@ function renderDiagnostics(summary) {
   for (const [name, stage] of stages) {
     for (const warning of stage.warnings || []) warnings.push(`${name.replaceAll("_", " ")}: ${warning}`);
   }
-  $("scanQualitySummary").textContent = `· ${formatDuration(diagnostics.total_duration_seconds)} · ${diagnostics.cache_hits || 0} cache hits`;
+  $("scanQualitySummary").textContent = `· ${formatDuration(diagnostics.total_duration_seconds)} · ${diagnostics.cache_hits || 0} cache hits${diagnostics.first_duplicate_seconds != null ? ` · first duplicate ${formatDuration(diagnostics.first_duplicate_seconds)}` : ""}`;
   $("scanQualityGrid").innerHTML = stages.map(([name, stage]) => {
     // Stage warnings are capped server-side; say so instead of implying the
     // shown list is complete.

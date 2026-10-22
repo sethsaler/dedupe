@@ -32,6 +32,7 @@ from flask import (
 
 from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups, undo_action
 from ..cache import HashCache
+from ..cleanup import cleanup_opportunity
 from ..engine import run_scan, run_scans_parallel
 from ..grouping import (
     apply_smart_select,
@@ -42,6 +43,7 @@ from ..grouping import (
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
 from ..keep_decisions import update_keep_decisions
+from ..media_details import comparison_details
 from ..models import (
     GroupKind,
     ReviewPolicy,
@@ -641,6 +643,10 @@ def create_app(
                     member_payload["orientation_label"] = (
                         ORIENTATION_LABELS[orientation] if orientation else None
                     )
+        agreements = [m["similarity_percent"] for m in payload["members"]
+                      if m.get("similarity_percent") is not None
+                      and m["path"] != group.suggested_keep]
+        payload["cleanup"] = cleanup_opportunity(group, agreements)
         deleted = state["deleted_files"]
         payload["deleted_paths"] = [
             member.path for member in group.members if member.path in deleted
@@ -1097,6 +1103,10 @@ def create_app(
         if not paths:
             return jsonify({"error": "paths required"}), 400
 
+        preferred_folders = data.get("preferred_folders") or []
+        if (not isinstance(preferred_folders, list)
+                or any(not isinstance(p, str) or not p.strip() for p in preferred_folders)):
+            return jsonify({"error": "preferred_folders must be a list of folder paths"}), 400
         human_backend = str(data.get("human_backend", "opencv")).strip().lower()
         if human_backend not in HUMAN_BACKENDS:
             return jsonify({"error": f"unknown human detector: {human_backend}"}), 400
@@ -1226,6 +1236,7 @@ def create_app(
                     raw_exclusions = raw_exclusions.split(",")
 
                 scan_kwargs = {
+                    "preferred_folders": preferred_folders,
                     "exact": bool(data.get("exact", True)),
                     "similar": bool(data.get("similar", True)),
                     "semantic": bool(data.get("semantic", False)),
@@ -2651,6 +2662,17 @@ def create_app(
         # The key already includes source mtime/size, so the body can never change.
         response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
         return response
+
+    @app.get("/api/media-details")
+    def api_media_details():
+        path = request.args.get("path", "")
+        media_path = Path(path)
+        if not path or not is_scanned_file(media_path, path):
+            return jsonify({"error": "not in scan"}), 403
+        try:
+            return jsonify(comparison_details(media_path))
+        except Exception:
+            return jsonify({"error": "Metadata unavailable"}), 422
 
     @app.get("/api/media")
     def api_media():

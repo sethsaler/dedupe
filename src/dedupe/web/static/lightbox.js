@@ -103,17 +103,16 @@ function lightboxDetails(item) {
   return parts.join(" · ");
 }
 
-// The keeper overlay compares at preview fidelity; zoom is single-file full
-// detail, so the compare tools hide while zoomed.
+// Both images share the comparison surface at preview or full fidelity.
 function syncCompareTools(item, isVideo) {
-  const canCompare = !zoomed && !isVideo && item
+  const canCompare = !isVideo && item
     && item.mediaType !== "gif" && item.kind === "similar" && item.keeper && item.keeper !== item.path;
   const keeperImage = $("lbKeeperImage");
   $("lbCompareTools").hidden = !canCompare;
   keeperImage.hidden = !canCompare;
   if (canCompare) {
-    keeperImage.src = previewUrl(item.keeper);
-    keeperImage.style.opacity = String(Number($("lbOpacity").value) / 100);
+    keeperImage.src = zoomed ? fullUrl(item.keeper) : previewUrl(item.keeper);
+    applyCompareMode();
   } else {
     keeperImage.removeAttribute("src");
   }
@@ -226,11 +225,19 @@ $("lbSpeed").addEventListener("change", () => {
 $("lbVideo").addEventListener("loadedmetadata", () => {
   $("lbVideo").playbackRate = Number($("lbSpeed").value);
 });
-$("lbOpacity").addEventListener("input", () => {
-  $("lbKeeperImage").style.opacity = String(Number($("lbOpacity").value) / 100);
-});
+function applyCompareMode() {
+  const difference = $("lbCompareMode").value === "difference";
+  $("lbKeeperImage").style.mixBlendMode = difference ? "difference" : "normal";
+  $("lbKeeperImage").style.opacity = difference ? "1" : String(Number($("lbOpacity").value) / 100);
+  $("lbOpacity").disabled = difference;
+}
+$("lbCompareMode").addEventListener("change", applyCompareMode);
+$("lbOpacity").addEventListener("input", applyCompareMode);
 const showKeeper = (show) => {
-  $("lbKeeperImage").style.opacity = show ? "1" : "0";
+  if (show) {
+    $("lbKeeperImage").style.mixBlendMode = "normal";
+    $("lbKeeperImage").style.opacity = "1";
+  } else applyCompareMode();
   $("lbFlicker").setAttribute("aria-pressed", show ? "true" : "false");
 };
 ["pointerdown", "keydown"].forEach((eventName) => $("lbFlicker").addEventListener(eventName, (event) => {

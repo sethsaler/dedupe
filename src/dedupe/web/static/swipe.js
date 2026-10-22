@@ -6,6 +6,8 @@
 // decision cycles the next pair in until every copy has been addressed.
 
 import { api } from "./api.js";
+import { noteReviewPair, recordReview, undoReview } from "./review-metrics.js";
+import { wireComparison } from "./comparison.js";
 import { boardActive } from "./board.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { openLightbox, updateLightbox } from "./lightbox.js";
@@ -88,7 +90,7 @@ function memberMeta(member) {
     && member.width > 0 && member.height > 0
     ? `${member.width}×${member.height}`
     : "—";
-  return [formatBytes(member.size), dims, formatMtime(member.mtime)].join(" · ");
+  return [formatBytes(member.size), dims, member.duration != null ? `${Number(member.duration).toFixed(1)}s` : null, formatMtime(member.mtime)].filter(Boolean).join(" · ");
 }
 
 function mediaHtml(member) {
@@ -200,6 +202,7 @@ function renderSwipeReview(g) {
     : `${decided} of ${total} compared · ${trashedCount} in Trash · ← same photo → different`;
 
   const candidate = done ? null : memberByPath(g, deck[0]);
+  if (candidate && anchorMember) noteReviewPair(anchorMember.path, candidate.path);
 
   const pairHtml = done
     ? `<div class="swipe-done">
@@ -229,6 +232,11 @@ function renderSwipeReview(g) {
         </div>
         ${sideHtml(candidate, { card: true, meta: similarityChip(candidate, g, anchor) })}
       </div>
+      <div class="comparison-summary" id="comparisonSummary" aria-live="polite">
+        <span>${escapeHtml(g.cleanup?.reason || "Compare each copy with the reference")}. Reference: ${escapeHtml(g.cleanup?.keeper_reason || "your choice")}.</span>
+        ${candidate.media_type === "video" && anchorMember?.media_type === "video" ? '<label><input type="checkbox" id="syncVideos" /> Synchronize playback and seeking</label>' : '<span>Expand for overlay, difference, and shared zoom. Crops may require visual alignment.</span>'}
+        <span id="comparisonMetadata">Reading metadata…</span>
+      </div>
       <div class="swipe-mid">
         <span class="swipe-progress">${decided} / ${total} reviewed${deck.length > 1 ? ` · ${deck.length - 1} after this` : ""}</span>
         <button class="linkish" id="swipeSkip" type="button" ${deck.length < 2 ? "disabled" : ""} title="Decide later — send this copy to the back of the queue">Skip</button>
@@ -238,6 +246,7 @@ function renderSwipeReview(g) {
 
   box.innerHTML = `<div class="swipe-review">${pairHtml}</div>`;
   wireSwipeDom(g);
+  if (candidate && anchorMember) wireComparison(box, anchorMember, candidate);
 }
 
 function wireSwipeDom(g) {
@@ -474,6 +483,7 @@ async function decideSwipe(direction, path = null) {
           dry_run: false,
         }),
       });
+      recordReview(anchor, target, true);
       patchGroup(updated);
       refreshAfterDecision(updated);
       toast(`Same photo — moved ${basename(target)} to Trash`, "ok", {
@@ -490,6 +500,7 @@ async function decideSwipe(direction, path = null) {
           scan_id: state.scanId,
         }),
       });
+      recordReview(anchor, target, false);
       if (res.dissolved || !res.group) {
         toast("Different — pair marked, group finished", "ok");
         await loadGroups();
@@ -531,6 +542,7 @@ async function undoSwipe() {
       });
       patchGroup(updated);
       restoreToDeck(g.id, entry.path);
+      undoReview(entry.anchor, entry.path);
       stack.pop();
       refreshAfterDecision(updated);
       toast("Image restored", "ok");
@@ -544,6 +556,7 @@ async function undoSwipe() {
           scan_id: state.scanId,
         }),
       });
+      undoReview(entry.anchor, entry.path);
       stack.pop();
       if (res.group) {
         patchGroup(res.group);

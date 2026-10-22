@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from .cache import HashCache, default_cache_path
+from .edited_copy import edited_copy_verdict
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 
@@ -359,10 +360,12 @@ def semantic_neighbors(
     for start in range(0, total, SIMILARITY_BLOCK):
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
-        block = matrix[start : start + SIMILARITY_BLOCK] @ matrix.T
+        # Earlier blocks already compared this block with preceding rows.
+        block = matrix[start : start + SIMILARITY_BLOCK] @ matrix[start:].T
         rows, cols = np.nonzero(block >= threshold)
         for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
             i = start + row
+            col += start
             if col <= i:
                 continue
             a, b = paths[i], paths[col]
@@ -489,8 +492,14 @@ def find_semantic_groups(
     def duplicate_pair(a: str, b: str, score: float) -> bool:
         if score < duplicate_threshold or a in excluded or b in excluded:
             return False
+        # Broader discovery must establish image correspondence, not just
+        # matching subject matter or a similar brightness distribution.
+        verdict = edited_copy_verdict(a, b)
+        if verdict is not None:
+            return verdict
         left, right = histogram(a), histogram(b)
-        return left is not None and right is not None and histograms_agree(left, right)
+        return (score >= DEFAULT_DUPLICATE_THRESHOLD and left is not None
+                and right is not None and histograms_agree(left, right))
 
     duplicates = build(restrict(duplicate_pair), distinct)
     del adjacency

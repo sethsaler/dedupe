@@ -239,7 +239,7 @@ function updateDetailMeta(g) {
 
   const keeper = (g.members || []).find((member) => member.path === g.suggested_keep);
   const keeperWhy = keeper
-    ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ranked by resolution, size, date, and path.`
+    ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ${g.cleanup?.keeper_reason || "ranked by resolution, size, date, and path"}.`
     : "";
   $("detailMeta").textContent =
     `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
@@ -257,7 +257,7 @@ function restartMemberList() {
 }
 
 async function selectGroup(id, { silent = false, preservePlayback = false } = {}) {
-  memberObserver.disconnect();
+  if (state.currentId !== id) memberObserver.disconnect();
   const myToken = ++state.selectToken;
   if (!silent) state.pendingGroupFocus = { id, from: document.activeElement };
   const preserveMemberFocus = silent && state.currentId === id;
@@ -283,11 +283,11 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
   if (state.selectToken !== myToken || g.id !== state.currentId) return;
-  // Keep native video nodes on unchanged passive refreshes, even while paused
-  // or starting playback. Replacing them loses the playhead and can race Play.
+  // Preserve unchanged media on passive refreshes: rebuilding loses video
+  // playback, image scroll position, and the identity of appended gallery cards.
   // Changed data and explicit view changes still repaint.
   if (preservePlayback && preserveMemberFocus && JSON.stringify(g) === renderedGroupSnapshot
-    && $("members").querySelector(".review-video, .swipe-media video")) {
+    && $("members").querySelector(".card, .swipe-review")) {
     applyPendingGroupFocus(id);
     return;
   }

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
+import threading
 from pathlib import Path
 
 from .cache import DistinctReviews
@@ -27,15 +29,42 @@ DEFAULT_RANDOM_REVIEW_COUNT = 50
 FACE_COUNTED_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
 
 
+_keeper_metadata_lock = threading.Lock()
+
+
 def rank_keep_candidate(rec: FileRecord) -> tuple:
     """
     Higher is better for 'automatic' keep.
-    Prefer: more pixels, larger bytes, newer mtime, shorter path.
+    Folder preferences and capture metadata precede dimensions. Size alone
+    cannot measure quality; recognizable export names lose otherwise equal ties.
+    These hints never establish whether files are duplicates.
     """
+    with _keeper_metadata_lock:
+        if rec.capture_metadata is None:
+            rec.capture_metadata = False
+            if rec.media_type == MediaType.IMAGE:
+                try:
+                    from PIL import Image
+
+                    with Image.open(rec.path) as image:
+                        exif = image.getexif()
+                        capture = exif.get(36867)
+                        if not capture and exif.get(34665):
+                            capture = exif.get_ifd(34665).get(36867)
+                        rec.capture_metadata = bool(capture and (exif.get(271) or exif.get(272)))
+                except Exception:
+                    pass
     path_depth = len(Path(rec.path).parts)
     name_len = len(Path(rec.path).name)
+    export_name = bool(re.search(
+        r"(?:^|[ _-])(copy|edited|export|compressed|whatsapp)(?:[ _.-]|$)",
+        Path(rec.path).name, re.IGNORECASE,
+    ))
     return (
+        rec.keeper_preference,
+        bool(rec.capture_metadata),
         rec.pixels,
+        not export_name,
         rec.size,
         rec.mtime,
         -path_depth,

@@ -124,6 +124,8 @@ class FileRecord:
     face_detector: str | None = None
     face_detection_signature: str | None = None
     error: str | None = None
+    keeper_preference: int = 0
+    capture_metadata: bool | None = None
 
     @property
     def path_obj(self) -> Path:
@@ -160,6 +162,8 @@ class FileRecord:
             mtime=float(data["mtime"]),
             media_type=mt,
             extension=data.get("extension", Path(data["path"]).suffix.lower()),
+            keeper_preference=int(data.get("keeper_preference", 0)),
+            capture_metadata=data.get("capture_metadata"),
             device=data.get("device"),
             inode=data.get("inode"),
             mtime_ns=data.get("mtime_ns"),
@@ -429,10 +433,12 @@ class ScanDiagnostics:
     total_duration_seconds: float = 0.0
     cache_hits: int = 0
     stages: dict[str, StageDiagnostics] = field(default_factory=dict)
+    first_duplicate_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_duration_seconds": self.total_duration_seconds,
+            "first_duplicate_seconds": self.first_duplicate_seconds,
             "cache_hits": self.cache_hits,
             "stages": {name: stage.to_dict() for name, stage in self.stages.items()},
         }
@@ -442,6 +448,7 @@ class ScanDiagnostics:
         raw_stages = data.get("stages", {})
         return cls(
             total_duration_seconds=float(data.get("total_duration_seconds", 0.0)),
+            first_duplicate_seconds=data.get("first_duplicate_seconds"),
             cache_hits=int(data.get("cache_hits", 0)),
             stages={
                 str(name): StageDiagnostics.from_dict(value)

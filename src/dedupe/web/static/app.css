@@ -3041,3 +3041,11 @@ kbd {
   .app:has(> .results:not([hidden])) .board-row { scroll-margin: 12px 0; }
   .app:has(> .results:not([hidden])) .tagline { display: none; }
 }
+
+/* Both comparison images share coordinates, including while zoomed/panned. */
+.lb-image-plane { position: relative; display: grid; place-items: center; width: 100%; height: 100%; min-height: 0; }
+.lb-image-plane > img { grid-area: 1 / 1; }
+.lb-image-stack.zoomed .lb-image-plane { width: max-content; height: max-content; display: block; }
+.lb-image-stack.zoomed #lbKeeperImage { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; object-fit: fill; }
+.comparison-summary { display: grid; gap: 8px; padding: 12px; font-size: 13px; overflow-wrap: anywhere; }
+#preferredFolders { width: 100%; box-sizing: border-box; font: inherit; }

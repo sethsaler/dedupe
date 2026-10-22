@@ -261,6 +261,8 @@ function applyResultControls() {
     g, (g.members || []).reduce((latest, m) => Math.max(latest, m.mtime || 0), 0),
   ])) : null;
   groups.sort((a, b) => {
+    if (sort === "opportunity") return (b.cleanup?.score || 0) - (a.cleanup?.score || 0)
+      || (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
     if (sort === "size") return (b.member_count || 0) - (a.member_count || 0);
     if (sort === "date") return newestDates.get(b) - newestDates.get(a);
     if (sort === "media") return String(a.media_type).localeCompare(String(b.media_type));
@@ -304,6 +306,7 @@ function groupItemHtml(g) {
             <span>${folderLabel ? `${escapeHtml(folderLabel)} · ` : ""}${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
             <span class="badge ${g.kind}">${badgeLabel}</span>
           </div>
+          ${g.kind === "similar" && g.cleanup ? `<div class="g-state" title="${escapeHtml(g.cleanup.reason)}">${escapeHtml(g.cleanup.label)}</div>` : ""}
           <div class="g-state"><span class="g-state-glyph" aria-hidden="true">${stateGlyph}</span>${stateLabel}</div>
           <div class="g-sub">
             <span>${groupSummary}</span>

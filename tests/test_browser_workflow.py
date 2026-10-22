@@ -2500,6 +2500,10 @@ def test_similar_native_video_controls_never_commit_a_swipe(page, tmp_path):
         page.locator('.tab[data-kind="similar"]').click()
         expect(page.locator("#members video[controls]")).to_have_count(2)
         candidate = page.locator(".swipe-top video")
+        page.locator("#syncVideos").check()
+        candidate.evaluate("v => { v.currentTime = 1; }")
+        page.wait_for_function("() => Math.abs(document.querySelector('.swipe-keeper video').currentTime - 1) < 0.2")
+        expect(page.locator("#comparisonMetadata")).to_contain_text("no audio track")
         # Playback promises can stay pending if the media node is detached.
         # Assert progress with Playwright's bounded wait instead of hanging.
         candidate.evaluate("v => { v.play().catch(() => {}); }")
@@ -2579,3 +2583,83 @@ def test_sidebar_partial_window_shift_keeps_scroll_anchor(page, live_dedupe_serv
     assert offsets["count"] == 250
     assert offsets["afterDown"] == pytest.approx(offsets["before"], abs=1)
     assert offsets["afterUp"] == pytest.approx(offsets["before"], abs=1)
+
+
+@pytest.mark.e2e
+def test_cleanup_preset_compares_folders_and_persists_preferences(page, live_dedupe_server, tmp_path):
+    originals, exports = tmp_path / "originals", tmp_path / "exports"
+    originals.mkdir()
+    exports.mkdir()
+    source = Image.open(Path(__file__).parent / "fixtures/astronaut.png").convert("RGB")
+    source.save(originals / "original.png")
+    source.resize((256, 256)).save(exports / "export.jpg", quality=90)
+    page.goto(live_dedupe_server)
+    page.locator("#scanPreset").select_option("cleanup")
+    page.locator("#optsToggle").click()
+    for selector in ("#optCountFaces", "#optNoHumans", "#optLowResolution", "#optRandomReview", "#optParallel"):
+        expect(page.locator(selector)).not_to_be_checked()
+    page.locator("#preferredFolders").fill(str(originals))
+    page.locator("#paths").fill(f"{originals}, {exports}")
+    with page.expect_request("**/api/scan") as request:
+        page.locator("#btnScan").click()
+    sent = request.value.post_data_json
+    assert sent["preferred_folders"] == [str(originals)]
+    assert sent["parallel_streams"] is False
+    page.locator('.tab[data-kind="similar"]').click()
+    expect(page.locator(".group-item")).to_have_count(1, timeout=20000)
+    expect(page.locator("#resultSort")).to_have_value("opportunity")
+    expect(page.locator("#comparisonSummary")).to_contain_text("preferred folder")
+    page.reload()
+    expect(page.locator("#preferredFolders")).to_have_value(str(originals))
+    assert (originals / "original.png").exists() and (exports / "export.jpg").exists()
+
+
+@pytest.mark.e2e
+def test_difference_zoom_and_local_review_export(page, tmp_path):
+    page.add_init_script("localStorage.setItem('dedupe.reviewLabels.v1', '{\"bad\":true}')")
+    paths = [tmp_path / "original.png", tmp_path / "copy.png"]
+    source = Image.open(Path(__file__).parent / "fixtures/astronaut.png").convert("RGB")
+    source.resize((2048, 2048)).save(paths[0])
+    source.resize((1024, 1024)).save(paths[1])
+    records = [FileRecord(str(p), p.stat().st_size, p.stat().st_mtime, MediaType.IMAGE,
+                          ".png", width=2048 // (i + 1), height=2048 // (i + 1))
+               for i, p in enumerate(paths)]
+    group = ReviewGroup("compare-upgrades", GroupKind.SIMILAR, MediaType.IMAGE, records,
+                        suggested_keep=str(paths[0]))
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=records, groups=[group]),
+                     review_session_path=tmp_path / "review.json")
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": 1440, "height": 900})
+    with _serve_app(app) as url:
+        page.goto(url)
+        page.locator('.tab[data-kind="similar"]').click()
+        page.locator('.swipe-top .swipe-expand').click()
+        page.locator("#lbCompareMode").select_option("difference")
+        expect(page.locator("#lbKeeperImage")).to_have_css("mix-blend-mode", "difference")
+        page.locator("#lbZoom").click()
+        expect(page.locator("#lbImage")).to_have_attribute("src", re.compile("variant=full"))
+        expect(page.locator("#lbKeeperImage")).to_be_visible()
+        expect(page.locator("#lbKeeperImage")).to_have_attribute("src", re.compile("variant=full"))
+        page.wait_for_function("""() => {
+            const a = document.querySelector('#lbImage').getBoundingClientRect();
+            const b = document.querySelector('#lbKeeperImage').getBoundingClientRect();
+            return a.width > 0 && Math.abs(a.width-b.width) < 2 && Math.abs(a.height-b.height) < 2;
+        }""")
+        page.screenshot(path="/tmp/dedupe-difference-desktop.png")
+        page.locator("#lbClose").click()
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path="/tmp/dedupe-cleanup-mobile.png")
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.locator("#swipeDiff").click()
+        page.wait_for_function("() => JSON.parse(localStorage.getItem('dedupe.reviewLabels.v1') || '[]').length === 1")
+        # Export button lives inside the organize disclosure; open its parent directly.
+        page.locator("#exportReviewLabels").evaluate("el => { el.closest('details').open = true; }")
+        with page.expect_download() as download:
+            page.locator("#exportReviewLabels").click()
+        import json
+        data = json.loads(Path(download.value.path()).read_text())
+        assert data["pairs"][0]["similar"] is False
+        assert data["review"]["pairs"] == 1
+        assert all(p.exists() for p in paths)
+        assert errors == []

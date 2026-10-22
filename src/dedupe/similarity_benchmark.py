@@ -22,6 +22,7 @@ class SimilarityBenchmarkPair:
     path_b: Path
     similar: bool
     media_type: MediaType
+    category: str = "unspecified"
 
 
 def load_similarity_manifest(path: str | Path) -> list[SimilarityBenchmarkPair]:
@@ -71,7 +72,9 @@ def load_similarity_manifest(path: str | Path) -> list[SimilarityBenchmarkPair]:
             media_type = MediaType.VIDEO
         else:
             raise ValueError(f"benchmark pair {index} must contain the same media kind")
-        pairs.append(SimilarityBenchmarkPair(paths[0], paths[1], expected, media_type))
+        pairs.append(SimilarityBenchmarkPair(
+            paths[0], paths[1], expected, media_type, str(raw.get("category", "unspecified"))
+        ))
     return pairs
 
 
@@ -112,6 +115,8 @@ def run_similarity_benchmark(
     image_threshold: int = IMAGE_THRESHOLD,
     video_threshold: int = VIDEO_THRESHOLD,
     workers: int | None = None,
+    semantic: bool = False,
+    semantic_duplicate_threshold: float = 0.94,
 ) -> dict[str, Any]:
     """Run existing similarity detectors against labeled pairs."""
     manifest_path = Path(manifest).expanduser().resolve()
@@ -137,6 +142,15 @@ def run_similarity_benchmark(
                 groups = find_similar_image_groups(
                     records, threshold=image_threshold, workers=workers
                 )
+            if semantic and pair.media_type == MediaType.IMAGE and not groups:
+                from .semantic import find_semantic_groups
+
+                _sets, groups, semantic_errors = find_semantic_groups(
+                    records, duplicate_threshold=semantic_duplicate_threshold,
+                    workers=workers or 1, use_cache=False,
+                )
+                if semantic_errors:
+                    error = "; ".join(semantic_errors)
             record_error = next((record.error for record in records if record.error), None)
             if error or record_error:
                 error = error or record_error
@@ -151,6 +165,7 @@ def run_similarity_benchmark(
                 "path_a": str(pair.path_a),
                 "path_b": str(pair.path_b),
                 "media_type": pair.media_type.value,
+                "category": pair.category,
                 "similar": pair.similar,
                 "predicted_similar": predicted,
                 "latency_seconds": time.perf_counter() - pair_started,
@@ -160,6 +175,12 @@ def run_similarity_benchmark(
 
     elapsed = time.perf_counter() - started
     report = summarize_similarity_predictions(predictions)
+    report["categories"] = {
+        category: summarize_similarity_predictions(
+            [p for p in predictions if p["category"] == category]
+        ) for category in sorted({p["category"] for p in predictions})
+    }
+    report["semantic"] = semantic
     report.update(
         {
             "manifest": str(manifest_path),

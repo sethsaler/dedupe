@@ -141,6 +141,7 @@ def _populate_missing_dimensions(
 def run_scan(
     roots: list[str | Path],
     *,
+    preferred_folders: list[str] | None = None,
     exact: bool = True,
     similar: bool = True,
     semantic: bool = False,
@@ -213,6 +214,7 @@ def run_scan(
         "low_resolution": [],
     }
     cache_hits = 0
+    first_duplicate_seconds = None
 
     # Per-file progress arrives from every concurrent stage; invoking the
     # caller's callback for each one means hundreds of thousands of lock
@@ -265,6 +267,7 @@ def run_scan(
         Thread-safe: the concurrent similar-image and similar-video stages both
         publish their groups from worker threads.
         """
+        nonlocal first_duplicate_seconds
         added = 0
         with publish_lock:
             for members in member_lists:
@@ -274,6 +277,8 @@ def run_scan(
                 if g is None:
                     continue
                 groups.append(g)
+                if first_duplicate_seconds is None:
+                    first_duplicate_seconds = max(0.0, time.monotonic() - started)
                 if kind == GroupKind.EXACT:
                     exact_path_sets.append({m.path for m in g.members})
                 added += 1
@@ -334,6 +339,13 @@ def run_scan(
         except Exception as exc:
             emit("cache", 0, 0, f"Cache unavailable: {exc}")
             cache = None
+
+    preferred_roots = [Path(p).expanduser().resolve() for p in (preferred_folders or [])]
+    for record in records:
+        record.keeper_preference = next(
+            (len(preferred_roots) - index for index, folder in enumerate(preferred_roots)
+             if Path(record.path).is_relative_to(folder)), 0
+        )
 
     run_exact = exact and bool(records)
     run_similar = similar
@@ -437,11 +449,14 @@ def run_scan(
 
         def publish_prebuilt(new_groups: list[DuplicateGroup]) -> None:
             """Append already-built review groups and stream them (thread-safe)."""
+            nonlocal first_duplicate_seconds
             if not new_groups:
                 return
             with publish_lock:
                 for group in new_groups:
                     groups.append(group)
+                    if group.kind == GroupKind.SIMILAR and first_duplicate_seconds is None:
+                        first_duplicate_seconds = max(0.0, time.monotonic() - started)
                     if on_group:
                         on_group(group)
                 groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
@@ -1097,6 +1112,7 @@ def run_scan(
         errors=recorded_errors,
         diagnostics=ScanDiagnostics(
             total_duration_seconds=total_duration,
+            first_duplicate_seconds=first_duplicate_seconds,
             cache_hits=cache_hits,
             stages=stages,
         ),
@@ -1143,6 +1159,7 @@ def run_scans_parallel(
     roots: list[str | Path],
     *,
     max_streams: int | None = None,
+    preferred_folders: list[str] | None = None,
     exact: bool = True,
     similar: bool = True,
     semantic: bool = False,
@@ -1266,6 +1283,7 @@ def run_scans_parallel(
 
         return run_scan(
             [root],
+            preferred_folders=preferred_folders,
             exact=exact,
             similar=similar,
             semantic=semantic,

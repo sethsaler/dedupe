@@ -76,6 +76,15 @@
           </p>
         </div>
 
+        <div class="field-row">
+          <label for="scanPreset">Scan goal</label>
+          <select id="scanPreset">
+            <option value="custom">Custom settings</option>
+            <option value="cleanup">Find duplicates quickly</option>
+            <option value="deep">Find duplicates and edited copies</option>
+          </select>
+          <p class="thresh-hint" id="presetHint">Cleanup presets compare all folders together and skip face analysis.</p>
+        </div>
         <div class="scan-meta-row">
           <button type="button" class="opts-toggle" id="optsToggle" aria-expanded="false">
             <span class="chev" aria-hidden="true">▸</span>
@@ -100,12 +109,16 @@
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
             <span class="thresh-hint" id="depHint" hidden></span>
           </div>
+          <label class="field-row" for="preferredFolders">Preferred keeper folders (one per line, highest priority first)
+            <textarea id="preferredFolders" rows="2" placeholder="~/Pictures/Originals"></textarea>
+            <span class="thresh-hint">A preference chooses which duplicate survives. It does not protect every file in the folder.</span>
+          </label>
           <div class="semantic-fields" id="semanticFields" hidden>
             <label class="thresh" for="semanticDuplicateThreshold">
               <span class="opt-label">Look-alike duplicates</span>
-              <input type="range" id="semanticDuplicateThreshold" min="95" max="99.9" step="0.1" value="97" />
+              <input type="range" id="semanticDuplicateThreshold" min="90" max="99.9" step="0.1" value="97" />
               <span id="semanticDuplicateVal" class="thresh-val">97%</span>
-              <span class="thresh-hint">higher = stricter; 99%+ keeps only resizes, re-saves and recompressions</span>
+              <span class="thresh-hint">Below 97% requires geometric copy verification (OpenCV). Higher scores are still review suggestions, not proof.</span>
             </label>
             <label class="thresh" for="semanticSetThreshold">
               <span class="opt-label">Sets</span>
@@ -265,10 +278,12 @@
           </label>
           <details class="review-filters" id="reviewFilters">
             <summary>Filter &amp; organize</summary>
+            <button class="btn ghost" id="exportReviewLabels" type="button" title="Export local Same/Different decisions and review timing; restore trashed samples before benchmarking">Export review labels</button>
           <div class="result-control-grid">
             <label class="control-field" for="resultSort">
               <span>Sort</span>
               <select id="resultSort">
+                <option value="opportunity">Best cleanup opportunities</option>
                 <option value="reclaimable">Reclaimable bytes</option>
                 <option value="size">Group size</option>
                 <option value="date">Newest date</option>
@@ -544,8 +559,10 @@
     <div class="lb-stage">
       <div class="lb-media">
         <div class="lb-image-stack" id="lbImageStack">
-          <img id="lbImage" alt="Current file preview" />
-          <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+          <div class="lb-image-plane">
+            <img id="lbImage" alt="Current file preview" />
+            <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+          </div>
         </div>
         <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
       </div>
@@ -553,6 +570,8 @@
         <button class="btn ghost" id="lbZoom" type="button" aria-pressed="false" title="Full-resolution zoom (z)">Zoom</button>
       </div>
       <div class="lb-compare-tools" id="lbCompareTools" hidden>
+        <label for="lbCompareMode">Comparison</label>
+        <select id="lbCompareMode"><option value="overlay">Overlay</option><option value="difference">Difference</option></select>
         <label for="lbOpacity">Keeper overlay</label>
         <input id="lbOpacity" type="range" min="0" max="100" value="50" />
         <button class="btn ghost" id="lbFlicker" type="button" aria-pressed="false">Hold to flicker keeper</button>
