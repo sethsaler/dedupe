@@ -48,6 +48,16 @@ Dedupe's core — finding exact and similar images, reviewing groups, moving fil
 
 **How to get it.** Install DigUp (https://github.com/ARahim3/DigUp, or `brew install --cask arahim3/tap/digup`) and open it once so it downloads the model.
 
+## Decider
+
+**What needs it.** Decider verification of semantic look-alike duplicates ([Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works)). Decider.app (Perplexity) serves `pplx-decider-flash`, a Qwen3.5-4B vision model, on this Mac. Dedupe sends it image pairs over HTTP at `/v1/decisions` and adds no Python packages.
+
+**Where Dedupe looks.** `$DEDUPE_DECIDER_URL`, otherwise `http://127.0.0.1:8080`. The server must report `ready` with images enabled at `/health`. `dedupe doctor` prints whether it is reachable.
+
+**What happens without it.** The *Verify look-alikes with Decider* option is disabled, and its tooltip names the reason. The server is checked once, at startup. A CLI `--decider` scan runs the DigUp layer without Decider and reports `Decider verification skipped: …` in the semantic diagnostics. If the server stops partway through a scan, the rest of the scan uses the brightness check and reports `Decider verification stopped: …`.
+
+**How to get it.** Install and open Decider.app. It downloads the model (~5.8 GB) into `~/Library/Caches/ai.perplexity.decider/models`.
+
 ## Required Python packages
 
 **What needs them.** Everything: PIL (image decoding), imagehash (perceptual hashes), pybktree (hash candidate lookup), send2trash (system Trash), flask (the web UI).

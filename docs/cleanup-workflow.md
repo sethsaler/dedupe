@@ -73,7 +73,8 @@ Evaluate a labeled corpus using:
 
 ```bash
 .venv/bin/dedupe benchmark-similarity pairs.json --json /tmp/accuracy.json
-# Add --semantic --semantic-duplicate-threshold 0.94 for edited copies.
+# Add --semantic --semantic-duplicate-threshold 0.94 for edited copies,
+# or --decider to also judge unconfirmed candidates with Decider.app.
 ```
 
 Reports include precision, recall, errors, individual missed/wrong pairs, timings,

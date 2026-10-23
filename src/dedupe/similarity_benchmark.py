@@ -117,12 +117,18 @@ def run_similarity_benchmark(
     workers: int | None = None,
     semantic: bool = False,
     semantic_duplicate_threshold: float = 0.94,
+    decider: bool = False,
 ) -> dict[str, Any]:
     """Run existing similarity detectors against labeled pairs."""
     manifest_path = Path(manifest).expanduser().resolve()
     pairs = load_similarity_manifest(manifest_path)
     started = time.perf_counter()
     predictions: list[dict[str, Any]] = []
+    judge = None
+    if decider:
+        from .decider import DeciderJudge
+
+        judge = DeciderJudge(use_cache=False)
 
     for pair in pairs:
         pair_started = time.perf_counter()
@@ -147,7 +153,7 @@ def run_similarity_benchmark(
 
                 _sets, groups, semantic_errors = find_semantic_groups(
                     records, duplicate_threshold=semantic_duplicate_threshold,
-                    workers=workers or 1, use_cache=False,
+                    workers=workers or 1, use_cache=False, judge=judge,
                 )
                 if semantic_errors:
                     error = "; ".join(semantic_errors)
@@ -180,7 +186,10 @@ def run_similarity_benchmark(
             [p for p in predictions if p["category"] == category]
         ) for category in sorted({p["category"] for p in predictions})
     }
+    if judge is not None:
+        judge.close()
     report["semantic"] = semantic
+    report["decider"] = decider
     report.update(
         {
             "manifest": str(manifest_path),

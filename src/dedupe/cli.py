@@ -24,6 +24,7 @@ from .actions import (
     summarize_scan,
     undo_action,
 )
+from .decider import decider_available, decider_url
 from .engine import run_scan, run_scans_parallel
 from .grouping import apply_smart_select_all
 from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
@@ -84,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.97,
         metavar="COSINE",
         help="Cosine similarity for --semantic duplicates added to Similar (default 0.97)",
+    )
+    scan.add_argument(
+        "--decider",
+        action="store_true",
+        help=(
+            "Judge --semantic duplicates OpenCV cannot confirm with Perplexity's Decider "
+            "(implies --semantic; needs Decider.app running)"
+        ),
     )
     scan.add_argument(
         "--count-faces",
@@ -407,6 +416,8 @@ def build_parser() -> argparse.ArgumentParser:
     similarity.add_argument("--semantic", action="store_true",
                             help="Also benchmark edited-copy discovery (requires DigUp)")
     similarity.add_argument("--semantic-duplicate-threshold", type=float, default=0.94)
+    similarity.add_argument("--decider", action="store_true",
+                            help="Judge edited-copy candidates with Decider (implies --semantic)")
 
     return p
 
@@ -463,9 +474,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "preferred_folders": args.prefer_folder,
         "exact": not args.no_exact,
         "similar": not args.no_similar,
-        "semantic": args.semantic,
+        "semantic": args.semantic or args.decider,
         "semantic_threshold": args.semantic_threshold,
         "semantic_duplicate_threshold": args.semantic_duplicate_threshold,
+        "decider": args.decider,
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,
         "find_low_resolution": not args.no_low_resolution,
@@ -523,7 +535,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             f"Faces: {with_faces} file(s) with faces, "
             f"{multi_face} with more than one face ({len(counted)} analyzed)"
         )
-    if args.semantic:
+    if args.semantic or args.decider:
         sets = [g for g in result.groups if g.kind == GroupKind.SETS]
         print(
             f"Sets: {len(sets)} set(s) of look-alike images "
@@ -920,6 +932,7 @@ def collect_doctor_report() -> dict[str, object]:
         "ffmpeg": _executable_status("ffmpeg"),
         "ffprobe": _executable_status("ffprobe"),
         "opencv": opencv,
+        "decider": {"url": decider_url(), "available": decider_available()},
         "paths": paths,
         "core_ready": not blockers,
         "blockers": blockers,
@@ -947,6 +960,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(
             f"OpenCV/YuNet (optional): "
             f"{'ready' if cv.get('available') and cv.get('yunet_ready') else 'not ready'}"
+        )
+        decider = report["decider"]
+        print(
+            f"Decider (optional): "
+            f"{'ready' if decider['available'] else 'not running'} at {decider['url']}"
         )
         path_labels = {"cache": "Cache", "state": "State", "keep_decisions": "Keep decisions"}
         for name, status in report["paths"].items():
@@ -983,8 +1001,9 @@ def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
             image_threshold=args.threshold,
             video_threshold=args.video_threshold,
             workers=args.workers,
-            semantic=args.semantic,
+            semantic=args.semantic or args.decider,
             semantic_duplicate_threshold=args.semantic_duplicate_threshold,
+            decider=args.decider,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

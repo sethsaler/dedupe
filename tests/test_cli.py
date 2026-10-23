@@ -194,6 +194,7 @@ def test_doctor_plain_output_uses_plain_path_labels(monkeypatch, capsys) -> None
         "ffmpeg": {},
         "ffprobe": {},
         "opencv": {},
+        "decider": {"url": "http://127.0.0.1:8080", "available": False},
         "paths": {
             "cache": {"path": "/tmp/cache.sqlite3", "writable": True},
             "state": {"path": "/tmp/review-session.json", "writable": True},
@@ -208,6 +209,7 @@ def test_doctor_plain_output_uses_plain_path_labels(monkeypatch, capsys) -> None
     out = capsys.readouterr().out
     assert "Keep decisions path: /tmp/keep-decisions.json (writable)" in out
     assert "Keep_Decisions" not in out
+    assert "Decider (optional): not running at http://127.0.0.1:8080" in out
 
 
 def test_main_reports_keyboard_interrupt_cleanly(monkeypatch, capsys) -> None:
@@ -423,7 +425,8 @@ def test_similarity_handler_writes_report_and_prioritizes_false_positives(
     assert json.loads(output.read_text(encoding="utf-8")) == report
     assert calls == [("pairs.json", {"image_threshold": 7, "video_threshold": 8,
                                     "workers": None, "semantic": False,
-                                    "semantic_duplicate_threshold": 0.94})]
+                                    "semantic_duplicate_threshold": 0.94,
+                                    "decider": False})]
 
 
 def _quarantine_receipts(tmp_path: Path):

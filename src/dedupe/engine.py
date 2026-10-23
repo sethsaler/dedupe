@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .cache import DistinctReviews, HashCache
+from .decider import DeciderJudge
 from .exact import (
     ERROR_PARTIAL_HASH_FAILED,
     ERROR_SHA256_FAILED,
@@ -147,6 +148,7 @@ def run_scan(
     semantic: bool = False,
     semantic_threshold: float = SEMANTIC_THRESHOLD,
     semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
+    decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_low_resolution: bool = True,
@@ -209,6 +211,7 @@ def run_scan(
         "similar_image": [],
         "similar_video": [],
         "semantic": [],
+        "decider": [],
         "human_detection": [],
         "face_detection": [],
         "low_resolution": [],
@@ -612,6 +615,12 @@ def run_scan(
                     for member in group.members
                 }
                 exact_sets = [set(paths) for paths in exact_path_sets]
+            judge: DeciderJudge | None = None
+            if decider:
+                try:
+                    judge = DeciderJudge(use_cache=use_cache, cache_path=cache_path)
+                except Exception as exc:
+                    stage_errors["decider"].append(f"Decider verification skipped: {exc}")
             try:
                 set_lists, duplicate_lists, errors = find_semantic_groups(
                     records,
@@ -625,6 +634,7 @@ def run_scan(
                     workers=cpu_workers,
                     progress=semantic_progress,
                     cancelled=cancelled,
+                    judge=judge,
                 )
             except InterruptedError:
                 raise
@@ -632,6 +642,11 @@ def run_scan(
                 stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
                 _stage_progress("semantic", "Look-alikes unavailable", 0, 0)
                 return time.monotonic() - started_at
+            finally:
+                if judge is not None:
+                    judge.close()
+                    if judge.failure:
+                        stage_errors["decider"].append(judge.failure)
             stage_errors["semantic"].extend(errors)
             set_count = duplicate_count = 0
             with publish_lock:
@@ -1044,7 +1059,8 @@ def run_scan(
                     if semantic_failures
                     else []
                 )
-            ),
+            )
+            + stage_errors["decider"][:1],
         ),
         "human_detection": StageDiagnostics(
             attempted=len(records) if find_no_humans else 0,
@@ -1165,6 +1181,7 @@ def run_scans_parallel(
     semantic: bool = False,
     semantic_threshold: float = SEMANTIC_THRESHOLD,
     semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
+    decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_low_resolution: bool = True,
@@ -1289,6 +1306,7 @@ def run_scans_parallel(
             semantic=semantic,
             semantic_threshold=semantic_threshold,
             semantic_duplicate_threshold=semantic_duplicate_threshold,
+            decider=decider,
             find_no_humans=find_no_humans,
             count_faces=count_faces,
             find_low_resolution=find_low_resolution,

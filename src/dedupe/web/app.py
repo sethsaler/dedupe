@@ -33,6 +33,7 @@ from flask import (
 from ..actions import ActionResult, apply_actions, format_bytes, isolate_groups, undo_action
 from ..cache import HashCache
 from ..cleanup import cleanup_opportunity
+from ..decider import decider_available
 from ..engine import run_scan, run_scans_parallel
 from ..grouping import (
     apply_smart_select,
@@ -449,6 +450,7 @@ def detect_capabilities() -> dict:
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ffprobe": shutil.which("ffprobe") is not None,
         "semantic": semantic_available(),
+        "decider": decider_available(),
     }
 
 
@@ -1244,6 +1246,8 @@ def create_app(
                     "semantic_duplicate_threshold": _cosine(
                         data.get("semantic_duplicate_threshold"), 0.97
                     ),
+                    "decider": bool(data.get("semantic", False))
+                    and bool(data.get("decider", False)),
                     "find_no_humans": bool(data.get("find_no_humans", False)),
                     "count_faces": bool(data.get("count_faces", False)),
                     "find_low_resolution": bool(data.get("find_low_resolution", True)),

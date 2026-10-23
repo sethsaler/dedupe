@@ -285,3 +285,86 @@ def test_scan_form_thresholds_reach_the_engine(tmp_path: Path, monkeypatch) -> N
     assert seen["semantic"] is True
     assert seen["semantic_threshold"] == pytest.approx(0.93)
     assert seen["semantic_duplicate_threshold"] == pytest.approx(0.999)
+
+
+def test_judge_decides_pairs_opencv_cannot_confirm(tmp_path: Path, fake_helper: Path) -> None:
+    root = tmp_path / "media"
+    root.mkdir()
+    Image.new("RGB", (64, 64), (128, 128, 128)).save(root / "gray.png")
+    split = Image.new("RGB", (64, 64), (0, 0, 0))
+    split.paste((255, 255, 255), (0, 0, 64, 32))
+    split.save(root / "split.png")  # brightness alone would reject this pair
+    asked: list[tuple[str, str]] = []
+
+    def judge(a: FileRecord, b: FileRecord) -> float:
+        asked.append((Path(a.path).name, Path(b.path).name))
+        return 0.85
+
+    sets, duplicates, _ = find_semantic_groups(_records(root), use_cache=False, judge=judge)
+    assert len(sets) == 1 and len(duplicates) == 1
+    assert sorted(asked[0]) == ["gray.png", "split.png"]
+
+    # Below judge_min, and a judge with no answer falls back to brightness.
+    _, duplicates, _ = find_semantic_groups(
+        _records(root), use_cache=False, judge=judge, judge_min=0.9
+    )
+    assert duplicates == []
+    _, duplicates, _ = find_semantic_groups(
+        _records(root), use_cache=False, judge=lambda _a, _b: None
+    )
+    assert duplicates == []
+
+
+def test_judge_can_veto_a_pair_brightness_would_accept(
+    tmp_path: Path, fake_helper: Path
+) -> None:
+    root = _media(tmp_path / "media")
+
+    _, duplicates, _ = find_semantic_groups(
+        _records(root), use_cache=False, judge=lambda _a, _b: 0.05
+    )
+
+    assert duplicates == []
+
+
+def test_decider_not_running_is_a_warning_and_falls_back(
+    tmp_path: Path, fake_helper: Path, monkeypatch
+) -> None:
+    from dedupe.decider import URL_ENV
+
+    monkeypatch.setenv(URL_ENV, "http://127.0.0.1:9")
+    root = _media(tmp_path / "media")
+
+    result = run_scan([root], similar=False, semantic=True, decider=True, use_cache=False)
+
+    assert len([g for g in result.groups if g.kind == GroupKind.SIMILAR]) == 1
+    warnings = result.diagnostics.stages["semantic"].warnings
+    assert any("Decider verification skipped" in w for w in warnings)
+
+
+def test_scan_form_decider_needs_look_alikes(tmp_path: Path, monkeypatch) -> None:
+    import dedupe.web.app as web
+
+    seen: list[dict] = []
+
+    def fake_scan(roots, **kwargs):
+        seen.append(kwargs)
+        return ScanResult(roots=[str(r) for r in roots], files=[], groups=[])
+
+    monkeypatch.setattr(web, "run_scan", fake_scan)
+    for semantic in (True, False):
+        app = create_app(None)
+        headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+        before = len(seen)
+        response = app.test_client().post(
+            "/api/scan",
+            json={"paths": [str(tmp_path)], "parallel": False,
+                  "semantic": semantic, "decider": True},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        for _ in range(200):
+            if len(seen) > before:
+                break
+            time.sleep(0.01)
+        assert seen[-1]["decider"] is semantic

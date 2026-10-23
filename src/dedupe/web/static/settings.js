@@ -98,6 +98,7 @@ const settingIds = [
   "optExact",
   "optSimilar",
   "optSemantic",
+  "optDecider",
   "optNoHumans",
   "optCountFaces",
   "humanBackend",
@@ -360,6 +361,12 @@ function applyCapabilities(caps) {
     "optSemanticWrap",
     Boolean(caps.semantic),
     "Look-alikes need DigUp installed (github.com/ARahim3/DigUp) — it runs EmbeddingGemma 2",
+  );
+  gate(
+    "optDecider",
+    "optDeciderWrap",
+    Boolean(caps.decider),
+    "Decider verification needs Decider.app running — run `dedupe doctor` to check",
   );
   gate(
     "optCountFaces",

@@ -417,6 +417,8 @@ def find_semantic_groups(
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
     helper: str | None = None,
+    judge: Callable[[FileRecord, FileRecord], float | None] | None = None,
+    judge_min: float = 0.8,
 ) -> tuple[
     list[tuple[list[FileRecord], dict[str, float]]],
     list[tuple[list[FileRecord], dict[str, float]]],
@@ -432,6 +434,10 @@ def find_semantic_groups(
     (``exclude_from_duplicates``). Each entry is ``(members, scores)``: the
     members built around an anchor (first), and each other member's cosine
     with it.
+
+    ``judge`` (Decider) returns P(same picture) for a candidate pair. With one,
+    candidates OpenCV cannot confirm are duplicates when the judge says so with
+    ``judge_min``; the brightness fallback applies only to pairs it can't judge.
     """
     vectors, errors = embed_records(
         records,
@@ -495,6 +501,14 @@ def find_semantic_groups(
         # Broader discovery must establish image correspondence, not just
         # matching subject matter or a similar brightness distribution.
         verdict = edited_copy_verdict(a, b)
+        if verdict is True:
+            return True
+        if judge is not None:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            probability = judge(by_path[a], by_path[b])
+            if probability is not None:
+                return probability >= judge_min
         if verdict is not None:
             return verdict
         left, right = histogram(a), histogram(b)
