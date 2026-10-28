@@ -32,7 +32,6 @@ const state = {
   capabilities: null,
   keepDecisionsError: null,
   trashUndoClearedNotified: false,
-  autoDeleteNotified: null,
   dismissedSessionKey: "",
   emptyResumeNotified: false,
   groupsVersion: -1, // tracks streaming updates mid-scan

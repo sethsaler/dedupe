@@ -85,10 +85,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 }
 .session-status { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .scan-quality summary { cursor: pointer; color: var(--text); font-weight: 650; }
-.exact-recovery-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
-.exact-recovery-row details { flex: 1 1 260px; min-width: 0; }
-.exact-recovery-row summary { cursor: pointer; color: var(--text); }
-.exact-recovery-row ul { overflow-wrap: anywhere; padding-left: 20px; }
 .quality-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
 .quality-stage { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 9px; background: var(--panel); border-radius: 7px; text-transform: capitalize; }
 .quality-stage small { grid-column: 1 / -1; color: var(--muted); text-transform: none; }
@@ -123,7 +119,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .toggle-option input { margin: 0; accent-color: var(--accent); }
 /* —— Popovers ——
    A <details> whose summary is a compact header button and whose body floats
-   over the page: Exact recovery in the top bar and the review guides. */
+   over the page: the review guides. */
 .popover { position: relative; flex-shrink: 0; }
 .popover > summary {
   list-style: none;
@@ -324,7 +320,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 
 /* —— Top bar —— */
 .topbar {
-  /* Above the scan bar and results, so the Exact recovery popover overlays them. */
+  /* Above the scan bar and results, so popovers overlay them. */
   position: relative;
   z-index: 25;
   display: flex;
@@ -1910,7 +1906,7 @@ kbd {
   min-width: 240px;
 }
 /* Non-Human, Faces, and Files trash one file at a time: no batch footer.
-   A running action (an Exact recovery restore, say) still shows its note. */
+   A running action (an undo restore, say) still shows its note. */
 .actionbar.no-actions:not([aria-busy="true"]) { display: none; }
 
 /* —— Toast —— */

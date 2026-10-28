@@ -6,7 +6,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 ## Features
 
-- **Exact duplicates** — size → partial hash → SHA-256; web scans automatically move extra copies to Trash, keeping one copy per group. A toast reports the deleted count and offers Undo.
+- **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
 - **Sets and semantic look-alikes** — optional layer that embeds images and GIFs with Google DeepMind's EmbeddingGemma 2, run through [DigUp](https://github.com/ARahim3/DigUp)'s installed helper (no extra Python deps). A **Sets** tab groups images of one subject or shoot for browsing and one-click trash, and near-identical crops, flips, and re-saves the hashes missed join Similar with a "% look-alike" score (never preselected): `dedupe scan --semantic`, or *Sets & look-alikes (DigUp)* in the scan options. Add `--decider` (or *Verify look-alikes with Decider*) to let Perplexity's Decider.app judge each candidate pair OpenCV can't confirm
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
@@ -20,7 +20,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
 - **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, a lightbox with metadata, keeper overlay/flicker comparison, full-resolution zoom, and in-place selection, keyboard navigation, native picker, dependency-gated scan options, light and dark themes (follows the OS), and isolate
-- **Verified actions** — exact auto-trash rechecks file identity, hashes, and keepers; manual bulk Trash and quarantine use a confirmation sheet showing counts, affected bytes, and preview validity
+- **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
 - **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
 
 ## Requirements
@@ -93,7 +93,7 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 
 1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
-   With Exact detection enabled (the default), extra byte-identical copies move to Trash automatically when scanning finishes. The toast reports successful deletions and any failures, and offers **Undo**. Exact groups never enter manual review or bulk selection; **Exact duplicates · Recovery** offers restore controls only. Protected or unavailable files remain on disk for a later rescan. Loading or resuming saved results does not trigger auto-deletion. CLI scans are unchanged.
+   With Exact detection enabled (the default), byte-identical copies appear on the **Exact** tab for review; nothing moves until you confirm. **Delete All Exact Duplicates** marks every copy except each group's keeper and opens the confirmation sheet; **Delete All Selected Exact Matches** (`a`) trashes only what you marked.
 3. Choose a category across the top. **Similar** opens on the **Similar board**: every similar group as one row, the suggested keeper first and each copy already marked Remove. Click a photo (or press `Space`) to keep it, press `n` on a row that isn't really a duplicate (undo from the row), then move every marked copy to Trash with one confirmed batch that a single Undo restores. **Compare ↗** opens any group in the side-by-side swipe review — **Same · Trash copy**, **Different · Keep both**, Skip, and Undo, with videos playing and scrubbing in either pane — and **▦ Board** comes back.
 4. In **Non-Human**, **Faces**, and **All files**, switch between a resizable **Gallery** and single-file **Focus**. `←` / `→` navigate Focus without making a decision; Trash is immediate and undoable. Layout and preview size are remembered. **File details** reveals full paths, dates, and detection evidence.
 5. Review **Low-res** and **Random** one item at a time with `←` Delete and `→` Keep, including in the expanded lightbox. These decisions only stage removals; confirm with the Low-res + Random action to move selected files to `_Dedupe Quarantine`.
@@ -129,11 +129,11 @@ Keyboard:
 | `←` / `→` on tabs | Switch result category (tabs also take `Home` / `End`) |
 | `u` | Use the suggested selection for this group |
 | `s` | Apply the selection rule to this group |
-| `A` | Open the action review sheet (preview trash) for similar selections |
-| `Space` | Toggle remove on the focused card; in the lightbox, toggle removal for similar files (exact matches are read-only) |
+| `a` / `A` | Open the action review sheet (preview trash) for exact / similar selections |
+| `Space` | Toggle remove on the focused card; in the lightbox, toggle removal for exact/similar files |
 | `Enter` | Open the lightbox |
 | `←` / `→` | Delete / Keep in Low-res and Random 50 review; otherwise focus previous / next card or navigate the lightbox |
-| `d` | Trash the focused Non-Human/Faces file; in a similar lightbox, toggle removal |
+| `d` | Trash the focused Non-Human/Faces file; in an exact/similar lightbox, toggle removal |
 | `z` | Full-resolution zoom in the lightbox (drag pans) |
 | `Esc` | Close the lightbox, help, or overlay |
 | `?` | Shortcut help |
@@ -365,7 +365,7 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 - Quarantine receipts can restore files with `dedupe undo <receipt-id|path>`; Trash is restored through Finder
 - `dedupe receipts list / show / prune` browses and trims that history without touching the files themselves
 - Mutating localhost API calls require a per-launch session token and current scan generation
-- Exact duplicates move to Trash automatically after successful web scans, with safety revalidation and Undo; manual bulk actions still require a fresh preview and confirmation
+- Trash and quarantine execute only after a fresh preview and confirmation in the UI
 - Photos.app `.photoslibrary` packages are never entered or accepted as scan roots; export media from Photos to a normal folder first
 
 ### Photos.app libraries

@@ -39,7 +39,6 @@ from ..grouping import (
     apply_smart_select,
     apply_smart_select_all,
     ensure_all_files_groups,
-    pick_suggested_keep,
 )
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
@@ -53,7 +52,6 @@ from ..models import (
     SmartRule,
     effective_selected_paths,
 )
-from ..receipts import ReceiptError, list_receipts, load_receipt
 from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
@@ -73,7 +71,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 26
+WEB_API_VERSION = 27
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
@@ -487,7 +485,6 @@ def create_app(
         "scanning": False,
         "acting": False,
         "last_error": None,
-        "auto_deleted_exact": None,
         "groups_version": 0,
         "scan_id": secrets.token_hex(12),
         "cancel_event": None,
@@ -833,7 +830,6 @@ def create_app(
             "groups_version": state["groups_version"],
             "scan_id": state["scan_id"],
             "error": state["last_error"],
-            "auto_deleted_exact": state["auto_deleted_exact"],
             "streams": [dict(stream) for stream in state["streams"]],
             "review_session": state["review_session"].metadata(),
             "capabilities": capabilities,
@@ -991,7 +987,6 @@ def create_app(
             ensure_all_files_groups(report.result)
             state["result"] = report.result
             state["scan_id"] = secrets.token_hex(12)
-            state["auto_deleted_exact"] = None
             state["deleted_files"] = dict(report.deleted_files)
             state["groups_version"] += 1
             state["paths_version"] += 1
@@ -1023,7 +1018,6 @@ def create_app(
             state["result"] = None
             state["deleted_files"] = {}
             state["scan_id"] = secrets.token_hex(12)
-            state["auto_deleted_exact"] = None
             state["groups_version"] += 1
             state["paths_version"] += 1
             state["selected_count"] = 0
@@ -1131,7 +1125,6 @@ def create_app(
             state["scan_id"] = scan_id
             state["cancel_event"] = cancel_event
             state["last_error"] = None
-            state["auto_deleted_exact"] = None
             state["deleted_files"] = {}
             # A new scan ends in-app undo for anything trashed earlier; the
             # status payload reports this once so it is not a silent loss.
@@ -1297,51 +1290,6 @@ def create_app(
                         return
                     if not result.roots and result.errors:
                         raise RuntimeError("; ".join(result.errors))
-                    if cancel_event.is_set():
-                        raise InterruptedError("scan cancelled")
-                    # Cancellation stops before destructive work begins. Keep
-                    # scanning=True so no other scan or action can interleave.
-                    state["cancel_event"] = None
-                    state["progress"] = replace(
-                        state["progress"], phase="auto-trash", done=False,
-                        message="Moving exact duplicates to Trash…",
-                    )
-                    state["events"].notify_all()
-                # Use the same hash/identity/keeper checks and receipts as a
-                # manual action. Do not reselect: remembered Keep decisions win.
-                auto_result = apply_actions(
-                    result.groups, action="trash", dry_run=False,
-                    roots=result.roots, kinds={"exact"}, safety_groups=result.groups,
-                    source="auto_exact",
-                )
-                with lock:
-                    # Streamed groups share these objects: change membership
-                    # only while readers are excluded by the state lock.
-                    removed = {item.path for item in auto_result.items if item.ok}
-                    result.files = [file for file in result.files if file.path not in removed]
-                    for group in result.groups:
-                        group.members = [m for m in group.members if m.path not in removed]
-                        group.selected_for_removal = [
-                            path for path in group.selected_for_removal if path not in removed
-                        ]
-                        group.reviewed_paths = [
-                            path for path in group.reviewed_paths if path not in removed
-                        ]
-                        if group.suggested_keep in removed and group.members:
-                            group.suggested_keep = pick_suggested_keep(group.members)
-                    result.groups = [
-                        group for group in result.groups
-                        if len(group.members) >= (
-                            1 if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES else 2
-                        )
-                    ]
-                    result.recompute_stats()
-                    state["auto_deleted_exact"] = {
-                        "success_count": auto_result.success_count,
-                        "fail_count": auto_result.fail_count,
-                        "log_path": auto_result.log_path,
-                        "log_error": auto_result.log_error,
-                    }
                     ensure_all_files_groups(result)
                     state["result"] = result
                     state["groups_version"] = state.get("groups_version", 0) + 1
@@ -2499,34 +2447,6 @@ def create_app(
             with lock:
                 state["acting"] = False
 
-    @app.get("/api/exact-trash")
-    def api_exact_trash():
-        """Durable recovery history, independent of the current review session."""
-        receipts = []
-        restored = set()
-        for summary in list_receipts(include_previews=False, actions={"trash", "undo:trash"}):
-            try:
-                receipt = load_receipt(summary.log_path)
-            except (ReceiptError, OSError, ValueError):
-                continue
-            moved = [item for item in receipt.get("items", []) if item.get("ok")]
-            if receipt["action"] == "undo:trash":
-                restored.update((receipt.get("undo_of"), item["destination"]) for item in moved)
-            elif receipt.get("source") == "auto_exact" and moved:
-                receipts.append((summary, moved))
-        return jsonify({"receipts": [
-            {
-                "log_path": summary.log_path,
-                "completed_at": summary.completed_at,
-                "success_count": summary.success_count,
-                "restored_count": sum(
-                    (summary.session_id, item["path"]) in restored for item in moved
-                ),
-                "paths": [item["path"] for item in moved],
-            }
-            for summary, moved in receipts
-        ]})
-
     @app.post("/api/action/undo")
     def api_action_undo():
         """Restore an executed trash/quarantine action from its receipt(s).
@@ -2727,17 +2647,6 @@ def create_app(
         """
 
         def stop() -> None:
-            with lock:
-                if state["shutdown_timer"] is not threading.current_thread():
-                    return
-                # A scan now includes destructive exact cleanup. Closing the
-                # tab must not cut it off before receipts/results are saved.
-                if state["scanning"] or state["acting"]:
-                    timer = threading.Timer(SHUTDOWN_GRACE_SECONDS, stop)
-                    timer.daemon = True
-                    state["shutdown_timer"] = timer
-                    timer.start()
-                    return
             # Flush any debounced review-session write before the process exits.
             _flush_persist()
             server = app.extensions.get("dedupe_server")

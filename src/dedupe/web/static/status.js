@@ -2,7 +2,6 @@
 
 import { api } from "./api.js";
 import { undoAction } from "./actions.js";
-import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { addStreamedGroup, loadGroups, markEmptyTabs } from "./groups.js";
 import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
 import { state } from "./state.js";
@@ -200,13 +199,6 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   // only while a scan runs; afterwards the one-line summary is enough.
   $("scanPanel").classList.toggle("scanning", state.scanning);
   state.scanId = s.scan_id || state.scanId;
-  syncExactRecoveryBusy();
-  const exactRemaining = s.summary?.exact_groups || 0;
-  $("exactRecoveryStatus").textContent = s.scanning
-    ? "Scanning — exact duplicates will move to Trash automatically when the scan finishes."
-    : exactRemaining
-      ? `${exactRemaining} exact-match group${exactRemaining === 1 ? " remains" : "s remain"} on disk (protected, unavailable, or from an older scan). Scan again to retry automatic cleanup.`
-      : "";
   renderSession(s.review_session, s.progress?.message === "Resumed saved review");
   document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
     element.disabled = state.scanning || state.acting;
@@ -246,7 +238,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     statusEl.textContent = "Scanning…";
     statusEl.classList.remove("error");
     $("btnScan").disabled = true;
-    $("btnCancelScan").hidden = s.progress?.phase === "auto-trash";
+    $("btnCancelScan").hidden = false;
     $("btnScan").querySelector(".btn-label").textContent = "Scanning…";
     const p = s.progress || {};
     const total = p.files_found || 0;
@@ -287,7 +279,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (s.summary) {
     renderDiagnostics(s.summary);
     const scanningNote = s.scanning ? " · live" : "";
-    const reviewCount = s.summary.group_count - (s.summary.exact_groups || 0);
+    const reviewCount = s.summary.group_count;
     // One compact chip: the per-category counts live on the tabs below.
     top.innerHTML = `
       <span class="stat-chip"><span class="dot"></span><strong>${reviewCount}</strong> groups${scanningNote}<span class="stat-sep" aria-hidden="true">·</span><span class="reclaim-dot dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
@@ -301,7 +293,8 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
       // Actions only when scan finished (groups still changing mid-scan)
       $("actionBar").hidden = !!s.scanning;
     }
-    $("countAll").textContent = reviewCount;
+    $("countAll").textContent = s.summary.group_count;
+    $("countExact").textContent = s.summary.exact_groups;
     $("countSimilar").textContent = s.summary.similar_groups;
     $("countLowResolution").textContent = s.summary.low_resolution_files || 0;
     $("countRandomReview").textContent = s.summary.random_review_files || 0;
@@ -336,19 +329,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
-  const autoDeleted = s.auto_deleted_exact;
-  if (!s.scanning && autoDeleted && state.autoDeleteNotified !== s.scan_id) {
-    state.autoDeleteNotified = s.scan_id;
-    await refreshExactRecovery();
-    const count = autoDeleted.success_count;
-    let message = `${count} exact duplicate${count === 1 ? "" : "s"} auto-deleted (moved to Trash)`;
-    if (autoDeleted.fail_count) message += ` · ${autoDeleted.fail_count} could not be deleted; scan again to retry`;
-    if (autoDeleted.log_error) message += ` · Receipt could not be saved: ${autoDeleted.log_error}`;
-    toast(message, autoDeleted.fail_count || autoDeleted.log_error ? "error" : "ok",
-      count && autoDeleted.log_path
-        ? { actionLabel: "Undo", onAction: () => undoAction([autoDeleted.log_path]) }
-        : {});
-  } else if (scanCompleted) {
+  if (scanCompleted) {
     if (s.error) toast(s.error, "error");
     else toast(s.progress.message || "Scan complete", "ok");
   }

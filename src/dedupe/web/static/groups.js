@@ -35,7 +35,7 @@ async function fetchAllGroups(token) {
       offset += batch.length;
       if (collected.length === batch.length && collected.length < total) {
         // Paint the first page immediately so streamed groups appear without delay.
-        state.allGroups = collected.filter((g) => g.kind !== "exact");
+        state.allGroups = collected;
         renderGroupList();
       }
       if (!batch.length || collected.length >= total) break;
@@ -54,6 +54,7 @@ function renderTabCounts() {
     .filter((g) => g.kind === kind)
     .reduce((count, g) => count + (g.member_count || 0), 0);
   $("countAll").textContent = state.allGroups.length;
+  $("countExact").textContent = state.allGroups.filter((g) => g.kind === "exact").length;
   $("countSimilar").textContent = state.allGroups.filter((g) => g.kind === "similar").length;
   $("countSets").textContent = state.allGroups.filter((g) => g.kind === "sets").length;
   $("countLowResolution").textContent = memberCount("low_resolution");
@@ -96,8 +97,7 @@ async function loadGroups({ preserveSelection = false } = {}) {
   const token = ++state.groupsLoadToken;
   const all = await fetchAllGroups(token);
   if (all === null) return;
-  // Exact matches are automatic work, never manual review or bulk selection.
-  state.allGroups = all.filter((g) => g.kind !== "exact");
+  state.allGroups = all;
   applyResultControls();
   renderTabCounts();
 
@@ -143,7 +143,7 @@ async function loadGroups({ preserveSelection = false } = {}) {
 // without refetching the whole list.
 
 function addStreamedGroup(g) {
-  if (!g || !g.id || g.kind === "exact") return;
+  if (!g || !g.id) return;
   const existing = state.allGroups.findIndex((candidate) => candidate.id === g.id);
   if (existing >= 0) state.allGroups[existing] = g;
   else state.allGroups.push(g);

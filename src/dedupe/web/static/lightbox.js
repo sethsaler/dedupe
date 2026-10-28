@@ -153,7 +153,7 @@ function setZoom(on) {
 function syncLightboxSelect(item) {
   const group = currentGroup();
   const keeperGroup = group && !isIndependentReview(group)
-    && item.kind === "similar";
+    && (item.kind === "exact" || item.kind === "similar");
   $("lbSelectWrap").hidden = !keeperGroup;
   if (!keeperGroup) return;
   const isSelected = (group.selected_for_removal || []).includes(item.path);

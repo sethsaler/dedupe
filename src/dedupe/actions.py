@@ -74,8 +74,6 @@ class ActionResult:
     )
     completed_at: str | None = None
     log_error: str | None = None
-    source: str | None = None
-    undo_of: str | None = None
 
     @property
     def success_count(self) -> int:
@@ -98,8 +96,6 @@ class ActionResult:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "log_error": self.log_error,
-            "source": self.source,
-            "undo_of": self.undo_of,
             "items": [asdict(i) for i in self.items],
         }
 
@@ -623,7 +619,6 @@ def apply_actions(
     safety_groups: list[DuplicateGroup] | None = None,
     allow_cross_device: bool = False,
     workers: int | None = None,
-    source: str | None = None,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
@@ -661,7 +656,7 @@ def apply_actions(
             keep = group.suggested_keep if group.suggested_keep in member_paths else group.members[0].path
             selected.discard(keep)
     paths = [path for path in paths if path in selected]
-    result = ActionResult(dry_run=dry_run, action=action, source=source)
+    result = ActionResult(dry_run=dry_run, action=action)
 
     qdir: Path | None = None
     if action == "quarantine":
@@ -787,7 +782,7 @@ def undo_action(
         raise ValueError("only executed trash or quarantine receipts can be undone")
     undo_kind = f"undo:{action}"
 
-    result = ActionResult(dry_run=dry_run, action=undo_kind, undo_of=data.get("session_id"))
+    result = ActionResult(dry_run=dry_run, action=undo_kind)
     planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
         if not item.get("ok") or not item.get("destination"):

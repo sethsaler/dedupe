@@ -2,7 +2,6 @@
 
 import { api } from "./api.js";
 import { boardActive } from "./board.js";
-import { refreshExactRecovery, syncExactRecoveryBusy } from "./exact.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { renderMembers, restartMemberList, selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
@@ -13,15 +12,17 @@ import { refreshStatus } from "./status.js";
 import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
 const SCOPE_KINDS = {
+  exact: ["exact"],
   similar: ["similar"],
   review_suggestions: ["low_resolution", "random_review"],
 };
 
 function scopeKinds(scope) {
-  return SCOPE_KINDS[scope] || [];
+  return SCOPE_KINDS[scope] || [scope];
 }
 
 function scopeLabelFor(scope) {
+  if (scope === "exact") return "Exact matches";
   if (scope === "similar") return "Similar matches";
   return "Low-res + Random review files";
 }
@@ -63,9 +64,10 @@ function effectiveSelection(scope) {
 }
 
 // The footer only offers the batch actions that belong to the open tab:
-// Similar and Low-res + Random on All, one of them on their own tabs, and
-// none on the one-click Non-Human, Faces, and Files reviews. The A / D
+// Exact, Similar, and Low-res + Random on All, one of them on their own tabs,
+// and none on the one-click Non-Human, Faces, and Files reviews. The a / A / D
 // shortcuts keep working on every tab.
+const EXACT_ACTION_TABS = new Set(["all", "exact"]);
 const SIMILAR_ACTION_TABS = new Set(["all", "similar"]);
 const REVIEW_ACTION_TABS = new Set(["all", "low_resolution", "random_review"]);
 
@@ -77,10 +79,15 @@ function updateSelectionSummary() {
   // On the Similar board the footer is the board's one commit: it names what
   // will move, and the unrelated Low-res + Random button steps aside.
   const board = boardActive();
+  const exact = effectiveSelection("exact");
+  const exactBytes = exact.reduce((sum, member) => sum + (member.size || 0), 0);
   const similar = effectiveSelection("similar");
   const similarBytes = similar.reduce((sum, member) => sum + (member.size || 0), 0);
   const review = effectiveSelection("review_suggestions");
   const reviewBytes = review.reduce((sum, member) => sum + (member.size || 0), 0);
+  $("btnTrashExact").textContent = exact.length
+    ? `Delete ${exact.length} exact ${plural(exact.length, "copy", "copies")} · ${formatBytes(exactBytes)}`
+    : "No exact copies selected";
   $("btnTrashSimilar").textContent = board
     ? similar.length
       ? `Move ${similar.length} ${plural(similar.length, "copy", "copies")} to Trash · ${formatBytes(similarBytes)}`
@@ -93,14 +100,17 @@ function updateSelectionSummary() {
     : "No low-res or random files staged";
   $("btnTrashSimilar").classList.toggle("danger", board);
   $("btnTrashSimilar").classList.toggle("ghost", !board);
+  $("btnTrashExact").hidden = board || !EXACT_ACTION_TABS.has(state.kind);
+  $("btnTrashAllExact").hidden = $("btnTrashExact").hidden;
   $("btnTrashSimilar").hidden = !SIMILAR_ACTION_TABS.has(state.kind);
   $("btnTrashReview").hidden = board || !REVIEW_ACTION_TABS.has(state.kind);
   $("actionBar").classList.toggle(
     "no-actions",
-    $("btnTrashSimilar").hidden && $("btnTrashReview").hidden,
+    $("btnTrashExact").hidden && $("btnTrashSimilar").hidden && $("btnTrashReview").hidden,
   );
   $("boardKeysHint").hidden = !board;
   for (const [id, count, scope] of [
+    ["btnTrashExact", exact.length, "exact"],
     ["btnTrashSimilar", similar.length, "similar"],
     ["btnTrashReview", review.length, "review_suggestions"],
   ]) {
@@ -110,11 +120,21 @@ function updateSelectionSummary() {
       ? `${count} selected ${scopeLabelFor(scope).toLowerCase()}`
       : `No ${scopeLabelFor(scope).toLowerCase()} selected`;
   }
+  // The auto-delete button does not depend on the current selection: it acts
+  // on every exact group, so it is enabled whenever exact groups exist.
+  const source = state.allGroups.length ? state.allGroups : state.groups;
+  const exactGroups = source.filter(
+    (g) => g.kind === "exact" && (g.members || []).length >= 2,
+  ).length;
+  const autoButton = $("btnTrashAllExact");
+  autoButton.disabled = state.actionBusy || exactGroups === 0;
+  autoButton.title = exactGroups
+    ? `Trash every exact duplicate, keeping one copy per group (${exactGroups} group${exactGroups === 1 ? "" : "s"})`
+    : "No exact duplicate groups";
 }
 
 async function applyRuleToCurrentGroup(rule, successMessage) {
   if (!state.currentId) return toast("Select a group first");
-  if (currentGroup()?.kind === "exact") return;
   try {
     const g = await api("/api/smart-select", {
       method: "POST",
@@ -167,11 +187,7 @@ $("btnSmartAll").addEventListener("click", async () => {
   try {
     await api("/api/smart-select", {
       method: "POST",
-      body: JSON.stringify({
-        rule: $("smartRule").value,
-        group_ids: state.allGroups.map((group) => group.id),
-        scan_id: state.scanId,
-      }),
+      body: JSON.stringify({ rule: $("smartRule").value, scan_id: state.scanId }),
     });
     state.allGroups.forEach((group) => markGroupTouched(group.id));
     await loadGroups();
@@ -211,7 +227,7 @@ async function runBulkSelection(operation, criteria = null, label = "") {
     scheduleRender({ groupList: true, selection: true });
     const noun = result.changed_count === 1 ? "group" : "groups";
     toast(
-      `${label || operation}: ${result.changed_count} ${noun} updated`,
+      `${label || operation}: ${result.changed_count} ${noun} updated · ${result.selected_count} files selected`,
       "ok",
     );
   } catch (e) {
@@ -327,7 +343,6 @@ function previewNoticeHtml(notice) {
 // and after the scan there is no polling to notice the server's acting flag.
 function setActionBusy(busy, label = "") {
   state.actionBusy = busy;
-  syncExactRecoveryBusy();
   document.querySelectorAll("#actionBar button").forEach((button) => {
     button.disabled = busy;
   });
@@ -397,7 +412,6 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
       res.fail_count ? "error" : "ok",
     );
     setActionBusy(false);
-    await refreshExactRecovery();
   } catch (e) {
     const stale = e.data?.preview_stale
       || /preview expired|selection changed|fresh preview/i.test(e.message);
@@ -466,7 +480,11 @@ async function runDelete(scope, options = {}) {
     ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
     : "";
   const reviewScope = scope === "review_suggestions";
-  const titleScope = scope === "similar" ? "similar matches" : "Low-res + Random review files";
+  const titleScope = scope === "exact"
+    ? "exact matches"
+    : scope === "similar"
+      ? "similar matches"
+      : "Low-res + Random review files";
   // Duplicate groups always retain a keeper; independent review candidates
   // can all be selected, and they quarantine instead of going to system Trash.
   const destinationNote = reviewScope
@@ -553,6 +571,38 @@ async function runDelete(scope, options = {}) {
   }
 }
 
+// Auto-delete: select every exact group's non-keeper members (the Automatic
+// rule keeps each group's suggested keeper), then run the standard Trash flow
+// — preview, confirm, execute, undo — over that fresh selection.
+async function runAutoDeleteExact() {
+  const source = state.allGroups.length ? state.allGroups : state.groups;
+  const exactIds = source
+    .filter((g) => g.kind === "exact" && (g.members || []).length >= 2)
+    .map((g) => g.id);
+  if (!exactIds.length) {
+    toast("No exact duplicate groups", "error");
+    return;
+  }
+  try {
+    await api("/api/smart-select", {
+      method: "POST",
+      body: JSON.stringify({
+        rule: "automatic",
+        group_ids: exactIds,
+        scan_id: state.scanId,
+      }),
+    });
+    exactIds.forEach(markGroupTouched);
+    await loadGroups({ preserveSelection: true });
+  } catch (e) {
+    toast(e.message, "error");
+    return;
+  }
+  await runDelete("exact");
+}
+
+$("btnTrashAllExact").addEventListener("click", runAutoDeleteExact);
+$("btnTrashExact").addEventListener("click", () => runDelete("exact"));
 $("btnTrashSimilar").addEventListener("click", () => runDelete("similar"));
 $("btnTrashReview").addEventListener("click", () => runDelete("review_suggestions"));
 

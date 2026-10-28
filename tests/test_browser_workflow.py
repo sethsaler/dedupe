@@ -69,7 +69,7 @@ def duplicate_images(tmp_path: Path) -> Path:
 
 
 def _disable_exact_detection(page) -> None:
-    """Keep both byte-identical fixtures for tests of generic manual review UI."""
+    """Scan only for similar matches, so byte-identical fixtures form no exact group."""
     page.locator("#optsToggle").click()
     page.locator("#optExact").uncheck(force=True)
 
@@ -81,8 +81,7 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.on(
         "console",
-        lambda message: console_errors.append(f"{message.text} {message.location.get('url', '')}")
-        if message.type == "error" else None,
+        lambda message: console_errors.append(message.text) if message.type == "error" else None,
     )
 
     # The app polls status continuously, so network-idle is intentionally not a readiness signal.
@@ -97,17 +96,15 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     assert page.locator("#scanCollapse").get_attribute("aria-expanded") == "false"
     assert page.locator("#scanCollapsePaths").inner_text() == str(duplicate_images)
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator("#toast").filter(
-        has_text="1 exact duplicate auto-deleted (moved to Trash)"
-    ).wait_for(state="visible")
-    expect(page.locator("#toastAction")).to_be_visible()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     page.locator(".group-item").first.click()
     page.locator("#members .card").first.wait_for(state="visible")
 
-    # Exact copies are removed before completion; the remaining browse/review
-    # groups contain only the keeper.
-    assert len(list(duplicate_images.iterdir())) == 1
-    assert page.locator("#members .card").count() == 1
+    # The default exact-match recommendation removes one file and always keeps one.
+    assert page.locator("#members .card").count() == 2
+    assert page.locator("#members .card.selected").count() == 1
+    assert page.locator("#members .card.keep").count() == 1
+    assert page.locator("#members .sel-cb:checked").count() == 1
 
     # Focused reviews letterbox within a viewport-sized stage rather than
     # resizing the stage to each original's aspect ratio.
@@ -130,50 +127,62 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     # (Search input is debounced; to_have_count auto-retries until it applies.)
     page.locator("#resultSearch").fill("does-not-exist")
     expect(page.locator(".group-item")).to_have_count(0)
-    page.locator("#resultSearch").fill(next(duplicate_images.iterdir()).name)
-    expect(page.locator(".group-item")).to_have_count(3)
-    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
-    expect(page.locator(".group-item .badge.exact")).to_have_count(0)
-    expect(page.locator("#btnTrashExact")).to_have_count(0)
-    expect(page.locator("#btnTrashAllExact")).to_have_count(0)
+    page.locator("#resultSearch").fill("duplicate.png")
+    # Exact, Low-res, Random, and the All-Files browse group all contain it.
+    expect(page.locator(".group-item")).to_have_count(4)
+    page.get_by_role("tab", name="Exact 1").click()
+    expect(page.locator(".group-item")).to_have_count(1)
+    assert page.locator(".group-item").count() == 1
+
+    # Opening the exact-match action verifies the selection but cannot move either fixture
+    # unless the user confirms.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    page.locator("#modalCancel").click()
+    page.locator("#modalBackdrop").wait_for(state="hidden")
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
     assert page_errors == []
-    # Streamed media and groups can disappear between request and auto-trash.
-    assert all(
-        "404" in error and any(path in error for path in ("/api/thumbnail", "/api/media", "/api/groups/"))
-        for error in console_errors
-    )
+    assert console_errors == []
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("copies", [1, 2, 4])
-def test_scan_auto_trashes_exact_duplicates_and_reports_status(
-    page, live_dedupe_server: str, duplicate_images: Path, copies: int
+def test_delete_all_exact_duplicates_auto_selects_and_trashes(
+    page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
-    if copies == 1:
-        (duplicate_images / "duplicate.png").unlink()
-    for index in range(2, copies):
-        shutil.copyfile(duplicate_images / "keeper.png", duplicate_images / f"copy-{index}.png")
-    count = copies - 1
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator("#toast").filter(
-        has_text=f"{count} exact duplicate{'s' if count != 1 else ''} auto-deleted (moved to Trash)"
-    ).wait_for(state="visible")
+    page.locator('.tab[data-kind="exact"]').click()
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    # Let the scan's own "Done" toast clear so it cannot swallow the click.
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # Clear the suggested selection first (the exact copy list owns its own
+    # per-copy Remove toggles): auto-delete must not depend on it.
+    checked = page.locator("#members .sel-cb:checked")
+    checked.first.wait_for(state="visible")
+    assert checked.count() == 1
+    checked.first.uncheck()
+    expect(page.locator("#btnTrashExact")).to_be_disabled()
+    expect(page.locator("#btnTrashAllExact")).to_be_enabled()
+
+    # One click re-selects every non-keeper across all exact groups, previews,
+    # and on confirm trashes them — exactly one copy of the pair survives.
+    page.locator("#btnTrashAllExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalConfirm")).to_have_text("Move to Trash")
+    page.locator("#modalConfirm").click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     assert len(list(duplicate_images.iterdir())) == 1
-    status = page.request.get(f"{live_dedupe_server}/api/status").json()
-    assert status["auto_deleted_exact"]["success_count"] == count
-    assert status["auto_deleted_exact"]["fail_count"] == 0
-    assert status["auto_deleted_exact"]["log_path"]
-    assert status["auto_deleted_exact"]["log_error"] is None
-    if count:
-        expect(page.locator("#toastAction")).to_be_visible()
-    else:
-        expect(page.locator("#toastAction")).to_be_hidden()
+    expect(page.locator('.tab[data-kind="exact"]')).to_contain_text("0")
     assert page_errors == []
 
 
@@ -184,12 +193,11 @@ def test_empty_results_offer_recovery_without_changing_selections(
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
-    page.locator("#toast").filter(has_text="auto-deleted").wait_for(
-        state="visible", timeout=20_000
-    )
-    review_tab = page.locator('.tab[data-kind="low_resolution"]')
-    review_tab.click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible", timeout=20_000)
+    exact_tab = page.locator('.tab[data-kind="exact"]')
+    exact_tab.click()
     page.locator(".group-item").first.click()
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
     expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
     page.locator("#reviewFilters > summary").click()
     page.locator("#resultSort").select_option("date")
@@ -203,8 +211,9 @@ def test_empty_results_offer_recovery_without_changing_selections(
     page.keyboard.press("Enter")
     expect(page.locator("#resultSearch")).to_be_focused()
     expect(page.locator(".group-item")).to_have_count(1)
-    expect(review_tab).to_have_attribute("aria-selected", "true")
+    expect(exact_tab).to_have_attribute("aria-selected", "true")
     expect(page.locator("#resultSort")).to_have_value("date")
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
 
     page.locator("#advancedFilters summary").click()
     page.locator("#filterMinWidth").fill("99999")
@@ -212,6 +221,7 @@ def test_empty_results_offer_recovery_without_changing_selections(
     empty.get_by_role("button", name="Clear filters").click()
     expect(page.locator("#filterMinWidth")).to_have_value("")
     expect(page.locator(".group-item")).to_have_count(1)
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
 
     # A genuinely empty category should not imply that clearing filters will help.
     page.locator('.tab[data-kind="faces"]').click()
@@ -221,9 +231,10 @@ def test_empty_results_offer_recovery_without_changing_selections(
     all_tab = page.locator('.tab[data-kind="all"]')
     expect(all_tab).to_be_focused()
     expect(all_tab).to_have_attribute("aria-selected", "true")
-    expect(page.locator(".group-item")).to_have_count(3)
-    review_tab.click()
+    expect(page.locator(".group-item")).to_have_count(4)
+    exact_tab.click()
     page.locator(".group-item").first.click()
+    expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
 
 
 @pytest.mark.e2e
@@ -282,7 +293,6 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -320,7 +330,7 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     # but it does enable the Low-res + Random review action.
     page.keyboard.press("ArrowLeft")
     expect(page.locator("#detailMeta")).to_contain_text("1 marked Delete")
-    expect(page.locator("#btnTrashExact")).to_have_count(0)
+    expect(page.locator("#btnTrashExact")).to_be_disabled()
     expect(page.locator("#btnTrashSimilar")).to_be_disabled()
     expect(page.locator("#btnTrashReview")).to_be_enabled()
 
@@ -347,22 +357,22 @@ def test_executed_trash_can_be_undone_from_the_result_toast(
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
-    # Force the streamed-group race: a detail request can arrive after the
-    # exact group dissolves. Its 404 must resync, never obscure the Undo toast.
-    page.route(
-        re.compile(r"/api/groups/[^/?]+$"),
-        lambda route: route.fulfill(
-            status=404, content_type="application/json", body='{"error": "group not found"}'
-        ),
-        times=1,
-    )
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator("#toast").filter(has_text="1 exact duplicate auto-deleted").wait_for(
-        state="visible"
-    )
+    page.locator(".group-item").first.click()
+    page.locator("#members .card").first.wait_for(state="visible")
+    # Let the scan's own "Done" toast clear so it cannot swallow the click.
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+
+    # Execute the exact-match Trash for real; the fixture lands in the Trash.
+    page.locator("#btnTrashExact").click()
+    page.locator("#modalBackdrop").wait_for(state="visible")
+    expect(page.locator("#modalConfirm")).to_have_text("Move to Trash")
+    page.locator("#modalConfirm").click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    # The keeper ranking decides which name survives; exactly one file goes.
     assert len(list(duplicate_images.iterdir())) == 1
 
     # The result toast carries a sticky Undo; pressing it opens the restore
@@ -374,57 +384,14 @@ def test_executed_trash_can_be_undone_from_the_result_toast(
     expect(page.locator("#modalBody")).to_contain_text("next scan")
     page.locator("#modalConfirm").click()
     page.locator("#toast").filter(has_text="Restored 1 file").wait_for(state="visible")
-    assert len(list(duplicate_images.iterdir())) == 2
+    assert sorted(path.name for path in duplicate_images.iterdir()) == [
+        "duplicate.png",
+        "keeper.png",
+    ]
 
-    # The review is not re-populated by the restore.
-    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
-    assert page_errors == []
-
-
-@pytest.mark.e2e
-def test_exact_recovery_survives_toast_dismissal_reload_and_new_scan(
-    page, live_dedupe_server: str, duplicate_images: Path
-) -> None:
-    page_errors: list[str] = []
-    page.on("pageerror", lambda error: page_errors.append(str(error)))
-    for name in ("extra.png", "last.png"):
-        shutil.copyfile(duplicate_images / "keeper.png", duplicate_images / name)
-    originals = {path.name: path.read_bytes() for path in duplicate_images.iterdir()}
-    page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    page.locator("#paths").fill(str(duplicate_images))
-    page.locator("#btnScan").click()
-    expect(page.locator("#toast")).to_contain_text("3 exact duplicates auto-deleted", timeout=20_000)
-    page.locator("#toastDismiss").click()
-    assert len(list(duplicate_images.iterdir())) == 1
-
-    # A scan with no new removals cannot replace the earlier recovery record.
-    page.locator("#scanCollapse").click()
-    page.locator("#btnScan").click()
-    expect(page.locator("#toast")).to_contain_text("0 exact duplicates auto-deleted", timeout=20_000)
-    page.reload(wait_until="domcontentloaded")
-    page.locator("#exactRecovery > summary").click()
-    recover = page.get_by_role("button", name="Recover 3 files", exact=True)
-    expect(recover).to_be_visible()
-    expect(page.locator("#exactRecoveryList .exact-recovery-row")).to_have_count(1)
-    page.locator("#exactRecoveryList summary").click()
-    expect(page.locator("#exactRecoveryList li")).to_have_count(3)
-
-    recover.click()
-    expect(page.locator("#modalTitle")).to_have_text("Restore 3 files?")
-    page.locator("#modalCancel").click()
-    assert len(list(duplicate_images.iterdir())) == 1
-    recover.click()
-    expect(page.locator("#modalTitle")).to_have_text("Restore 3 files?")
-    page.locator("#modalConfirm").click()
-    expect(page.locator("#exactRecoveryList")).to_contain_text("Recovered")
-    assert {path.name: path.read_bytes() for path in duplicate_images.iterdir()} == originals
-    expect(recover).to_have_count(0)
-
-    page.reload(wait_until="domcontentloaded")
-    page.locator("#exactRecovery > summary").click()
-    expect(page.locator("#exactRecoveryList")).to_contain_text("Recovered")
-    expect(recover).to_have_count(0)
-    expect(page.locator('.tab[data-kind="exact"], .badge.exact')).to_have_count(0)
+    # The review is not re-populated by the restore: the dissolved exact group
+    # stays gone until a rescan.
+    expect(page.locator('.tab[data-kind="exact"]')).to_contain_text("0")
     assert page_errors == []
 
 
@@ -436,13 +403,10 @@ def test_bulk_selection_and_advanced_filters(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
 
     # A path glob narrows the sidebar and Clear filters resets every result-display filter.
@@ -452,15 +416,16 @@ def test_bulk_selection_and_advanced_filters(
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#filterPathPattern").fill("*keeper*")
-    expect(page.locator(".group-item")).to_have_count(1)
+    # Exact, Low-res, Random, and the All-Files browse group all contain it.
+    expect(page.locator(".group-item")).to_have_count(4)
     page.locator("#resultSearch").fill("keeper")
     page.locator("#issuesOnly").check()
     page.locator("#btnClearFilters").click()
-    expect(page.locator(".group-item")).to_have_count(1)
+    expect(page.locator(".group-item")).to_have_count(4)
     assert page.locator("#resultSearch").input_value() == ""
     assert not page.locator("#issuesOnly").is_checked()
 
-    page.locator('.tab[data-kind="similar"]').click()
+    page.locator('.tab[data-kind="exact"]').click()
     expect(page.locator(".group-item")).to_have_count(1)
 
     # Bulk operations always leave one member of a duplicate group behind.
@@ -475,7 +440,7 @@ def test_bulk_selection_and_advanced_filters(
     assert page.locator("#members .card.keep").count() == 1
 
     # The review sheet states how long its server-issued preview stays valid.
-    page.locator("#btnTrashSimilar").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
     assert "preview valid for" in page.locator("#modalValidity").inner_text()
     page.locator("#modalCancel").click()
@@ -524,7 +489,7 @@ def test_similar_cards_show_percentage_and_use_a_separate_bulk_scope(
         page.goto(url, wait_until="domcontentloaded")
         page.locator("#results").wait_for(state="visible", timeout=10_000)
 
-        expect(page.locator("#btnTrashExact")).to_have_count(0)
+        expect(page.locator("#btnTrashExact")).to_have_text("No exact copies selected")
         # The footer names what each batch action would move.
         expect(page.locator("#btnTrashSimilar")).to_have_text(
             re.compile(r"^Delete 1 similar match · ")
@@ -1157,8 +1122,9 @@ def test_results_scroll_batches_and_single_group_next(page, tmp_path: Path, kind
 
 
 @pytest.mark.e2e
-def test_exact_groups_never_enter_manual_review(page, tmp_path: Path) -> None:
-    """Loaded and streamed exact groups cannot surface selection or delete UI."""
+def test_exact_copy_list_shows_every_copy_and_keeps_selection(page, tmp_path: Path) -> None:
+    """Exact groups render the keeper-picker copy list — every copy in one
+    scrollable list, no paging — and per-copy picks update the selection."""
     media = tmp_path / "media"
     media.mkdir()
     first = media / "file-00.png"
@@ -1199,47 +1165,55 @@ def test_exact_groups_never_enter_manual_review(page, tmp_path: Path) -> None:
     with _serve_app(app) as url:
         page.goto(url, wait_until="domcontentloaded")
         page.locator("#results").wait_for(state="visible", timeout=10_000)
-        expect(page.locator("#countAll")).to_have_text("1")  # Files only
-        expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
-        expect(page.locator(".badge.exact, .copy-row")).to_have_count(0)
-        page.locator("#exactRecovery > summary").click()
-        expect(page.locator("#exactRecoveryStatus")).to_contain_text("1 exact-match group remains")
-        expect(page.locator("#exactRecoveryList")).to_contain_text("No automatic exact-match removals")
+        page.get_by_role("tab", name="Exact 1").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .copy-row").first.wait_for(state="visible")
+        expect(page.locator("#members .copy-row")).to_have_count(55)
+        expect(page.locator("#memberPagination")).to_be_hidden()
+        # The suggested keeper stays; every other copy is marked for removal.
+        expect(page.locator("#members .copy-row.keep")).to_have_count(1)
+        expect(page.locator("#members .copy-row.selected")).to_have_count(54)
 
-        # Sidebar bulk selection no longer reaches hidden exact groups.
-        page.locator("#reviewFilters > summary").click()
-        page.locator("#bulkPanel > summary").click()
-        page.locator("#btnBulkNone").click()
-        expect(page.locator("#toast")).to_contain_text("Select none: 0 groups updated")
-        assert group.selected_for_removal == [record.path for record in records[1:]]
-        page.evaluate("""async () => {
-            const {addStreamedGroup} = await import('/static/groups.js');
-            addStreamedGroup({id: 'streamed-exact', kind: 'exact', members: [], member_count: 2});
-        }""")
-        expect(page.locator("#countAll")).to_have_text("1")
-        expect(page.locator(".badge.exact")).to_have_count(0)
+        # Unchecking a pick keeps the copy list stable — it re-renders in
+        # place rather than paging.
+        page.locator("#members .copy-row .sel-cb").nth(1).click()
+        expect(page.locator("#groupSelectionSummary")).to_have_text(
+            "53 of 55 selected for removal"
+        )
+        expect(page.locator("#members .copy-row")).to_have_count(55)
+        expect(page.locator("#members .copy-row .sel-cb").nth(1)).not_to_be_checked()
+        expect(page.locator("#members .copy-row.keep")).to_have_count(2)
+
+        # The lightbox sifts the whole group.
+        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbCounter")).to_have_text("1 / 55")
+        for _ in range(50):
+            page.keyboard.press("ArrowRight")
+        expect(page.locator("#lbCounter")).to_have_text("51 / 55")
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
 
     assert page_errors == []
 
 
 @pytest.mark.e2e
-def test_modal_enter_respects_safe_focus(
+def test_a_shortcut_opens_action_sheet_and_enter_respects_focus(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
 
-    page.locator("#btnTrashSimilar").click()
+    # `a` opens the same Trash preview sheet as the primary action-bar button.
+    page.keyboard.press("a")
     page.locator("#modalBackdrop").wait_for(state="visible")
 
     # The sheet opens with focus on Cancel (the safe default), so a stray Enter
@@ -1254,7 +1228,7 @@ def test_modal_enter_respects_safe_focus(
     ]
 
     # Enter confirms only when the Confirm button itself has focus.
-    page.locator("#btnTrashSimilar").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
     page.locator("#modalConfirm").focus()
     assert page.evaluate("document.activeElement.id") == "modalConfirm"
@@ -1266,7 +1240,7 @@ def test_modal_enter_respects_safe_focus(
 
 
 @pytest.mark.e2e
-def test_keyboard_help_explains_automatic_exact_trash(page, live_dedupe_server: str) -> None:
+def test_keyboard_help_lists_a_shortcut(page, live_dedupe_server: str) -> None:
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
@@ -1275,10 +1249,8 @@ def test_keyboard_help_explains_automatic_exact_trash(page, live_dedupe_server: 
     page.locator("#helpBackdrop").wait_for(state="visible")
     expect(
         page.locator("#helpBackdrop .shortcuts dt").get_by_text("a", exact=True)
-    ).to_have_count(0)
-    expect(page.locator("#helpBackdrop .shortcuts")).to_contain_text(
-        "Exact duplicates move to Trash automatically after scanning"
-    )
+    ).to_be_visible()
+    expect(page.locator("#helpBackdrop .shortcuts")).to_contain_text("Preview Trash")
     page.keyboard.press("Escape")
     page.locator("#helpBackdrop").wait_for(state="hidden")
     assert page_errors == []
@@ -1292,13 +1264,10 @@ def test_lightbox_shows_metadata_and_toggles_selection(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     assert page.locator("#members .card.selected").count() == 1
 
@@ -1449,8 +1418,6 @@ def test_error_toasts_persist_until_dismissed(
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator("#toast").filter(has_text="auto-deleted").wait_for(state="visible")
-    page.locator("#toastDismiss").click()
     page.locator(".group-item").first.click()
     page.locator("#members .card").first.wait_for(state="visible")
 
@@ -1460,11 +1427,7 @@ def test_error_toasts_persist_until_dismissed(
             status=500, content_type="application/json", body='{"error": "boom"}'
         ),
     )
-    page.locator('.tab[data-kind="low_resolution"]').click()
-    expect(page.locator(".group-item")).to_have_count(1)
-    page.locator(".group-item").click()
-    page.locator("#members .decision-card").wait_for(state="visible")
-    page.locator("#members .candidate-delete").click()
+    page.locator("#members .sel-cb").first.click()
     page.locator("#toast").filter(has_text="boom").wait_for(state="visible")
     # An error must not vanish on a timer (plain toasts dismiss in ~3.4 s).
     page.wait_for_timeout(4200)
@@ -1490,12 +1453,15 @@ def test_tabs_and_group_list_are_keyboard_navigable(
     # written synchronously inside that reload, so it is the settle signal.
     page.locator('.tab[data-kind="all"]').focus()
     page.keyboard.press("ArrowRight")
+    assert page.evaluate("document.activeElement.dataset.kind") == "exact"
+    expect(page.locator('.tab[data-kind="exact"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
+    page.keyboard.press("ArrowRight")
     assert page.evaluate("document.activeElement.dataset.kind") == "similar"
-    expect(page.locator('.tab[data-kind="similar"]')).to_have_attribute("aria-selected", "true")
     expect(page.locator("#filteredCount")).to_have_text("0 of 0 groups shown")
     page.keyboard.press("Home")
     assert page.evaluate("document.activeElement.dataset.kind") == "all"
-    expect(page.locator("#filteredCount")).to_have_text("3 of 3 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("4 of 4 groups shown")
     # The auto-select marks its group item active synchronously at start; once
     # it exists, a j-initiated selection supersedes it and lands the focus.
     page.locator(".group-item.active").wait_for(state="attached")
@@ -1555,11 +1521,11 @@ def test_review_action_shortcut_and_card_reveal_from_the_keyboard(
             route.fulfill(status=200, content_type="application/json", body="{}"),
         ),
     )
-    page.locator('.tab[data-kind="low_resolution"]').click()
+    page.locator('.tab[data-kind="exact"]').click()
     expect(page.locator(".group-item")).to_have_count(1)
     page.locator(".group-item").click()
     page.locator("#members .card").first.wait_for(state="visible")
-    page.locator("#members .card").first.click()
+    page.keyboard.press("ArrowRight")
     page.locator("#members .card.focused").wait_for(state="attached")
     page.keyboard.press("r")
     expect(page.locator("#members .card.focused")).to_have_count(1)
@@ -1645,22 +1611,21 @@ def test_attention_navigation_and_space_u_shortcuts(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
     page.locator("#toast").wait_for(state="hidden", timeout=10_000)
 
-    # The Similar tab's one group is complete under the suggested selection, so
+    # The Exact tab's one group is complete under the suggested selection, so
     # no shown group needs attention — ] says so instead of moving.
-    page.locator('.tab[data-kind="similar"]').click()
+    page.locator('.tab[data-kind="exact"]').click()
     expect(page.locator(".group-item")).to_have_count(1)
     page.keyboard.press("]")
     expect(page.locator("#toastMessage")).to_have_text("No shown groups need attention")
 
     # Space toggles the focused card's checkbox; u restores the suggestion.
     page.locator(".group-item").click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     expect(page.locator("#members .card.selected")).to_have_count(1)
     selected_index = page.evaluate(
@@ -1740,10 +1705,6 @@ def test_results_fill_the_window_with_independently_scrolling_panes(
     expect(page.locator("#scanPanel")).to_have_class(re.compile(r"\bcollapsed\b"))
     expect(page.locator("#progressMsg")).to_be_visible()
     expect(page.locator("#progressBar")).to_be_hidden()
-    # Exact recovery opens over the page from the header.
-    page.locator("#exactRecovery > summary").click()
-    expect(page.locator("#exactRecoveryList")).to_be_visible()
-    page.locator("#exactRecovery > summary").click()
 
     # A small window keeps the ordinary scrolling page and floating footer.
     page.set_viewport_size({"width": 800, "height": 720})
@@ -1759,13 +1720,10 @@ def test_lightbox_enter_wrap_focus_trap_and_esc(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     expect(page.locator("#members .card.selected")).to_have_count(1)
 
@@ -1816,20 +1774,17 @@ def test_stale_preview_re_previews_on_confirm(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     # Let the scan's own "Done" toast clear so it cannot swallow the click.
     page.locator("#toast").wait_for(state="hidden", timeout=10_000)
 
-    page.locator("#btnTrashSimilar").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
-    expect(page.locator("#modalTitle")).to_have_text("Delete all selected similar matches?")
+    expect(page.locator("#modalTitle")).to_have_text("Delete all selected exact matches?")
     assert "preview valid for" in page.locator("#modalValidity").inner_text()
 
     # A second tab on the same session moves the selection to the other file
@@ -1839,9 +1794,7 @@ def test_stale_preview_re_previews_on_confirm(
     tab2.on("pageerror", lambda error: tab2_errors.append(str(error)))
     tab2.goto(live_dedupe_server, wait_until="domcontentloaded")
     tab2.locator("#results").wait_for(state="visible", timeout=10_000)
-    tab2.locator('.tab[data-kind="similar"]').click()
     tab2.locator(".group-item").first.click()
-    # This tab inherits the first tab's saved List-view preference.
     tab2.locator("#members .card").first.wait_for(state="visible")
     selected_index = tab2.evaluate(
         "[...document.querySelectorAll('#members .card')]"
@@ -1862,7 +1815,7 @@ def test_stale_preview_re_previews_on_confirm(
         "selection changed since the preview"
     )
     page.locator("#modalBackdrop").wait_for(state="visible")
-    expect(page.locator("#modalTitle")).to_have_text("Delete all selected similar matches?")
+    expect(page.locator("#modalTitle")).to_have_text("Delete all selected exact matches?")
     expect(page.locator("#modalBody .preview-notice")).to_contain_text("re-verified")
     assert sorted(path.name for path in duplicate_images.iterdir()) == [
         "duplicate.png",
@@ -1882,18 +1835,15 @@ def test_escape_discards_preview_and_reopening_renews_the_token(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     page.locator("#toast").wait_for(state="hidden", timeout=10_000)
 
     # Escape closes the sheet without moving anything; the preview dies with it.
-    page.locator("#btnTrashSimilar").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
     assert "preview valid for" in page.locator("#modalValidity").inner_text()
     page.keyboard.press("Escape")
@@ -1904,7 +1854,7 @@ def test_escape_discards_preview_and_reopening_renews_the_token(
     ]
 
     # Reopening runs a fresh preview: the server-issued validity line is back.
-    page.locator("#btnTrashSimilar").click()
+    page.locator("#btnTrashExact").click()
     page.locator("#modalBackdrop").wait_for(state="visible")
     assert "preview valid for" in page.locator("#modalValidity").inner_text()
     page.locator("#modalCancel").click()
@@ -1938,26 +1888,20 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
     # Parallel streams (the default): one progress line per folder, and no
     # cross-folder exact group is found.
     expect(page.locator("#streamProgress .stream-row")).to_have_count(2)
-    expect(page.locator('.tab[data-kind="exact"]')).to_have_count(0)
+    expect(page.locator("#countExact")).to_have_text("0")
     expect(page.locator("#countAll")).not_to_have_text("0")
-    status = page.request.get(f"{live_dedupe_server}/api/status").json()
-    assert status["auto_deleted_exact"]["success_count"] == 0
-    assert status["auto_deleted_exact"]["fail_count"] == 0
 
-    # Forcing one pool finds and immediately removes the cross-folder duplicate.
+    # Forcing one pool finds the cross-folder duplicate.
     page.locator("#scanCollapse").click()
     page.locator("#optsToggle").click()
     # Chip checkboxes are visually hidden behind their label; force the toggle.
     page.locator("#optParallel").uncheck(force=True)
     page.locator("#btnScan").click()
-    page.locator("#toast").filter(has_text="auto-deleted").wait_for(
-        state="visible", timeout=20_000
-    )
-    expect(page.locator(".badge.exact")).to_have_count(0)
+    expect(page.locator("#countExact")).to_have_text("1", timeout=20_000)
     # One-pool scans have no per-folder stream panel.
     expect(page.locator("#streamProgress")).to_be_hidden()
-    page.locator("#exactRecovery > summary").click()
-    expect(page.get_by_role("button", name="Recover 1 file", exact=True)).to_be_visible()
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
     assert page_errors == []
 
 
@@ -1974,7 +1918,6 @@ def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
     app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(app) as url:
         page.goto(url, wait_until="domcontentloaded")
-        _disable_exact_detection(page)
         page.locator("#paths").fill(str(duplicate_images))
         page.locator("#btnScan").click()
         page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -1990,7 +1933,6 @@ def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
     resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(resumed) as url:
         page.goto(url, wait_until="domcontentloaded")
-        _disable_exact_detection(page)
         # The page opens on the empty setup with the offer in the banner.
         expect(page.locator("#emptyState")).to_be_visible()
         expect(page.locator(".group-item")).to_have_count(0)
@@ -2002,7 +1944,7 @@ def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
         expect(page.locator("#results")).to_be_visible()
         page.locator(".group-item").first.wait_for(state="attached")
         # The exact group lost a member below its two-file minimum.
-        expect(page.locator(".badge.exact")).to_have_count(0)
+        expect(page.locator("#countExact")).to_have_text("0")
         expect(page.locator("#countAll")).to_have_text("3")
         expect(page.locator("#sessionStatusText")).to_contain_text("Resumed review")
         expect(page.locator("#sessionStatusText")).to_contain_text("1 stale file pruned")
@@ -2043,14 +1985,12 @@ def test_selections_survive_a_server_restart(
     app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(app) as url:
         page.goto(url, wait_until="domcontentloaded")
-        _disable_exact_detection(page)
         page.locator("#paths").fill(str(duplicate_images))
         page.locator("#btnScan").click()
         page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-        page.locator('.tab[data-kind="similar"]').click()
+        page.locator('.tab[data-kind="exact"]').click()
         expect(page.locator(".group-item")).to_have_count(1)
         page.locator(".group-item").click()
-        page.locator("#btnSimilarView").click()
         page.locator("#members .card").first.wait_for(state="visible")
         expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
         page.locator("#members .card.selected .sel-cb").click()
@@ -2065,13 +2005,11 @@ def test_selections_survive_a_server_restart(
     resumed.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
     with _serve_app(resumed) as url:
         page.goto(url, wait_until="domcontentloaded")
-        _disable_exact_detection(page)
         page.locator("#btnResumeSession").click()
         page.locator("#results").wait_for(state="visible", timeout=10_000)
-        page.locator('.tab[data-kind="similar"]').click()
+        page.locator('.tab[data-kind="exact"]').click()
         expect(page.locator(".group-item")).to_have_count(1)
         page.locator(".group-item").click()
-        page.locator("#btnSimilarView").click()
         page.locator("#members .card").first.wait_for(state="visible")
         expect(page.locator("#members .sel-cb:checked")).to_have_count(0)
         expect(page.locator("#members .card.selected")).to_have_count(0)
@@ -2089,13 +2027,10 @@ def test_sticky_toast_queues_newer_toasts(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator('.tab[data-kind="similar"]').click()
     page.locator(".group-item").first.click()
-    page.locator("#btnSimilarView").click()
     page.locator("#members .card").first.wait_for(state="visible")
     page.locator("#toast").wait_for(state="hidden", timeout=10_000)
 
@@ -2156,7 +2091,6 @@ def test_random_review_decision_mechanics(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    _disable_exact_detection(page)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -2185,12 +2119,10 @@ def test_random_review_decision_mechanics(
 
 @pytest.mark.e2e
 def test_scan_streams_groups_and_cancel_restores_previous(
-    page, live_dedupe_server: str, duplicate_images: Path, tmp_path: Path, monkeypatch
+    page, live_dedupe_server: str, duplicate_images: Path, tmp_path: Path
 ) -> None:
     import os
     import time
-
-    from dedupe.web import app as web_app
 
     page_errors: list[str] = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
@@ -2200,43 +2132,21 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
-    page.locator("#toast").filter(has_text="auto-deleted").wait_for(state="visible")
-    page.locator("#toastDismiss").click()
-    expect(page.locator(".badge.exact")).to_have_count(0)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    page.locator("#toast").wait_for(state="hidden", timeout=10_000)
+    expect(page.locator("#countExact")).to_have_text("1")
 
-    # Exact groups are hidden now; pause after publishing a manual-review
-    # group so Cancel is deterministic rather than racing the final stages.
+    # A bigger fixture: exact-duplicate pairs of random-noise PNGs, so groups
+    # keep streaming in while the similar-image stage is still hashing.
     big = tmp_path / "big"
     big.mkdir()
-    for index in range(2):
+    for index in range(125):
         image_path = big / f"noise-{index:03d}-a.png"
         Image.frombytes("RGB", (96, 96), os.urandom(96 * 96 * 3)).save(image_path)
-        # Same pixels but different bytes: these are Similar review groups,
-        # not the hidden Exact groups used by the old version of this test.
-        with Image.open(image_path) as image:
-            image.save(big / f"noise-{index:03d}-b.png", compress_level=0)
-
-    run_scan = web_app.run_scan
-
-    def pause_after_review_group(paths, **kwargs):
-        publish = kwargs["on_group"]
-
-        def on_group(group):
-            publish(group)
-            if group.kind != GroupKind.EXACT:
-                deadline = time.monotonic() + 10
-                while not kwargs["cancelled"]() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-
-        kwargs["on_group"] = on_group
-        return run_scan(paths, **kwargs)
-
-    monkeypatch.setattr(web_app, "run_scan", pause_after_review_group)
+        shutil.copyfile(image_path, big / f"noise-{index:03d}-b.png")
 
     # Start the second scan from the collapsed setup bar.
     page.locator("#scanCollapse").click()
-    page.locator("#optsToggle").click()
-    page.locator("#optParallel").uncheck(force=True)
     page.locator("#paths").fill(str(big))
     page.locator("#btnScan").click()
 
@@ -2274,15 +2184,15 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     page.locator("#btnCancelScan").click()
     # The scan stops and the previous (duplicate_images) results come back.
     expect(page.locator("#btnCancelScan")).to_be_hidden(timeout=30_000)
-    expect(page.locator(".badge.exact")).to_have_count(0)
-    expect(page.locator(".group-item")).to_have_count(3, timeout=30_000)
+    expect(page.locator("#countExact")).to_have_text("1", timeout=30_000)
+    expect(page.locator(".group-item")).to_have_count(4, timeout=30_000)
     toast_log = page.evaluate("window.__toastLog")
     assert any("Cancelling" in text for text in toast_log)
     assert page_errors == []
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("kind", ["all_files", "random_review"])
+@pytest.mark.parametrize("kind", ["exact", "all_files", "random_review"])
 @pytest.mark.parametrize("dimensions", [(400, 2400), (2400, 400)])
 @pytest.mark.parametrize("media_type", ["image", "video"])
 def test_card_media_stays_inside_preview(
@@ -2353,7 +2263,8 @@ def test_card_media_stays_inside_preview(
     else:
         assert pane["height"] <= 600 * 0.58 + 1
 
-    if media_type == "video" and kind == "all_files":
+    # Exact copy rows and Files cards play video on hover; other cards embed a player.
+    if media_type == "video" and kind in ("exact", "all_files"):
         page.route("**/api/media?*", lambda route: route.abort())
         page.locator("#members .thumb-wrap").hover()
         expect(image).to_have_attribute("src", re.compile(r"/api/media"))
