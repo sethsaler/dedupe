@@ -1,5 +1,6 @@
 """Ordered video fingerprint comparisons."""
 
+import json
 import random
 import subprocess
 from pathlib import Path
@@ -18,6 +19,7 @@ from dedupe.similar_video import (
     ffmpeg_available,
     find_similar_video_groups,
     probe_duration,
+    probe_video,
     video_fingerprint_distances,
 )
 
@@ -30,6 +32,15 @@ def test_video_fingerprint_preserves_frame_order() -> None:
 
     assert video_fingerprint_distances(ordered, ordered) == [0, 0]
     assert video_fingerprint_distances(ordered, reversed_order) == [64, 64]
+
+
+def test_legacy_longer_fingerprint_still_compares_with_current_samples() -> None:
+    sample = "0123456789abcdef"
+    legacy = "v2:" + ",".join([sample] * 16)
+    current = "v3:" + ",".join([sample] * 8)
+
+    assert video_fingerprint_distances(legacy, current) == [0] * 8
+    assert video_fingerprint_distances(current, legacy) == [0] * 8
 
 
 def _single_pass_runner(calls: list[list[str]]):
@@ -435,3 +446,134 @@ def test_duration_bucketing_matches_exhaustive_comparison(monkeypatch) -> None:
 
     assert optimized == reference
     assert any(len(group) > 1 for group in reference)
+
+
+@pytest.mark.parametrize(
+    ("stream_duration", "container_duration", "expected"),
+    [("3.0", "10.0", 3.0), ("N/A", "10.0", 10.0),
+     (None, "10.0", 10.0), ("nan", "inf", None), ("0", "-1", None)],
+)
+def test_probe_uses_valid_video_duration_before_container_duration(
+    monkeypatch, stream_duration, container_duration, expected
+) -> None:
+    monkeypatch.setattr("dedupe.similar_video.shutil.which", lambda _name: "ffprobe")
+    monkeypatch.setattr(
+        "dedupe.similar_video.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "streams": [{"duration": stream_duration, "width": 640, "height": 480}],
+                "format": {"duration": container_duration},
+            }),
+        ),
+    )
+
+    assert probe_video("video.mp4") == (expected, 640, 480)
+
+
+def test_video_with_longer_audio_still_matches_its_video_copy(tmp_path: Path) -> None:
+    """A longer audio stream must not produce seeks past the final video frame."""
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    with_audio = tmp_path / "long-audio.mp4"
+    video_only = tmp_path / "video-only.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+            "testsrc2=size=160x120:rate=12:duration=3", "-f", "lavfi", "-i",
+            "sine=frequency=440:duration=10", "-threads", "1", str(with_audio),
+        ],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(with_audio),
+            "-an", "-c:v", "copy", str(video_only),
+        ],
+        capture_output=True, check=True,
+    )
+    records = inventory([with_audio, video_only])
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    assert [{record.path for record in group} for group in groups] == [
+        {str(with_audio), str(video_only)}
+    ]
+    assert all(record.duration == pytest.approx(3.0) for record in records)
+    assert all(record.error is None for record in records)
+
+
+def test_unknown_duration_video_rejects_undecodable_sample(tmp_path: Path, monkeypatch) -> None:
+    from PIL import Image
+
+    good, bad = tmp_path / "good.jpg", tmp_path / "bad.jpg"
+    Image.new("RGB", (32, 32), "red").save(good)
+    bad.write_bytes(b"incomplete image")
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (None, 640, 480))
+    monkeypatch.setattr(
+        "dedupe.similar_video._extract_frames", lambda *_args, **_kwargs: [good, bad]
+    )
+
+    assert compute_video_fingerprint(tmp_path / "video.mp4") == (None, 640, 480, None)
+
+
+@pytest.mark.parametrize("invalid", ["v3:", "v3:xyz", "v3:0", "v3:" + "0" * 17,
+                                    "v3:" + "0" * 16 + ","])
+def test_malformed_cached_fingerprint_is_refreshed_without_losing_other_matches(
+    monkeypatch, invalid
+) -> None:
+    valid = "v3:" + ",".join(["0123456789abcdef"] * 8)
+    records = [
+        FileRecord(
+            path=f"{name}.mp4", size=1, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=fingerprint, duration=10.0,
+        )
+        for name, fingerprint in [("a", valid), ("b", valid), ("broken", invalid)]
+    ]
+    refreshed = []
+
+    def failed_refresh(path, **_kwargs):
+        refreshed.append(path)
+        return None, None, None, None
+
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video.compute_video_fingerprint", failed_refresh)
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    assert refreshed == ["broken.mp4"]
+    assert [{record.path for record in group} for group in groups] == [{"a.mp4", "b.mp4"}]
+    assert records[2].video_fingerprint is None
+    assert records[2].error.startswith("video fingerprint failed:")
+    assert video_fingerprint_distances(invalid, valid) is None
+
+
+def test_current_fingerprint_with_too_many_samples_is_refreshed(monkeypatch) -> None:
+    current = "v3:" + ",".join(["0123456789abcdef"] * 8)
+    oversized = "v3:" + ",".join(["0123456789abcdef"] * 16)
+    records = [
+        FileRecord(
+            path=f"{name}.mp4", size=1, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=fingerprint, duration=10.0,
+        )
+        for name, fingerprint in [("normal", current), ("oversized", oversized)]
+    ]
+    refreshed = []
+
+    def refresh(path, **_kwargs):
+        refreshed.append(path)
+        return current, 640, 480, 10.0
+
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video.compute_video_fingerprint", refresh)
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    assert refreshed == ["oversized.mp4"]
+    assert records[1].video_fingerprint == current
+    assert [{record.path for record in group} for group in groups] == [
+        {"normal.mp4", "oversized.mp4"}
+    ]

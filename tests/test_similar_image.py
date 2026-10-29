@@ -771,3 +771,85 @@ def test_hamming_index_matches_brute_force(radius: int) -> None:
             ((query ^ h).bit_count(), h) for h in hashes if (query ^ h).bit_count() <= radius
         )
         assert sorted(index.find(query, radius)) == expected
+
+
+@pytest.mark.parametrize("extension", ["gif", "webp", "png"])
+def test_animation_checks_colors_after_the_first_frame(tmp_path, extension):
+    """Equal first frames and grayscale structure cannot hide later color changes."""
+    from dedupe.cache import HashCache
+    from dedupe.scanner import inventory
+
+    first = Image.new("RGB", (128, 128), "navy")
+    paths = []
+    for folder, color in [("left", (200, 40, 40)), ("right", (40, 121, 40))]:
+        directory = tmp_path / folder
+        directory.mkdir()
+        path = directory / f"animation.{extension}"
+        frame = Image.new("RGB", (128, 128), color)
+        ImageDraw.Draw(frame).ellipse((20, 30, 100, 110), fill="white")
+        first.save(
+            path, save_all=True, append_images=[frame], duration=100, loop=0, lossless=True
+        )
+        paths.append(path)
+
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    try:
+        for cached in (False, True):
+            records = inventory(paths)
+            if cached:
+                assert cache.hydrate(records) == 2
+                records.reverse()
+            assert find_similar_image_groups(records, workers=1) == []
+            cache.store_all(records)
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_orientation_hash_ties_try_each_verified_turn(tmp_path, reverse):
+    """Grayscale pHash cannot decide the correct turn of colored symmetric art."""
+    from dedupe.scanner import inventory
+
+    original = Image.new("RGB", (128, 128), (200, 40, 40))
+    ImageDraw.Draw(original).rectangle((64, 0, 127, 127), fill=(40, 121, 40))
+    source, mirrored = tmp_path / "original.png", tmp_path / "mirrored.png"
+    original.save(source)
+    original.transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(mirrored)
+    records = inventory([source, mirrored])
+    if reverse:
+        records.reverse()
+
+    groups = find_similar_image_groups(records, workers=1)
+
+    assert len(groups) == 1
+    assert {record.path for record in groups[0]} == {str(source), str(mirrored)}
+
+
+@pytest.mark.parametrize("local_change", [False, True])
+def test_alpha_changes_are_not_invisible_to_similarity(tmp_path, local_change):
+    """Transparency changes matter even when the stored RGB channels are identical."""
+    from dedupe.scanner import inventory
+
+    original = Image.new("RGBA", (128, 128), (200, 40, 40, 255))
+    changed = original.copy()
+    if local_change:
+        ImageDraw.Draw(changed).rectangle((48, 48, 63, 63), fill=(200, 40, 40, 0))
+    else:
+        changed.putalpha(0)
+    original.save(tmp_path / "opaque.png")
+    changed.save(tmp_path / "transparent.png")
+
+    assert find_similar_image_groups(inventory([tmp_path]), workers=1) == []
+
+
+def test_transparent_reexport_still_matches(tmp_path):
+    from dedupe.scanner import inventory
+
+    original = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(original)
+    draw.ellipse((10, 20, 90, 100), fill=(200, 40, 80, 255))
+    draw.rectangle((70, 80, 100, 110), fill=(40, 120, 240, 128))
+    original.save(tmp_path / "original.png")
+    original.save(tmp_path / "reexport.webp", lossless=True)
+
+    assert len(find_similar_image_groups(inventory([tmp_path]), workers=1)) == 1

@@ -26,12 +26,13 @@ _UPSERT_SQL = """
         tile_phashes, orientation_phashes, video_fingerprint, duration,
         human_detection_status, human_detector, human_detection_signature,
         human_frames_analyzed, human_max_confidence, face_count, face_detector,
-        face_detection_signature
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        face_detection_signature, ctime_ns
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
         mtime_ns=excluded.mtime_ns,
+        ctime_ns=excluded.ctime_ns,
         device=excluded.device,
         inode=excluded.inode,
         algorithm_version=excluded.algorithm_version,
@@ -85,6 +86,7 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.face_count,
         rec.face_detector,
         rec.face_detection_signature,
+        rec.ctime_ns,
     )
 
 
@@ -212,6 +214,7 @@ class HashCache:
                 size INTEGER NOT NULL,
                 mtime REAL NOT NULL,
                 mtime_ns INTEGER,
+                ctime_ns INTEGER,
                 device INTEGER,
                 inode INTEGER,
                 algorithm_version TEXT NOT NULL DEFAULT '',
@@ -274,6 +277,7 @@ class HashCache:
         }
         migrations = {
             "mtime_ns": "INTEGER",
+            "ctime_ns": "INTEGER",
             "device": "INTEGER",
             "inode": "INTEGER",
             "algorithm_version": "TEXT NOT NULL DEFAULT ''",
@@ -326,6 +330,14 @@ class HashCache:
                 return None
         elif abs(float(cached["mtime"]) - rec.mtime) >= 0.001:
             return None
+        # On supported Unix filesystems, changing bytes or restoring mtime
+        # updates ctime. Require it when inventory supplied it; older cache
+        # rows are refreshed once instead of trusting incomplete identities.
+        # Renames that update ctime deliberately rehash as well.
+        if rec.ctime_ns is not None:
+            cached_ctime = cached.get("ctime_ns")
+            if cached_ctime is None or int(cached_ctime) != int(rec.ctime_ns):
+                return None
         for key in ("device", "inode"):
             current = getattr(rec, key)
             prior = cached.get(key)

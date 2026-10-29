@@ -1137,10 +1137,9 @@ def create_app(
             state["paths_version"] += 1
             state["selected_count"] = 0
             state["streamed_group_index"] = {}
-            # Default to parallel per-folder streams when more than one folder is
-            # given; each folder becomes its own concurrent scan (no cross-folder dedup).
-            parallel_default = len(resolved_roots) > 1
-            parallel_streams = bool(data.get("parallel_streams", parallel_default))
+            # Compare every selected root together by default. Independent streams
+            # intentionally exclude cross-folder matches and must be opted into.
+            parallel_streams = bool(data.get("parallel_streams", False))
             state["streams"] = (
                 [
                     {

@@ -22,7 +22,7 @@ Plus one thing that is not a file at all: the browser's local storage remembers 
 
 ## The hash cache
 
-The cache is a SQLite database keyed by strong file identity — size, modification time, inode, and device — so an entry only applies while the file is byte-for-byte the one that was scanned; change the file and its cached identity stops matching. It stores the work of the expensive stages: exact hashes, image perceptual hashes and tile hashes, video fingerprints, person-detection verdicts, and face counts.
+The cache is a SQLite database keyed by file identity — size, modification time, filesystem change time, inode, and device. Change time catches same-size edits even when an application restores the original modification time. Older entries without it are refreshed once; renames that update change time also trigger a refresh. This identity check is a cache optimization, not a substitute for the exact-content revalidation before file actions. The cache stores the work of the expensive stages: exact hashes, image perceptual hashes and tile hashes, video fingerprints, person-detection verdicts, and face counts.
 
 It is read at the start of a scan (hydration — matching files skip re-hashing entirely, which is why a second scan of the same library is mostly an inventory walk) and written at the end (`store_all`). Two kinds of *decisions* also live here, because they must outlive any single review session:
 
@@ -106,3 +106,4 @@ This document *is* the files-on-disk entry of the cross-cutting list; the remain
 - (Answered 2026-09-03.) The receipts directory is created with default permissions (`drwxr-xr-x`), not the session directory's 0700 — observed on the drafting machine and in `_write_action_log`'s plain `mkdir(parents=True, exist_ok=True)`. Whether receipts (which list media paths) should get the session's private treatment is a product call, not a defect: nothing in a receipt is more revealing than the paths themselves.
 
 Verified against dedupe commit `2a6cede` (post-improvement working tree through 2026-09-03).
+Hash-cache change-time migration and invalidation verified by real-filesystem regression tests against the 2026-10-29 working tree.

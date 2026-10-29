@@ -7,6 +7,7 @@ single decoder thread, with one-pass frame extraction and small frame size.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -86,7 +87,7 @@ def probe_video(path: str | Path) -> tuple[float | None, int | None, int | None]
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "format=duration:stream=width,height",
+                "format=duration:stream=duration,width,height",
                 "-of",
                 "json",
                 str(path),
@@ -99,9 +100,19 @@ def probe_video(path: str | Path) -> tuple[float | None, int | None, int | None]
         if result.returncode != 0:
             return None, None, None
         data = json.loads(result.stdout or "{}")
-        dur_raw = (data.get("format") or {}).get("duration")
-        duration = float(dur_raw) if dur_raw is not None else None
         streams = data.get("streams") or []
+        stream = streams[0] if streams else {}
+        # Container duration includes audio. A longer soundtrack must not make
+        # us seek beyond the end of an otherwise readable video stream.
+        duration = None
+        for raw in (stream.get("duration"), (data.get("format") or {}).get("duration")):
+            try:
+                candidate = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(candidate) and candidate > 0:
+                duration = candidate
+                break
         w = h = None
         if streams:
             w = streams[0].get("width")
@@ -458,7 +469,9 @@ def compute_video_fingerprint(
                 with Image.open(fp) as img:
                     hashes.append(imagehash.phash(img.convert("RGB")))
             except Exception:
-                continue
+                # Dropping a frame would shift the remaining sample positions
+                # and allow an incomplete fingerprint to stand for the video.
+                return None, width, height, duration
             else:
                 if on_frame:
                     on_frame(idx + 1, len(frames))
@@ -489,31 +502,27 @@ def aligned_position_indexes(
 
 def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
     """Compare ordered frame hashes at normalized positions."""
-    import imagehash
-
-    def parse(value: str) -> list[str]:
-        if value.startswith(("v2:", "v3:")):
-            return [part for part in value[3:].split(",") if part]
-        # Backward-compatible parser; cache versioning prevents normal reuse.
-        return [value] if value else []
-
-    left = parse(a)
-    right = parse(b)
+    left = _fingerprint_hashes(a)
+    right = _fingerprint_hashes(b)
     if not left or not right:
         return None
     left_indexes, right_indexes = aligned_position_indexes(len(left), len(right))
     return [
-        int(
-            imagehash.hex_to_hash(left[left_index])
-            - imagehash.hex_to_hash(right[right_index])
-        )
+        (left[left_index] ^ right[right_index]).bit_count()
         for left_index, right_index in zip(left_indexes, right_indexes, strict=True)
     ]
 
 
 def _fingerprint_hashes(value: str) -> tuple[int, ...]:
+    """Parse complete 64-bit samples; malformed cached data is not evidence."""
     raw = value[3:] if value.startswith(("v2:", "v3:")) else value
-    return tuple(int(part, 16) for part in raw.split(",") if part)
+    parts = raw.split(",")
+    if any(
+        len(part) != 16 or any(char not in "0123456789abcdefABCDEF" for char in part)
+        for part in parts
+    ):
+        return ()
+    return tuple(int(part, 16) for part in parts)
 
 
 def _video_fingerprint_job(
@@ -559,7 +568,9 @@ def find_similar_video_groups(
     need = [
         r
         for r in videos
-        if not r.video_fingerprint or not r.video_fingerprint.startswith("v3:")
+        if not r.video_fingerprint
+        or not r.video_fingerprint.startswith("v3:")
+        or not 1 <= len(_fingerprint_hashes(r.video_fingerprint)) <= MAX_FRAMES
     ]
     cached = total - len(need)
     videos_done = cached

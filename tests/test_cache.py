@@ -39,6 +39,54 @@ def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_cache_rejects_changed_ctime_even_when_other_identity_matches(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    original = _record(tmp_path / "photo.jpg", inode=10)
+    original.ctime_ns = 1_000_000_000
+    cache.store_all([original])
+    changed = _record(tmp_path / "photo.jpg", inode=10)
+    changed.ctime_ns = 2_000_000_000
+    changed.phash = None
+
+    assert cache.get(changed) is None
+    assert cache.hydrate([changed]) == 0
+    assert changed.phash is None
+    # The inode fallback for a renamed file must enforce the same check.
+    changed.path = str(tmp_path / "renamed.jpg")
+    assert cache.get(changed) is None
+    assert cache.hydrate([changed]) == 0
+    assert changed.phash is None
+    cache.close()
+
+
+def test_cache_refreshes_rows_without_change_time(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    legacy = _record(tmp_path / "photo.jpg", inode=10)
+    cache.store_all([legacy])
+    current = _record(tmp_path / "photo.jpg", inode=10)
+    current.ctime_ns = 1_000_000_000
+    current.phash = None
+
+    assert cache.get(current) is None
+    assert cache.hydrate([current]) == 0
+    current.phash = "1" * 16
+    cache.store_all([current])
+    current.phash = None
+    assert cache.hydrate([current]) == 1
+    assert current.phash == "1" * 16
+    cache.close()
+
+
+def test_file_record_change_time_serialization_is_backward_compatible(tmp_path: Path) -> None:
+    original = _record(tmp_path / "photo.jpg", inode=10)
+    original.ctime_ns = 123_456_789
+    serialized = original.to_dict()
+
+    assert FileRecord.from_dict(serialized).ctime_ns == original.ctime_ns
+    serialized.pop("ctime_ns")
+    assert FileRecord.from_dict(serialized).ctime_ns is None
+
+
 def test_cache_reuses_hashes_after_same_filesystem_move(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     original = _record(tmp_path / "before" / "photo.jpg", inode=10)

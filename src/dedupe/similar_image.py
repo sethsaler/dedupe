@@ -49,11 +49,13 @@ DENSE_GRID = 8
 DEFAULT_DENSE_LOCAL_MAX = 3.0
 DEFAULT_DENSE_CONCENTRATION = 8.0
 # Grayscale hashes ignore hue and largely ignore uniform brightness. Bound
-# each RGB channel's mean absolute difference (0–255) as well: a loose 32-level
-# allowance retains re-exports/moderate exposure edits, not different colors.
+# each color/alpha channel's mean absolute difference (0–255) as well: a loose
+# 32-level allowance retains re-exports/moderate exposure edits, not different
+# colors or substantially different transparency.
 DEFAULT_DENSE_COLOR_MEAN_MAX = 32.0
-# RGB thumbnails use up to 64 KB each in Pillow's storage; cap near 64 MB.
-DENSE_CACHE_SIZE = 1024
+# A cached animation contains eight RGB thumbnails, up to 64 KB each in
+# Pillow's storage; keep the worst-case thumbnail cache near 64 MB.
+DENSE_CACHE_SIZE = 128
 
 # pHash/dHash only need ~32×32 DCT input; anything larger is wasted decode/RAM.
 # 512 keeps edge structure for rescaled/quality variants without loading full HEIC/JPEG.
@@ -114,11 +116,11 @@ def _register_heif() -> None:
         pass
 
 
-def _downscale_for_hash(img, max_side: int = HASH_MAX_SIDE):
-    """Return RGB image scaled so longest side ≤ max_side (in-place safe copy)."""
+def _downscale_for_hash(img, max_side: int = HASH_MAX_SIDE, *, preserve_alpha: bool = False):
+    """Return RGB(A) scaled so longest side ≤ max_side (in-place safe copy)."""
     from PIL import Image as PILImage
 
-    rgb = img.convert("RGB")
+    rgb = img.convert("RGBA" if preserve_alpha else "RGB")
     if max(rgb.size) > max_side:
         # Bilinear is enough pre-pHash and much cheaper than LANCZOS on 12MP shots.
         rgb.thumbnail((max_side, max_side), PILImage.Resampling.BILINEAR)
@@ -252,10 +254,10 @@ def _orient(img, orientation: str | None):
     return img.transpose(PILImage.Transpose[orientation])
 
 
-def _hash_frames(img) -> list:
+def _hash_frames(img, *, preserve_alpha: bool = False) -> list:
     """Sample animations in playback order and time, independent of frame rate."""
     if not getattr(img, "is_animated", False):
-        return [_downscale_for_hash(img)]
+        return [_downscale_for_hash(img, preserve_alpha=preserve_alpha)]
     starts = []
     duration = 0.0
     for index in range(img.n_frames):
@@ -266,7 +268,7 @@ def _hash_frames(img) -> list:
     for sample in range(ANIMATION_HASH_FRAMES):
         timestamp = sample * (duration - 0.001) / (ANIMATION_HASH_FRAMES - 1)
         img.seek(max(0, bisect_right(starts, timestamp) - 1))
-        frames.append(_downscale_for_hash(img))
+        frames.append(_downscale_for_hash(img, preserve_alpha=preserve_alpha))
     return frames
 
 
@@ -414,17 +416,17 @@ def is_near_identical(
 
 
 @lru_cache(maxsize=DENSE_CACHE_SIZE)
-def _dense_thumb_for_path(path: str, orientation: str | None = None):
-    """Run-cached RGB thumbnail for color and dense detail verification.
+def _dense_thumbs_for_path(path: str, orientation: str | None = None):
+    """Run-cached RGBA thumbnails for color and dense detail verification.
 
-    Same decode ladder as the tile path so stills and animation first frames
-    compare under identical normalization. Resizing (not letterboxing) keeps
-    tiny images comparable without padding mismatches. A turned thumbnail is
-    the upright one transposed, so verifying a rotated pair never re-decodes.
+    The same playback samples as the tile path are checked, so later color
+    or local changes cannot hide behind an identical first frame. Resizing
+    (not letterboxing) keeps tiny images comparable without padding mismatches.
+    Turned thumbnails reuse the upright decode.
     """
     if orientation is not None:
-        upright = _dense_thumb_for_path(path)
-        return None if upright is None else _orient(upright, orientation)
+        upright = _dense_thumbs_for_path(path)
+        return None if upright is None else tuple(_orient(frame, orientation) for frame in upright)
     _ensure_image_deps()
     _register_heif()
     from PIL import Image, ImageOps
@@ -437,30 +439,18 @@ def _dense_thumb_for_path(path: str, orientation: str | None = None):
                 img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
             except Exception:
                 pass
-            if getattr(img, "is_animated", False):
-                frame = _hash_frames(img)[0]
-            else:
-                frame = _downscale_for_hash(img)
-            return frame.resize(
-                (DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR
+            return tuple(
+                frame.resize((DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR)
+                for frame in _hash_frames(img, preserve_alpha=True)
             )
     except Exception:
         return None
 
 
-def dense_difference(
-    path_a: str, path_b: str, *, orientation_a: str | None = None
-) -> tuple[float, float] | None:
-    """Mean and worst-block mean abs difference of grayscale thumbnails.
-
-    None if either thumbnail fails to load.
-    """
+def _dense_frame_difference(ta, tb) -> tuple[float, float]:
+    """Mean and worst-block grayscale difference for one aligned frame pair."""
     import numpy as np
 
-    ta = _dense_thumb_for_path(path_a, orientation_a)
-    tb = _dense_thumb_for_path(path_b)
-    if ta is None or tb is None:
-        return None
     diff = np.abs(
         np.asarray(ta.convert("L"), dtype=np.int16) - np.asarray(tb.convert("L"), dtype=np.int16)
     )
@@ -478,6 +468,26 @@ def dense_difference(
     return sum(means) / len(means), max(means)
 
 
+def dense_difference(
+    path_a: str, path_b: str, *, orientation_a: str | None = None
+) -> tuple[float, float] | None:
+    """Mean and worst-block mean abs difference of aligned grayscale samples.
+
+    None if thumbnails fail to load or the still/animation sample counts differ.
+    """
+    frames_a = _dense_thumbs_for_path(path_a, orientation_a)
+    frames_b = _dense_thumbs_for_path(path_b)
+    if not frames_a or not frames_b or len(frames_a) != len(frames_b):
+        return None
+    differences = [
+        _dense_frame_difference(ta, tb) for ta, tb in zip(frames_a, frames_b, strict=True)
+    ]
+    return (
+        sum(mean for mean, _worst in differences) / len(differences),
+        max(worst for _mean, worst in differences),
+    )
+
+
 def is_dense_match(
     path_a: str,
     path_b: str,
@@ -486,7 +496,7 @@ def is_dense_match(
     concentration: float = DEFAULT_DENSE_CONCENTRATION,
     orientation_a: str | None = None,
 ) -> bool:
-    """Require similar colors and no concentrated, burst-like local change.
+    """Require similar colors/transparency and no concentrated local change.
 
     The local check rejects when the worst block exceeds local_max AND
     dominates the overall mean by concentration. The color check also rejects
@@ -495,22 +505,25 @@ def is_dense_match(
     """
     import numpy as np
 
-    ta = _dense_thumb_for_path(path_a, orientation_a)
-    tb = _dense_thumb_for_path(path_b)
-    if ta is None or tb is None:
+    frames_a = _dense_thumbs_for_path(path_a, orientation_a)
+    frames_b = _dense_thumbs_for_path(path_b)
+    if not frames_a or not frames_b or len(frames_a) != len(frames_b):
         return False
-    color_diff = np.abs(
-        np.asarray(ta.convert("RGB"), dtype=np.int16) - np.asarray(tb.convert("RGB"), dtype=np.int16)
-    )
-    if float(color_diff.reshape(-1, 3).mean(axis=0).max()) > DEFAULT_DENSE_COLOR_MEAN_MAX:
-        return False
-    result = dense_difference(path_a, path_b, orientation_a=orientation_a)
-    if result is None:
-        return False
-    mean, worst = result
-    if worst <= local_max or mean <= 0:
-        return True
-    return not worst / mean > concentration
+    for ta, tb in zip(frames_a, frames_b, strict=True):
+        color_diff = np.abs(
+            np.asarray(ta, dtype=np.int16) - np.asarray(tb, dtype=np.int16)
+        )
+        if float(color_diff.reshape(-1, 4).mean(axis=0).max()) > DEFAULT_DENSE_COLOR_MEAN_MAX:
+            return False
+        mean, worst = _dense_frame_difference(ta, tb)
+        if worst > local_max and mean > 0 and worst / mean > concentration:
+            return False
+        # Alpha-only edits can reveal/hide a local subject without changing RGB.
+        if np.any(color_diff[:, :, 3]):
+            mean, worst = _dense_frame_difference(ta.getchannel("A"), tb.getchannel("A"))
+            if worst > local_max and mean > 0 and worst / mean > concentration:
+                return False
+    return True
 
 
 def encode_tile_phashes(values: tuple[str, ...]) -> str:
@@ -738,6 +751,8 @@ def find_similar_image_groups(
 
     def verified(rec: FileRecord, other: FileRecord, orientation: str | None) -> bool:
         """Regional + dense verification of rec (turned by orientation) against other."""
+        if not _compatible_aspect_ratios(rec, other, orientation):
+            return False
         if orientation is None:
             # Secondary dHash check to reduce false positives. dHash has no
             # stored orientations; turned pairs rely on the regional checks.
@@ -754,9 +769,6 @@ def find_similar_image_groups(
         else:
             tiles_a = None
             tiles_b = _record_tile_phashes(other)
-        # Near-identical: also prefer similar aspect ratio
-        if not _compatible_aspect_ratios(rec, other, orientation):
-            return False
         # Regional structure: reject different pose / composition
         if not is_near_identical(
             rec.path,
@@ -783,10 +795,9 @@ def find_similar_image_groups(
         for i, rec in enumerate(hashed):
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
-            # Upright candidates first, then each remaining pair at most once
-            # more, in the one orientation whose pHash agrees best. A
-            # near-symmetric or near-blank image matches in several
-            # orientations; verifying each would re-decode the pair per turn.
+            # Upright candidates first, then turns in pHash-distance order.
+            # Symmetric grayscale structure can hide different color layouts,
+            # so a failed best turn must not suppress another valid orientation.
             candidates: list[tuple[FileRecord, str | None]] = [
                 (other, None)
                 for _distance, matched_hash in tree.find(int(rec.phash or "0", 16), threshold)
@@ -794,16 +805,18 @@ def find_similar_image_groups(
             ]
             turned = decode_orientation_phashes(rec.orientation_phashes)
             if turned and rec.media_type == MediaType.IMAGE:
-                best_turn: dict[str, tuple[int, str, FileRecord]] = {}
+                turns: dict[str, list[tuple[int, str, FileRecord]]] = {}
                 for name, value in zip(ORIENTATIONS, turned, strict=True):
                     for distance, matched_hash in tree.find(int(value, 16), threshold):
                         for other in by_phash[matched_hash]:
                             if other.media_type != MediaType.IMAGE:
                                 continue
-                            seen = best_turn.get(other.path)
-                            if seen is None or distance < seen[0]:
-                                best_turn[other.path] = (distance, name, other)
-                candidates.extend((other, name) for _d, name, other in best_turn.values())
+                            turns.setdefault(other.path, []).append((distance, name, other))
+                candidates.extend(
+                    (other, name)
+                    for matches in turns.values()
+                    for _distance, name, other in sorted(matches, key=lambda match: match[0])
+                )
             for other, orientation in candidates:
                 # Every pair only needs verification once.
                 if positions[other.path] <= i or other.path in adjacency[rec.path]:
@@ -822,7 +835,7 @@ def find_similar_image_groups(
     finally:
         # Records retain hashes for this run and the disk cache; free path cache.
         _tile_phashes_for_path.cache_clear()
-        _dense_thumb_for_path.cache_clear()
+        _dense_thumbs_for_path.cache_clear()
 
     return cluster_around_best(hashed, adjacency, distinct)
 
@@ -879,6 +892,6 @@ def _bruteforce_groups(
             progress("image-cluster", i + 1, len(hashed))
 
     _tile_phashes_for_path.cache_clear()
-    _dense_thumb_for_path.cache_clear()
+    _dense_thumbs_for_path.cache_clear()
 
     return cluster_around_best(hashed, adjacency, distinct)

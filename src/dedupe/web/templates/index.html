@@ -61,8 +61,8 @@
           </div>
           <div class="recent-paths" id="recentPaths" hidden></div>
           <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
-            Multiple folders scan as parallel streams: duplicates <em>across</em> folders are not found.
-            Scan their common parent folder — or turn off Parallel streams in Options — to catch those.
+            Scan folders separately is on: duplicates <em>across</em> folders are not found.
+            Turn it off in Options to compare all selected folders together.
           </p>
         </div>
 
@@ -153,8 +153,8 @@
           </div>
           <div class="opt-group">
             <span class="opt-label">Folders</span>
-            <label class="chip-check"><input type="checkbox" id="optParallel" checked /><span>Parallel streams</span></label>
-            <span class="thresh-hint">scan each folder concurrently &amp; independently (no cross-folder dedup)</span>
+            <label class="chip-check"><input type="checkbox" id="optParallel" /><span>Scan folders separately</span></label>
+            <span class="thresh-hint">By default, find matches within and across all selected folders. Separate scans only find matches within each folder.</span>
           </div>
           <label class="preset-field">
             <span class="opt-label">Similarity preset</span>

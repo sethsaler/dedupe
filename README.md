@@ -439,6 +439,10 @@ MIT
 
 ### Cleanup improvements
 
+Scans compare all selected folders together by default, finding exact and similar
+copies both within and across folders. **Scan folders separately** (CLI: `--parallel`)
+is an explicit option for independent scans that exclude cross-folder matches.
+
 Use the **Scan goal** presets, preferred keeper folders, and **Best cleanup
 opportunities** sort to focus review. Similar pairs include image difference/shared
 zoom and synchronized video comparison. The [cleanup workflow](docs/cleanup-workflow.md)

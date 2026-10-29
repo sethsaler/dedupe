@@ -53,10 +53,19 @@ def test_run_scan_finds_exact_and_similar(tmp_path: Path) -> None:
     assert len(result.groups) >= 1
 
 
-def test_exact_and_similar_membership_is_stable_across_cached_scans(tmp_path):
+@pytest.mark.parametrize("across_folders", [False, True])
+@pytest.mark.parametrize("workers", [1, 2])
+def test_exact_and_similar_membership_is_stable_across_cached_scans(
+    tmp_path, across_folders, workers
+):
     media = tmp_path / "media"
     media.mkdir()
-    original, copy, download = (media / name for name in ("original.jpg", "copy.jpg", "small.jpg"))
+    exports = tmp_path / "exports" if across_folders else media
+    exports.mkdir(exist_ok=True)
+    original = media / "original.jpg"
+    copy, download = (exports / name for name in ("copy.jpg", "small.jpg"))
+    # Explicit file roots and overlapping directories must not duplicate records.
+    roots = [media, exports, original] if across_folders else [media]
     with Image.open(Path(__file__).parent / "fixtures" / "astronaut.png") as image:
         image.save(original, quality=95)
         image.resize((128, 128)).save(download, quality=75)
@@ -68,10 +77,11 @@ def test_exact_and_similar_membership_is_stable_across_cached_scans(tmp_path):
     for cached in (False, True):
         streamed = []
         result = run_scan(
-            [media], cache_path=tmp_path / "cache.sqlite3", workers=2,
+            roots, cache_path=tmp_path / "cache.sqlite3", workers=workers,
             find_low_resolution=False, random_review_count=0, on_group=streamed.append,
         )
         assert len(result.groups) == 2
+        assert len(result.files) == len({record.path for record in result.files}) == 5
         assert {g.kind: {m.path for m in g.members} for g in result.groups} == {
             GroupKind.EXACT: {str(original), str(copy)},
             GroupKind.SIMILAR: {str(original), str(copy), str(download)},
@@ -422,6 +432,28 @@ def test_parallel_streams_scan_folders_independently(tmp_path: Path) -> None:
     for group in exact_groups:
         assert all(member.path.startswith(group.root) for member in group.members)
     assert len(result.files) == 4
+
+
+@pytest.mark.parametrize("nested_first", [False, True])
+def test_parallel_overlapping_roots_do_not_repeat_files_or_groups(tmp_path, nested_first):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    _save(nested / "original.jpg", (30, 60, 90))
+    (nested / "copy.jpg").write_bytes((nested / "original.jpg").read_bytes())
+    roots = [nested, tmp_path] if nested_first else [tmp_path, nested]
+    streamed = []
+
+    result = run_scans_parallel(
+        roots, use_cache=False, similar=False, find_low_resolution=True,
+        random_review_count=50, workers=2, on_group=streamed.append,
+    )
+
+    assert len(result.files) == 2
+    assert result.exact_groups == 1
+    assert result.low_resolution_files == result.random_review_files == 2
+    assert len({group.id for group in streamed}) == len(streamed)
+    assert len({group.id for group in result.groups}) == len(result.groups)
+    assert {g.id: g.root for g in streamed} == {g.id: g.root for g in result.groups}
 
 
 def test_parallel_streams_report_per_stream_and_aggregate_progress(

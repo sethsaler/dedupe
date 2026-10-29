@@ -106,6 +106,34 @@ def test_inventory_dedupes_hardlinked_files_by_inode(tmp_path: Path) -> None:
     assert len(records) == 1
 
 
+@pytest.mark.parametrize("file_first", [False, True])
+def test_inventory_dedupes_file_roots_with_their_folders(tmp_path, file_first):
+    original = _touch(tmp_path / "nested" / "original.jpg")
+    second = _touch(tmp_path / "second.jpg")
+    roots = [original, tmp_path, original.parent, original]
+    if not file_first:
+        roots = [tmp_path, original.parent, original, original]
+    progress = []
+
+    records = inventory(roots, progress=lambda *args: progress.append(args))
+
+    assert len(records) == 2
+    assert {record.path for record in records} == {str(original), str(second)}
+    assert progress[-1] == ("inventory", 2, 2)
+
+
+def test_inventory_dedupes_hardlinks_supplied_as_file_roots(tmp_path):
+    original = _touch(tmp_path / "original.jpg")
+    link = tmp_path / "other" / "hardlink.jpg"
+    link.parent.mkdir()
+    os.link(original, link)
+
+    records = inventory([original, link, link.parent])
+
+    assert len(records) == 1
+    assert records[0].path == str(original)
+
+
 def test_inventory_cancel_raises_interrupted(tmp_path: Path) -> None:
     _touch(tmp_path / "a.jpg")
 

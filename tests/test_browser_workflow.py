@@ -1551,13 +1551,15 @@ def test_scan_setup_hints_and_exclusion_check(
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
 
-    # Two folders with parallel streams (the default) surface the
-    # no-cross-folder-dedup hint; turning streams off hides it again.
+    # All folders are compared together by default. Opting into separate
+    # scans surfaces the warning beside the paths.
     expect(page.locator("#crossFolderHint")).to_be_hidden()
     page.locator("#paths").fill(f"{folder_a}, {folder_b}")
-    expect(page.locator("#crossFolderHint")).to_be_visible()
+    expect(page.locator("#crossFolderHint")).to_be_hidden()
     page.locator("#optsToggle").click()
     # Chip checkboxes are visually hidden behind their label; force the toggle.
+    page.locator("#optParallel").check(force=True)
+    expect(page.locator("#crossFolderHint")).to_be_visible()
     page.locator("#optParallel").uncheck(force=True)
     expect(page.locator("#crossFolderHint")).to_be_hidden()
 
@@ -1885,24 +1887,43 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
 
-    # Parallel streams (the default): one progress line per folder, and no
-    # cross-folder exact group is found.
-    expect(page.locator("#streamProgress .stream-row")).to_have_count(2)
-    expect(page.locator("#countExact")).to_have_text("0")
+    # The default finds copies that exist only across selected folders.
+    expect(page.locator("#streamProgress")).to_be_hidden()
+    expect(page.locator("#countExact")).to_have_text("1")
     expect(page.locator("#countAll")).not_to_have_text("0")
+    page.locator('.tab[data-kind="exact"]').click()
+    expect(page.locator(".group-item")).to_have_count(1)
 
-    # Forcing one pool finds the cross-folder duplicate.
+    # Explicitly separate scans still keep each folder independent.
     page.locator("#scanCollapse").click()
     page.locator("#optsToggle").click()
     # Chip checkboxes are visually hidden behind their label; force the toggle.
-    page.locator("#optParallel").uncheck(force=True)
+    page.locator("#optParallel").check(force=True)
     page.locator("#btnScan").click()
-    expect(page.locator("#countExact")).to_have_text("1", timeout=20_000)
-    # One-pool scans have no per-folder stream panel.
-    expect(page.locator("#streamProgress")).to_be_hidden()
-    page.locator('.tab[data-kind="exact"]').click()
-    expect(page.locator(".group-item")).to_have_count(1)
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    expect(page.locator("#streamProgress .stream-row")).to_have_count(2)
+    expect(page.locator("#countExact")).to_have_text("0", timeout=20_000)
     assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_legacy_folder_default_migrates_and_explicit_choice_persists(
+    page, live_dedupe_server: str
+) -> None:
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.evaluate("""() => localStorage.setItem('dedupe.scanSettings.v1', JSON.stringify({
+        optParallel: true, threshold: '3', exclusions: '*.tmp', optVideos: false
+    }))""")
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#optsToggle").click()
+    expect(page.locator("#optParallel")).not_to_be_checked()
+    expect(page.locator("#threshold")).to_have_value("3")
+    expect(page.locator("#exclusions")).to_have_value("*.tmp")
+    expect(page.locator("#optVideos")).not_to_be_checked()
+
+    page.locator("#optParallel").check(force=True)
+    page.reload(wait_until="domcontentloaded")
+    expect(page.locator("#optParallel")).to_be_checked()
 
 
 @pytest.mark.e2e

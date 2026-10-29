@@ -406,6 +406,49 @@ def test_action_undo_validates_the_request(tmp_path: Path) -> None:
     assert stale.status_code == 409
 
 
+def test_default_scan_matches_within_and_across_folders(tmp_path: Path) -> None:
+    from PIL import Image
+
+    folder_a, folder_b = tmp_path / "a", tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    source = Path(__file__).parent / "fixtures" / "astronaut.png"
+    with Image.open(source) as image:
+        image.save(folder_a / "original.jpg", quality=95)
+        image.resize((256, 256)).save(folder_b / "resized.jpg", quality=85)
+    payload = (folder_a / "original.jpg").read_bytes()
+    (folder_a / "copy.jpg").write_bytes(payload)
+    (folder_b / "copy.jpg").write_bytes(payload)
+
+    app = create_app(review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "cache.sqlite3")
+    client = app.test_client()
+    response = client.post(
+        "/api/scan",
+        json={
+            "paths": [str(folder_a), str(folder_b)],
+            "find_low_resolution": False,
+            "random_review_count": 0,
+            "workers": 2,
+        },
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    )
+    assert response.status_code == 200
+    _wait_idle(client)
+    status = client.get("/api/status").get_json()
+    assert status["streams"] == []
+    exact = client.get("/api/groups?kind=exact").get_json()["groups"]
+    similar = client.get("/api/groups?kind=similar").get_json()["groups"]
+    assert len(exact) == len(similar) == 1
+    assert {m["path"] for m in exact[0]["members"]} == {
+        str(folder_a / "original.jpg"), str(folder_a / "copy.jpg"), str(folder_b / "copy.jpg")
+    }
+    assert {m["path"] for m in similar[0]["members"]} == {
+        str(folder_a / "original.jpg"), str(folder_a / "copy.jpg"),
+        str(folder_b / "copy.jpg"), str(folder_b / "resized.jpg")
+    }
+
+
 def test_parallel_scan_streams_report_per_folder_and_tag_groups(tmp_path: Path) -> None:
     data = b"identical-binary-payload-for-exact-match!!!"
     folder_a = tmp_path / "a"

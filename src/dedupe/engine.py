@@ -1254,6 +1254,9 @@ def run_scans_parallel(
     stream_progress: dict[int, ScanProgress] = {}
     all_files: list = []
     all_groups: list[DuplicateGroup] = []
+    seen_files: set[str] = set()
+    seen_groups: set[str] = set()
+    group_roots: dict[str, str] = {}
     stream_errors: list[str] = []
 
     def emit_aggregate() -> None:
@@ -1294,7 +1297,13 @@ def run_scans_parallel(
 
         def stream_group_cb(group: DuplicateGroup) -> None:
             with lock:
+                # Overlapping roots can discover the very same group. Keep its
+                # first source label and publish it only once for the review UI.
+                if group.id in group_roots:
+                    group.root = group_roots[group.id]
+                    return
                 group.root = str(root)
+                group_roots[group.id] = group.root
                 if on_group:
                     on_group(group)
 
@@ -1357,10 +1366,15 @@ def run_scans_parallel(
                     stream_errors.append(f"{root}: {exc}")
                     continue
                 with lock:
+                    for record in sub.files:
+                        if record.path not in seen_files:
+                            seen_files.add(record.path)
+                            all_files.append(record)
                     for group in sub.groups:
-                        group.root = str(root)
-                    all_files.extend(sub.files)
-                    all_groups.extend(sub.groups)
+                        if group.id not in seen_groups:
+                            seen_groups.add(group.id)
+                            group.root = group_roots.get(group.id, str(root))
+                            all_groups.append(group)
                     stream_errors.extend(sub.errors)
 
     review_groups: list[DuplicateGroup] = []

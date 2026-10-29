@@ -100,7 +100,11 @@ def inventory(
             continue
         if root_path.is_file():
             rec = _record_for_file(root_path, exts)
-            if rec:
+            if rec and (rec.device, rec.inode) not in seen_inodes:
+                # Explicit file roots share the same inventory as directories.
+                # Otherwise a repeated file, a hardlink, or a file plus its
+                # parent folder can appear twice and be compared with itself.
+                seen_inodes.add((rec.device, rec.inode))
                 records.append(rec)
                 found += 1
                 if progress:
@@ -303,6 +307,7 @@ def _record_for_file(
             device=int(st.st_dev),
             inode=int(st.st_ino),
             mtime_ns=int(st.st_mtime_ns),
+            ctime_ns=int(st.st_ctime_ns),
         )
     except OSError:
         return None

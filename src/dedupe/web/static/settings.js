@@ -120,7 +120,7 @@ const settingIds = [
 ];
 
 function saveScanSettings() {
-  const settings = {};
+  const settings = { folderScopeVersion: 2 };
   for (const id of settingIds) {
     const element = $(id);
     settings[id] = element.type === "checkbox" ? element.checked : element.value;
@@ -144,6 +144,10 @@ function restoreScanSettings() {
     const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     for (const id of settingIds) {
       if (!(id in settings)) continue;
+      // Older versions saved the automatic independent-folder default on every
+      // scan. Reset only that legacy choice so existing users also find matches
+      // across folders; future explicit choices and all other settings persist.
+      if (id === "optParallel" && settings.folderScopeVersion !== 2) continue;
       const element = $(id);
       if (element.type === "checkbox") element.checked = !!settings[id];
       else element.value = settings[id];
@@ -316,7 +320,7 @@ pathWrap.addEventListener("drop", (e) => {
 });
 
 // —— Cross-folder duplicate hint ——
-// Parallel streams (the default for several paths) never match files across
+// Opt-in independent streams never match files across
 // folders; say so next to the path field, where the user actually looks.
 function syncCrossFolderHint() {
   const hint = $("crossFolderHint");

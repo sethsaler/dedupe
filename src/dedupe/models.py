@@ -126,6 +126,9 @@ class FileRecord:
     error: str | None = None
     keeper_preference: int = 0
     capture_metadata: bool | None = None
+    # Change time catches in-place edits that preserve both size and mtime.
+    # Optional for older serialized review sessions and external callers.
+    ctime_ns: int | None = None
 
     @property
     def path_obj(self) -> Path:
@@ -167,6 +170,7 @@ class FileRecord:
             device=data.get("device"),
             inode=data.get("inode"),
             mtime_ns=data.get("mtime_ns"),
+            ctime_ns=data.get("ctime_ns"),
             width=data.get("width"),
             height=data.get("height"),
             sha256=data.get("sha256"),

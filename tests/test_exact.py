@@ -44,6 +44,39 @@ def test_exact_different_size_never_grouped(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("workers", [1, 2])
+def test_exact_matches_within_and_across_overlapping_roots(tmp_path, workers):
+    first = tmp_path / "first"
+    nested = first / "nested"
+    second = tmp_path / "second"
+    nested.mkdir(parents=True)
+    second.mkdir()
+    # Sharing the first 64 KiB is insufficient: only the complete copies match.
+    prefix = b"x" * (64 * 1024)
+    paths = [first / "original.jpg", nested / "copy.png", second / "renamed.jpg"]
+    for path in paths:
+        path.write_bytes(prefix + b"same tail")
+    (second / "different.jpg").write_bytes(prefix + b"diff tail")
+    records = inventory([first, nested, second, paths[0]])
+
+    groups = find_exact_groups(records, workers=workers)
+
+    assert len(records) == 4
+    assert [{record.path for record in group} for group in groups] == [
+        {str(path) for path in paths}
+    ]
+
+
+def test_repeated_file_and_folder_are_not_exact_duplicates(tmp_path):
+    path = tmp_path / "single.jpg"
+    path.write_bytes(b"only one physical file")
+
+    records = inventory([path, path, tmp_path])
+
+    assert len(records) == 1
+    assert find_exact_groups(records) == []
+
+
+@pytest.mark.parametrize("workers", [1, 2])
 @pytest.mark.parametrize("size", [65535, 65536, 65537])
 def test_exact_only_rereads_files_larger_than_prefix(tmp_path, monkeypatch, workers, size):
     import hashlib

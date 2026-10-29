@@ -27,7 +27,7 @@ The page loads with whatever the server already holds: nothing (the setup form p
 
 - **Folders…** opens the native folder picker; **Files…** opens a file picker for scanning specific files. Picked paths are appended to the field, deduplicated. Dragging text or a URI onto the field appends it the same way; dropping actual files or folders whose drag carries no text gets an error toast — "The browser can't read a dropped folder's location — use Folders… to pick it" — because the browser never exposes a dropped item's absolute path.
 - **Recent folders** appear as chips below the field; clicking one appends its path to the field (deduplicated), exactly like the native picker. Recent paths are remembered in the browser's local storage.
-- When the field holds two or more comma-separated paths and **Parallel streams** is on (the default for multiple folders), a hint under the field warns that the folders scan as parallel streams and duplicates *across* folders are not found, and suggests scanning the common parent folder or turning off Parallel streams. It appears and hides live as the paths are edited or the toggle changes.
+- Multiple folders are compared together by default. When the field holds two or more comma-separated paths and **Scan folders separately** is on, a hint under the field warns that duplicates *across* folders are not found and suggests turning that option off. It appears and hides live as the paths are edited or the toggle changes.
 - **Exclusions** — glob patterns, comma-separated — remove matching paths from the scan. A **Check** button beside the field walks the entered folders read-only with the real scan rules (hidden files skipped, excluded directories pruned, built-in patterns always applied), bounded at 100,000 visited entries, and reports each glob under the field as "✓ pattern — N matches" or "⚠ pattern — matches nothing (typo?)"; when the walk stops early the line says so and the counts are lower bounds. With an empty path field, Check asks for the folders first; with no globs entered it answers "No exclusion globs to check."
 - **Scan options** (collapsible): exact and similar detection on/off; no-person review, which reveals a person-detector dropdown (`opencv`, `photon`, `ensemble`); faces counting; low-resolution review with per-type pixel bounds; random review count; images/GIFs/videos toggles; hidden files; similarity thresholds (image default 6, video default 8); worker count; cache on/off. When the raw threshold slider sits between preset values, the Similarity preset select shows a disabled "Custom (raw slider)" entry instead of going blank. Scan option values are remembered in the browser's local storage and restored on the next visit, and the panel closes with a note saying so: "Scan settings and recent folders are remembered in this browser only."
 - **Dependency-gated options**: on page load, the server's startup dependency probe (reported in the status payload as `capabilities`) disables what cannot run, with the reason as a tooltip on the chip — Non-Human needs OpenCV with the bundled YuNet model or Photon, Count faces needs OpenCV. The person-detector dropdown disables its unavailable backends (`opencv` needs OpenCV and the YuNet model, `photon` the Moondream SDK, `ensemble` both) and switches to an available one when the saved choice is unavailable. A "Not installed: …" line inside the Detect group lists what is missing — including ffmpeg, which limits video similarity and thumbnails without disabling the Videos checkbox — and points to `dedupe doctor`.
@@ -42,7 +42,7 @@ Leaving the page without scanning records nothing. The server's auto-shutdown (c
 
 The scan becomes real the moment the server accepts it: a new scan id is issued, any previous preview tokens are voided, the previous result is held in reserve, and an empty result is installed so groups can stream into it. If a scan or an action is already running, the request is refused ("scan already running" / "file action already running") — one scan at a time.
 
-Several folders default to **parallel streams**: each folder scans as its own concurrent stream with its own progress bar, and no duplicates are found across folders. The scan-options toggle can force a one-pool scan, which finds duplicates across folders ([Scan pipeline](../foundations/scan-pipeline.md#one-pool-vs-parallel-streams)).
+Several folders default to one combined scan, finding matches both within and across the selected folders. **Scan folders separately** opts into independent concurrent streams, with a progress bar for each folder and no cross-folder matching ([Scan pipeline](../foundations/scan-pipeline.md#one-pool-vs-parallel-streams)). Older saved settings migrate to combined scanning once, preserving the other options; subsequent explicit folder-mode choices persist.
 
 ### While extended
 
@@ -60,7 +60,7 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 | --- | --- | --- |
 | Scan options (thresholds, backends, toggles) | Define what this scan detects; defaults per [Scan pipeline](../foundations/scan-pipeline.md). Remembered in local storage for next time. | Options cannot change mid-scan; the next scan picks them up. |
 | Exclusion globs | Remove matching paths before anything is read. | Same: fixed for the run. |
-| Parallel streams vs one pool | Decided at start (default: streams when more than one folder). Cross-folder duplicates only exist in one-pool mode. | Fixed for the run. |
+| Scan folders separately vs combined scan | Decided at start (default: combined). Cross-folder duplicates only exist in combined mode. | Fixed for the run. |
 | Saved review session present | A prior session is offered through the banner, not auto-loaded; a scan replaces it and saves the new one when complete. | No effect on the running scan. |
 
 ## Cancel and interrupt
@@ -95,10 +95,10 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 ## Edge cases
 
 - Scanning while results exist: the old results stay browsable only as a streaming placeholder — the empty result replaces them at scan start, and a failed scan restores them.
-- The same folder listed twice is scanned twice in streams mode (one stream per listed folder after de-duplication of identical resolved paths).
+- Identical resolved paths share one stream. Overlapping streams may examine the same file, but their combined inventory and identical review groups are shown only once.
 - A scan of a folder that yields zero media files completes normally with an empty group list.
 - Exclusion patterns are strings, still not validated at scan time — a typo simply matches nothing. The **Check** button beside the field is how a dead glob is caught before the scan starts.
-- Changing the similarity threshold does not affect cached groupings of unchanged files until the hashes are recomputed — thresholds compare hashes; the hashes themselves are cached.
+- Changing the similarity threshold regroups cached fingerprints on the next scan; unchanged files do not need to be fingerprinted again.
 
 ## Open questions and verification
 
@@ -106,3 +106,4 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 - The dependency gating (disabled chips, tooltips, the "Not installed: …" line) was read from `applyCapabilities` in `settings.js` and `detect_capabilities` in `app.py`; the drafting machine has every optional dependency installed, so the disabled state was not watched live. The cross-folder hint and the exclusion check are covered in a real browser by the e2e test `test_scan_setup_hints_and_exclusion_check`.
 
 Verified against the post-improvement working tree (2026-09 UX phase + the Delete All Exact Duplicates button, commit `a3f94a8`; pinned at `2a6cede` plus later improvement commits).
+Combined-folder defaults, the separate-scan warning, and saved-setting migration verified by browser regressions against the 2026-10-29 working tree.
