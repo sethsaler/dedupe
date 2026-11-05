@@ -313,24 +313,36 @@ $("btnMarkRemainingHuman").addEventListener("click", async () => {
 $("btnMarkDistinct").addEventListener("click", async () => {
   const current = state.allGroups.find((group) => group.id === state.currentId);
   if (!current || current.kind !== "similar") return;
-  const ok = await confirmModal({
-    title: "Mark as distinct?",
-    body: `<div class="review-sheet"><p>Mark these <strong>${current.member_count} files</strong> as distinct?</p><p>This group will stay hidden in future scans unless one of the files' contents changes.</p></div>`,
-    confirmLabel: "Mark as distinct",
-    danger: false,
-  });
-  if (ok !== true) return;
+  // One click: the decision is undoable from the toast, so no confirm step.
+  const groupId = current.id;
   try {
     await api("/api/similar/mark-distinct", {
       method: "POST",
-      body: JSON.stringify({ group_id: current.id, scan_id: state.scanId }),
+      body: JSON.stringify({ group_id: groupId, scan_id: state.scanId }),
     });
     await loadGroups();
-    toast("Similar files marked as distinct", "ok");
+    toast("Marked as distinct — this group won't come back", "ok", {
+      actionLabel: "Undo",
+      onAction: () => undoMarkDistinct(groupId),
+    });
   } catch (e) {
     toast(e.message, "error");
   }
 });
+
+async function undoMarkDistinct(groupId) {
+  try {
+    await api("/api/similar/restore-group", {
+      method: "POST",
+      body: JSON.stringify({ group_id: groupId, scan_id: state.scanId }),
+    });
+    await loadGroups();
+    await selectGroup(groupId);
+    toast("Back in review — these files can match again", "ok");
+  } catch (e) {
+    toast(e.message || "Could not undo", "error");
+  }
+}
 
 // —— Actions ——
 const MAX_PREVIEW_REFRESHES = 2;
