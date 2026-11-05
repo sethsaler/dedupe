@@ -110,6 +110,8 @@ function tileHtml(g, member, index, selected, rowFocused) {
   const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   const chip = member.path === g.suggested_keep
     ? '<span class="board-chip keeper" title="${escapeHtml(g.cleanup?.keeper_reason || "Ranked by resolution, size, date, and path")}">Suggested keeper</span>'
+    : g.match_basis === "video_version"
+      ? `<span class="board-chip uncertain">${escapeHtml(member.match_label || "Matching video section")}</span>`
     : member.match_label
       ? `<span class="board-chip uncertain" title="EmbeddingGemma cosine similarity with the suggested keeper: same subject, not necessarily the same shot">${escapeHtml(member.match_label)}</span>`
       : Number.isFinite(percent)
@@ -122,7 +124,7 @@ function tileHtml(g, member, index, selected, rowFocused) {
         <button class="thumb-wrap board-thumb" type="button" data-path="${escapeHtml(member.path)}" data-index="${index}"
                 aria-pressed="${remove}" aria-label="${escapeHtml(name)}: ${state_}" tabindex="${focused ? 0 : -1}">
           <img class="thumb-image" src="/api/thumbnail?path=${encodeURIComponent(member.path)}" alt="" loading="lazy" decoding="async" draggable="false" />
-          <span class="thumb-badge ${remove ? "remove" : "keep"}">${remove ? "Remove" : "Keep"}</span>
+          <span class="thumb-badge ${remove ? "remove" : "keep"}">${member.protected ? "Protected" : remove ? "Remove" : "Keep"}</span>
           ${member.media_type === "video" ? '<span class="board-video-badge">Video</span>' : ""}
         </button>
         <button class="board-expand" type="button" data-index="${index}" tabindex="-1" title="Open in the comparison view (Enter)" aria-label="Open ${escapeHtml(name)} in the comparison view">⤢</button>
@@ -340,6 +342,10 @@ async function flushSelection(id) {
 }
 
 function toggleMember(g, path) {
+  if ((g.members || []).some((member) => member.path === path && member.protected)) {
+    toast("This file is in a protected library");
+    return;
+  }
   const selected = new Set(g.selected_for_removal || []);
   if (selected.has(path)) {
     selected.delete(path);
@@ -355,7 +361,7 @@ function toggleMember(g, path) {
 }
 
 function keepOnly(g, path) {
-  setRowSelection(g, (g.members || []).map((member) => member.path).filter((other) => other !== path));
+  setRowSelection(g, (g.members || []).filter((member) => !member.protected).map((member) => member.path).filter((other) => other !== path));
 }
 
 // —— Whole-group decisions ——

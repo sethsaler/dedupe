@@ -243,7 +243,7 @@ function updateDetailMeta(g) {
     ? ` Suggested keeper: ${basename(keeper.path)} (${keeper.width && keeper.height ? `${keeper.width}×${keeper.height}, ` : ""}${formatBytes(keeper.size)}), ${g.cleanup?.keeper_reason || "ranked by resolution, size, date, and path"}.`
     : "";
   $("detailMeta").textContent =
-    `${formatBytes(g.reclaimable_bytes)} reclaimable · every member was directly verified against the suggested keeper.${keeperWhy}`;
+    `${formatBytes(g.reclaimable_bytes)} reclaimable · ${g.match_basis === "video_version" ? "matching video sections; inspect audio and edits" : "every member was directly verified against the suggested keeper"}.${keeperWhy}`;
 }
 
 // A fresh member list (another group, sort, or filter) starts on its first
@@ -554,7 +554,9 @@ function renderMembers(g, { append = false } = {}) {
       const focused = singleReview || i === state.memberFocus ? "focused" : "";
       const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);
       const fileName = basename(m.path);
-      const badge = isSel
+      const badge = m.protected
+        ? `<span class="thumb-badge keep">Protected library</span>`
+        : isSel
         ? `<span class="thumb-badge remove">Remove</span>`
         : isKeep
           ? `<span class="thumb-badge keep">Keep</span>`
@@ -562,7 +564,9 @@ function renderMembers(g, { append = false } = {}) {
       const similarity = m.similarity_percent == null ? null : Number(m.similarity_percent);
       // A rotated or mirrored copy is named so the turned thumbnail reads as intended.
       const turnedEvidence = m.orientation_label ? ` · ${m.orientation_label} copy` : "";
-      const similarityEvidence = m.match_label
+      const similarityEvidence = g.match_basis === "video_version"
+        ? "Matching video section; review the time ranges and audio before removing a version"
+        : m.match_label
         ? `${m.match_label} of suggested keeper · EmbeddingGemma meaning match, not a pixel match`
         : Number.isFinite(similarity)
           ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
@@ -593,7 +597,7 @@ function renderMembers(g, { append = false } = {}) {
       const mediaPreview = m.media_type === "video"
         ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${thumb}" ${singleReview ? 'controls src' : 'data-src'}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
         : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
-      const overlayDelete = isPagedIndependentReview(g) && !deleted
+      const overlayDelete = isPagedIndependentReview(g) && !deleted && !m.protected
         ? `<button class="thumb-delete delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click, undo from the toast" aria-label="Move ${escapeHtml(fileName)} to Trash">Trash</button>`
         : "";
       const preview = deleted
@@ -606,7 +610,9 @@ function renderMembers(g, { append = false } = {}) {
             </${singleReview && m.media_type === "video" ? "div" : "button"}>
             ${singleReview ? "" : overlayDelete}
           </div>`;
-      const actions = decisionReview
+      const actions = m.protected
+        ? `<span class="protected-label">Protected library</span><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
+        : decisionReview
         ? `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
               <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
               <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
@@ -816,6 +822,7 @@ function renderMembers(g, { append = false } = {}) {
 }
 
 async function reviewCandidate(group, path, remove) {
+  if (remove && group.members.some((m) => m.path === path && m.protected)) return toast("This file is in a protected library");
   if (!isDecisionReview(group)) return;
   if (state.reviewingCandidate) {
     // Held arrow keys repeat faster than the network round-trip: keep only

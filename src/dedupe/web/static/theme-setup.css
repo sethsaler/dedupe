@@ -712,3 +712,23 @@
   }
 }
 
+
+/* Reusable cleanup workflows */
+.saved-jobs, .protected-setup { padding: 12px 0; border-bottom: 1px solid var(--border, #d6d9df); }
+.saved-jobs summary, .protected-setup summary { cursor: pointer; font-weight: 600; }
+.job-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding-top: 12px; }
+.job-controls label { display: grid; gap: 5px; flex: 1 1 200px; }
+.job-controls input, .job-controls select { min-width: 0; width: 100%; }
+.protected-setup .field-row { padding-top: 12px; }
+.history-panel { padding: 20px; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section-heading h2 { margin: 0; font-size: 18px; }
+.history-entry { padding: 14px 0; border-bottom: 1px solid var(--border, #d6d9df); overflow-wrap: anywhere; }
+.history-entry-title, .history-pagination { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.history-files { font-size: 12px; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.protected-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+@media (max-width: 600px) {
+  .job-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .job-controls label { grid-column: 1 / -1; }
+  .history-panel { padding: 14px; }
+}

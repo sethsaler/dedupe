@@ -30,6 +30,7 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
     ? `${member.width}×${member.height}`
     : "—";
   const chips = [
+    member.protected ? '<span class="copy-chip keeping protected-label">Protected library</span>' : "",
     isSurvivor ? '<span class="copy-chip keeping">Keeping</span>' : "",
     isSuggested ? '<span class="copy-chip suggested">Suggested</span>' : "",
     isSelected ? '<span class="copy-chip removing">Will be removed</span>' : "",
@@ -72,7 +73,7 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
           <span class="copy-radio" aria-hidden="true"></span>Keep
         </button>
         <label class="copy-remove" title="Mark this copy for removal">
-          <input type="checkbox" class="sel-cb" data-path="${escapeHtml(member.path)}" ${isSelected ? "checked" : ""} />
+          <input type="checkbox" class="sel-cb" data-path="${escapeHtml(member.path)}" ${isSelected ? "checked" : ""} ${member.protected ? "disabled" : ""} />
           Remove
         </label>
         <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
@@ -172,7 +173,7 @@ function renderExactReview(g) {
   box.querySelectorAll(".copy-keep").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const keepPath = btn.dataset.path;
-      const picks = members.map((member) => member.path).filter((path) => path !== keepPath);
+      const picks = members.filter((member) => !member.protected).map((member) => member.path).filter((path) => path !== keepPath);
       try {
         afterSelection(await postSelection(g, picks));
       } catch (error) {

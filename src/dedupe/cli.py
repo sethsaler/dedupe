@@ -53,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="Scan folders for duplicates")
     scan.add_argument("--prefer-folder", action="append", default=[],
                       help="Prefer keeping files here (repeat in priority order)")
+    scan.add_argument("--protect-folder", action="append", default=[],
+                      help="Compare with this library but never remove or move its files")
+    scan.add_argument("--video-versions", action="store_true",
+                      help="Find video excerpts and soundtrack changes for manual review")
     scan.add_argument("paths", nargs="+", help="Folders or files to scan")
     scan.add_argument("--no-exact", action="store_true", help="Skip exact duplicate detection")
     scan.add_argument("--no-similar", action="store_true", help="Skip similar detection")
@@ -472,6 +476,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     scan_kwargs = {
         "preferred_folders": args.prefer_folder,
+        "protected_folders": args.protect_folder,
+        "video_versions": args.video_versions,
         "exact": not args.no_exact,
         "similar": not args.no_similar,
         "semantic": args.semantic or args.decider,

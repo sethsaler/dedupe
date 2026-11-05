@@ -8,6 +8,8 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 
 - **Exact duplicates** — size → partial hash → SHA-256
 - **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
+- **Protected libraries** — compare cleanup folders against an archive whose files cannot be removed or moved; use **Compare against a protected library** or repeat `--protect-folder PATH`
+- **Video clips & versions** — optional `--video-versions` pass finds overlapping footage and compares sampled audio; approximate matching ranges align pair playback, and these suggestions require manual selection
 - **Sets and semantic look-alikes** — optional layer that embeds images and GIFs with Google DeepMind's EmbeddingGemma 2, run through [DigUp](https://github.com/ARahim3/DigUp)'s installed helper (no extra Python deps). A **Sets** tab groups images of one subject or shoot for browsing and one-click trash, and near-identical crops, flips, and re-saves the hashes missed join Similar with a "% look-alike" score (never preselected): `dedupe scan --semantic`, or *Sets & look-alikes (DigUp)* in the scan options. Add `--decider` (or *Verify look-alikes with Decider*) to let Perplexity's Decider.app judge each candidate pair OpenCV can't confirm
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
@@ -17,11 +19,14 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media, hydrated in batched queries so large libraries start fast
 - **Thumbnail cache** — previews are kept on disk under `~/.cache/dedupe/thumbnails/` and pruned least-recently-used against a size budget
-- **Resumable reviews** — the last completed review and selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
+- **Saved cleanup jobs** — named folders/settings with separate resumable reviews and **Check new arrivals**, which focuses results on new or changed files while comparing against the full library
+- **Resumable reviews** — the last completed review and each saved job's selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
 - **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, a lightbox with metadata, keeper overlay/flicker comparison, full-resolution zoom, and in-place selection, keyboard navigation, native picker, dependency-gated scan options, light and dark themes (follows the OS), and isolate
 - **Preview-first actions** — Trash and quarantine always run preflight before their final confirmation; the review sheet shows category counts, affected bytes, and how long the preview stays valid
 - **Action receipts** — every executed action and dry-run preview writes a JSON receipt you can list, inspect, prune, and undo from the CLI
+- **Permanent History** — browse earlier cleanups, restore available files after restarting, and reconsider remembered **Not duplicates** pairs
+- **Interrupted cleanup recovery** — move intentions and outcomes are recorded durably as work proceeds; History reconciles interrupted batches without moving files and flags uncertain outcomes
 
 ## Requirements
 
@@ -91,10 +96,10 @@ dedupe ui
 **macOS double-click:** open `Dedupe.command` (repo root) or `launchers/Dedupe.command`.  
 That starts the local server, opens your browser, and keeps a Terminal window for logs / Ctrl+C.
 
-1. Paste a folder path (e.g. `~/Pictures`) or click **Choose…**
+1. Paste a folder path (e.g. `~/Pictures`) or choose **Folders…** / **Files…**. To clean an inbox against an archive, put the inbox here and add the archive under **Compare against a protected library**.
 2. Configure optional exclusion globs, then hit **Scan** — review groups stream into the sidebar
    With Exact detection enabled (the default), byte-identical copies appear on the **Exact** tab for review; nothing moves until you confirm. **Delete All Exact Duplicates** marks every copy except each group's keeper and opens the confirmation sheet; **Delete All Selected Exact Matches** (`a`) trashes only what you marked.
-3. Choose a category across the top. **Similar** opens on the **Similar board**: every similar group as one row, the suggested keeper first and each copy already marked Remove. Click a photo (or press `Space`) to keep it, press `n` on a row that isn't really a duplicate (undo from the row), then move every marked copy to Trash with one confirmed batch that a single Undo restores. **Compare ↗** opens any group in the side-by-side swipe review — **Same · Trash copy**, **Different · Keep both**, Skip, and Undo, with videos playing and scrubbing in either pane — and **▦ Board** comes back.
+3. Choose a category across the top. **Similar** opens on the **Similar board**: every similar group as one row, with the suggested keeper first. Standard similar copies start marked Remove; semantic look-alikes and video-version suggestions require manual selection. Click a photo (or press `Space`) to keep it, press `n` on a row that isn't really a duplicate (undo from the row), then move every marked copy to Trash with one confirmed batch that a single Undo restores. **Compare ↗** opens any group in the side-by-side swipe review — **Same · Trash copy**, **Different · Keep both**, Skip, and Undo, with videos playing and scrubbing in either pane — and **▦ Board** comes back.
 4. In **Non-Human**, **Faces**, and **All files**, switch between a resizable **Gallery** and single-file **Focus**. `←` / `→` navigate Focus without making a decision; Trash is immediate and undoable. Layout and preview size are remembered. **File details** reveals full paths, dates, and detection evidence.
 5. Review **Low-res** and **Random** one item at a time with `←` Delete and `→` Keep, including in the expanded lightbox. These decisions only stage removals; confirm with the Low-res + Random action to move selected files to `_Dedupe Quarantine`.
 6. Open **Filter & organize** for advanced filters (size, dimensions, path, faces) and bulk selection. A group matches when any of its files match. Bulk selection applies only to the groups currently shown.
@@ -118,6 +123,21 @@ resumed review before it is shown, and every file is still revalidated immediate
 action. The resumed-session banner reports how many files were pruned and why (no longer on
 disk, changed since the scan, outside the scanned folders, became a symbolic link, could not
 be read), with a "What was dropped?" list of up to 20 example files.
+
+For recurring work, open **Saved cleanup jobs**, enter a name, and **Save job**.
+Selecting a job restores its folders and settings; **Resume review** restores its
+own saved progress. **Check new arrivals** compares against all current files but
+shows duplicate groups involving new or changed files and new independent review
+candidates. It requires an initial completed scan. Changed job settings require
+another full scan before checking arrivals. **Delete job** removes only that job
+and its saved review, not media.
+
+Open **History** to browse completed or interrupted cleanups, even before loading
+a scan. **Restore files…** verifies the recorded destinations and original paths,
+then asks for confirmation. Unavailable or changed files can block restoration.
+**Reconsider this pair** removes a remembered Not duplicates decision so those
+files can match on the next scan. Recovery never guesses which file moved or
+automatically restores uncertain outcomes.
 
 Keyboard:
 
@@ -151,6 +171,12 @@ dedupe scan ~/Pictures ~/Downloads --json results.json
 
 # Exact only (faster)
 dedupe scan ~/Movies --no-similar
+
+# Clean Downloads against an archive that must remain untouched
+dedupe scan ~/Downloads --protect-folder ~/Pictures/Archive --ui
+
+# Include trimmed/offset video versions for manual review
+dedupe scan ~/Movies --video-versions --ui
 
 # Surface non-human media where OpenCV detected no person, for manual review
 dedupe scan ~/Pictures --find-no-person --ui
@@ -258,6 +284,7 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
 | Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
 | Similar videos | Ordered pHashes from direct ffmpeg timeline seeks, compared at normalized positions (default mean Hamming ≤ 8) |
+| Video clips & versions (opt-in) | Denser sampled footage alignment with approximate overlapping ranges and sampled-audio evidence; always manual review |
 | Low resolution | Display-oriented dimensions below the pre-scan megapixel bound for that media type (1 MP by default); candidates remain unselected until reviewed |
 | Random review | A fresh, unique sample of up to 50 scanned images, GIFs, and videos; Keep/Delete decisions are staged for the normal preview-and-confirm action flow |
 | No person detected | Offline OpenCV YuNet face (recall-first: 0.35, extra close-up scale, mirrored + tiled passes) + INRIA/Daimler HOG on images, representative GIF frames, and up to 16 direct-seek video frames with positive-evidence early exit |
@@ -321,6 +348,20 @@ matching for low false-positive rates before increasing recall.
 
 **Near-identical only** — same photo at different quality/export/resolution. Different poses of the same person (or burst frames that actually move) are filtered out by comparing pHash across image quadrants + center crop.
 
+**Video clips & versions** adds a separate review pass for trims, offsets, and
+soundtrack changes. It samples at most 96 video positions and requires at least
+two seconds and 80% coverage of the shorter video to agree. Matching ranges are
+approximate; short excerpts inside long recordings, heavy edits, and speed changes
+can be missed. Audio labels describe sampled audio, not a full soundtrack proof.
+Review both versions before selecting a removal. See the [cleanup workflow](docs/cleanup-workflow.md).
+
+Semantic analysis can be cancelled while waiting for its helper, and stalled
+requests time out. Completed batches remain cached. **Retry analysis using cached
+work**, in Scan quality, reruns the last scan settings and reuses completed work.
+Content-based embedding reuse covers renamed or moved files; cached neighbor
+comparisons avoid recomputing unchanged pairs when new files are added. A broader
+similarity threshold or changed model can require comparison work again.
+
 ### Parallelism & resource limits
 
 Hashing stages run in a **bounded** thread pool so large libraries don’t pin every core or thrash disk/RAM:
@@ -348,21 +389,28 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 | --- | --- |
 | `~/.cache/dedupe/hashes.sqlite3` | Scan cache: hashes, video fingerprints, and completed person checks |
 | `~/.cache/dedupe/thumbnails/` | Disk-backed grid and lightbox thumbnails, pruned least-recently-used against a 512 MB budget |
-| `~/.cache/dedupe/logs/` | Action receipts: `action-*.json` for executed actions, `preview-*.json` for dry-run previews |
+| `~/.cache/dedupe/logs/` | Action receipts, plus `.journal` move events until completion or reconciliation; preview receipts use `preview-*.json` |
 | `~/.local/state/dedupe/review-session.json` | The resumable review (result + selections); honours `XDG_STATE_HOME` |
+| `~/.local/state/dedupe/cleanup-jobs/` | Named job settings, scan baselines, and each job's saved review; honours `XDG_STATE_HOME` |
 
 `DEDUPE_THUMBNAIL_CACHE_DIR` relocates the thumbnail cache and
 `DEDUPE_THUMBNAIL_CACHE_BUDGET` sets its budget in bytes. Receipts are pruned with
-`dedupe receipts prune`; the other caches can be deleted safely and are rebuilt on demand.
+`dedupe receipts prune`. Thumbnail and analysis data can be regenerated, but
+deleting the hash database also forgets remembered Not duplicates and person-review
+decisions stored there.
+Keep receipts and pending `.journal` files while you may need to restore or inspect
+a cleanup. Deleting a receipt removes its History entry and restoration record.
 
 ## Safety
 
 - Never hard-deletes in the UI
 - Always leaves at least one file per group
 - File identity, scan-root containment, and exact hashes are revalidated before execution
+- Protected library files cannot be selected for removal or moved, including through isolate-move
 - File and directory symlinks are skipped by default
 - Executed actions receive unique atomic receipts under `~/.cache/dedupe/logs/`, named `action-<stamp>-<session>.json`; dry-run previews are written alongside them as `preview-<stamp>-<session>.json`
-- Quarantine receipts can restore files with `dedupe undo <receipt-id|path>`; Trash is restored through Finder
+- Trash and quarantine receipts can restore files through History or `dedupe undo <receipt-id|path>` when their destinations remain available; unresolved Trash locations require Finder
+- Destructive moves require a writable journal before starting; interrupted actions are reconciled from recorded intent and file identity, with uncertain outcomes left for inspection
 - `dedupe receipts list / show / prune` browses and trims that history without touching the files themselves
 - Mutating localhost API calls require a per-launch session token and current scan generation
 - Trash and quarantine execute only after a fresh preview and confirmation in the UI
@@ -400,10 +448,13 @@ src/dedupe/
   human_benchmark.py # labeled OpenCV / Photon comparison harness
   similarity_benchmark.py # labeled near-duplicate pair benchmark
   review_session.py  # atomic resumable review storage
+  jobs.py            # named cleanup jobs and new-arrival review
   parallel.py        # thread-pool map for hashing stages
   grouping.py        # ranking + smart select
   actions.py         # trash / quarantine
   receipts.py        # receipt discovery, inspection, and pruning
+  action_journal.py  # durable move events and interruption reconciliation
+  history.py         # past cleanups and remembered pair decisions
   cache.py           # SQLite hash cache
   cli.py             # `dedupe` entry point
   web/               # Flask UI, native picker, and media previews

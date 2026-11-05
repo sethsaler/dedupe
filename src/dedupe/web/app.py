@@ -42,6 +42,7 @@ from ..grouping import (
 )
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
+from ..jobs import JobStore, focus_new_arrivals
 from ..keep_decisions import update_keep_decisions
 from ..media_details import comparison_details
 from ..models import (
@@ -71,7 +72,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 27
+WEB_API_VERSION = 28
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
@@ -469,6 +470,10 @@ def create_app(
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     capabilities = detect_capabilities()
     lock = threading.RLock()
+    jobs = JobStore(review_session_path)
+    from ..action_journal import recover_interrupted_actions
+
+    recovered_actions = recover_interrupted_actions()
     # The server starts clean: the saved review is offered through the banner
     # (resume button), never auto-installed. A peek reads only the session's
     # identity, deferring the expensive per-file revalidation to an explicit
@@ -535,6 +540,8 @@ def create_app(
                 metadata = save_review_session(
                     result, review_session_path, deleted_files=state["deleted_files"]
                 )
+                if result.job_id:
+                    jobs.save_review(result, state["deleted_files"])
                 state["review_session"] = ReviewSessionLoad(
                     result=result,
                     path=Path(metadata["path"]),
@@ -624,6 +631,14 @@ def create_app(
                 for member, member_payload in zip(
                     group.members, payload["members"], strict=True
                 ):
+                    if group.match_basis == "video_version":
+                        member_payload["similarity_percent"] = None
+                        member_payload["match_label"] = (
+                            "Matching video excerpt" if group.match_details.get("relation") == "excerpt"
+                            else "Same footage · review audio"
+                        )
+                        member_payload["orientation_label"] = None
+                        continue
                     if group.match_basis == "semantic":
                         # Cosine of embeddings is not fingerprint agreement:
                         # label it apart and leave the percent empty so the
@@ -713,6 +728,12 @@ def create_app(
     def refresh_selected_count_locked() -> None:
         """Full refresh after post-scan selection/membership mutations."""
         result: ScanResult | None = state["result"]
+        if result is not None:
+            for group in result.groups:
+                protected = {m.path for m in group.members if m.protected}
+                group.selected_for_removal = [
+                    p for p in group.selected_for_removal if p not in protected
+                ]
         state["selected_count"] = (
             len(effective_selected_paths(result.groups)) if result is not None else 0
         )
@@ -797,6 +818,80 @@ def create_app(
     def index():
         return render_template("index.html", csrf_token=csrf_token)
 
+    @app.get("/api/jobs")
+    def api_jobs():
+        return jsonify({"jobs": jobs.list()})
+
+    @app.post("/api/jobs")
+    def api_save_job():
+        data = request.get_json(silent=True) or {}
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "Cleanup jobs are locked during active work"}), 409
+            try:
+                saved = jobs.save(data.get("name"), data.get("settings"), data.get("id"))
+            except (OSError, ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify(saved)
+
+    @app.post("/api/jobs/delete")
+    def api_delete_job():
+        data = request.get_json(silent=True) or {}
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "Cleanup jobs are locked during active work"}), 409
+            try:
+                jobs.remove(data.get("id"))
+                if state["result"] and state["result"].job_id == data.get("id"):
+                    state["result"].job_id = None
+                    state["result"].scan_settings.pop("job_id", None)
+                    persist_result()
+                else:
+                    saved = load_review_session(review_session_path)
+                    if saved.result and saved.result.job_id == data.get("id"):
+                        saved.result.job_id = None
+                        saved.result.scan_settings.pop("job_id", None)
+                        save_review_session(saved.result, review_session_path, saved.deleted_files)
+                        if state["result"] is None:
+                            state["review_session"] = peek_review_session(review_session_path)
+                if (state.get("last_scan_settings") or {}).get("job_id") == data.get("id"):
+                    state["last_scan_settings"].pop("job_id", None)
+            except (OSError, ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True})
+
+    @app.get("/api/history")
+    def api_history():
+        from ..history import list_history
+
+        with lock:
+            if state["acting"]:
+                return jsonify({"error": "Wait for the current file action to finish"}), 409
+            return jsonify(list_history(
+                cache_path=app.config["DEDUPE_CACHE_PATH"],
+                limit=request.args.get("limit", 50, type=int),
+                offset=request.args.get("offset", 0, type=int),
+            ))
+
+    @app.post("/api/history/reconsider")
+    def api_history_reconsider():
+        from ..history import reconsider_distinct_decision
+
+        data = request.get_json(silent=True) or {}
+        with lock:
+            if state["scanning"] or state["acting"]:
+                return jsonify({"error": "History is locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            try:
+                outcome = reconsider_distinct_decision(
+                    data.get("path_a"), data.get("path_b"),
+                    cache_path=app.config["DEDUPE_CACHE_PATH"],
+                )
+            except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify(outcome)
+
     @app.get("/favicon.ico")
     def favicon():
         svg = (
@@ -835,6 +930,8 @@ def create_app(
             "capabilities": capabilities,
             "keep_decisions_error": state["keep_decisions_error"],
             "trash_undo_cleared": state["trash_undo_cleared"],
+            "recovered_actions": len(recovered_actions),
+            "scan_settings": state.get("last_scan_settings") or (result.scan_settings if result else {}),
             "system": {
                 "cpu_count": cpu,
                 "auto_workers": resolve_workers(None),
@@ -977,7 +1074,15 @@ def create_app(
         with lock:
             if state["scanning"] or state["acting"]:
                 return jsonify({"error": "review is locked during active work"}), 409
-            report = load_review_session(review_session_path)
+            if state["persist_dirty"] and not persist_result():
+                return jsonify({"error": "Could not save the current review before switching"}), 400
+            data = request.get_json(silent=True) or {}
+            try:
+                source = (jobs.session_path(data["job_id"])
+                          if data.get("job_id") is not None else review_session_path)
+                report = load_review_session(source)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
             state["review_session"] = report
             if report.result is None:
                 return jsonify(report.metadata()), 404
@@ -986,6 +1091,7 @@ def create_app(
             drop_marked_distinct_groups(report.result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(report.result)
             state["result"] = report.result
+            state["last_scan_settings"] = report.result.scan_settings
             state["scan_id"] = secrets.token_hex(12)
             state["deleted_files"] = dict(report.deleted_files)
             state["groups_version"] += 1
@@ -1092,12 +1198,36 @@ def create_app(
     @app.post("/api/scan")
     def api_scan():
         data = request.get_json(silent=True) or {}
+        job = None
+        if data.get("job_id") is not None:
+            try:
+                job = jobs.get(data["job_id"])
+            except (OSError, ValueError) as exc:
+                return jsonify({"error": f"Could not load cleanup job: {exc}"}), 400
+            data = {**job["settings"], **data}
         paths = data.get("paths") or []
         if isinstance(paths, str):
             paths = [paths]
         paths = [p for p in paths if p and str(p).strip()]
         if not paths:
             return jsonify({"error": "paths required"}), 400
+
+        protected_folders = data.get("protected_folders") or []
+        if (not isinstance(protected_folders, list)
+                or any(not isinstance(p, str) or not p.strip() for p in protected_folders)):
+            return jsonify({"error": "protected_folders must be a list of folder paths"}), 400
+        protected_folders = [str(Path(p).expanduser().resolve()) for p in protected_folders]
+        if any(not Path(p).is_dir() for p in protected_folders):
+            return jsonify({"error": "Each protected library must be an existing folder"}), 400
+        if protected_folders and data.get("parallel_streams"):
+            return jsonify({"error": "Protected libraries require comparing folders together"}), 400
+        if data.get("new_only") and (job is None or "baseline" not in job):
+            return jsonify({"error": "Run this saved job once before checking new arrivals"}), 400
+        if data.get("new_only"):
+            settings = {key: value for key, value in data.items()
+                        if key not in {"job_id", "new_only", "scan_id", "retry"}}
+            if settings != job["settings"]:
+                return jsonify({"error": "Settings changed; run a full scan before checking new arrivals"}), 400
 
         preferred_folders = data.get("preferred_folders") or []
         if (not isinstance(preferred_folders, list)
@@ -1117,6 +1247,15 @@ def create_app(
                 return jsonify({"error": "scan already running"}), 409
             if state["acting"]:
                 return jsonify({"error": "file action already running"}), 409
+            if state["persist_dirty"] and not persist_result():
+                return jsonify({"error": "Could not save the current review before scanning"}), 400
+            if job and not data.get("new_only"):
+                try:
+                    jobs.save(job["name"], data, job["id"])
+                    job = jobs.get(job["id"])
+                except (OSError, ValueError) as exc:
+                    return jsonify({"error": f"Could not save cleanup job: {exc}"}), 400
+            state["last_scan_settings"] = dict(data)
             scan_id = secrets.token_hex(12)
             previous_result = state["result"]
             previous_deleted = dict(state["deleted_files"])
@@ -1131,7 +1270,10 @@ def create_app(
             state["trash_undo_cleared"] = len(previous_deleted)
             state["progress"] = ScanProgress(phase="starting", message="Starting…")
             # Empty result so the UI can stream groups as they appear.
-            state["result"] = ScanResult(roots=resolved_roots, files=[], groups=[])
+            state["result"] = ScanResult(
+                roots=list(dict.fromkeys([*resolved_roots, *protected_folders])),
+                files=[], groups=[], protected_folders=protected_folders,
+            )
             state["preview_tokens"] = {}
             state["groups_version"] = state.get("groups_version", 0) + 1
             state["paths_version"] += 1
@@ -1169,6 +1311,8 @@ def create_app(
 
                 def on_group(group) -> None:
                     with lock:
+                        if data.get("new_only"):
+                            return  # Publish only the focused result after inventory completes.
                         result: ScanResult | None = state["result"]
                         if result is None or state["scan_id"] != scan_id:
                             return
@@ -1231,6 +1375,8 @@ def create_app(
 
                 scan_kwargs = {
                     "preferred_folders": preferred_folders,
+                    "protected_folders": protected_folders,
+                    "video_versions": bool(data.get("video_versions", False)),
                     "exact": bool(data.get("exact", True)),
                     "similar": bool(data.get("similar", True)),
                     "semantic": bool(data.get("semantic", False)),
@@ -1290,6 +1436,15 @@ def create_app(
                     if not result.roots and result.errors:
                         raise RuntimeError("; ".join(result.errors))
                     ensure_all_files_groups(result)
+                    result.protected_folders = protected_folders
+                    result.job_id = job["id"] if job else None
+                    result.scan_settings = {
+                        key: value for key, value in data.items()
+                        if key not in {"scan_id", "retry"}
+                    }
+                    arrivals = None
+                    if data.get("new_only"):
+                        arrivals = focus_new_arrivals(result, job["baseline"])
                     state["result"] = result
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
@@ -1302,7 +1457,8 @@ def create_app(
                         files_found=len(result.files),
                         groups_found=len(result.groups),
                         message=(
-                            f"Done — {result.exact_groups} exact, "
+                            (f"{arrivals} new or changed files — " if arrivals is not None else "Done — ")
+                            + f"{result.exact_groups} exact, "
                             f"{result.similar_groups} similar, "
                             f"{result.low_resolution_files} low-resolution, "
                             f"{result.random_review_files} random review, "
@@ -1311,7 +1467,10 @@ def create_app(
                         elapsed_seconds=result.diagnostics.total_duration_seconds,
                         eta_seconds=0.0,
                     )
-                    persist_result()
+                    if not persist_result():
+                        raise OSError(state["last_error"])
+                    if job:
+                        jobs.finish_scan(result)
                     state["scanning"] = False
                     state["cancel_event"] = None
                     state["events"].notify_all()
@@ -1444,6 +1603,7 @@ def create_app(
             for g in result.groups:
                 if g.id == group_id:
                     member_paths = {m.path for m in g.members}
+                    protected_paths = {m.path for m in g.members if m.protected}
                     decision_path = data.get("decision_path")
                     if decision_path is not None:
                         decision_path = str(decision_path)
@@ -1453,6 +1613,8 @@ def create_app(
                         ):
                             return jsonify({"error": "candidate decision is not in this group"}), 400
                         remove = data.get("decision_remove")
+                        if remove and decision_path in protected_paths:
+                            return jsonify({"error": "This file is in a protected library"}), 400
                         if not isinstance(remove, bool):
                             return jsonify({"error": "decision_remove must be a boolean"}), 400
                         # The newest arrow-key decision wins in every overlapping
@@ -1490,7 +1652,7 @@ def create_app(
                         payload = group_payload(g)
                         schedule_persist()
                         return jsonify(payload)
-                    picks = [p for p in selected if p in member_paths]
+                    picks = [p for p in selected if p in member_paths and p not in protected_paths]
                     # Duplicate groups retain one file; independent review candidates may remove all.
                     if (
                         g.policy == ReviewPolicy.KEEP_ONE
@@ -1615,6 +1777,8 @@ def create_app(
             )
             if group is None or path not in {member.path for member in group.members}:
                 return jsonify({"error": "review candidate not found"}), 404
+            if any(m.path == path and m.protected for m in group.members):
+                return jsonify({"error": "This file is in a protected library"}), 400
             if path in state["deleted_files"]:
                 return jsonify(group_payload(group))
             state["acting"] = True

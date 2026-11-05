@@ -2322,7 +2322,7 @@ def test_expired_preview_token_reports_expiry_and_refuses_to_execute(
     assert not quarantine.exists()
 
     # Re-previewing issues a usable token, so the user only re-confirms the numbers.
-    monkeypatch.undo()
+    monkeypatch.setattr(web_app, "PREVIEW_TOKEN_TTL_SECONDS", 600)
     refreshed = client.post(
         "/api/action", json={**base, "dry_run": True}, headers=headers
     ).get_json()

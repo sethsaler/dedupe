@@ -33,7 +33,14 @@
       <div class="top-stats" id="topStats">
         <span class="stat-chip muted-chip">No scan yet</span>
       </div>
+      <button type="button" class="btn ghost" id="btnHistory" aria-expanded="false" aria-controls="historyPanel">History</button>
     </header>
+
+    <section id="historyPanel" class="scan-panel history-panel" hidden aria-label="Cleanup history">
+      <div class="section-heading"><h2>Cleanup history</h2><button type="button" class="btn ghost" id="btnCloseHistory">Close</button></div>
+      <p class="muted">Restore previous cleanups or reconsider files marked as different.</p>
+      <div id="historyList" aria-live="polite"></div>
+    </section>
 
     <section class="scan-panel" id="scanPanel" tabindex="-1">
       <button type="button" class="scan-collapse" id="scanCollapse" aria-expanded="true" aria-controls="scanMain">
@@ -42,6 +49,18 @@
         <span class="scan-collapse-paths" id="scanCollapsePaths"></span>
       </button>
       <div class="scan-main" id="scanMain">
+        <details class="saved-jobs" id="savedJobs">
+          <summary>Saved cleanup jobs</summary>
+          <div class="job-controls">
+            <label for="cleanupJob">Job<select id="cleanupJob"><option value="">New cleanup</option></select></label>
+            <label for="cleanupJobName">Name<input id="cleanupJobName" type="text" maxlength="100" placeholder="Downloads against archive" /></label>
+            <button class="btn ghost" type="button" id="btnSaveJob">Save job</button>
+            <button class="btn ghost" type="button" id="btnResumeJob" disabled>Resume review</button>
+            <button class="btn ghost" type="button" id="btnNewArrivals" disabled>Check new arrivals</button>
+            <button class="btn ghost" type="button" id="btnDeleteJob" disabled>Delete job</button>
+          </div>
+          <p class="thresh-hint" id="jobHint">Save folders and settings together. Each job keeps its own review progress.</p>
+        </details>
         <div class="field-row path-row">
           <label for="paths">Folders or files to scan</label>
           <div class="path-input-wrap">
@@ -65,6 +84,14 @@
             Turn it off in Options to compare all selected folders together.
           </p>
         </div>
+
+        <details class="protected-setup">
+          <summary>Compare against a protected library</summary>
+          <label class="field-row" for="protectedFolders">Protected library folders (one per line)
+            <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive"></textarea>
+          </label>
+          <p class="thresh-hint">These folders are included in the comparison. Their files cannot be removed or moved; only the cleanup folders above can change.</p>
+        </details>
 
         <div class="field-row">
           <label for="scanPreset">Scan goal</label>
@@ -94,6 +121,7 @@
             <span class="opt-label">Detect</span>
             <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check" id="optSimilarWrap"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
+            <label class="chip-check" id="optVideoVersionsWrap"><input type="checkbox" id="optVideoVersions" /><span>Video clips &amp; versions</span></label>
             <label class="chip-check" id="optSemanticWrap" title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp"><input type="checkbox" id="optSemantic" /><span>Sets &amp; look-alikes (DigUp)</span></label>
             <label class="chip-check" id="optNoHumansWrap"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
@@ -221,6 +249,7 @@
         <div class="quality-warning" id="scanQualityWarning" hidden role="alert"></div>
         <div class="quality-grid" id="scanQualityGrid"></div>
         <ul class="quality-warnings" id="scanQualityWarnings"></ul>
+        <button class="btn ghost" type="button" id="btnRetryAnalysis">Retry analysis using cached work</button>
       </details>
     </section>
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -17,10 +18,13 @@ from dedupe.models import FileRecord, MediaType
 class FakeDecider:
     """Serves /health, /v1/models and /v1/decisions; answers ``same`` = probability."""
 
-    def __init__(self, probability: float = 0.9, images: bool = True) -> None:
+    def __init__(
+        self, probability: float = 0.9, images: bool = True, *, stall: bool = False,
+    ) -> None:
         self.probability = probability
         self.images = images
         self.requests: list[dict] = []
+        self.release = threading.Event()
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -50,6 +54,14 @@ class FakeDecider:
             def do_POST(self) -> None:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fake.requests.append(request)
+                if stall:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    self.wfile.write(b"{")
+                    self.wfile.flush()
+                    fake.release.wait(10)
+                    return
                 same = fake.probability
                 self._reply({"answers": {"copy": {"type": "choice", "probabilities": {
                     "same": same, "burst": (1 - same) / 2, "different": (1 - same) / 2,
@@ -60,6 +72,7 @@ class FakeDecider:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def close(self) -> None:
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -144,3 +157,44 @@ def test_availability_needs_a_ready_image_model(monkeypatch, tmp_path: Path) -> 
     assert not decider_available()
     with pytest.raises(RuntimeError, match="Decider is not running"):
         DeciderJudge(use_cache=False)
+
+
+def test_cancel_stops_waiting_for_a_partial_decider_reply(tmp_path: Path) -> None:
+    server = FakeDecider(stall=True)
+    cancelled = threading.Event()
+    timer = threading.Timer(0.2, cancelled.set)
+    a = _record(tmp_path / "a.png", (200, 20, 20))
+    b = _record(tmp_path / "b.png", (20, 200, 20))
+    try:
+        with DeciderJudge(server.url, use_cache=False, cancelled=cancelled.is_set) as judge:
+            timer.start()
+            started = time.monotonic()
+            with pytest.raises(InterruptedError, match="scan cancelled"):
+                judge(a, b)
+            assert time.monotonic() - started < 1
+            assert judge.failure is None
+            assert not any(t.name == "dedupe-decider-request" for t in threading.enumerate())
+    finally:
+        timer.cancel()
+        server.close()
+
+
+def test_decider_deadline_falls_back_and_does_not_repeat_the_request(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from dedupe import decider
+
+    server = FakeDecider(stall=True)
+    monkeypatch.setattr(decider, "REQUEST_TIMEOUT", 0.15)
+    a = _record(tmp_path / "a.png", (200, 20, 20))
+    b = _record(tmp_path / "b.png", (20, 200, 20))
+    try:
+        with DeciderJudge(server.url, use_cache=False) as judge:
+            started = time.monotonic()
+            assert judge(a, b) is None
+            assert time.monotonic() - started < 1
+            assert judge.failure and "stopped" in judge.failure
+            assert judge(a, b) is None
+            assert len(server.requests) == 1
+    finally:
+        server.close()

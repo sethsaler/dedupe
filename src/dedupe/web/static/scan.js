@@ -13,6 +13,9 @@ import { $, toast } from "./util.js";
 
 // —— Scan ——
 $("btnScan").addEventListener("click", startScan);
+$("btnRetryAnalysis").addEventListener("click", () => {
+  if (state.lastScanSettings) startScan({ ...state.lastScanSettings, new_only: false });
+});
 $("btnCancelScan").addEventListener("click", async () => {
   try {
     await api("/api/scan/cancel", {
@@ -29,8 +32,50 @@ $("paths").addEventListener("keydown", (e) => {
   if (e.key === "Enter") startScan();
 });
 
-async function startScan() {
-  const raw = $("paths").value.trim();
+export function collectScanSettings() {
+  const workersRaw = Number($("workers").value);
+  const lowResolutionBounds = {
+    images: lowResolutionMaxPixels("lowResolutionImageMaxMp"),
+    gifs: lowResolutionMaxPixels("lowResolutionGifMaxMp"),
+    videos: lowResolutionMaxPixels("lowResolutionVideoMaxMp"),
+  };
+  return {
+        paths: $("paths").value.split(",").map((s) => s.trim()).filter(Boolean),
+        preferred_folders: $("preferredFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
+        protected_folders: $("protectedFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
+        video_versions: $("optVideoVersions").checked,
+        exact: $("optExact").checked,
+        similar: $("optSimilar").checked,
+        semantic: $("optSemantic").checked,
+        decider: $("optSemantic").checked && $("optDecider").checked,
+        semantic_threshold: Number($("semanticSetThreshold").value) / 100,
+        semantic_duplicate_threshold: Number($("semanticDuplicateThreshold").value) / 100,
+        find_no_humans: $("optNoHumans").checked,
+        count_faces: $("optCountFaces").checked,
+        find_low_resolution: $("optLowResolution").checked,
+        low_resolution_images: $("optLowResolutionImages").checked,
+        low_resolution_gifs: $("optLowResolutionGifs").checked,
+        low_resolution_videos: $("optLowResolutionVideos").checked,
+        low_resolution_image_max_pixels: lowResolutionBounds.images,
+        low_resolution_gif_max_pixels: lowResolutionBounds.gifs,
+        low_resolution_video_max_pixels: lowResolutionBounds.videos,
+        random_review_count: $("optRandomReview").checked ? 50 : 0,
+        human_backend: $("humanBackend") ? $("humanBackend").value : "opencv",
+        include_images: $("optImages").checked,
+        include_gifs: $("optGifs").checked,
+        include_videos: $("optVideos").checked,
+        threshold: Number($("threshold").value),
+        parallel_streams: $("optParallel").checked,
+        // 0 / Auto → null so backend uses resolve_workers auto
+        workers: workersRaw > 0 ? workersRaw : null,
+        exclusions: $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean),
+  };
+}
+
+export async function startScan(overrides = {}) {
+  if (overrides instanceof Event) overrides = {};
+  const settings = { ...collectScanSettings(), job_id: state.selectedJobId || null, ...overrides };
+  const raw = (settings.paths || []).join(", ");
   if (!raw) {
     toast("Enter at least one folder path");
     $("paths").focus();
@@ -81,37 +126,11 @@ async function startScan() {
     state.touchedGroups.clear();
     rememberFocusedGroup(null);
     resetGroupListWindow();
-    const workersRaw = Number($("workers").value);
+    state.lastScanSettings = settings;
     const started = await api("/api/scan", {
       method: "POST",
       body: JSON.stringify({
-        paths,
-        preferred_folders: $("preferredFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
-        exact: $("optExact").checked,
-        similar: $("optSimilar").checked,
-        semantic: $("optSemantic").checked,
-        decider: $("optSemantic").checked && $("optDecider").checked,
-        semantic_threshold: Number($("semanticSetThreshold").value) / 100,
-        semantic_duplicate_threshold: Number($("semanticDuplicateThreshold").value) / 100,
-        find_no_humans: $("optNoHumans").checked,
-        count_faces: $("optCountFaces").checked,
-        find_low_resolution: $("optLowResolution").checked,
-        low_resolution_images: $("optLowResolutionImages").checked,
-        low_resolution_gifs: $("optLowResolutionGifs").checked,
-        low_resolution_videos: $("optLowResolutionVideos").checked,
-        low_resolution_image_max_pixels: lowResolutionBounds.images,
-        low_resolution_gif_max_pixels: lowResolutionBounds.gifs,
-        low_resolution_video_max_pixels: lowResolutionBounds.videos,
-        random_review_count: $("optRandomReview").checked ? 50 : 0,
-        human_backend: $("humanBackend") ? $("humanBackend").value : "opencv",
-        include_images: $("optImages").checked,
-        include_gifs: $("optGifs").checked,
-        include_videos: $("optVideos").checked,
-        threshold: Number($("threshold").value),
-        parallel_streams: $("optParallel").checked,
-        // 0 / Auto → null so backend uses resolve_workers auto
-        workers: workersRaw > 0 ? workersRaw : null,
-        exclusions: $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean),
+        ...settings,
       }),
     });
     state.scanId = started.scan_id || state.scanId;
@@ -244,7 +263,14 @@ $("btnRescanSession").addEventListener("click", () => {
   $("paths").value = roots.join(", ");
   $("scanPanel").classList.remove("collapsed");
   $("scanCollapse").setAttribute("aria-expanded", "true");
-  startScan();
+  const saved = state.reviewSession.scan_settings || {};
+  startScan({
+    ...saved,
+    paths: saved.paths?.length ? saved.paths : roots,
+    protected_folders: state.reviewSession.protected_folders || [],
+    job_id: state.reviewSession.job_id || null,
+    new_only: false,
+  });
 });
 
 $("btnResumeSession").addEventListener("click", async () => {
@@ -279,5 +305,3 @@ $("btnDiscardSession").addEventListener("click", async () => {
     toast("Saved review discarded", "ok");
   } catch (error) { toast(error.message, "error"); }
 });
-
-export { startScan };

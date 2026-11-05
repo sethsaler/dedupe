@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -15,9 +16,12 @@ from dedupe.grouping import apply_smart_select, apply_smart_select_all
 from dedupe.models import FileRecord, GroupKind, MediaType, ScanResult, SmartRule
 from dedupe.semantic import (
     HELPER_ENV,
+    EmbeddingCache,
     EmbeddingWorker,
+    embed_records,
     find_digup_helper,
     find_semantic_groups,
+    semantic_neighbors,
 )
 from dedupe.web.app import create_app
 
@@ -368,3 +372,169 @@ def test_scan_form_decider_needs_look_alikes(tmp_path: Path, monkeypatch) -> Non
                 break
             time.sleep(0.01)
         assert seen[-1]["decider"] is semantic
+
+
+def _script_helper(tmp_path: Path, source: str) -> Path:
+    script = tmp_path / "worker.py"
+    script.write_text(source)
+    helper = tmp_path / "worker"
+    helper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    helper.chmod(0o755)
+    return helper
+
+
+def test_stalled_worker_startup_has_a_deadline_and_is_reaped(tmp_path: Path) -> None:
+    pid_path = tmp_path / "pid"
+    helper = _script_helper(tmp_path, f"""
+import os, time
+open({str(pid_path)!r}, 'w').write(str(os.getpid()))
+time.sleep(30)
+""")
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="retry the deep scan"):
+        EmbeddingWorker(str(helper), startup_timeout=0.2)
+    assert time.monotonic() - started < 2
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_path.read_text()), 0)
+
+
+def test_cancel_interrupts_a_partial_helper_reply_and_reaps_process(tmp_path: Path) -> None:
+    helper = _script_helper(tmp_path, """
+import json, sys, time
+print(json.dumps({'ready': True}), flush=True)
+sys.stdin.readline()
+print('{', end='', flush=True)
+time.sleep(30)
+""")
+    cancelled = threading.Event()
+    with EmbeddingWorker(str(helper), cancelled=cancelled.is_set) as worker:
+        timer = threading.Timer(0.1, cancelled.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(InterruptedError, match="scan cancelled"):
+                worker.embed_images(["unused.jpg"])
+            assert time.monotonic() - started < 1
+            assert worker._process.poll() is not None
+        finally:
+            timer.cancel()
+
+
+def test_later_helper_failure_preserves_completed_batches_for_retry(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from dedupe import semantic
+
+    helper = _script_helper(tmp_path, FAKE_HELPER.replace(
+        'floats, errors = [], []',
+        'if request["id"] == 2:\n        import time\n        time.sleep(30)\n'
+        '    floats, errors = [], []',
+    ))
+    monkeypatch.setenv("FAKE_DIGUP_LOG", str(tmp_path / "log"))
+    monkeypatch.setattr(semantic, "REQUEST_BATCH", 1)
+    monkeypatch.setattr(semantic, "REQUEST_TIMEOUT", 0.15)
+    records = _records(_media(tmp_path / "media"))
+    cache = tmp_path / "cache.db"
+    vectors, errors = embed_records(records, helper=str(helper), cache_path=cache)
+    assert len(vectors) == 1 and len(errors) == 2
+    helper = _script_helper(tmp_path, FAKE_HELPER)
+    vectors, errors = embed_records(records, helper=str(helper), cache_path=cache)
+    assert len(vectors) == 3 and errors == []
+    assert len((tmp_path / "log").read_text().splitlines()) == 3
+
+
+def test_embeddings_follow_renames_and_copies(
+    tmp_path: Path, fake_helper: Path,
+) -> None:
+    root = _media(tmp_path / "media")
+    cache = tmp_path / "cache.db"
+    embed_records(_records(root), cache_path=cache)
+    (root / "beach.jpg").rename(root / "renamed.jpg")
+    (root / "copied.jpg").write_bytes((root / "forest.png").read_bytes())
+    vectors, errors = embed_records(_records(root), cache_path=cache)
+    assert len(vectors) == 4 and errors == []
+    assert len(fake_helper.read_text().splitlines()) == 3
+
+
+def test_embedding_cache_invalidates_content_change_with_preserved_size_and_mtime(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "a.jpg"
+    path.write_bytes(b"aaa")
+    stat = path.stat()
+    record = _records(tmp_path)[0]
+    cache = EmbeddingCache(tmp_path / "cache.db")
+    try:
+        cache.put_many([(record, b"vector")], "model")
+        assert cache.get_many([record], "model") == {str(path): b"vector"}
+        path.write_bytes(b"bbb")
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert cache.get_many([record], "model") == {}
+    finally:
+        cache.close()
+
+
+def test_incremental_neighbors_match_full_scan_and_only_compare_new_vectors(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import numpy as np
+
+    from dedupe import semantic
+
+    rng = np.random.default_rng(57)
+    vectors = {f"p{i}": rng.random(12).astype("<f4").tobytes() for i in range(6)}
+    cache = tmp_path / "cache.db"
+    work: list[int] = []
+    real = semantic._cosine_block
+
+    def measured(rows, matrix):
+        work.append(len(rows) * len(matrix))
+        return real(rows, matrix)
+
+    monkeypatch.setattr(semantic, "_cosine_block", measured)
+
+    def check(current, expected_work, threshold=0.7, same_set=None):
+        full = semantic_neighbors(current, threshold, same_set=same_set)
+        work.clear()
+        result = semantic_neighbors(current, threshold, same_set=same_set,
+                                    use_cache=True, cache_path=cache)
+        assert result[0] == full[0]
+        assert result[1] == pytest.approx(full[1])
+        assert sum(work) == expected_work
+
+    check(vectors, 36)
+    renamed = {f"renamed/{p}": v for p, v in vectors.items()}
+    check(renamed, 0)
+    renamed["new"] = rng.random(12).astype("<f4").tobytes()
+    check(renamed, 7)
+    renamed["renamed/p0"] = rng.random(12).astype("<f4").tobytes()
+    check(renamed, 7)
+    check(renamed, 0, threshold=0.8)
+    check(renamed, 49, threshold=0.6)
+    renamed["copy"] = renamed["new"]
+    check(renamed, 0)
+    check(renamed, 0, same_set={"copy": 0, "new": 0})
+
+
+def test_cancelled_neighbor_pass_does_not_publish_incomplete_coverage(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import numpy as np
+
+    from dedupe import semantic
+
+    vectors = {f"p{i}": np.array([1, i, i / 2], dtype="<f4").tobytes() for i in range(5)}
+    cache = tmp_path / "cache.db"
+    monkeypatch.setattr(semantic, "SIMILARITY_BLOCK", 1)
+    calls = 0
+
+    def cancelled():
+        nonlocal calls
+        calls += 1
+        return calls > 2
+
+    with pytest.raises(InterruptedError):
+        semantic_neighbors(vectors, 0.5, use_cache=True, cache_path=cache, cancelled=cancelled)
+    full = semantic_neighbors(vectors, 0.5)
+    retried = semantic_neighbors(vectors, 0.5, use_cache=True, cache_path=cache)
+    assert retried == full

@@ -25,6 +25,7 @@ from .grouping import (
     build_one_group,
     build_random_review_groups,
     build_set_group,
+    pick_suggested_keep,
 )
 from .human_detection import (
     DEFAULT_BACKEND as DEFAULT_HUMAN_BACKEND,
@@ -57,8 +58,10 @@ from .similar_image import (
 from .similar_video import DEFAULT_THRESHOLD as VID_THRESHOLD
 from .similar_video import (
     ERROR_VIDEO_FINGERPRINT_FAILED,
+    compare_video_audio,
     ffmpeg_available,
     find_similar_video_groups,
+    find_video_version_matches,
     probe_video,
 )
 
@@ -143,6 +146,8 @@ def run_scan(
     roots: list[str | Path],
     *,
     preferred_folders: list[str] | None = None,
+    protected_folders: list[str] | None = None,
+    video_versions: bool = False,
     exact: bool = True,
     similar: bool = True,
     semantic: bool = False,
@@ -274,6 +279,8 @@ def run_scan(
         added = 0
         with publish_lock:
             for members in member_lists:
+                if all(member.protected for member in members):
+                    continue
                 g = build_one_group(
                     kind, members, exact_path_sets=exact_path_sets or None
                 )
@@ -299,7 +306,7 @@ def run_scan(
 
     resolved_roots: list[Path] = []
     root_errors: list[str] = []
-    for root in roots:
+    for root in dict.fromkeys([*roots, *(protected_folders or [])]):
         resolved = Path(root).expanduser().resolve(strict=False)
         if not resolved.exists():
             root_errors.append(f"scan root does not exist: {resolved}")
@@ -344,14 +351,35 @@ def run_scan(
             cache = None
 
     preferred_roots = [Path(p).expanduser().resolve() for p in (preferred_folders or [])]
+    protected_roots = [Path(p).expanduser().resolve() for p in (protected_folders or [])]
+    # macOS can preserve different spellings of the same case-insensitive path.
+    # Ancestor identities also handle aliases without weakening protection.
+    protected_identities = {(p.stat().st_dev, p.stat().st_ino) for p in protected_roots}
+    protected_ancestors: dict[Path, bool] = {}
+
+    def is_protected(path: Path) -> bool:
+        if not protected_roots:
+            return False
+        if path not in protected_ancestors:
+            stat = path.stat()
+            protected_ancestors[path] = (
+                (stat.st_dev, stat.st_ino) in protected_identities
+                or (path.parent != path and is_protected(path.parent))
+            )
+        return protected_ancestors[path]
+
     for record in records:
+        record.protected = (
+            (record.device, record.inode) in protected_identities
+            or is_protected(Path(record.path).parent)
+        )
         record.keeper_preference = next(
             (len(preferred_roots) - index for index, folder in enumerate(preferred_roots)
              if Path(record.path).is_relative_to(folder)), 0
         )
 
     run_exact = exact and bool(records)
-    run_similar = similar
+    run_similar = similar or video_versions
     run_semantic = semantic and bool(records)
     run_dimensions = find_low_resolution and bool(records)
     run_human = find_no_humans and bool(records)
@@ -576,7 +604,57 @@ def run_scan(
                     cancelled=cancelled,
                 )
                 exact_done.wait()
-                count = publish(GroupKind.SIMILAR, vid_groups)
+                if video_versions:
+                    versions = find_video_version_matches(
+                        records, distinct=distinct, progress=vid_progress,
+                        workers=n_workers, cancelled=cancelled,
+                        use_cache=use_cache,
+                        cache_path=(Path(cache_path).with_suffix(".video-versions.sqlite3")
+                                    if cache_path else None),
+                        errors=stage_errors["similar_video"],
+                    )
+                    by_pair = {tuple(sorted(m.path for m in members)): (members, details)
+                               for members, details in versions}
+                    for members in vid_groups:
+                        keeper_path = pick_suggested_keep(members)
+                        keeper = next(m for m in members if m.path == keeper_path)
+                        for member in members:
+                            if member is keeper:
+                                continue
+                            key = tuple(sorted((keeper.path, member.path)))
+                            if key in by_pair:
+                                continue
+                            duration = min(keeper.duration or 0, member.duration or 0)
+                            ranges = {m.path: [0, duration] for m in (keeper, member)}
+                            audio = compare_video_audio(
+                                keeper.path, member.path, ranges, cancelled=cancelled,
+                            )
+                            by_pair[key] = ([keeper, member], {
+                                "ranges": ranges, "relation": "same_footage", "audio": audio,
+                                "audio_scope": "sampled overlap", "manual_review": True,
+                            })
+                    count = 0
+                    with publish_lock:
+                        for members, details in by_pair.values():
+                            if all(m.protected for m in members):
+                                continue
+                            group = build_one_group(
+                                GroupKind.SIMILAR, members, match_basis="video_version",
+                                exact_path_sets=exact_path_sets or None,
+                            )
+                            if group is None:
+                                continue
+                            group.match_details = details
+                            if details.get("relation") == "excerpt":
+                                group.suggested_keep = max(
+                                    members, key=lambda m: (m.protected, m.duration or 0)
+                                ).path
+                            groups.append(group)
+                            count += 1
+                            if on_group:
+                                on_group(group)
+                else:
+                    count = publish(GroupKind.SIMILAR, vid_groups)
                 _stage_progress(
                     "video",
                     f"Found {count} similar video group{'s' if count != 1 else ''}",
@@ -618,7 +696,9 @@ def run_scan(
             judge: DeciderJudge | None = None
             if decider:
                 try:
-                    judge = DeciderJudge(use_cache=use_cache, cache_path=cache_path)
+                    judge = DeciderJudge(
+                        use_cache=use_cache, cache_path=cache_path, cancelled=cancelled,
+                    )
                 except Exception as exc:
                     stage_errors["decider"].append(f"Decider verification skipped: {exc}")
             try:
@@ -909,11 +989,11 @@ def run_scan(
                 for record in records
                 if record.error and record.error.startswith(ERROR_IMAGE_HASH_FAILED)
             ]
-            stage_errors["similar_video"] = [
+            stage_errors["similar_video"].extend([
                 record.error
                 for record in records
                 if record.error and record.error.startswith(ERROR_VIDEO_FINGERPRINT_FAILED)
-            ]
+            ])
         if run_semantic:
             stage_durations["semantic"] = stage_results["semantic"]
         if run_dimensions:
@@ -965,12 +1045,15 @@ def run_scan(
 
     exact_failures = stage_errors["exact"]
     image_failures = stage_errors["similar_image"]
-    video_failures = stage_errors["similar_video"]
-    image_attempted = len(image_records) if similar and len(image_records) >= 2 else 0
+    video_cache_warnings = [error for error in stage_errors["similar_video"]
+                            if error.startswith("video version cache unavailable")]
+    video_failures = [error for error in stage_errors["similar_video"]
+                      if error not in video_cache_warnings]
+    image_attempted = len(image_records) if run_similar and len(image_records) >= 2 else 0
     video_dependency = ffmpeg_available()
     video_attempted = (
         len(video_records)
-        if similar and len(video_records) >= 2 and video_dependency
+        if run_similar and len(video_records) >= 2 and video_dependency
         else 0
     )
     semantic_failures = stage_errors["semantic"]
@@ -999,7 +1082,7 @@ def run_scan(
     stages = {
         "inventory": StageDiagnostics(
             unit="roots",
-            attempted=len(roots),
+            attempted=len(dict.fromkeys([*roots, *(protected_folders or [])])),
             succeeded=len(resolved_roots),
             failed=len(root_errors),
             duration_seconds=stage_durations.get("inventory", 0.0),
@@ -1031,19 +1114,19 @@ def run_scan(
         ),
         "similar_video": StageDiagnostics(
             attempted=video_attempted,
-            succeeded=video_attempted - len(video_failures),
-            failed=len(video_failures),
+            succeeded=max(0, video_attempted - len(video_failures)),
+            failed=min(video_attempted, len(video_failures)),
             skipped=len(records) - video_attempted,
             duration_seconds=stage_durations.get("similar_video", 0.0),
             warnings=(
                 ["ffmpeg/ffprobe unavailable; eligible videos were not analyzed"]
-                if similar and video_records and not video_dependency
+                if run_similar and video_records and not video_dependency
                 else (
-                    [f"{len(video_failures)} video fingerprint(s) failed"]
+                    [f"{min(video_attempted, len(video_failures))} video file(s) could not be fully analyzed"]
                     if video_failures
                     else []
                 )
-            ),
+            ) + video_cache_warnings[:5],
         ),
         "semantic": StageDiagnostics(
             attempted=semantic_attempted,
@@ -1126,6 +1209,7 @@ def run_scan(
         files=records,
         groups=groups,
         errors=recorded_errors,
+        protected_folders=[str(p) for p in protected_roots],
         diagnostics=ScanDiagnostics(
             total_duration_seconds=total_duration,
             first_duplicate_seconds=first_duplicate_seconds,
@@ -1176,6 +1260,8 @@ def run_scans_parallel(
     *,
     max_streams: int | None = None,
     preferred_folders: list[str] | None = None,
+    protected_folders: list[str] | None = None,
+    video_versions: bool = False,
     exact: bool = True,
     similar: bool = True,
     semantic: bool = False,
@@ -1225,6 +1311,8 @@ def run_scans_parallel(
     - ``progress`` fires with an aggregate ``ScanProgress`` across all streams.
     - ``on_group`` fires as each group is finalized, tagged with its ``root``.
     """
+    if protected_folders:
+        raise ValueError("Protected libraries require comparing folders together")
     resolved_roots, root_errors = _resolve_stream_roots(roots)
     if not resolved_roots:
         result = ScanResult(roots=[], files=[], groups=[], errors=root_errors)
@@ -1310,6 +1398,8 @@ def run_scans_parallel(
         return run_scan(
             [root],
             preferred_folders=preferred_folders,
+            protected_folders=protected_folders,
+            video_versions=video_versions,
             exact=exact,
             similar=similar,
             semantic=semantic,

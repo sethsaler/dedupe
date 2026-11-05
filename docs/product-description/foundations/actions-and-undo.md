@@ -20,13 +20,13 @@ Every destructive path through the product applies the same layers, in this orde
 2. **Batch preflight.** Before anything moves, every selected file is checked against the disk: it exists, is a regular file (symbolic links are refused outright), is still inside the scanned folders, and its size, device, inode, and modification time match the scan snapshot. For exact groups the files are additionally re-hashed: each must still match its scan hash and still be byte-identical to the group's keeper. Any file failing preflight is excluded with its reason; the others proceed.
 3. **Keeper protection.** Each keep-one group's retained member is validated too. If it has only drifted in metadata (an mtime or inode change with identical size), Dedupe re-hashes it and accepts it when the content still matches — this tolerates filesystems and sync tools that touch metadata. If the keeper genuinely changed, the whole group is held back: removing duplicates of a file that is itself no longer what it was is exactly the mistake the product exists to prevent.
 4. **Immediate revalidation.** In an executed action each file is checked *again*, alone, in the instant before its own move. The batch preflight can be seconds old by the time a large action reaches its last files; this check closes that window.
-5. **The receipt.** After execution, a JSON receipt records the action, every file, its outcome and destination, and the time. Receipts live in `~/.cache/dedupe/logs/` and are what `dedupe receipts` reads and `dedupe undo` consumes.
+5. **The receipt and move journal.** Before execution, a durable receipt records the intended action. Each move records its content identity before starting and its outcome afterward. After execution, the receipt includes every file, its outcome and destination, and the time. Receipts live in `~/.cache/dedupe/logs/` and are what `dedupe receipts` reads and `dedupe undo` consumes.
 
 Dry runs stop after step 2: the preview is a real preflight, not an estimate — a file that would fail to move says so in the preview.
 
 ## Undo
 
-**Action undo** (`dedupe undo`, or the Undo button on the UI's result toast after an executed action) reads the action's receipt and moves every successfully moved file back to its original path, in reverse order — from the quarantine folder for a quarantine action, from the recorded Trash destination for a trash action. The preflight is all-or-nothing: if any moved file is gone from its recorded destination, has no recorded destination, or its original path is now occupied, the entire undo is refused — nothing is partially restored. (In the UI, an executed action that wrote several receipts — a Trash that split into a quarantine part and a system-trash part — restores them together: the sheet previews every receipt and the execute preflights all of them again before moving anything.) Restores always may cross volumes, since a quarantine folder or the Trash may legitimately live on another disk. The undo itself writes a receipt. Restoring returns files to disk only: it does not resurrect their review groups — restored files reappear in the review on the next scan.
+**Action undo** (`dedupe undo`, History → Restore files, or the Undo button on the UI's result toast after an executed action) reads the action's receipt and moves every successfully moved file back to its original path, in reverse order — from the quarantine folder for a quarantine action, from the recorded Trash destination for a trash action. The preflight is all-or-nothing: if any moved file is gone from its recorded destination, has no recorded destination, or its original path is now occupied, the entire undo is refused — nothing is partially restored. (In the UI, an executed action that wrote several receipts — a Trash that split into a quarantine part and a system-trash part — restores them together: the sheet previews every receipt and the execute preflights all of them again before moving anything.) Restores always may cross volumes, since a quarantine folder or the Trash may legitimately live on another disk. The undo itself writes a receipt. Restoring returns files to disk only: it does not resurrect their review groups — restored files reappear in the review on the next scan.
 
 **Per-candidate trash undo** is the narrower sibling: one Non-Human, Faces, or Files candidate moves back to its original path with the same occupied-path refusal, from its card or the toast, for as long as the app's trash map remembers the destination (it survives restarts; a new scan ends it).
 
@@ -38,16 +38,16 @@ The web UI adds one more layer: an action preview is confirmed against a short-l
 
 | Event | Before execute | During execute |
 | --- | --- | --- |
-| The user aborts explicitly | Closing the sheet or letting the preview token lapse cancels; nothing moved. | There is no stop button once files begin moving; the action runs to completion of the file list. Ctrl+C against the server mid-action is the only abort, and it is not safe: files already moved stay moved, and the receipt may be missing them. |
+| The user aborts explicitly | Closing the sheet or letting the preview token lapse cancels; nothing moved. | There is no stop button once files begin moving; the action runs to completion of the file list. Ctrl+C against the server interrupts the batch. Files already moved stay moved; on restart, the move journal is reconciled without moving files. Confirmed moves can be restored from History; uncertain destinations are flagged for inspection. |
 | The user does something else mid-way | Selection changes after the preview was taken are re-verified by the token check; a mismatch means confirming again. | File actions are locked while an action runs — other requests get a "file actions are locked" refusal rather than interleaving. |
 | A clean complete happens elsewhere | A completed action writes its receipt and releases the lock; a second action then previews from the new state. | Same lock applies; nothing runs concurrently. |
 | The environment fails | A preflight failure (disk full surfaced as an unreadable destination, permission denied) excludes the affected files with reasons shown in the result. | A per-file failure is recorded on that file's item; the remaining files still move. The receipt records both outcomes. |
-| The page or process goes away | Preview state lives in the server; reloading the browser loses the sheet but not the scan. | The server-side action continues or dies with the process; a death mid-action leaves some files moved and possibly no receipt. This is the product's one genuinely unsafe window. |
+| The page or process goes away | Preview state lives in the server; reloading the browser loses the sheet but not the scan. | The server-side action continues or dies with the process. On restart, Dedupe reconciles the durable move journal and displays interrupted cleanups in History. It does not guess an uncertain destination or automatically restore files. |
 | Something else changes the target | That is what preflight and immediate revalidation catch: changed files are excluded with their reasons. | The immediate revalidation runs per file; a file that changes between its check and its move is a race too small to close entirely. |
 | The input channel changes | No effect (UI); the CLI takes no stdin. | No effect. |
 | A resumed review supersedes | A resumed session revalidates everything before the first preview, so resumed selections act under the same rules. | No effect during execution. |
 
-After an interrupted or failed action the receipt (when written) is authoritative for what moved; `dedupe receipts show` displays it.
+After an interrupted or failed action, History and `dedupe receipts show` display confirmed outcomes and unresolved items. Recovery never moves files by itself.
 
 ## Interactions with other systems
 
@@ -74,10 +74,12 @@ After an interrupted or failed action the receipt (when written) is authoritativ
 - Isolate in move mode is the only isolate mode that can lose data; it is refused across filesystem boundaries unless explicitly allowed.
 - A file that became a symbolic link between scan and action is refused by name — acting on the link would silently act on its target.
 
+The current working tree also enforces protected-library membership before selection or moves. Protected files remain available for comparison, but Trash, quarantine, and isolate-move cannot remove them. See [the current cleanup workflow](../../cleanup-workflow.md) for saved jobs, History, and recovery details.
+
 ## Open questions and verification
 
-- The exact behavior when the server process is killed mid-action (is a partial receipt written?) is read from the code path, not reproduced by hand; reproducing it safely needs a disposable setup.
+- Interrupted-move recovery is covered with disposable fixtures, including moves without recorded outcomes and changed destinations. Unknown Trash destinations remain unresolved when the original file cannot be identified safely.
 - The preview-token lifetime is a number to be confirmed in [Action sheet](../ui/action-sheet.md).
 - Trash recovery via Finder's "Put Back" is a macOS behavior Dedupe relies on but does not control; its reliability across macOS versions is outside the product.
 
-Verified against dedupe commit `2a6cede`.
+Originally verified against dedupe commit `2a6cede`; the protection and recovery sections describe the current working tree.

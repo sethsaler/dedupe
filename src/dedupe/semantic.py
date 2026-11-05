@@ -22,12 +22,16 @@ Protocol (see DigUp's ``worker/digup_worker.py``)::
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import selectors
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -60,6 +64,9 @@ SIMILARITY_BLOCK = 512
 SEMANTIC_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF)
 ERROR_SEMANTIC_FAILED = "semantic embedding failed"
 HELPER_ENV = "DEDUPE_DIGUP_HELPER"
+STARTUP_TIMEOUT = 180.0
+REQUEST_TIMEOUT = 120.0
+MAX_REPLY_BYTES = 8 * 1024 * 1024
 
 ProgressCb = Callable[[str, int, int], None]
 
@@ -86,7 +93,17 @@ def semantic_available() -> bool:
 class EmbeddingWorker:
     """One ``digup worker`` process; closes (and frees the model) on exit."""
 
-    def __init__(self, helper: str | None = None) -> None:
+    def __init__(
+        self, helper: str | None = None, *,
+        cancelled: Callable[[], bool] | None = None,
+        startup_timeout: float | None = None,
+        request_timeout: float | None = None,
+    ) -> None:
+        self._cancelled = cancelled
+        self._request_timeout = REQUEST_TIMEOUT if request_timeout is None else request_timeout
+        self._buffer = bytearray()
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         helper = helper or find_digup_helper()
         if helper is None:
             raise RuntimeError(
@@ -99,14 +116,19 @@ class EmbeddingWorker:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
+            bufsize=0,
+            start_new_session=True,
         )
         self._next_id = 0
-        ready = self._read_message()
-        if not ready.get("ready"):
-            self.close()
-            raise RuntimeError(f"DigUp worker failed to start: {ready.get('error')}")
+        try:
+            ready = self._read_message(
+                STARTUP_TIMEOUT if startup_timeout is None else startup_timeout
+            )
+            if not ready.get("ready"):
+                raise RuntimeError(f"DigUp worker failed to start: {ready.get('error')}")
+        except BaseException:
+            self.close(force=True)
+            raise
         self.info: dict = ready.get("info") or {}
         self.dim = int(self.info.get("dim") or 768)
 
@@ -124,15 +146,34 @@ class EmbeddingWorker:
             )
         )
 
-    def _read_message(self) -> dict:
+    def _read_message(self, timeout: float | None = None) -> dict:
         assert self._process.stdout is not None
-        while True:
-            line = self._process.stdout.readline()
-            if not line:
-                raise RuntimeError("DigUp worker exited unexpectedly")
-            line = line.strip()
-            if line.startswith("{"):
-                return json.loads(line)
+        deadline = time.monotonic() + (self._request_timeout if timeout is None else timeout)
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._process.stdout, selectors.EVENT_READ)
+            while True:
+                if self._cancelled and self._cancelled():
+                    raise InterruptedError("scan cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("DigUp stopped responding; retry the deep scan to continue")
+                if b"\n" in self._buffer:
+                    line, _, rest = self._buffer.partition(b"\n")
+                    self._buffer = bytearray(rest)
+                    if line.lstrip().startswith(b"{"):
+                        reply = json.loads(line)
+                        if not isinstance(reply, dict):
+                            raise RuntimeError("DigUp returned an invalid reply")
+                        return reply
+                    continue
+                if not selector.select(min(0.05, remaining)):
+                    continue
+                chunk = os.read(self._process.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("DigUp worker exited unexpectedly; retry the deep scan")
+                self._buffer.extend(chunk)
+                if len(self._buffer) > MAX_REPLY_BYTES:
+                    raise RuntimeError("DigUp returned an oversized reply")
 
     def embed_images(
         self, paths: list[str], budget: int = DEFAULT_BUDGET
@@ -143,31 +184,47 @@ class EmbeddingWorker:
         assert self._process.stdin is not None
         self._next_id += 1
         request = {"id": self._next_id, "op": "image", "inputs": paths, "budget": budget}
-        self._process.stdin.write(json.dumps(request) + "\n")
-        self._process.stdin.flush()
-        reply = self._read_message()
+        try:
+            self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+            self._process.stdin.flush()
+            reply = self._read_message()
+        except BaseException:
+            self.close(force=True)
+            raise
+        if reply.get("id") != self._next_id:
+            raise RuntimeError("DigUp returned a reply for a different request")
         if not reply.get("ok"):
             raise RuntimeError(f"DigUp worker: {reply.get('error')}")
         dim = int(reply.get("dim") or self.dim)
         matrix = np.frombuffer(base64.b64decode(reply["vectors"]), dtype="<f4")
         matrix = matrix.reshape(int(reply["count"]), dim)
         errors = list(reply.get("errors") or [None] * len(paths))
+        if len(matrix) != len(paths) or len(errors) != len(paths) or not np.isfinite(matrix).all():
+            raise RuntimeError("DigUp returned invalid embedding vectors")
         vectors: list[bytes | None] = []
         for row, error in zip(matrix, errors, strict=True):
             vectors.append(None if error else row.astype("<f4").tobytes())
         return vectors, errors
 
-    def close(self) -> None:
+    def close(self, *, force: bool = False) -> None:
         process = self._process
         if process.poll() is None:
             try:
+                if force:
+                    raise TimeoutError
                 assert process.stdin is not None
-                process.stdin.write('{"id": 0, "op": "quit"}\n')
+                process.stdin.write(b'{"id": 0, "op": "quit"}\n')
                 process.stdin.flush()
-                process.wait(timeout=5)
+                process.wait(timeout=0.5)
             except Exception:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
 
     def __enter__(self) -> Self:
         return self
@@ -202,11 +259,50 @@ class EmbeddingCache:
             )
             """
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS semantic_content_embeddings (
+                content_hash TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (content_hash, signature)
+            )"""
+        )
+        self._digests: dict[str, str] = {}
+        self._identities: dict[str, str] = {}
         self._conn.commit()
 
-    def get_many(self, records: list[FileRecord], signature: str) -> dict[str, bytes]:
+    @staticmethod
+    def _identity(record: FileRecord) -> str:
+        # Include change time even for callers with an old serialized record.
+        # The filesystem identity also prevents a same-size/mtime replacement
+        # from reusing a stale embedding.
+        stat = Path(record.path).stat()
+        identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        return f"v2|{HashCache._identity(record)}|{identity}"
+
+    @staticmethod
+    def _digest(record: FileRecord, cancelled: Callable[[], bool] | None = None) -> str:
+        digest = hashlib.sha256()
+        with open(record.path, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def get_many(
+        self, records: list[FileRecord], signature: str,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, bytes]:
         found: dict[str, bytes] = {}
         by_path = {record.path: record for record in records}
+        for record in records:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            try:
+                self._identities[record.path] = self._identity(record)
+            except OSError:
+                pass  # The preparation pass reports unreadable files individually.
         paths = list(by_path)
         for start in range(0, len(paths), 400):
             chunk = paths[start : start + 400]
@@ -216,20 +312,49 @@ class EmbeddingCache:
                 chunk,
             ).fetchall()
             for path, identity, row_signature, vector in rows:
-                record = by_path[path]
-                if row_signature == signature and identity == HashCache._identity(record):
+                if row_signature == signature and identity == self._identities.get(path):
                     found[path] = bytes(vector)
+        renamed: list[tuple[FileRecord, bytes]] = []
+        for record in records:
+            if record.path in found:
+                continue
+            try:
+                digest = self._digest(record, cancelled)
+                if self._identity(record) != self._identities.get(record.path):
+                    continue
+                self._digests[record.path] = digest
+            except OSError:
+                continue
+            row = self._conn.execute(
+                "SELECT vector FROM semantic_content_embeddings "
+                "WHERE content_hash = ? AND signature = ?", (digest, signature),
+            ).fetchone()
+            if row:
+                found[record.path] = bytes(row[0])
+                renamed.append((record, bytes(row[0])))
+        if renamed:
+            self.put_many(renamed, signature)
         return found
 
     def put_many(self, items: list[tuple[FileRecord, bytes]], signature: str) -> None:
-        self._conn.executemany(
-            "INSERT OR REPLACE INTO semantic_embeddings (path, identity, signature, vector) "
-            "VALUES (?, ?, ?, ?)",
-            [
-                (record.path, HashCache._identity(record), signature, vector)
-                for record, vector in items
-            ],
-        )
+        for record, vector in items:
+            try:
+                identity = self._identity(record)
+                if record.path in self._identities and identity != self._identities[record.path]:
+                    continue
+                digest = self._digests.get(record.path) or self._digest(record)
+                if identity != self._identity(record):
+                    continue
+            except OSError:
+                continue
+            self._conn.execute(
+                "INSERT OR REPLACE INTO semantic_embeddings (path, identity, signature, vector) "
+                "VALUES (?, ?, ?, ?)", (record.path, identity, signature, vector),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO semantic_content_embeddings "
+                "(content_hash, signature, vector) VALUES (?, ?, ?)", (digest, signature, vector),
+            )
         self._conn.commit()
 
     def close(self) -> None:
@@ -280,10 +405,10 @@ def embed_records(
     total = len(candidates)
     cache = EmbeddingCache(cache_path) if use_cache else None
     try:
-        with EmbeddingWorker(helper) as worker:
+        with EmbeddingWorker(helper, cancelled=cancelled) as worker:
             signature = worker.signature
             if cache is not None:
-                vectors.update(cache.get_many(candidates, signature))
+                vectors.update(cache.get_many(candidates, signature, cancelled))
             pending = [r for r in candidates if r.path not in vectors]
             done = total - len(pending)
             if progress:
@@ -294,6 +419,7 @@ def embed_records(
             ):
 
                 def prepare(record: FileRecord) -> str | None:
+                    check_cancelled()
                     try:
                         return prepare_image(record.path, tmp)
                     except Exception as exc:
@@ -307,7 +433,19 @@ def embed_records(
                     prepared = list(pool.map(prepare, batch))
                     ready = [(r, p) for r, p in zip(batch, prepared, strict=True) if p]
                     if ready:
-                        rows, row_errors = worker.embed_images([p for _r, p in ready])
+                        try:
+                            rows, row_errors = worker.embed_images([p for _r, p in ready])
+                        except InterruptedError:
+                            raise
+                        except (RuntimeError, OSError, ValueError) as exc:
+                            # Keep completed batches useful and cached. Failed
+                            # files remain pending on a retry of these folders.
+                            unfinished = [r for r, _p in ready] + pending[start + len(batch):]
+                            errors.extend(
+                                f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
+                                for r in unfinished
+                            )
+                            break
                         fresh: list[tuple[FileRecord, bytes]] = []
                         for (record, prepared_path), row, error in zip(
                             ready, rows, row_errors, strict=True
@@ -338,6 +476,8 @@ def semantic_neighbors(
     same_set: dict[str, int] | None = None,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
+    use_cache: bool = False,
+    cache_path: str | Path | None = None,
 ) -> tuple[dict[str, set[str]], dict[tuple[str, str], float]]:
     """All pairs at or above ``threshold`` cosine, as adjacency plus pair scores.
 
@@ -352,31 +492,142 @@ def semantic_neighbors(
     scores: dict[tuple[str, str], float] = {}
     if len(paths) < 2:
         return adjacency, scores
-    matrix = np.stack([np.frombuffer(vectors[p], dtype="<f4") for p in paths])
+    # Content keys make the comparison snapshot independent of file paths,
+    # renames, exact-copy suppression, and the model that produced the bytes.
+    paths_by_key: dict[str, list[str]] = {}
+    by_key: dict[str, bytes] = {}
+    for path in paths:
+        key = hashlib.sha256(vectors[path]).hexdigest()
+        by_key[key] = vectors[path]
+        paths_by_key.setdefault(key, []).append(path)
+    keys = sorted(by_key)
+    matrix = np.stack([np.frombuffer(by_key[key], dtype="<f4") for key in keys])
+    if not np.isfinite(matrix).all():
+        raise ValueError("semantic embeddings contain invalid numbers; retry the deep scan")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     matrix = matrix / np.maximum(norms, 1e-12)
     sets = same_set or {}
-    total = len(paths)
-    for start in range(0, total, SIMILARITY_BLOCK):
+    cache = NeighborCache(cache_path) if use_cache else None
+    try:
+        known, cached_scores = cache.load(threshold) if cache else (set(), {})
+        current = set(keys)
+        key_scores = {
+            pair: score for pair, score in cached_scores.items()
+            if pair[0] in current and pair[1] in current
+        }
+        pending = [i for i, key in enumerate(keys) if key not in known]
+        pending_set = set(pending)
+        for start in range(0, len(pending), SIMILARITY_BLOCK):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            indexes = pending[start : start + SIMILARITY_BLOCK]
+            # Prior new-vector blocks have already compared these rows.
+            # Keep every old vector, but omit those completed new blocks.
+            columns = [i for i in range(len(keys)) if i not in pending_set or i >= indexes[0]]
+            block = _cosine_block(matrix[indexes], matrix[columns])
+            rows, cols = np.nonzero(block >= threshold)
+            for row, local_col in zip(rows.tolist(), cols.tolist(), strict=True):
+                col = columns[local_col]
+                i = indexes[row]
+                if col == i or (col in pending_set and col < i):
+                    continue
+                a, b = sorted((keys[i], keys[col]))
+                key_scores[(a, b)] = float(block[row, local_col])
+            if progress:
+                progress("semantic-cluster", min(len(pending), start + len(indexes)), len(pending))
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
-        # Earlier blocks already compared this block with preceding rows.
-        block = matrix[start : start + SIMILARITY_BLOCK] @ matrix[start:].T
-        rows, cols = np.nonzero(block >= threshold)
-        for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
-            i = start + row
-            col += start
-            if col <= i:
-                continue
-            a, b = paths[i], paths[col]
+        if cache:
+            cache.save(keys, key_scores, threshold)
+
+        def add_pair(a: str, b: str, score: float) -> None:
             if a in sets and sets.get(b) == sets[a]:
-                continue
+                return
+            a, b = sorted((a, b))
             adjacency.setdefault(a, set()).add(b)
             adjacency.setdefault(b, set()).add(a)
-            scores[(a, b)] = float(block[row, col])
+            scores[(a, b)] = score
+
+        for (left, right), score in key_scores.items():
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            for a in paths_by_key[left]:
+                for b in paths_by_key[right]:
+                    add_pair(a, b, score)
+        # Equal vector bytes can belong to different media. Compare their
+        # diagonal once rather than omitting new copies of a cached vector.
+        for index, key in enumerate(keys):
+            siblings = paths_by_key[key]
+            score = float(matrix[index] @ matrix[index])
+            if len(siblings) > 1 and score >= threshold:
+                for i, a in enumerate(siblings):
+                    for b in siblings[i + 1:]:
+                        add_pair(a, b, score)
         if progress:
-            progress("semantic-cluster", min(total, start + SIMILARITY_BLOCK), total)
+            progress("semantic-cluster", len(paths), len(paths))
+    finally:
+        if cache:
+            cache.close()
     return adjacency, scores
+
+
+def _cosine_block(rows, matrix):
+    """One bounded matrix operation, kept separate for comparison-work metrics."""
+    return rows @ matrix.T
+
+
+class NeighborCache:
+    """Atomic sparse snapshot of one completely compared set of vectors.
+
+    Missing edges mean below the saved threshold. An added/changed vector is
+    compared with every current vector; unchanged pairs reuse those results.
+    Lowering the threshold recomputes every pair. Removing or renaming paths
+    cannot change coverage because the snapshot is keyed by vector content.
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        target = Path(path) if path else default_cache_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(target), timeout=30.0)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_neighbor_snapshot "
+            "(id INTEGER PRIMARY KEY, threshold REAL, payload TEXT NOT NULL)"
+        )
+        self._conn.commit()
+
+    def load(self, threshold: float) -> tuple[set[str], dict[tuple[str, str], float]]:
+        row = self._conn.execute(
+            "SELECT threshold, payload FROM semantic_neighbor_snapshot WHERE id = 1"
+        ).fetchone()
+        if not row or row[0] > threshold:
+            return set(), {}
+        try:
+            payload = json.loads(row[1])
+            if payload.get("version") != 1:
+                return set(), {}
+            keys = payload["keys"]
+            edges = {(keys[a], keys[b]): score for a, b, score in payload["edges"]
+                     if score >= threshold}
+            return set(keys), edges
+        except (ValueError, TypeError, KeyError, IndexError):
+            return set(), {}
+
+    def save(self, keys: list[str], scores: dict[tuple[str, str], float], threshold: float) -> None:
+        # Very dense libraries can produce huge graphs. Do not turn a useful
+        # cache into unbounded disk growth; detection still returns all pairs.
+        if len(scores) > 250_000:
+            return
+        index = {key: i for i, key in enumerate(keys)}
+        payload = {"version": 1, "keys": keys,
+                   "edges": [[index[a], index[b], score] for (a, b), score in scores.items()]}
+        self._conn.execute(
+            "INSERT OR REPLACE INTO semantic_neighbor_snapshot VALUES (1, ?, ?)",
+            (threshold, json.dumps(payload, separators=(",", ":"))),
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 def pair_score(scores: dict[tuple[str, str], float], a: str, b: str) -> float | None:
@@ -458,6 +709,8 @@ def find_semantic_groups(
         same_set=same_set,
         progress=progress,
         cancelled=cancelled,
+        use_cache=use_cache,
+        cache_path=cache_path,
     )
     by_path = {r.path: r for r in records}
 
@@ -496,6 +749,8 @@ def find_semantic_groups(
         return histograms[path]
 
     def duplicate_pair(a: str, b: str, score: float) -> bool:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         if score < duplicate_threshold or a in excluded or b in excluded:
             return False
         # Broader discovery must establish image correspondence, not just

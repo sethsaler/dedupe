@@ -109,6 +109,7 @@ function similarityChip(member, g, anchor) {
   if (anchor !== g.suggested_keep) {
     return '<span class="swipe-sim" title="Fingerprint scores measure against the suggested keeper, not your chosen reference">vs your reference</span>';
   }
+  if (g.match_basis === "video_version") return `<span class="swipe-sim">${escapeHtml(member.match_label || "Matching video section")}</span>`;
   if (member.match_label) {
     return `<span class="swipe-sim" title="EmbeddingGemma cosine similarity with the reference: same subject, not necessarily the same shot">${escapeHtml(member.match_label)}</span>`;
   }
@@ -246,7 +247,7 @@ function renderSwipeReview(g) {
 
   box.innerHTML = `<div class="swipe-review">${pairHtml}</div>`;
   wireSwipeDom(g);
-  if (candidate && anchorMember) wireComparison(box, anchorMember, candidate);
+  if (candidate && anchorMember) wireComparison(box, anchorMember, candidate, g);
 }
 
 function wireSwipeDom(g) {

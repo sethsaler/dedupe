@@ -94,6 +94,8 @@ function collapseScanPanel(pathsText = "") {
 
 const settingIds = [
   "preferredFolders",
+  "protectedFolders",
+  "optVideoVersions",
   "optParallel",
   "optExact",
   "optSimilar",
@@ -181,6 +183,7 @@ function applyScanPreset(preset) {
     $(id).checked = false;
   }
   $("optSemantic").checked = deep && !$("optSemantic").disabled;
+  $("optVideoVersions").checked = deep && !$("optVideoVersions").disabled;
   $("optDecider").checked = false;
   if (deep) { $("semanticDuplicateThreshold").value = "94"; syncSemanticLabels(); }
   $("presetHint").textContent = deep && $("optSemantic").disabled
@@ -356,6 +359,8 @@ function applyCapabilities(caps) {
       (wrap || input).removeAttribute("title");
     }
   };
+  gate("optVideoVersions", "optVideoVersionsWrap", Boolean(caps.ffmpeg && caps.ffprobe),
+    "Video version detection needs ffmpeg and ffprobe");
   gate(
     "optNoHumans",
     "optNoHumansWrap",

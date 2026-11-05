@@ -74,6 +74,9 @@ class ReviewSessionLoad:
         "peeked": self.peeked,
             "saved_at": self.saved_at,
             "roots": list(self.result.roots) if self.result else [],
+            "protected_folders": list(self.result.protected_folders) if self.result else [],
+            "scan_settings": dict(self.result.scan_settings) if self.result else {},
+            "job_id": self.result.job_id if self.result else None,
             "pruned_files": self.pruned_files,
             "pruned_reasons": dict(self.pruned_reasons),
             "pruned_reason_labels": {

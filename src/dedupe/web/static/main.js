@@ -10,12 +10,15 @@ import "./lightbox.js";
 import "./members.js";
 import "./modal.js";
 import "./scan.js";
+import "./jobs.js";
+import { initHistory } from "./history.js";
 import { collapseScanPanel, renderRecent } from "./settings.js";
 import { CSRF_TOKEN } from "./state.js";
 import { openEventStream, refreshStatus } from "./status.js";
 
 // —— Init ——
 renderRecent();
+initHistory();
 openEventStream();
 refreshStatus()
   .then((s) => {

@@ -100,6 +100,10 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 - Exclusion patterns are strings, still not validated at scan time — a typo simply matches nothing. The **Check** button beside the field is how a dead glob is caught before the scan starts.
 - Changing the similarity threshold regroups cached fingerprints on the next scan; unchanged files do not need to be fingerprinted again.
 
+## Saved jobs and protected libraries
+
+The setup includes Saved cleanup jobs and Compare against a protected library. Protected folders join the comparison but never supply removal candidates, even with bulk rules. The folder protection survives saved reviews and rescans. Video clips & versions adds manual review of matched video sections and sampled audio. See [the current cleanup workflow](../../cleanup-workflow.md) for the controls and limitations.
+
 ## Open questions and verification
 
 - The exact behavior of the workers slider at the cap (label text, enforcement) was read from `updateWorkersUI` in `settings.js`, not watched by hand.

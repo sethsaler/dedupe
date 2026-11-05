@@ -12,6 +12,10 @@ def cleanup_opportunity(group, agreements: list[float] | None = None) -> dict:
         return {"score": 0, "label": "Browse", "reason": "Individual review"}
     others = [m for m in group.members if m.path != keeper.path]
     reasons = []
+    if keeper.protected:
+        reasons.append("in your protected library")
+    elif group.match_basis == "video_version" and group.match_details.get("relation") == "excerpt":
+        reasons.append("the longer recording")
     if keeper.keeper_preference:
         reasons.append("in your preferred folder")
     if keeper.capture_metadata:
@@ -25,6 +29,8 @@ def cleanup_opportunity(group, agreements: list[float] | None = None) -> dict:
         weight, label, reason = 1.0, "Identical files", "Byte-identical copies"
     elif semantic:
         weight, label, reason = 0.25, "Inspect edits", "Visual look-alike; confirm the same shot"
+    elif group.match_basis == "video_version":
+        weight, label, reason = 0.25, "Review video versions", "Inspect matching sections and audio"
     elif agreements and minimum >= 95:
         weight, label, reason = 0.9, "Strong match", "High fingerprint agreement with the keeper"
     else:

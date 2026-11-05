@@ -61,6 +61,7 @@ def rank_keep_candidate(rec: FileRecord) -> tuple:
         Path(rec.path).name, re.IGNORECASE,
     ))
     return (
+        rec.protected,
         rec.keeper_preference,
         bool(rec.capture_metadata),
         rec.pixels,
@@ -171,7 +172,7 @@ def build_one_group(
         match_scores=dict(match_scores or {}),
     )
     apply_smart_select(g, SmartRule.AUTOMATIC)
-    if match_basis == "semantic":
+    if match_basis in ("semantic", "video_version"):
         # Meaning matches include distinct shots of one subject (burst
         # frames, slides from one deck), so nothing is preselected for
         # removal: the reviewer opts each file in.
@@ -408,6 +409,8 @@ def ensure_all_files_groups(result: ScanResult) -> None:
     saved before the view existed are upgraded here on load. Existing groups
     are left untouched so review progress (reviewed_paths) survives.
     """
+    if result.scan_settings.get("new_only"):
+        return
     if any(group.kind == GroupKind.ALL_FILES for group in result.groups):
         return
     built = build_all_files_groups(result.files, result.roots)
@@ -457,7 +460,9 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
         group.suggested_keep = None
         if rule == SmartRule.SELECT_CANDIDATES:
             reviewed = set(group.reviewed_paths)
-            group.selected_for_removal = [m.path for m in members if m.path in reviewed]
+            group.selected_for_removal = [
+                m.path for m in members if m.path in reviewed and not m.protected
+            ]
         return
 
     if rule == SmartRule.SELECT_CANDIDATES:
@@ -466,7 +471,9 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     if rule == SmartRule.AUTOMATIC:
         keep = group.suggested_keep or pick_suggested_keep(members)
         group.suggested_keep = keep
-        group.selected_for_removal = [m.path for m in members if m.path != keep]
+        group.selected_for_removal = [
+            m.path for m in members if m.path != keep and not m.protected
+        ]
         return
 
     if rule == SmartRule.NEWEST:
@@ -483,12 +490,14 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
         keep = group.suggested_keep or pick_suggested_keep(members)
 
     group.suggested_keep = keep
-    group.selected_for_removal = [m.path for m in members if m.path != keep]
+    group.selected_for_removal = [
+        m.path for m in members if m.path != keep and not m.protected
+    ]
 
 
 def apply_smart_select_all(groups: list[DuplicateGroup], rule: SmartRule) -> None:
     for g in groups:
-        if g.match_basis == "semantic" and rule != SmartRule.DESELECT_ALL:
+        if g.match_basis in ("semantic", "video_version") and rule != SmartRule.DESELECT_ALL:
             # Bulk rules never select look-alikes; see build_one_group.
             continue
         apply_smart_select(g, rule)

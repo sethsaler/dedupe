@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 
+from .action_journal import ActionJournal, atomic_json, recover_interrupted_actions
 from .exact import file_sha256
 from .models import (
     DuplicateGroup,
@@ -74,6 +75,7 @@ class ActionResult:
     )
     completed_at: str | None = None
     log_error: str | None = None
+    _journal: ActionJournal | None = field(default=None, repr=False)
 
     @property
     def success_count(self) -> int:
@@ -127,18 +129,24 @@ def _write_action_log(
 ) -> None:
     log_base = resolve_log_dir(log_dir)
     try:
+        if result._journal is not None:
+            result.log_path = str(result._journal.path)
+            result._journal.finalize(result.to_dict())
+            return
         log_base.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         log_path = log_base / receipt_filename(
             dry_run=result.dry_run, stamp=stamp, session_id=result.session_id
         )
         result.log_path = str(log_path)
-        temp_path = log_path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
-        temp_path.replace(log_path)
+        atomic_json(log_path, result.to_dict())
     except OSError as exc:
-        result.log_path = None
+        if result._journal is None:
+            result.log_path = None
         result.log_error = str(exc)
+    finally:
+        if result._journal is not None:
+            result._journal.close()
 
 
 def _path_in_roots(path: Path, roots: list[str] | None) -> bool:
@@ -521,6 +529,7 @@ def _preflight_action(
     check_paths: set[str] | None = None,
     dest_dir: Path | None = None,
     device_cache: dict[str, int | None] | None = None,
+    verified_hashes: dict[str, tuple[str, os.stat_result]] | None = None,
 ) -> dict[str, str]:
     """Return path -> error for stale, out-of-scope, or no-longer-exact selections.
 
@@ -589,12 +598,16 @@ def _preflight_action(
             for member in members_to_verify:
                 if member.path in errors:
                     continue
-                current = current_hashes.setdefault(
-                    member.path, file_sha256(member.path)
-                )
+                if member.path not in current_hashes:
+                    current_hashes[member.path] = file_sha256(member.path)
+                current = current_hashes[member.path]
+                if verified_hashes is not None:
+                    verified_hashes[member.path] = (current, Path(member.path).stat())
                 if member.sha256 and current != member.sha256:
                     errors[member.path] = "file content no longer matches its scan hash"
-            keep_hash = current_hashes.setdefault(keep.path, file_sha256(keep.path))
+            if keep.path not in current_hashes:
+                current_hashes[keep.path] = file_sha256(keep.path)
+            keep_hash = current_hashes[keep.path]
             for member in members_to_verify:
                 if member.path == keep.path or member.path in errors:
                     continue
@@ -693,6 +706,14 @@ def apply_actions(
             destinations[path_str] = dest
 
     trash_batch = TrashBatch()
+    journal_indexes = {path: index for index, path in enumerate(paths)}
+    if not dry_run:
+        result._journal = ActionJournal(result.to_dict(), [
+            {"path": path, "size": sizes.get(path),
+             "destination": str(destinations[path]) if path in destinations else "Trash"}
+            for path in paths
+        ], log_dir)
+        result.log_path = str(result._journal.path)
 
     def _apply_one(path_str: str) -> ActionItem:
         src = Path(path_str)
@@ -711,6 +732,7 @@ def apply_actions(
                 path=path_str, ok=True, action=action, destination=destination, size=size
             )
         # Revalidate immediately before this file's destructive operation.
+        verified_hashes = {}
         immediate_errors = _preflight_action(
             all_safety_groups,
             paths,
@@ -718,6 +740,7 @@ def apply_actions(
             check_paths={path_str},
             dest_dir=guarded_dest,
             device_cache=device_cache,
+            verified_hashes=verified_hashes,
         )
         if path_str in immediate_errors:
             return ActionItem(
@@ -728,6 +751,12 @@ def apply_actions(
                 size=size,
             )
         try:
+            if result._journal is not None:
+                result._journal.begin(
+                    journal_indexes[path_str],
+                    search_dirs=_trash_dirs_for(src) if action == "trash" else (),
+                    verified_hash=verified_hashes.get(path_str),
+                )
             if action == "trash":
                 trashed = _send_to_trash(src, trash_batch)
                 destination = str(trashed) if trashed else "Trash"
@@ -741,14 +770,29 @@ def apply_actions(
         except Exception as exc:
             return ActionItem(path=path_str, ok=False, action=action, error=str(exc), size=size)
 
+    def _apply_recorded(path_str: str) -> ActionItem:
+        item = _apply_one(path_str)
+        if result._journal is not None:
+            try:
+                result._journal.record(journal_indexes[path_str], asdict(item))
+            except OSError as exc:
+                # The pre-move intent remains recoverable. Stop subsequent
+                # begins, and expose the persistence failure to the caller.
+                result.log_error = str(exc)
+        return item
+
     if dry_run:
         result.items = [_apply_one(path_str) for path_str in paths]
     else:
-        result.items = map_parallel(
-            _apply_one,
-            paths,
-            workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
-        )
+        try:
+            result.items = map_parallel(
+                _apply_recorded,
+                paths,
+                workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
+            )
+        except BaseException:
+            result._journal.close()
+            raise
 
     result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir)
@@ -776,13 +820,20 @@ def undo_action(
     whole undo, so a bulk restore never half-applies.
     """
     log_path = resolve_receipt_path(action_log, receipt_dir)
+    recover_interrupted_actions(log_path.parent)
     data = json.loads(log_path.read_text(encoding="utf-8"))
+    if data.get("status") == "running":
+        raise ValueError("this action is still running; wait before restoring its files")
     action = str(data.get("action") or "")
     if data.get("dry_run") or action not in ("trash", "quarantine"):
         raise ValueError("only executed trash or quarantine receipts can be undone")
     undo_kind = f"undo:{action}"
 
     result = ActionResult(dry_run=dry_run, action=undo_kind)
+    recorded_identities = {
+        entry["path"]: entry.get("identity")
+        for entry in data.get("journal", []) if isinstance(entry, dict) and entry.get("path")
+    }
     planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
         if not item.get("ok") or not item.get("destination"):
@@ -793,10 +844,19 @@ def undo_action(
         error = None
         if action == "trash" and item["destination"] == "Trash":
             error = "trash destination was not recorded; restore this one in Finder"
+        elif moved.is_symlink():
+            error = "moved file became a symbolic link"
         elif not moved.is_file():
             error = "moved file no longer exists at its recorded destination"
         elif original.exists() or original.is_symlink():
             error = "original path is already occupied"
+        elif (identity := recorded_identities.get(str(original))):
+            try:
+                if (moved.stat().st_size != identity["size"]
+                        or file_sha256(moved) != identity["sha256"]):
+                    error = "moved file changed since the cleanup"
+            except OSError as exc:
+                error = f"moved file could not be verified: {exc}"
         if error:
             result.items.append(
                 ActionItem(
@@ -824,9 +884,20 @@ def undo_action(
                 )
             )
     else:
-        for moved, original, size in planned:
+        if not dry_run and planned:
+            result._journal = ActionJournal(result.to_dict(), [
+                {"path": str(moved), "destination": str(original), "size": size}
+                for moved, original, size in planned
+            ], log_dir or log_path.parent)
+            result.log_path = str(result._journal.path)
+        for index, (moved, original, size) in enumerate(planned):
             try:
                 if not dry_run:
+                    if original.exists() or original.is_symlink():
+                        raise OSError("original path became occupied before restore")
+                    if moved.is_symlink():
+                        raise OSError("moved file became a symbolic link")
+                    result._journal.begin(index)
                     original.parent.mkdir(parents=True, exist_ok=True)
                     # Restores are always allowed to cross volumes: the
                     # quarantine folder or Trash may live on another disk.
@@ -851,6 +922,15 @@ def undo_action(
                         size=size,
                     )
                 )
+            except BaseException:
+                if result._journal is not None:
+                    result._journal.close()
+                raise
+            if result._journal is not None:
+                try:
+                    result._journal.record(index, asdict(result.items[-1]))
+                except OSError as exc:
+                    result.log_error = str(exc)
 
     result.completed_at = datetime.now(UTC).isoformat()
     _write_action_log(result, log_dir or log_path.parent)
@@ -1015,6 +1095,8 @@ def isolate_groups(
     for group in filtered:
         for member in group.members:
             error = validate_file_record(member, roots)
+            if mode == "move" and getattr(member, "protected", False):
+                error = "protected library files cannot be moved"
             if not error and mode == "move" and not allow_cross_device:
                 error = cross_device_error(Path(member.path), root, device_cache)
             if error:
@@ -1087,6 +1169,8 @@ def isolate_groups(
             src = Path(member.path)
             if not src.exists():
                 raise FileNotFoundError(member.path)
+            if result._journal is not None:
+                result._journal.begin(journal_indexes[(group.id, member.path, str(dest))])
             _link_or_copy(src, dest, mode, allow_cross_device=allow_cross_device)
             return ActionItem(
                 path=member.path,
@@ -1106,6 +1190,18 @@ def isolate_groups(
                 size=member.size,
             )
 
+    def _place_recorded(task):
+        item = _place(task)
+        if result._journal is not None:
+            group, member, dest = task
+            try:
+                result._journal.record(
+                    journal_indexes[(group.id, member.path, str(dest))], asdict(item),
+                )
+            except OSError as exc:
+                result.log_error = str(exc)
+        return item
+
     outcomes: list[ActionItem] = []
     if not dry_run:
         tasks = [
@@ -1113,11 +1209,26 @@ def isolate_groups(
             for group, _group_dir, planned_members in plans
             for member, dest, _is_keep in planned_members
         ]
-        outcomes = map_parallel(
-            _place,
-            tasks,
-            workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
-        )
+        if mode == "move":
+            journal_indexes = {
+                (group.id, member.path, str(dest)): index
+                for index, (group, member, dest) in enumerate(tasks)
+            }
+            result._journal = ActionJournal(result.to_dict(), [
+                {"path": member.path, "destination": str(dest), "size": member.size}
+                for group, member, dest in tasks
+            ], log_dir)
+            result.log_path = str(result._journal.path)
+        try:
+            outcomes = map_parallel(
+                _place_recorded,
+                tasks,
+                workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
+            )
+        except BaseException:
+            if result._journal is not None:
+                result._journal.close()
+            raise
     placed = iter(outcomes)
 
     for group, group_dir, planned_members in plans:

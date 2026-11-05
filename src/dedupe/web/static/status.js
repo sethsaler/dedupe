@@ -199,6 +199,12 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   // only while a scan runs; afterwards the one-line summary is enough.
   $("scanPanel").classList.toggle("scanning", state.scanning);
   state.scanId = s.scan_id || state.scanId;
+  $("btnHistory").textContent = s.recovered_actions ? `History · ${s.recovered_actions} recovered` : "History";
+  if (s.scan_settings?.paths?.length) state.lastScanSettings = s.scan_settings;
+  $("btnRetryAnalysis").disabled = state.scanning || state.acting || !state.lastScanSettings;
+  window.dispatchEvent(new CustomEvent("dedupe:work-state", { detail: {
+    busy: state.scanning || state.acting, scanId: state.scanId, done: s.progress?.done,
+  } }));
   renderSession(s.review_session, s.progress?.message === "Resumed saved review");
   document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
     element.disabled = state.scanning || state.acting;

@@ -40,8 +40,9 @@ function groupSelectedCount(g) {
 }
 
 function groupComplete(g) {
-  if (isIndependentReview(g)) return (g.reviewed_paths || []).length >= (g.member_count || 0);
-  return (g.selected_for_removal || []).length >= Math.max(0, (g.member_count || 0) - 1);
+  const protectedCount = (g.members || []).filter((member) => member.protected).length;
+  if (isIndependentReview(g)) return (g.members || []).every((member) => member.protected || (g.reviewed_paths || []).includes(member.path));
+  return (g.selected_for_removal || []).length >= Math.max(0, (g.member_count || 0) - Math.max(1, protectedCount));
 }
 
 function groupNeedsAttention(g) {

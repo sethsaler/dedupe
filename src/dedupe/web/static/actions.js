@@ -32,6 +32,7 @@ function effectiveSelection(scope) {
   const source = state.allGroups.length ? state.allGroups : state.groups;
   const protectedPaths = new Set();
   for (const g of source) {
+    for (const member of g.members || []) if (member.protected) protectedPaths.add(member.path);
     if (!isIndependentReview(g)) continue;
     const selectedPaths = new Set(g.selected_for_removal || []);
     for (const path of g.reviewed_paths || []) {

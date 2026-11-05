@@ -10,11 +10,14 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -258,7 +261,8 @@ def _extract_hash_frames(path: str | Path, timestamps: list[float]) -> list[byte
 
 
 def _extract_hash_frames_once(
-    path: str | Path, timestamps: list[float], hwaccel: tuple[str, ...]
+    path: str | Path, timestamps: list[float], hwaccel: tuple[str, ...],
+    *, cancelled: Callable[[], bool] | None = None,
 ) -> list[bytes]:
     expected = HASH_FRAME_SIZE * HASH_FRAME_SIZE
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
@@ -281,7 +285,7 @@ def _extract_hash_frames_once(
                 "-y",
                 str(target),
             ]
-        result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
         if result.returncode != 0:
             return []
         frames: list[bytes] = []
@@ -702,3 +706,378 @@ def find_similar_video_groups(
         progress("video-cluster", len(hashed), len(hashed), "")
 
     return cluster_around_best(hashed, adjacency, distinct)
+
+
+# The optional version pass is independent of the v3 hashes. Its denser cache
+# never changes the meaning of hashes used by existing reviews or revalidation.
+VERSION_SAMPLE_LIMIT = 96
+VERSION_SAMPLE_STEP = 0.5
+VERSION_MIN_SECONDS = 2.0
+VERSION_CACHE_VERSION = 2
+
+
+def _run_video_command(
+    command: list[str], *, timeout: float = 90,
+    cancelled: Callable[[], bool] | None = None,
+) -> subprocess.CompletedProcess:
+    if cancelled is None:
+        return subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+    if cancelled():
+        raise InterruptedError("scan cancelled")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if cancelled():
+                raise InterruptedError("scan cancelled")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("video analysis timed out")
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+
+def _version_timestamps(duration: float) -> list[float]:
+    count = min(VERSION_SAMPLE_LIMIT, max(1, math.ceil(duration / VERSION_SAMPLE_STEP)))
+    step = duration / count
+    # Stay away from boundary frames which can be black or absent after an edit.
+    return [(i + 0.25) * step for i in range(count)]
+
+
+def _version_frame_batches(
+    path: str, timestamps: list[float], cancelled: Callable[[], bool] | None,
+) -> list[bytes]:
+    frames: list[bytes] = []
+    for start in range(0, len(timestamps), 12):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        chunk = timestamps[start:start + 12]
+        frames.extend(_extract_hash_frames_once(path, chunk, (), cancelled=cancelled))
+    if len(frames) != len(timestamps):
+        raise ValueError("incomplete video version samples")
+    return frames
+
+
+def _version_cache_identity(record: FileRecord) -> str:
+    stat = Path(record.path).stat()
+    return json.dumps([
+        VERSION_CACHE_VERSION, str(Path(record.path).resolve()), stat.st_dev, stat.st_ino,
+        stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+    ], separators=(",", ":"))
+
+
+def _version_samples(
+    record: FileRecord, connection: sqlite3.Connection | None,
+    cancelled: Callable[[], bool] | None,
+    cache_errors: list[str] | None = None,
+) -> list[tuple[float, int]]:
+    import imagehash
+    import numpy as np
+    from PIL import Image
+
+    key = _version_cache_identity(record) if connection is not None else None
+    if connection is not None:
+        try:
+            row = connection.execute(
+                "SELECT samples FROM samples WHERE identity = ?", (key,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            if cache_errors is not None:
+                cache_errors.append(str(exc))
+            connection, row = None, None
+        if row:
+            try:
+                data = json.loads(row[0])
+                duration = float(data["duration"])
+                samples = [(float(t), int(h, 16)) for t, h in data["samples"]]
+                if (
+                    math.isfinite(duration) and duration > 0
+                    and len(samples) <= VERSION_SAMPLE_LIMIT
+                    and all(0 <= t < duration and 0 <= h < (1 << 64) for t, h in samples)
+                ):
+                    record.duration = duration
+                    return samples
+            except (KeyError, TypeError, ValueError):
+                pass
+    duration = record.duration
+    if not duration or not math.isfinite(duration):
+        duration, record.width, record.height = probe_video(record.path)
+        record.duration = duration
+    if not duration or duration < VERSION_MIN_SECONDS:
+        return []
+    timestamps = _version_timestamps(duration)
+    frames = _version_frame_batches(record.path, timestamps, cancelled)
+    samples = []
+    for timestamp, raw in zip(timestamps, frames, strict=True):
+        # Blank frames and nearly uniform fades are not useful candidate evidence.
+        if float(np.frombuffer(raw, dtype=np.uint8).std()) < 8:
+            continue
+        im = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
+        samples.append((timestamp, int(str(imagehash.phash(im)), 16)))
+    if connection is not None:
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO samples(identity, samples) VALUES (?, ?)",
+                (key, json.dumps({"duration": duration,
+                                  "samples": [(t, f"{h:016x}") for t, h in samples]})),
+            )
+            connection.commit()
+        except sqlite3.Error as exc:
+            if cache_errors is not None:
+                cache_errors.append(str(exc))
+    return samples
+
+
+def _version_candidate_pairs(
+    samples: list[list[tuple[float, int]]],
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[tuple[int, int], list[tuple[float, float]]]:
+    """Index frame hashes once; avoid decoding or testing every pair of videos."""
+    import pybktree
+
+    occurrences: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for index, timeline in enumerate(samples):
+        for timestamp, fingerprint in timeline:
+            occurrences[fingerprint].append((index, timestamp))
+    tree = pybktree.BKTree(lambda a, b: (a ^ b).bit_count(), occurrences)
+    candidates: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    for i, timeline in enumerate(samples):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        for ta, fingerprint in timeline:
+            # Off-grid cuts shift samples by a fraction of a second. Candidate
+            # lookup is deliberately looser than the aligned verification.
+            matches = tree.find(fingerprint, 10)
+            # Generic repeated title cards must not expand into an unbounded join.
+            if sum(len(occurrences[h]) for _distance, h in matches) > 256:
+                continue
+            for _distance, matched in matches:
+                for j, tb in occurrences[matched]:
+                    if j > i:
+                        candidates[(i, j)].append((ta, tb))
+    return {
+        pair: votes for pair, votes in candidates.items()
+        if len({ta for ta, _tb in votes}) >= 3 and len({tb for _ta, tb in votes}) >= 3
+    }
+
+
+def _offset_candidates(
+    votes: list[tuple[float, float]], step: float,
+) -> list[float]:
+    bins: dict[int, list[float]] = defaultdict(list)
+    for ta, tb in votes:
+        offset = tb - ta
+        bins[round(offset / step)].append(offset)
+    ranked = sorted(bins.values(), key=lambda values: (-len(values), abs(sum(values) / len(values))))
+    return [sorted(values)[len(values) // 2] for values in ranked[:3]]
+
+
+def _verify_video_offset(
+    a: FileRecord, b: FileRecord, offset: float,
+    cancelled: Callable[[], bool] | None,
+) -> dict | None:
+    """Verify distributed samples across the overlap, not just matching titles.
+
+    Offset maps an A timestamp onto B. This deliberately requires essentially
+    all of the shorter clip, not an arbitrary small scene shared by two movies.
+    """
+    import imagehash
+    import numpy as np
+    from PIL import Image
+
+    da, db = float(a.duration or 0), float(b.duration or 0)
+    start = max(0.0, -offset)
+    end = min(da, db - offset)
+    overlap = end - start
+    if overlap < VERSION_MIN_SECONDS or overlap < min(da, db) * 0.8:
+        return None
+    times = [start + overlap * fraction for fraction in (0.08, 0.22, 0.36, 0.5, 0.64, 0.78, 0.92)]
+    left = _version_frame_batches(a.path, times, cancelled)
+    right = _version_frame_batches(b.path, [t + offset for t in times], cancelled)
+    distances, residuals, hashes = [], [], []
+    for ra, rb in zip(left, right, strict=True):
+        ia = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), ra)
+        ib = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), rb)
+        ha, hb = imagehash.phash(ia), imagehash.phash(ib)
+        hashes.append(int(str(ha), 16))
+        distances.append(ha - hb)
+        aa, ab = np.frombuffer(ra, np.uint8).astype(float), np.frombuffer(rb, np.uint8).astype(float)
+        residuals.append(float(np.abs(aa - ab).mean()))
+    diverse = sum((hashes[0] ^ h).bit_count() >= 4 for h in hashes[1:]) >= 2
+    good = [d <= 10 and residual <= 18 for d, residual in zip(distances, residuals, strict=True)]
+    if not diverse or sum(good) < 6 or sum(distances) / len(distances) > 7:
+        return None
+    return {
+        "ranges": {a.path: [round(start, 3), round(end, 3)],
+                   b.path: [round(start + offset, 3), round(end + offset, 3)]},
+        "overlap_seconds": round(overlap, 3),
+        "mean_frame_distance": round(float(sum(distances)) / len(distances), 3),
+        "verified_samples": len(times),
+        "approximate_alignment": True,
+        "relation": "same_footage" if abs(offset) < 0.1 and abs(da - db) < 0.2 else "excerpt",
+    }
+
+
+def _audio_stream_present(path: str, cancelled: Callable[[], bool] | None) -> bool:
+    result = _run_video_command([
+        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+        "-of", "json", path,
+    ], timeout=15, cancelled=cancelled)
+    if result.returncode:
+        raise ValueError("audio stream unavailable")
+    return bool(json.loads(result.stdout).get("streams"))
+
+
+def _audio_window(path: str, start: float, duration: float, cancelled) -> bytes:
+    result = _run_video_command([
+        "ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.4f}", "-threads", "1",
+        "-i", path, "-t", f"{duration:.4f}", "-vn", "-ac", "1", "-ar", "8000",
+        "-f", "s16le", "pipe:1",
+    ], timeout=30, cancelled=cancelled)
+    if result.returncode:
+        raise ValueError("audio sample unavailable")
+    return result.stdout
+
+
+def compare_video_audio(
+    a: str, b: str, ranges: dict[str, list[float]],
+    *, cancelled: Callable[[], bool] | None = None,
+) -> str:
+    """Conservative audio comparison of two distributed windows of the overlap.
+
+    'same' means sampled audio agrees, not that complete tracks are identical.
+    Decode failures stay 'unavailable' rather than becoming false differences.
+    """
+    import numpy as np
+    from scipy.signal import correlate
+
+    try:
+        presence = [_audio_stream_present(path, cancelled) for path in (a, b)]
+        if presence == [False, False]:
+            return "none"
+        if presence[0] != presence[1]:
+            return "different"
+        overlap = min(ranges[a][1] - ranges[a][0], ranges[b][1] - ranges[b][0])
+        duration = min(6.0, overlap * 0.4)
+        scores = []
+        for fraction in (0.1, 0.5):
+            arrays = [np.frombuffer(_audio_window(
+                path, ranges[path][0] + overlap * fraction, duration, cancelled,
+            ), dtype="<i2").astype(float) for path in (a, b)]
+            n = min(map(len, arrays))
+            if n < 800:
+                return "unavailable"
+            left, right = (array[:n] - array[:n].mean() for array in arrays)
+            norms = [float(np.linalg.norm(array)) for array in (left, right)]
+            if min(norms) < 1:
+                scores.append(1.0 if max(norms) < 1 else 0.0)
+                continue
+            cross = correlate(left, right, mode="full", method="fft")
+            radius = min(4000, n // 5)
+            center = n - 1
+            scores.append(float(np.max(cross[center - radius:center + radius + 1]) / np.prod(norms)))
+        if min(scores) >= 0.85:
+            return "same"
+        return "different" if max(scores) < 0.5 else "unavailable"
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
+        return "unavailable"
+
+
+def find_video_version_matches(
+    records: list[FileRecord], *, distinct: DistinctReviews | None = None,
+    progress: ProgressCb | None = None, workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None, cache_path: str | Path | None = None,
+    errors: list[str] | None = None, use_cache: bool = True,
+) -> list[tuple[list[FileRecord], dict]]:
+    """Find manual-review video versions and attach aligned ranges/audio evidence.
+
+    Dense samples are cached independently of the standard v3 fingerprint. No
+    full pairwise video decoding is performed: a frame-hash index proposes pairs
+    and at most three offsets per pair receive seven-frame verification. Bounded
+    sampling can miss very short excerpts in long movies; it never proves that
+    unsampled frames/audio are identical.
+    """
+    del workers  # Analysis is intentionally serial and cancellable to bound ffmpeg RAM.
+    videos = [r for r in records if r.media_type == MediaType.VIDEO]
+    if len(videos) < 2 or not ffmpeg_available():
+        return []
+    if cache_path is None:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        cache_path = base / "dedupe" / "video-versions.sqlite3"
+    connection = None
+    cache_errors: list[str] = []
+    try:
+        if use_cache:
+            try:
+                Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(str(cache_path), timeout=0.25)
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS samples(identity TEXT PRIMARY KEY, samples TEXT)"
+                )
+            except (OSError, sqlite3.Error) as exc:
+                cache_errors.append(str(exc))
+                if connection is not None:
+                    connection.close()
+                    connection = None
+        samples = []
+        for i, record in enumerate(videos):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            try:
+                samples.append(_version_samples(record, connection, cancelled, cache_errors))
+            except InterruptedError:
+                raise
+            except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+                samples.append([])
+                if errors is not None:
+                    errors.append(f"video version analysis failed: {record.path}: {exc}")
+            if cache_errors and connection is not None:
+                # One failed cache operation disables it for the remainder of
+                # this scan. Already extracted samples remain usable.
+                connection.close()
+                connection = None
+            if progress:
+                progress("video-versions", i + 1, len(videos), "Finding video excerpts")
+        matches = []
+        pairs = _version_candidate_pairs(samples, cancelled)
+        for (i, j), votes in pairs.items():
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            a, b = videos[i], videos[j]
+            if distinct and distinct.is_distinct(a, b):
+                continue
+            step = max(float(a.duration or 0), float(b.duration or 0)) / VERSION_SAMPLE_LIMIT
+            offsets = _offset_candidates(votes, max(0.25, step))
+            evidence = None
+            for offset in offsets:
+                try:
+                    evidence = _verify_video_offset(a, b, offset, cancelled)
+                except InterruptedError:
+                    raise
+                except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
+                    continue
+                if evidence:
+                    break
+            if evidence is None:
+                continue
+            evidence["audio"] = compare_video_audio(a.path, b.path, evidence["ranges"], cancelled=cancelled)
+            evidence["audio_scope"] = "sampled overlap"
+            evidence["manual_review"] = True
+            # Same-footage pairs with agreeing audio retain the standard matcher.
+            if evidence["relation"] == "same_footage" and evidence["audio"] in {"same", "none"}:
+                continue
+            matches.append(([a, b], evidence))
+        return matches
+    finally:
+        if connection is not None:
+            connection.close()
+        if cache_errors and errors is not None:
+            errors.append(f"video version cache unavailable; continued uncached: {cache_errors[0]}")

@@ -2,7 +2,7 @@
 
 ## Summary
 
-The review session is how a finished review survives an app restart. When a scan completes, its results — files, groups, selections, reviewed paths, and the destinations of any trashed review candidates — are saved to a single JSON file; the next time the app starts, the session is offered back through a banner, and when the user resumes, every file in it is revalidated against the disk, anything that no longer matches is pruned, and the user resumes where they left off. Nothing is loaded automatically — a restart opens at the scan setup. This document owns the save format's guarantees, the pruning rules and their reasons, and what *resume* commits to. The banner the user actually sees is [Session resume](../ui/session-resume.md); what can be done with the resumed selections is [Actions and undo](actions-and-undo.md).
+The review session is how a finished review survives an app restart. When a scan completes, its results — files, groups, selections, reviewed paths, and the destinations of any trashed review candidates — are saved to the last-review JSON file and, for a named cleanup job, a separate review file; the next time the app starts, the session is offered back through a banner, and when the user resumes, every file in it is revalidated against the disk, anything that no longer matches is pruned, and the user resumes where they left off. Nothing is loaded automatically — a restart opens at the scan setup. This document owns the save format's guarantees, the pruning rules and their reasons, and what *resume* commits to. The banner the user actually sees is [Session resume](../ui/session-resume.md); what can be done with the resumed selections is [Actions and undo](actions-and-undo.md).
 
 ## The simple case
 
@@ -86,6 +86,10 @@ What remains is installed as the current scan result exactly as if it had just b
 - Pruning can collapse a keep-one group to a single file, which then disappears entirely — a lone survivor is not a duplicate.
 - The same file pruned from three groups counts once in the banner's total.
 - If the session file exists but the scan it describes had zero groups, a resume loads an empty result rather than starting blank.
+
+## Named cleanup jobs
+
+Saved cleanup jobs retain their folders, protection rules, scan settings, and separate review progress. Switching jobs flushes pending review choices first. After one full scan, Check new arrivals compares the inventory with that job's baseline and shows groups containing new or changed files. Existing files remain available as comparison references. Changing job settings requires another full scan. See [the current cleanup workflow](../../cleanup-workflow.md).
 
 ## Open questions and verification
 

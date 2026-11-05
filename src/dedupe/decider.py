@@ -23,12 +23,18 @@ Protocol::
 from __future__ import annotations
 
 import base64
+import http.client
 import io
 import json
 import os
+import queue
+import socket
 import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Self
 
@@ -172,8 +178,10 @@ class DeciderJudge:
         *,
         use_cache: bool = True,
         cache_path: str | Path | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         self.url = url or decider_url()
+        self.cancelled = cancelled
         if not decider_available(self.url):
             raise RuntimeError(f"Decider is not running at {self.url}; open Decider.app")
         self.model = _model_id(self.url)
@@ -198,18 +206,89 @@ class DeciderJudge:
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                reply = json.load(response)
-        except urllib.error.HTTPError as exc:
+        # urllib's socket timeout alone is not a total deadline, and a stalled
+        # response must not stop the UI's Cancel button from working.
+        completed: queue.Queue = queue.Queue(maxsize=1)
+        connections: list[http.client.HTTPConnection] = []
+        sockets: list[socket.socket] = []
+        aborted = threading.Event()
+
+        class TrackedHTTPConnection(http.client.HTTPConnection):
+            def connect(connection):
+                super().connect()
+                sockets.append(connection.sock)
+
+        class TrackedHTTPSConnection(http.client.HTTPSConnection):
+            def connect(connection):
+                super().connect()
+                sockets.append(connection.sock)
+
+        class HTTPHandler(urllib.request.HTTPHandler):
+            def http_open(handler, req):
+                def connect(*args, **kwargs):
+                    conn = TrackedHTTPConnection(*args, **kwargs)
+                    connections.append(conn)
+                    return conn
+                return handler.do_open(connect, req)
+
+        class HTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(handler, req):
+                def connect(*args, **kwargs):
+                    conn = TrackedHTTPSConnection(*args, **kwargs)
+                    connections.append(conn)
+                    return conn
+                return handler.do_open(connect, req)
+
+        def request_reply() -> None:
             try:
-                message = json.load(exc)["error"]["message"]
-            except Exception:
-                message = str(exc)
-            raise RuntimeError(f"Decider: {message}") from exc
+                opener = urllib.request.build_opener(HTTPHandler(), HTTPSHandler())
+                with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+                    reply = json.load(response)
+                completed.put((reply, None))
+            except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        message = json.load(exc)["error"]["message"]
+                    except Exception:
+                        message = str(exc)
+                    exc = RuntimeError(f"Decider: {message}")
+                completed.put((None, exc))
+            finally:
+                if aborted.is_set():
+                    for conn in connections:
+                        conn.close()
+
+        thread = threading.Thread(target=request_reply, name="dedupe-decider-request", daemon=True)
+        thread.start()
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        try:
+            while True:
+                if self.cancelled and self.cancelled():
+                    raise InterruptedError("scan cancelled")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Decider stopped responding; retry verification")
+                try:
+                    reply, error = completed.get(timeout=0.05)
+                    if error:
+                        raise error
+                    break
+                except queue.Empty:
+                    continue
+        finally:
+            aborted.set()
+            for stream in sockets:
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            for conn in connections:
+                conn.close()
+            thread.join(timeout=0.1)
         return float(reply["answers"]["copy"]["probabilities"]["same"])
 
     def __call__(self, a: FileRecord, b: FileRecord) -> float | None:
+        if self.cancelled and self.cancelled():
+            raise InterruptedError("scan cancelled")
         if self.failure is not None:
             return None
         if self.cache is not None:
@@ -222,6 +301,8 @@ class DeciderJudge:
             return None  # unreadable media: this pair only
         try:
             probability = self._ask(left, right)
+        except InterruptedError:
+            raise
         except Exception as exc:
             self.failure = f"Decider verification stopped: {exc}"
             return None

@@ -129,6 +129,8 @@ class FileRecord:
     # Change time catches in-place edits that preserve both size and mtime.
     # Optional for older serialized review sessions and external callers.
     ctime_ns: int | None = None
+    # Reference-library members can be compared but never removed or moved.
+    protected: bool = False
 
     @property
     def path_obj(self) -> Path:
@@ -171,6 +173,7 @@ class FileRecord:
             inode=data.get("inode"),
             mtime_ns=data.get("mtime_ns"),
             ctime_ns=data.get("ctime_ns"),
+            protected=bool(data.get("protected", False)),
             width=data.get("width"),
             height=data.get("height"),
             sha256=data.get("sha256"),
@@ -216,6 +219,7 @@ class ReviewGroup:
     # member's cosine similarity with the keeper in match_scores.
     match_basis: str | None = None
     match_scores: dict[str, float] = field(default_factory=dict)
+    match_details: dict[str, Any] = field(default_factory=dict)
 
     @property
     def policy(self) -> ReviewPolicy:
@@ -241,6 +245,7 @@ class ReviewGroup:
                 m.size
                 for m in self.members
                 if m.path in selected
+                and not m.protected
                 and m.path in reviewed
                 and (
                     self.kind != GroupKind.NO_HUMANS
@@ -248,9 +253,9 @@ class ReviewGroup:
                 )
             )
         keep = self.suggested_keep
-        total = sum(m.size for m in self.members)
+        total = sum(m.size for m in self.members if not m.protected)
         if keep:
-            keep_size = next((m.size for m in self.members if m.path == keep), 0)
+            keep_size = next((m.size for m in self.members if m.path == keep and not m.protected), 0)
             return max(0, total - keep_size)
         # keep largest as fallback
         return max(0, total - max(m.size for m in self.members))
@@ -271,6 +276,7 @@ class ReviewGroup:
             "distinct_participants": list(self.distinct_participants),
             "match_basis": self.match_basis,
             "match_scores": dict(self.match_scores),
+            "match_details": dict(self.match_details),
         }
 
     @classmethod
@@ -324,6 +330,7 @@ class ReviewGroup:
             # member_paths like the selection lists above.
             distinct_participants=list(data.get("distinct_participants", [])),
             match_basis=data.get("match_basis"),
+            match_details=dict(data.get("match_details") or {}),
             match_scores={
                 path: float(score)
                 for path, score in (data.get("match_scores") or {}).items()
@@ -347,6 +354,7 @@ def effective_selected_paths(
     protection_source = protection_groups if protection_groups is not None else groups
     protected: set[str] = set()
     for group in protection_source:
+        protected.update(member.path for member in group.members if member.protected)
         if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
             protected.update(set(group.reviewed_paths) - set(group.selected_for_removal))
     ordered: list[str] = []
@@ -476,6 +484,9 @@ class ScanResult:
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
+    protected_folders: list[str] = field(default_factory=list)
+    job_id: str | None = None
+    scan_settings: dict[str, Any] = field(default_factory=dict)
 
     def recompute_stats(self) -> None:
         self.exact_groups = sum(1 for g in self.groups if g.kind == GroupKind.EXACT)
@@ -514,6 +525,9 @@ class ScanResult:
             "group_count": len(self.groups),
             "errors": list(self.errors),
             "diagnostics": self.diagnostics.to_dict(),
+            "protected_folders": list(self.protected_folders),
+            "job_id": self.job_id,
+            "scan_settings": dict(self.scan_settings),
         }
 
     @classmethod
@@ -531,6 +545,9 @@ class ScanResult:
             groups=groups,
             errors=list(data.get("errors", [])),
             diagnostics=ScanDiagnostics.from_dict(data.get("diagnostics", {})),
+            protected_folders=list(data.get("protected_folders", [])),
+            job_id=data.get("job_id"),
+            scan_settings=dict(data.get("scan_settings") or {}),
         )
         result.recompute_stats()
         return result

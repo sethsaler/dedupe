@@ -137,6 +137,8 @@ def _sort_key(summary: ReceiptSummary) -> str:
 
 def _undo_state(data: dict) -> tuple[bool, str | None]:
     action = str(data.get("action") or "")
+    if data.get("status") == "running":
+        return False, "action is still running"
     if data.get("dry_run"):
         return False, "dry-run previews change nothing"
     if action not in UNDOABLE_ACTIONS:

@@ -2,9 +2,9 @@
 
 Choose **Find duplicates quickly** to compare all selected folders together,
 without face counting, person detection, low-resolution review, or random review.
-The existing exact-duplicate behavior still applies: when Exact is enabled in
-the browser, identical extra copies move to Trash after scanning. Presets do not
-change deletion safeguards. **Custom settings** retains individual controls.
+Exact copies appear for review; scanning never automatically trashes them.
+**Delete All Exact Duplicates** prepares the suggested selection and opens a
+confirmation sheet. **Custom settings** retains individual controls.
 
 Choose **Find duplicates and edited copies** to add the optional DigUp semantic
 engine at a 94% candidate threshold. Below 97%, candidates must pass OpenCV
@@ -15,6 +15,24 @@ If either dependency is absent, this deeper capability is unavailable. Standard
 matching continues to work. Semantic matches stay manual review suggestions;
 no semantic score is a probability or proof of duplication. Related subjects
 remain in Sets. Animations do not use the new still-image geometry verifier.
+
+## Clean an inbox against a protected archive
+
+Enter the folder to clean under **Folders or files to scan**. Open **Compare
+against a protected library** and enter archive folders, one per line. Dedupe
+includes both sides in the comparison and prevents archive files from being
+selected for removal or moved, including through isolate-move. Protected copies
+are preferred as keepers. A folder included on both sides remains protected.
+Turn off **Scan folders separately** before using protected libraries; protection
+requires one combined comparison across folders.
+
+```bash
+dedupe scan ~/Downloads --protect-folder ~/Pictures/Archive --ui
+# Repeat --protect-folder for additional archives.
+```
+
+Protected library folders are stronger than keeper preferences: preferences
+rank copies, while protection prevents a file from being removed or moved.
 
 ## Decide what to keep
 
@@ -36,16 +54,91 @@ rank more conservatively. The explanation appears with each group; files with
 analysis errors are deprioritized. This ordering never changes selection or
 authorizes deletion.
 
+## Repeat a cleanup without losing your place
+
+Open **Saved cleanup jobs**, enter a name, and choose **Save job**. The job stores
+the current folders and scan settings. Select it later to restore those settings,
+then choose **Resume review** to continue its independently saved review.
+Switching jobs does not replace another job's saved progress.
+
+After the job has completed a scan, **Check new arrivals** compares the current
+library and focuses review on new or changed files. Duplicate groups retain
+their older matching copies, so a new download can still be compared with the
+archive. This is a focused review backed by cached analysis, not a filesystem
+watcher: the scan still inventories the selected folders. Changing a job's
+settings requires a full scan before checking new arrivals again.
+
+**Delete job** removes the saved settings and review, leaving media untouched.
+The ordinary **Resume saved review** banner remains available for the last review.
+
 ## Compare details
 
 In Similar pair review, expand a still image for an overlay, hold-to-flicker,
 or Difference mode. Zoom loads both originals into one coordinate space;
 panning moves them together. Different aspect ratios/crops may not line up, so
 a bright difference is not itself proof of different content. GIFs retain their
-animation view. Video pairs offer synchronized playback, seeking, and speed;
-time is aligned from the start, not content-aligned across trims. Metadata shows
-image format/capture details or audio codec/channel information. Audio content
-is not compared. Metadata is fetched only for the visible pair.
+animation view. Video pairs offer synchronized playback, seeking, and speed.
+Standard pairs align playback from the start. Metadata shows image format/capture
+details or audio codec/channel information and is fetched only for the visible pair.
+
+Enable **Video clips & versions** in Options to look for trimmed clips, offset
+versions, and soundtrack changes. The CLI equivalent is:
+
+```bash
+dedupe scan ~/Movies --video-versions --ui
+```
+
+Version matches show an **Approximate matching section** for each file, and
+synchronized playback starts at those offsets. Audio labels distinguish sampled
+agreement, different audio, no audio, and unavailable evidence. These suggestions
+require manual selection; matching footage does not establish that either
+version is expendable.
+
+The version pass samples at most 96 timeline positions and requires at least two
+seconds of matching footage covering 80% of the shorter video. Short excerpts
+inside long recordings, heavy edits, or speed changes can be missed. Alignment is
+approximate. Audio comparison checks two windows inside the overlap; agreement
+does not prove complete soundtracks are identical. Standard video matching does
+not compare audio content.
+
+## Review past cleanups and recover interruptions
+
+Open **History** to see previous cleanups and their affected files. **Restore
+files…** checks that the moved files are still available and their original paths
+are free, then opens a confirmation. It works after restarting, without loading
+the old scan. Restoring files does not recreate review groups; scan again to see
+them. Changed, missing, or already-restored files can block a restore.
+
+The **Not duplicates** section lists remembered pair decisions. **Reconsider this
+pair** removes that exclusion so the files can match on a subsequent scan. It
+does not move either file.
+
+Before moving files, Dedupe writes a receipt and records each move's intent and
+outcome as work proceeds. An unwritable journal stops destructive work. If a
+cleanup is interrupted, History checks the recorded paths and file identities
+without moving anything. Confirmed moves can be restored normally. Outcomes that
+cannot be identified safely remain flagged for inspection, including unresolved
+Trash locations or an interrupted copy with both paths present. No uncertain
+file is automatically restored or removed.
+
+Keep the receipts and pending `.journal` files under `~/.cache/dedupe/logs/`
+while a cleanup may need recovery. The CLI can also inspect complete receipts
+and restore supported actions with `dedupe receipts` and `dedupe undo`.
+
+## Retry incomplete analysis
+
+Expand **Scan quality** to inspect failures and warnings. **Retry analysis using
+cached work** reruns the last scan configuration, reusing completed work and
+retrying uncached analysis. It is a full scan with cache reuse, not a retry limited
+to the displayed error list.
+
+Semantic analysis responds to cancellation while waiting for its helper. Stalled
+helper startup or requests time out, and completed embedding batches remain
+cached. Content-based reuse follows unchanged media through renames and moves.
+Neighbor comparisons reuse unchanged pairs and compare newly added vectors with
+the current library; a broader threshold or changed model may require more work.
+These changes do not guarantee every file can be decoded or matched: review the
+quality report after a retry.
 
 ## Measure improvements
 
@@ -58,8 +151,8 @@ never calls deletion actions:
 # Add --semantic to include the optional edited-copy engine.
 ```
 
-The optional semantic neighbor search skips already-compared matrix blocks.
-This preserves the same exact cosine matches while reducing repeated work.
+The semantic neighbor cache preserves exact cosine comparisons for unchanged
+vectors, avoiding repeat comparisons on compatible subsequent scans.
 
 **Export review labels**, under Filter & organize, downloads Same/Different
 pair decisions and review timing collected locally in this browser. Undo removes
