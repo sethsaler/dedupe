@@ -439,6 +439,12 @@ MIT
 
 ### Cleanup improvements
 
+The UI opens in **Find duplicates quickly** on every launch, including after a
+Sets or custom scan. Exact and similar detection are on; Sets, face/person analysis,
+low-resolution review, and Random 50 are off. Resized and lightly edited copies
+are covered by similar matching; deeper edited-copy search is available explicitly.
+Keeper preferences, exclusions, media types, and thresholds remain remembered.
+
 Scans compare all selected folders together by default, finding exact and similar
 copies both within and across folders. **Scan folders separately** (CLI: `--parallel`)
 is an explicit option for independent scans that exclude cross-folder matches.

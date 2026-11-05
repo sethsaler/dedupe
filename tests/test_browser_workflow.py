@@ -128,8 +128,8 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     page.locator("#resultSearch").fill("does-not-exist")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#resultSearch").fill("duplicate.png")
-    # Exact, Low-res, Random, and the All-Files browse group all contain it.
-    expect(page.locator(".group-item")).to_have_count(4)
+    # Quick cleanup returns Exact plus the All-Files browse group.
+    expect(page.locator(".group-item")).to_have_count(2)
     page.get_by_role("tab", name="Exact 1").click()
     expect(page.locator(".group-item")).to_have_count(1)
     assert page.locator(".group-item").count() == 1
@@ -231,7 +231,7 @@ def test_empty_results_offer_recovery_without_changing_selections(
     all_tab = page.locator('.tab[data-kind="all"]')
     expect(all_tab).to_be_focused()
     expect(all_tab).to_have_attribute("aria-selected", "true")
-    expect(page.locator(".group-item")).to_have_count(4)
+    expect(page.locator(".group-item")).to_have_count(2)
     exact_tab.click()
     page.locator(".group-item").first.click()
     expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
@@ -293,6 +293,8 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#optsToggle").click()
+    page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -416,12 +418,12 @@ def test_bulk_selection_and_advanced_filters(
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#filterPathPattern").fill("*keeper*")
-    # Exact, Low-res, Random, and the All-Files browse group all contain it.
-    expect(page.locator(".group-item")).to_have_count(4)
+    # Quick cleanup returns Exact plus the All-Files browse group.
+    expect(page.locator(".group-item")).to_have_count(2)
     page.locator("#resultSearch").fill("keeper")
     page.locator("#issuesOnly").check()
     page.locator("#btnClearFilters").click()
-    expect(page.locator(".group-item")).to_have_count(4)
+    expect(page.locator(".group-item")).to_have_count(2)
     assert page.locator("#resultSearch").input_value() == ""
     assert not page.locator("#issuesOnly").is_checked()
 
@@ -1461,7 +1463,7 @@ def test_tabs_and_group_list_are_keyboard_navigable(
     expect(page.locator("#filteredCount")).to_have_text("0 of 0 groups shown")
     page.keyboard.press("Home")
     assert page.evaluate("document.activeElement.dataset.kind") == "all"
-    expect(page.locator("#filteredCount")).to_have_text("4 of 4 groups shown")
+    expect(page.locator("#filteredCount")).to_have_text("2 of 2 groups shown")
     # The auto-select marks its group item active synchronously at start; once
     # it exists, a j-initiated selection supersedes it and lands the focus.
     page.locator(".group-item.active").wait_for(state="attached")
@@ -1491,6 +1493,8 @@ def test_review_action_shortcut_and_card_reveal_from_the_keyboard(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#optsToggle").click()
+    page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -1613,6 +1617,8 @@ def test_attention_navigation_and_space_u_shortcuts(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#optsToggle").click()
+    page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -1907,7 +1913,7 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
 
 
 @pytest.mark.e2e
-def test_legacy_folder_default_migrates_and_explicit_choice_persists(
+def test_launch_resets_folder_mode_but_preserves_other_preferences(
     page, live_dedupe_server: str
 ) -> None:
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
@@ -1922,8 +1928,10 @@ def test_legacy_folder_default_migrates_and_explicit_choice_persists(
     expect(page.locator("#optVideos")).not_to_be_checked()
 
     page.locator("#optParallel").check(force=True)
+    expect(page.locator("#scanPreset")).to_have_value("custom")
     page.reload(wait_until="domcontentloaded")
-    expect(page.locator("#optParallel")).to_be_checked()
+    expect(page.locator("#scanPreset")).to_have_value("cleanup")
+    expect(page.locator("#optParallel")).not_to_be_checked()
 
 
 @pytest.mark.e2e
@@ -1966,7 +1974,7 @@ def test_saved_review_is_offered_not_loaded_and_resume_reports_pruned_files(
         page.locator(".group-item").first.wait_for(state="attached")
         # The exact group lost a member below its two-file minimum.
         expect(page.locator("#countExact")).to_have_text("0")
-        expect(page.locator("#countAll")).to_have_text("3")
+        expect(page.locator("#countAll")).to_have_text("1")
         expect(page.locator("#sessionStatusText")).to_contain_text("Resumed review")
         expect(page.locator("#sessionStatusText")).to_contain_text("1 stale file pruned")
         expect(page.locator("#sessionPrunedSummary")).to_contain_text(
@@ -2112,6 +2120,8 @@ def test_random_review_decision_mechanics(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#optsToggle").click()
+    page.locator("#optRandomReview").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
     page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
@@ -2206,7 +2216,7 @@ def test_scan_streams_groups_and_cancel_restores_previous(
     # The scan stops and the previous (duplicate_images) results come back.
     expect(page.locator("#btnCancelScan")).to_be_hidden(timeout=30_000)
     expect(page.locator("#countExact")).to_have_text("1", timeout=30_000)
-    expect(page.locator(".group-item")).to_have_count(4, timeout=30_000)
+    expect(page.locator(".group-item")).to_have_count(2, timeout=30_000)
     toast_log = page.evaluate("window.__toastLog")
     assert any("Cancelling" in text for text in toast_log)
     assert page_errors == []
@@ -2518,17 +2528,31 @@ def test_sidebar_partial_window_shift_keeps_scroll_anchor(page, live_dedupe_serv
 
 
 @pytest.mark.e2e
-def test_cleanup_preset_compares_folders_and_persists_preferences(page, live_dedupe_server, tmp_path):
+@pytest.mark.parametrize("saved_sets_scan", [False, True])
+def test_launch_quickly_finds_exact_and_resized_copies(
+    page, live_dedupe_server, tmp_path, saved_sets_scan
+):
     originals, exports = tmp_path / "originals", tmp_path / "exports"
     originals.mkdir()
     exports.mkdir()
     source = Image.open(Path(__file__).parent / "fixtures/astronaut.png").convert("RGB")
     source.save(originals / "original.png")
+    shutil.copyfile(originals / "original.png", exports / "copy.png")
     source.resize((256, 256)).save(exports / "export.jpg", quality=90)
+    page_errors = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.goto(live_dedupe_server)
-    page.locator("#scanPreset").select_option("cleanup")
+    if saved_sets_scan:
+        page.evaluate("""() => localStorage.setItem('dedupe.scanSettings.v1', JSON.stringify({
+            folderScopeVersion: 2, optExact: false, optSimilar: false, optSemantic: true,
+            optDecider: true, optCountFaces: true, optNoHumans: true, optLowResolution: true,
+            optRandomReview: true, optParallel: true
+        }))""")
+        page.reload()
+    expect(page.locator("#scanPreset")).to_have_value("cleanup")
     page.locator("#optsToggle").click()
-    for selector in ("#optCountFaces", "#optNoHumans", "#optLowResolution", "#optRandomReview", "#optParallel"):
+    for selector in ("#optSemantic", "#optDecider", "#optCountFaces", "#optNoHumans",
+                     "#optLowResolution", "#optRandomReview", "#optParallel"):
         expect(page.locator(selector)).not_to_be_checked()
     page.locator("#preferredFolders").fill(str(originals))
     page.locator("#paths").fill(f"{originals}, {exports}")
@@ -2537,6 +2561,12 @@ def test_cleanup_preset_compares_folders_and_persists_preferences(page, live_ded
     sent = request.value.post_data_json
     assert sent["preferred_folders"] == [str(originals)]
     assert sent["parallel_streams"] is False
+    assert sent["exact"] is True and sent["similar"] is True
+    for option in ("semantic", "decider", "find_no_humans", "count_faces", "find_low_resolution"):
+        assert sent[option] is False
+    assert sent["random_review_count"] == 0
+    expect(page.locator("#countExact")).to_have_text("1", timeout=20000)
+    expect(page.locator("#countSets")).to_have_text("0")
     page.locator('.tab[data-kind="similar"]').click()
     expect(page.locator(".group-item")).to_have_count(1, timeout=20000)
     expect(page.locator("#resultSort")).to_have_value("opportunity")
@@ -2544,6 +2574,7 @@ def test_cleanup_preset_compares_folders_and_persists_preferences(page, live_ded
     page.reload()
     expect(page.locator("#preferredFolders")).to_have_value(str(originals))
     assert (originals / "original.png").exists() and (exports / "export.jpg").exists()
+    assert page_errors == []
 
 
 @pytest.mark.e2e

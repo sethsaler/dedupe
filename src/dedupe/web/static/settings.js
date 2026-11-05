@@ -120,7 +120,7 @@ const settingIds = [
 ];
 
 function saveScanSettings() {
-  const settings = { folderScopeVersion: 2 };
+  const settings = {};
   for (const id of settingIds) {
     const element = $(id);
     settings[id] = element.type === "checkbox" ? element.checked : element.value;
@@ -144,10 +144,6 @@ function restoreScanSettings() {
     const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     for (const id of settingIds) {
       if (!(id in settings)) continue;
-      // Older versions saved the automatic independent-folder default on every
-      // scan. Reset only that legacy choice so existing users also find matches
-      // across folders; future explicit choices and all other settings persist.
-      if (id === "optParallel" && settings.folderScopeVersion !== 2) continue;
       const element = $(id);
       if (element.type === "checkbox") element.checked = !!settings[id];
       else element.value = settings[id];
@@ -177,8 +173,7 @@ function syncSemanticVisibility() {
 $("optSemantic").addEventListener("change", syncSemanticVisibility);
 syncSemanticVisibility();
 
-$("scanPreset").addEventListener("change", () => {
-  const preset = $("scanPreset").value;
+function applyScanPreset(preset) {
   if (preset === "custom") return;
   const deep = preset === "deep";
   for (const id of ["optExact", "optSimilar"]) $(id).checked = true;
@@ -186,16 +181,23 @@ $("scanPreset").addEventListener("change", () => {
     $(id).checked = false;
   }
   $("optSemantic").checked = deep && !$("optSemantic").disabled;
+  $("optDecider").checked = false;
   if (deep) { $("semanticDuplicateThreshold").value = "94"; syncSemanticLabels(); }
   $("presetHint").textContent = deep && $("optSemantic").disabled
     ? "Edited-copy search needs the optional DigUp helper. Standard duplicate detection is ready."
     : deep ? "Includes edited-copy discovery with DigUp; each look-alike needs review."
-    : "Exact and similar duplicates across all folders; face analysis and unrelated reviews are off.";
+    : "Find exact copies and similar versions, including resized or lightly edited media, across all folders.";
   syncSemanticVisibility();
   syncHumanBackendVisibility();
   syncCrossFolderHint();
   saveScanSettings();
-});
+}
+$("scanPreset").addEventListener("change", () => applyScanPreset($("scanPreset").value));
+// Every launch starts with the fast duplicate pass, even after a Sets or custom
+// scan. Keep saved keeper preferences, exclusions, media types, and thresholds.
+// Extra analysis remains available explicitly for subsequent scans in this page.
+$("scanPreset").value = "cleanup";
+applyScanPreset("cleanup");
 for (const id of settingIds) $(id).addEventListener("change", () => { $("scanPreset").value = "custom"; });
 
 // —— Recent paths ——

@@ -70,10 +70,10 @@
           <label for="scanPreset">Scan goal</label>
           <select id="scanPreset">
             <option value="custom">Custom settings</option>
-            <option value="cleanup">Find duplicates quickly</option>
+            <option value="cleanup" selected>Find duplicates quickly</option>
             <option value="deep">Find duplicates and edited copies</option>
           </select>
-          <p class="thresh-hint" id="presetHint">Cleanup presets compare all folders together and skip face analysis.</p>
+          <p class="thresh-hint" id="presetHint">Find exact copies and similar versions, including resized or lightly edited media, across all folders.</p>
         </div>
         <div class="scan-meta-row">
           <button type="button" class="opts-toggle" id="optsToggle" aria-expanded="false">
@@ -130,8 +130,8 @@
           </label>
           <div class="opt-group">
             <span class="opt-label">Review</span>
-            <label class="chip-check"><input type="checkbox" id="optLowResolution" checked /><span>Low resolution</span></label>
-            <label class="chip-check"><input type="checkbox" id="optRandomReview" checked /><span>Random set of 50</span></label>
+            <label class="chip-check"><input type="checkbox" id="optLowResolution" /><span>Low resolution</span></label>
+            <label class="chip-check"><input type="checkbox" id="optRandomReview" /><span>Random set of 50</span></label>
           </div>
           <div class="opt-group">
             <span class="opt-label">Low-res types</span>
@@ -191,7 +191,7 @@
             <span class="thresh-hint">comma-separated globs</span>
             <span class="thresh-hint exclusions-check-result" id="exclusionsCheckResult" hidden></span>
           </label>
-          <p class="thresh-hint settings-note">Scan settings and recent folders are remembered in this browser only.</p>
+          <p class="thresh-hint settings-note">Each launch starts with Find duplicates quickly. Other scan preferences and recent folders are remembered in this browser only.</p>
         </div>
       </div>
 
