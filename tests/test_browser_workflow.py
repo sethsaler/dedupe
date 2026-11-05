@@ -253,14 +253,14 @@ def test_lingering_hover_shows_a_full_image_preview(
     thumb = page.locator("#members .thumb-wrap").first
     thumb.wait_for(state="visible")
 
-    # A passing hover under a second never opens the quick-look.
+    # A passing hover under two seconds never opens the quick-look.
     thumb.hover()
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(1_200)
     assert page.locator("#hoverPreview").is_hidden()
 
-    # ...but lingering past one second shows the full-image preview, which then
+    # ...but lingering past two seconds shows the full-image preview, which then
     # swaps the cached thumbnail for the large preview variant.
-    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=3_500)
     expect(page.locator("#hoverPreviewImage")).to_have_attribute(
         "src", re.compile(r"variant=preview")
     )
@@ -272,14 +272,14 @@ def test_lingering_hover_shows_a_full_image_preview(
     # Escape dismisses it too — and dismissal sticks until the pointer leaves
     # and re-enters the thumbnail.
     thumb.hover()
-    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=3_500)
     page.keyboard.press("Escape")
     expect(page.locator("#hoverPreview")).to_be_hidden()
 
     # Clicking through the quick-look still opens the real lightbox.
     page.locator("#detailTitle").hover()
     thumb.hover()
-    expect(page.locator("#hoverPreview")).to_be_visible(timeout=2_000)
+    expect(page.locator("#hoverPreview")).to_be_visible(timeout=3_500)
     thumb.click()
     page.locator("#lightbox").wait_for(state="visible")
     expect(page.locator("#hoverPreview")).to_be_hidden()
@@ -754,6 +754,31 @@ def test_similar_board_hands_off_to_compare_and_back(page, tmp_path: Path) -> No
         page.locator("#results").wait_for(state="visible", timeout=10_000)
         page.locator('.tab[data-kind="similar"]').click()
         expect(page.locator("#similarBoard")).to_be_visible()
+
+
+@pytest.mark.e2e
+@pytest.mark.similar_board
+def test_list_view_mark_distinct_is_one_click_and_undoable(page, tmp_path: Path) -> None:
+    app, _media = _similar_board_app(tmp_path)
+    page.add_init_script("localStorage.setItem('dedupe.similarView', 'grid');")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="similar"]').click()
+        expect(page.locator(".group-item")).to_have_count(2)
+        page.locator(".group-item").first.click()
+
+        # One click marks the group — no confirmation sheet.
+        page.locator("#btnMarkDistinct").click()
+        expect(page.locator(".group-item")).to_have_count(1)
+        expect(page.locator("#modalBackdrop")).to_be_hidden()
+
+        # The toast's Undo puts the group back in review.
+        expect(page.locator("#toastAction")).to_be_visible()
+        page.locator("#toastAction").click()
+        expect(page.locator(".group-item")).to_have_count(2)
+        expect(page.locator("#toast")).to_contain_text("Back in review")
 
 
 @contextmanager

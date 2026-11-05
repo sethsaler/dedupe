@@ -1,4 +1,4 @@
-// Linger-to-preview: hovering a member-card image for more than a second
+// Linger-to-preview: hovering a member-card image for two seconds
 // shows a full-image quick-look overlay. It is purely visual — pointer-events
 // pass through it and it never takes focus — so the lightbox (click or Enter)
 // stays the interactive full view. Videos are excluded: their hover-to-play
@@ -7,7 +7,7 @@
 import { $ } from "./util.js";
 
 // The hover must be uninterrupted for this long before the preview opens.
-const LINGER_MS = 1000;
+const LINGER_MS = 2000;
 
 let pendingWrap = null;
 let timer = null;
