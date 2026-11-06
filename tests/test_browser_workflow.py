@@ -2651,3 +2651,43 @@ def test_difference_zoom_and_local_review_export(page, tmp_path):
         assert data["review"]["pairs"] == 1
         assert all(p.exists() for p in paths)
         assert errors == []
+
+
+def test_files_review_sorts_and_filters_by_people_likelihood(page, tmp_path: Path) -> None:
+    """"Fewest people first" scores the open folder on demand, then sorts and filters it."""
+    pytest.importorskip("cv2")
+    from dedupe.scanner import inventory
+
+    media = tmp_path / "media"
+    media.mkdir()
+    shutil.copy(Path(__file__).parent / "fixtures" / "astronaut.png", media / "a-astronaut.png")
+    still_life = Image.new("RGB", (480, 360), (150, 190, 230))
+    still_life.paste((150, 90, 40), (60, 220, 200, 330))
+    still_life.save(media / "b-still-life.png")
+    result = ScanResult(roots=[str(media)], files=inventory([media]), groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.get_by_role("tab", name="Files 2").click()
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        names = page.locator("#members .card .name")
+        expect(names.first).to_have_text("a-astronaut.png")  # folder order
+        expect(page.locator("#members .people-score")).to_have_count(0)
+
+        page.locator("#memberSort").select_option("people-asc")
+        expect(page.locator("#members .people-score")).to_have_count(2, timeout=30_000)
+        expect(names.first).to_have_text("b-still-life.png")
+        expect(page.locator("#members .card").first.locator(".people-score")).to_have_text(
+            re.compile(r"People (<1|\d)%")
+        )
+
+        page.locator("#memberPeople").select_option("probably-none")
+        expect(page.locator("#members .card")).to_have_count(1)
+        expect(names.first).to_have_text("b-still-life.png")
+
+        page.locator("#memberPeople").select_option("any")
+        expect(page.locator("#members .card")).to_have_count(2)

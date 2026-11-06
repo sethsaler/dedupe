@@ -54,6 +54,8 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Backend.** The person detector used by the no-person review: `opencv` (fast, default), `photon` (opt-in, downloads roughly 10 GB of model weights on first use), or `ensemble` (OpenCV first, then Photon on uncertain frames). All processing is local.
 
+**People score.** A 0–100% estimate of how likely a media file is to show a person, used to order or filter a review with the likeliest deletions (the least likely to show people) first. It comes from a bundled YOLOX-tiny person detector, is computed on demand for the open folder (or by `dedupe rank-people`), and is cached per file until the file changes. Unlike the no-person review's yes/no verdict, it is advice for ordering only and never selects or removes anything. Described in [ui/all-files-review.md](ui/all-files-review.md#while-extended).
+
 **Revalidation.** The check that every selected file still matches its scan snapshot immediately before an action runs. Files that changed, moved, or vanished are excluded; the action never runs on stale information.
 
 ## Interactions

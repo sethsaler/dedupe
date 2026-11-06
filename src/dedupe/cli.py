@@ -405,6 +405,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write detailed predictions and metrics as JSON",
     )
 
+    rank_people = sub.add_parser(
+        "rank-people",
+        help="List media least likely to show people first (likeliest deletions first)",
+    )
+    rank_people.add_argument("paths", nargs="+", help="Files or folders to rank")
+    rank_people.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="Print only the first N files"
+    )
+    rank_people.add_argument(
+        "--max-score",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help="Only list files scoring at or below SCORE (0-1; e.g. 0.1)",
+    )
+    rank_people.add_argument("--workers", type=int, default=None, metavar="N")
+    rank_people.add_argument("--include-hidden", action="store_true")
+    rank_people.add_argument(
+        "--no-cache", action="store_true", help="Neither read nor write the hash cache"
+    )
+    rank_people.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    people_benchmark = sub.add_parser(
+        "benchmark-people",
+        help="Measure people-likelihood ranking against a labeled JSON manifest",
+    )
+    people_benchmark.add_argument(
+        "manifest",
+        help="JSON list of {path, has_person}; relative paths use the manifest folder",
+    )
+    people_benchmark.add_argument("--workers", type=int, default=None, metavar="N")
+    people_benchmark.add_argument(
+        "--json", dest="json_out", metavar="FILE", help="Write scores and metrics as JSON"
+    )
+
     doctor = sub.add_parser("doctor", help="Check dependencies and writable application paths")
     doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
@@ -855,6 +890,93 @@ def cmd_benchmark_humans(args: argparse.Namespace) -> int:
     return 1 if any(r.get("error") for r in report["results"].values()) else 0
 
 
+def cmd_rank_people(args: argparse.Namespace) -> int:
+    from .people_score import least_likely_first_key, people_scoring_available, score_people
+    from .scanner import inventory
+
+    available, reason = people_scoring_available()
+    if not available:
+        print(f"error: {reason}", file=sys.stderr)
+        return 2
+    missing = [path for path in args.paths if not Path(path).expanduser().exists()]
+    for path in missing:
+        print(f"error: no such file or folder: {path}", file=sys.stderr)
+    roots = [Path(path).expanduser() for path in args.paths if path not in missing]
+    if not roots:
+        return 2
+    records = inventory(roots, include_hidden=args.include_hidden)
+    cache = None
+    if not args.no_cache:
+        from .cache import HashCache, default_cache_path
+
+        cache = HashCache(default_cache_path())
+        cache.hydrate(records)
+    total = len(records)
+
+    def progress(done: int, pending: int) -> None:
+        if pending and sys.stderr.isatty():
+            print(f"\rScoring {done}/{pending}…", end="", file=sys.stderr, flush=True)
+
+    try:
+        scored_now = score_people(records, workers=args.workers, progress=progress)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if sys.stderr.isatty():
+            print("\r\033[K", end="", file=sys.stderr)
+    if cache is not None:
+        if scored_now:
+            cache.store_all(scored_now)
+        cache.close()
+    ranked = sorted(records, key=least_likely_first_key)
+    unscored = [record for record in ranked if record.people_score is None]
+    ranked = [record for record in ranked if record.people_score is not None]
+    if args.max_score is not None:
+        ranked = [record for record in ranked if record.people_score <= args.max_score]
+    if args.limit is not None:
+        ranked = ranked[: max(0, args.limit)]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "files": [
+                        {"path": record.path, "people_score": record.people_score}
+                        for record in ranked
+                    ],
+                    "scanned": total,
+                    "unscored": [record.path for record in unscored],
+                },
+                indent=2,
+            )
+        )
+    else:
+        for record in ranked:
+            print(f"{record.people_score:.3f}  {record.path}")
+        print(
+            f"{len(ranked)} of {total} media files listed, least likely to show people first"
+            + (f"; {len(unscored)} could not be scored" if unscored else ""),
+            file=sys.stderr,
+        )
+    return 0 if not missing else 1
+
+
+def cmd_benchmark_people(args: argparse.Namespace) -> int:
+    from .human_benchmark import format_ranking_report, run_people_rank_benchmark
+
+    try:
+        report = run_people_rank_benchmark(args.manifest, workers=args.workers)
+    except (ValueError, TypeError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(format_ranking_report(report))
+    if args.json_out:
+        out = Path(args.json_out).expanduser()
+        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Wrote {out}")
+    return 0
+
+
 def _executable_status(name: str) -> dict[str, object]:
     path = shutil.which(name)
     version = None
@@ -1031,6 +1153,8 @@ _COMMANDS = frozenset(
         "benchmark-humans",
         "doctor",
         "benchmark-similarity",
+        "rank-people",
+        "benchmark-people",
     }
 )
 
@@ -1066,6 +1190,10 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return cmd_doctor(args)
     if args.command == "benchmark-similarity":
         return cmd_benchmark_similarity(args)
+    if args.command == "rank-people":
+        return cmd_rank_people(args)
+    if args.command == "benchmark-people":
+        return cmd_benchmark_people(args)
     parser.print_help()
     return 1
 

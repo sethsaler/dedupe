@@ -492,6 +492,11 @@
               <option value="week">Last week</option>
               <option value="month">Last month</option>
             </select>
+            <select id="memberPeople" aria-label="Filter by people likelihood" hidden>
+              <option value="any">People: any</option>
+              <option value="probably-none" title="People score 5% or less">Probably no people</option>
+              <option value="maybe-none" title="People score 20% or less">Maybe no people</option>
+            </select>
           </nav>
           <div class="members" id="members"></div>
           <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="More review results" hidden>

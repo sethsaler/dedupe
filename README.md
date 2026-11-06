@@ -14,6 +14,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected; one click (or `d`) moves a file to Trash, with Undo on the toast
+- **Fewest people first** — sort or filter any Files, Non-Human, or Faces review by how likely each file is to show a person, so the likeliest deletions come first. Scores come from a bundled YOLOX-tiny person detector, are computed on demand for the open folder, and are cached; `dedupe rank-people PATH…` does the same from the terminal
 - **Face counts** — optional OpenCV pass counts faces in images and GIFs; every file card shows its count, files with detected faces get their own Faces review tab (busiest shots first), and a bulk rule ("at least … faces") selects group-photo shots in one click
 - **Smart Select** — automatic keep (best resolution/size/date) plus keep newest/oldest/largest/etc.
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
@@ -295,6 +296,45 @@ The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 th
 
 The bundled YuNet model comes from the official OpenCV Model Zoo. Its MIT license is included at `src/dedupe/assets/LICENSE-YUNET.txt`.
 
+### People likelihood (least likely first)
+
+The Non-Human review answers yes/no. To *order* any set of files with the likeliest
+deletions first, Dedupe also computes a 0–1 **people score**: the highest "person"
+confidence from the bundled YOLOX-tiny COCO detector (Apache-2.0, Megvii; license at
+`src/dedupe/assets/LICENSE-YOLOX.txt`), run once per image at 512 px through OpenCV
+(videos: the maximum over five sampled frames; GIFs: first/middle/last). In the web UI,
+choose **Fewest people first** in the Files, Non-Human, or Faces sort menu, or narrow the
+cards with **Probably no people** (score ≤ 5%) / **Maybe no people** (≤ 20%). The open
+folder is scored on demand with progress in the pager; scores are cached per file and
+reused until the file changes. Nothing is ever selected or removed because of a score.
+
+```bash
+dedupe rank-people ~/Pictures/Downloads --limit 100        # least likely first
+dedupe rank-people ~/Pictures/Downloads --max-score 0.05 --json
+```
+
+Measured on a labeled COCO val2017 sample (500 images to tune on, 500 held out, half
+with people from frame-filling to tiny and distant), ranking people-free files first:
+
+| Scorer | Held-out AP | People-free files before the first person | Time per photo |
+| --- | --- | --- | --- |
+| Existing OpenCV presence detector (binary) | 0.56 | 0 | 0.09 s |
+| YOLOX-S @ 640 px | 0.984 | 93 / 250 | 0.46 s |
+| **YOLOX-tiny @ 512 px (shipped)** | **0.988** | **172 / 250** | **0.18 s** |
+
+At ≤ 5%, the filter kept about 80% of people-free photos, and 2–4% of what it kept
+contained a person, all of them tiny and distant. Larger inputs, tiling, mirrored
+passes, int8 weights, and fusing face/HOG/segmentation signals did not improve held-out
+ranking. Rerun the measurement on your own labeled media with the same manifest format
+as `benchmark-humans`:
+
+```bash
+dedupe benchmark-people benchmark.json --json people-rank.json
+# Recreate the COCO corpus used above (downloads ~400 MB):
+python scripts/create_people_corpus.py /tmp/people-corpus
+dedupe benchmark-people /tmp/people-corpus/test.json
+```
+
 ### Benchmark Photon against your own media
 
 Use a hand-labeled JSON manifest. The sample names below are illustrative; supply your own
@@ -456,7 +496,8 @@ src/dedupe/
   similar_image.py   # perceptual image/GIF groups
   similar_video.py   # video fingerprints
   human_detection.py # optional local person detection
-  human_benchmark.py # labeled OpenCV / Photon comparison harness
+  people_score.py    # 0–1 people likelihood (YOLOX-tiny) for least-likely-first order
+  human_benchmark.py # labeled detector comparison + people-ranking harness
   similarity_benchmark.py # labeled near-duplicate pair benchmark
   review_session.py  # atomic resumable review storage
   jobs.py            # named cleanup jobs and new-arrival review

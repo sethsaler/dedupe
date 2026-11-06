@@ -3500,7 +3500,8 @@ def test_status_reports_capabilities_and_review_health(tmp_path: Path) -> None:
     status = create_app(_result(tmp_path)).test_client().get("/api/status").get_json()
     capabilities = status["capabilities"]
     assert set(capabilities) == {
-        "opencv", "yunet_model", "photon", "ffmpeg", "ffprobe", "semantic", "decider"
+        "opencv", "yunet_model", "photon", "ffmpeg", "ffprobe", "semantic", "decider",
+        "people_score",
     }
     assert all(isinstance(value, bool) for value in capabilities.values())
     assert status["keep_decisions_error"] is None
