@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -95,3 +97,30 @@ def test_video_benchmark_is_unevaluated_without_ffmpeg(
     assert report["false_negatives"] == 0
     assert report["predictions"][0]["predicted_similar"] is None
     assert "ffmpeg" in report["predictions"][0]["error"]
+
+
+def test_generated_corpus_pairs_local_changes_with_their_own_reexports(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    source = tmp_path / "small-source.png"
+    with Image.open(repository / "tests/fixtures/astronaut.png") as image:
+        image.resize((256, 256)).save(source)
+    output = tmp_path / "corpus"
+
+    subprocess.run(
+        [sys.executable, str(repository / "scripts/create_similarity_corpus.py"),
+         str(output), "--source", str(source)],
+        check=True, capture_output=True, text=True,
+    )
+
+    pairs = load_similarity_manifest(output / "pairs.json")
+    assert len(pairs) == 24
+    for category in ("smile", "hair", "eyes", "pose"):
+        negatives = [pair for pair in pairs if pair.category == f"detail-{category}"]
+        assert len(negatives) == 2
+        assert all(not pair.similar for pair in negatives)
+        for negative in negatives:
+            controls = [pair for pair in pairs if pair.path_b == negative.path_b and pair.similar]
+            assert len(controls) == 1
+            assert controls[0].path_a.name == f"detail-{category}-source.png"
+            with Image.open(negative.path_b) as image:
+                assert image.size == (256, 256)

@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from .cache import HashCache, default_cache_path
-from .edited_copy import edited_copy_verdict
+from .edited_copy import edited_copy_verdict, is_aligned_image_copy
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 
@@ -47,10 +47,8 @@ if TYPE_CHECKING:
 
 # Same subject or shoot: groups for the Sets review.
 DEFAULT_THRESHOLD = 0.88
-# Near-duplicates for the Similar review, when brightness histograms agree too.
+# Near-duplicates for the Similar review, when local image verification agrees too.
 DEFAULT_DUPLICATE_THRESHOLD = 0.97
-DUPLICATE_HISTOGRAM_MIN = 0.75
-HISTOGRAM_SIDE = 256
 # Vision tokens per image. 140 separated edits from unrelated photos as well
 # as 280 did, at roughly half the cost.
 DEFAULT_BUDGET = 140
@@ -634,26 +632,6 @@ def pair_score(scores: dict[tuple[str, str], float], a: str, b: str) -> float | 
     return scores.get((a, b) if a < b else (b, a))
 
 
-def luminance_histogram(path: str):
-    """Normalized 32-bin brightness histogram of the upright first frame."""
-    import numpy as np
-    from PIL import Image, ImageOps
-
-    with Image.open(path) as img:
-        img.seek(0)
-        frame = ImageOps.exif_transpose(img).convert("L")
-    frame.thumbnail((HISTOGRAM_SIDE, HISTOGRAM_SIDE))
-    counts = np.asarray(frame.histogram(), dtype=np.float64).reshape(32, 8).sum(axis=1)
-    return counts / max(1.0, counts.sum())
-
-
-def histograms_agree(left, right, minimum: float = DUPLICATE_HISTOGRAM_MIN) -> bool:
-    """Histogram intersection: 1.0 for identical tonal distributions."""
-    import numpy as np
-
-    return float(np.minimum(left, right).sum()) >= minimum
-
-
 def find_semantic_groups(
     records: list[FileRecord],
     *,
@@ -679,16 +657,16 @@ def find_semantic_groups(
 
     *Sets* group every image at ``set_threshold`` cosine: same subject or
     shoot, for browsing. *Duplicates* keep only pairs at
-    ``duplicate_threshold`` whose brightness histograms also agree (crops,
-    flips, resizes, grayscale and recompression pass; other scenes the model
-    rates as close do not) and whose files no perceptual Similar group holds
+    ``duplicate_threshold`` whose image detail also agrees after geometric or
+    ordinary alignment, and whose files no perceptual Similar group holds
     (``exclude_from_duplicates``). Each entry is ``(members, scores)``: the
     members built around an anchor (first), and each other member's cosine
     with it.
 
     ``judge`` (Decider) returns P(same picture) for a candidate pair. With one,
-    candidates OpenCV cannot confirm are duplicates when the judge says so with
-    ``judge_min``; the brightness fallback applies only to pairs it can't judge.
+    candidates OpenCV cannot confirm still need ordinary local verification.
+    The judge can veto those candidates below ``judge_min``; a positive score
+    cannot override a local difference or substitute for missing evidence.
     """
     vectors, errors = embed_records(
         records,
@@ -738,16 +716,6 @@ def find_semantic_groups(
     sets = build(restrict(lambda _a, _b, score: score >= set_threshold), None)
 
     excluded = exclude_from_duplicates or set()
-    histograms: dict[str, object] = {}
-
-    def histogram(path: str):
-        if path not in histograms:
-            try:
-                histograms[path] = luminance_histogram(path)
-            except Exception:
-                histograms[path] = None
-        return histograms[path]
-
     def duplicate_pair(a: str, b: str, score: float) -> bool:
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
@@ -756,20 +724,24 @@ def find_semantic_groups(
         # Broader discovery must establish image correspondence, not just
         # matching subject matter or a similar brightness distribution.
         verdict = edited_copy_verdict(a, b)
-        if verdict is True:
-            return True
+        if verdict is not None:
+            return verdict
+        if not is_aligned_image_copy(a, b):
+            return False
         if judge is not None:
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
             probability = judge(by_path[a], by_path[b])
             if probability is not None:
                 return probability >= judge_min
-        if verdict is not None:
-            return verdict
-        left, right = histogram(a), histogram(b)
-        return (score >= DEFAULT_DUPLICATE_THRESHOLD and left is not None
-                and right is not None and histograms_agree(left, right))
+        return True
 
-    duplicates = build(restrict(duplicate_pair), distinct)
+    from .similar_image import clear_image_comparison_cache
+
+    clear_image_comparison_cache()
+    try:
+        duplicates = build(restrict(duplicate_pair), distinct)
+    finally:
+        clear_image_comparison_cache()
     del adjacency
     return sets, duplicates, errors

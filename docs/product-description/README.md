@@ -143,7 +143,7 @@ Status is one of `not started`, `drafted`, or `verified`.
 | glossary.md | drafted |
 | bug-triage.md | drafted |
 | verification/ (3 checklists) | drafted |
-| foundations/scan-pipeline.md | verified |
+| foundations/scan-pipeline.md | drafted |
 | foundations/duplicate-group.md | verified |
 | foundations/review-session.md | verified |
 | foundations/actions-and-undo.md | verified |
@@ -159,13 +159,18 @@ Status is one of `not started`, `drafted`, or `verified`.
 | ui/all-files-review.md | verified |
 | ui/session-resume.md | drafted |
 | cli/doctor.md | verified |
-| cli/scan.md | verified |
+| cli/scan.md | drafted |
 | cli/ui-command.md | drafted |
 | cli/isolate.md | verified |
 | cli/undo.md | verified |
 | cli/receipts.md | verified |
 | cross-cutting/caches-and-files.md | verified |
-| cross-cutting/optional-dependencies.md | verified |
+| cross-cutting/optional-dependencies.md | drafted |
+
+The 2026-11-06 fine-detail matching update returned the scan pipeline, CLI scan,
+and optional-dependency descriptions to `drafted` pending a new hand-verification
+pass. Earlier verification results remain recorded; the new matching cases are
+listed in `verification/foundations.md`.
 
 ## Reference
 

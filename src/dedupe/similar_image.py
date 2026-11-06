@@ -1,10 +1,9 @@
 """Perceptual near-duplicate detection for images and GIFs.
 
-Uses global pHash/dHash for candidate finding, then a regional tile pHash
-check to reject "same scene, different pose" false positives, then a dense
-detail check to reject burst-like pairs whose difference is concentrated in
-one spot (a blink, a shifted hand) while still matching true duplicates at
-different resolutions/quality.
+Uses global pHash/dHash for candidate finding, then regional, color and
+fine-detail checks to reject "same scene, different moment" false positives.
+Overlapping detail windows retain small expression/pose changes even when
+compression or exposure changes add differences across the whole frame.
 
 Memory-conscious: images are drafted/thumbnail-scaled before hashing so a
 12MP phone photo never becomes a full-res RGB buffer in the worker pool.
@@ -56,6 +55,10 @@ DEFAULT_DENSE_COLOR_MEAN_MAX = 32.0
 # A cached animation contains eight RGB thumbnails, up to 64 KB each in
 # Pillow's storage; keep the worst-case thumbnail cache near 64 MB.
 DENSE_CACHE_SIZE = 128
+# Fine verification is lazy: only hash candidates decode these frames. The
+# bounded grayscale cache uses at most 72 MiB for eight-frame animations.
+DETAIL_MAX_SIDE = 768
+DETAIL_CACHE_SIZE = 16
 
 # pHash/dHash only need ~32×32 DCT input; anything larger is wasted decode/RAM.
 # 512 keeps edge structure for rescaled/quality variants without loading full HEIC/JPEG.
@@ -254,10 +257,10 @@ def _orient(img, orientation: str | None):
     return img.transpose(PILImage.Transpose[orientation])
 
 
-def _hash_frames(img, *, preserve_alpha: bool = False) -> list:
+def _hash_frames(img, *, preserve_alpha: bool = False, max_side: int = HASH_MAX_SIDE) -> list:
     """Sample animations in playback order and time, independent of frame rate."""
     if not getattr(img, "is_animated", False):
-        return [_downscale_for_hash(img, preserve_alpha=preserve_alpha)]
+        return [_downscale_for_hash(img, max_side, preserve_alpha=preserve_alpha)]
     starts = []
     duration = 0.0
     for index in range(img.n_frames):
@@ -268,7 +271,7 @@ def _hash_frames(img, *, preserve_alpha: bool = False) -> list:
     for sample in range(ANIMATION_HASH_FRAMES):
         timestamp = sample * (duration - 0.001) / (ANIMATION_HASH_FRAMES - 1)
         img.seek(max(0, bisect_right(starts, timestamp) - 1))
-        frames.append(_downscale_for_hash(img, preserve_alpha=preserve_alpha))
+        frames.append(_downscale_for_hash(img, max_side, preserve_alpha=preserve_alpha))
     return frames
 
 
@@ -468,6 +471,49 @@ def _dense_frame_difference(ta, tb) -> tuple[float, float]:
     return sum(means) / len(means), max(means)
 
 
+@lru_cache(maxsize=DETAIL_CACHE_SIZE)
+def _detail_frames_cached(path: str, size: int, mtime_ns: int, ctime_ns: int):
+    """Identity-keyed grayscale evidence, never persisted as a match verdict."""
+    from PIL import Image, ImageOps
+
+    _register_heif()
+    try:
+        with Image.open(path) as img:
+            img.draft("RGB", (DETAIL_MAX_SIDE, DETAIL_MAX_SIDE))
+            if not getattr(img, "is_animated", False):
+                img = ImageOps.exif_transpose(img)
+            return tuple(frame.convert("L") for frame in _hash_frames(img, max_side=DETAIL_MAX_SIDE))
+    except (OSError, ValueError):
+        return None
+
+
+def _fine_detail_matches(path_a: str, path_b: str, orientation_a: str | None) -> bool:
+    from PIL import Image
+
+    from .image_detail import aligned_detail_matches
+
+    def frames(path):
+        stat = Path(path).stat()
+        return _detail_frames_cached(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    try:
+        left, right = frames(path_a), frames(path_b)
+    except OSError:
+        return False
+    if not left or not right or len(left) != len(right):
+        return False
+    for a, b in zip(left, right, strict=True):
+        a = _orient(a, orientation_a)
+        # Never invent detail by enlarging a small download. Both images get
+        # the same sampling grid at the lower available resolution.
+        size = min(a.width, b.width), min(a.height, b.height)
+        a = a.resize(size, Image.Resampling.LANCZOS)
+        b = b.resize(size, Image.Resampling.LANCZOS)
+        if not aligned_detail_matches(a, b):
+            return False
+    return True
+
+
 def dense_difference(
     path_a: str, path_b: str, *, orientation_a: str | None = None
 ) -> tuple[float, float] | None:
@@ -523,7 +569,7 @@ def is_dense_match(
             mean, worst = _dense_frame_difference(ta.getchannel("A"), tb.getchannel("A"))
             if worst > local_max and mean > 0 and worst / mean > concentration:
                 return False
-    return True
+    return _fine_detail_matches(path_a, path_b, orientation_a)
 
 
 def encode_tile_phashes(values: tuple[str, ...]) -> str:
@@ -649,7 +695,7 @@ def find_similar_image_groups(
        with each still's rotated and mirrored pHashes
     2. Secondary dHash + aspect-ratio filter
     3. Regional tile pHash (reject pose / composition changes)
-    4. Dense detail check (reject burst-like concentrated local changes)
+    4. Dense and fine detail checks (reject small local subject changes)
     """
     skip_paths = skip_paths or set()
     distinct = distinct or DistinctReviews.empty()
@@ -834,10 +880,16 @@ def find_similar_image_groups(
             progress("image-cluster", len(hashed), len(hashed))
     finally:
         # Records retain hashes for this run and the disk cache; free path cache.
-        _tile_phashes_for_path.cache_clear()
-        _dense_thumbs_for_path.cache_clear()
+        clear_image_comparison_cache()
 
     return cluster_around_best(hashed, adjacency, distinct)
+
+
+def clear_image_comparison_cache() -> None:
+    """Release comparison pixels and path-only hashes at a scan boundary."""
+    _tile_phashes_for_path.cache_clear()
+    _dense_thumbs_for_path.cache_clear()
+    _detail_frames_cached.cache_clear()
 
 
 def _bruteforce_groups(

@@ -83,7 +83,7 @@ def _image(path: Path, color: tuple[int, int, int], stripes: bool) -> Path:
 
 def _media(root: Path) -> Path:
     _image(root / "beach.jpg", (20, 120, 220), stripes=False)
-    _image(root / "beach-edit.jpg", (30, 110, 210), stripes=True)
+    _image(root / "beach-edit.jpg", (30, 110, 210), stripes=False)
     _image(root / "forest.png", (30, 200, 40), stripes=False)
     return root
 
@@ -291,7 +291,9 @@ def test_scan_form_thresholds_reach_the_engine(tmp_path: Path, monkeypatch) -> N
     assert seen["semantic_duplicate_threshold"] == pytest.approx(0.999)
 
 
-def test_judge_decides_pairs_opencv_cannot_confirm(tmp_path: Path, fake_helper: Path) -> None:
+def test_judge_cannot_approve_pairs_without_local_evidence(
+    tmp_path: Path, fake_helper: Path
+) -> None:
     root = tmp_path / "media"
     root.mkdir()
     Image.new("RGB", (64, 64), (128, 128, 128)).save(root / "gray.png")
@@ -305,10 +307,10 @@ def test_judge_decides_pairs_opencv_cannot_confirm(tmp_path: Path, fake_helper: 
         return 0.85
 
     sets, duplicates, _ = find_semantic_groups(_records(root), use_cache=False, judge=judge)
-    assert len(sets) == 1 and len(duplicates) == 1
-    assert sorted(asked[0]) == ["gray.png", "split.png"]
+    assert len(sets) == 1 and duplicates == []
+    assert asked == []
 
-    # Below judge_min, and a judge with no answer falls back to brightness.
+    # No confidence threshold or unavailable judge bypasses the local veto.
     _, duplicates, _ = find_semantic_groups(
         _records(root), use_cache=False, judge=judge, judge_min=0.9
     )
@@ -316,6 +318,52 @@ def test_judge_decides_pairs_opencv_cannot_confirm(tmp_path: Path, fake_helper: 
     _, duplicates, _ = find_semantic_groups(
         _records(root), use_cache=False, judge=lambda _a, _b: None
     )
+    assert duplicates == []
+
+
+def test_judge_cannot_override_an_explicit_detail_veto(
+    tmp_path: Path, fake_helper: Path, monkeypatch
+) -> None:
+    root = _media(tmp_path / "media")
+    monkeypatch.setattr("dedupe.semantic.edited_copy_verdict", lambda *_args: False)
+
+    def judge(*_args):
+        pytest.fail("A local difference must be final, even if the model would say 100%")
+
+    sets, duplicates, _ = find_semantic_groups(_records(root), use_cache=False, judge=judge)
+    assert len(sets) == 1
+    assert duplicates == []
+
+
+def test_same_subject_with_different_detail_stays_only_in_sets(
+    tmp_path: Path, fake_helper: Path, monkeypatch
+) -> None:
+    root = tmp_path / "media"
+    _image(root / "a.png", (20, 120, 220), stripes=False)
+    _image(root / "b.png", (20, 120, 220), stripes=True)
+    # Featureless media / absent OpenCV must not fall back to histogram or
+    # embedding similarity alone, regardless of the model's confidence.
+    monkeypatch.setattr("dedupe.semantic.edited_copy_verdict", lambda *_args: None)
+    for judge in (None, lambda *_args: 1.0):
+        sets, duplicates, _ = find_semantic_groups(_records(root), use_cache=False, judge=judge)
+        assert len(sets) == 1
+        assert duplicates == []
+
+
+def test_fallback_checks_pixels_again_after_another_scan(
+    tmp_path: Path, fake_helper: Path, monkeypatch
+) -> None:
+    root = _media(tmp_path / "media")
+    monkeypatch.setattr("dedupe.semantic.edited_copy_verdict", lambda *_args: None)
+    _, duplicates, _ = find_semantic_groups(_records(root), use_cache=False)
+    assert len(duplicates) == 1
+    changed = root / "beach-edit.jpg"
+    with Image.open(changed) as image:
+        image = image.convert("RGB")
+    image.paste((200, 80, 40), (20, 20, 36, 36))
+    image.save(changed, quality=95)
+    sets, duplicates, _ = find_semantic_groups(_records(root), use_cache=False)
+    assert len(sets) == 1
     assert duplicates == []
 
 

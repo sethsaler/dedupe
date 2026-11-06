@@ -18,9 +18,9 @@ Dedupe's core — finding exact and similar images, reviewing groups, moving fil
 
 ## OpenCV and the bundled models
 
-**What needs them.** The no-person review (`opencv` and `ensemble` backends) and the faces review. OpenCV is CPU-only; the YuNet face model and the InsightFace genderage model ship in the application's assets and download nothing at runtime.
+**What needs them.** The no-person review (`opencv` and `ensemble` backends), the faces review, and geometric alignment for edited-copy verification in semantic search. OpenCV is CPU-only; the YuNet face model and the InsightFace genderage model ship in the application's assets and download nothing at runtime. Edited-copy alignment does not use those face models.
 
-**What happens without them.** The affected review categories produce nothing. The no-person review fails closed by design: OpenCV runs the bundled YuNet face model before its full-body detector, and if the face model is missing, corrupt, or cannot start, the scan surfaces no media as Non-Human rather than guessing. With no candidates, there is nothing to select and nothing an action can move from that category. A scan that did not request these reviews is entirely unaffected.
+**What happens without them.** The no-person and faces review categories produce nothing. The no-person review fails closed by design: OpenCV runs the bundled YuNet face model before its full-body detector, and if the face model is missing, corrupt, or cannot start, the scan surfaces no media as Non-Human rather than guessing. With no candidates, there is nothing to select and nothing an action can move from that category. Semantic search still forms Sets. To add a pair to Similar without geometric alignment, the ordinary orientation, tile, and local-detail checks must establish a match; some cropped or heavily edited copies can be missed. Embedding scores, brightness histograms, and a model answer cannot replace that evidence.
 
 > Technical note: failing closed is deliberate — a person detector that quietly misses people would lead to deleting photos of people, which is the exact mistake the product exists to prevent.
 
@@ -54,7 +54,7 @@ Dedupe's core — finding exact and similar images, reviewing groups, moving fil
 
 **Where Dedupe looks.** `$DEDUPE_DECIDER_URL`, otherwise `http://127.0.0.1:8080`. The server must report `ready` with images enabled at `/health`. `dedupe doctor` prints whether it is reachable.
 
-**What happens without it.** The *Verify look-alikes with Decider* option is disabled, and its tooltip names the reason. The server is checked once, at startup. A CLI `--decider` scan runs the DigUp layer without Decider and reports `Decider verification skipped: …` in the semantic diagnostics. If the server stops partway through a scan, the rest of the scan uses the brightness check and reports `Decider verification stopped: …`.
+**What happens without it.** The *Verify look-alikes with Decider* option is disabled, and its tooltip names the reason. The server is checked once, at startup. A CLI `--decider` scan runs the DigUp layer without Decider and reports `Decider verification skipped: …` in the semantic diagnostics. If the server stops partway through a scan, the rest of the scan still requires local image evidence and reports `Decider verification stopped: …`. No histogram-only or model-only fallback adds a pair to Similar. See [the scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works) for the verification rules.
 
 **How to get it.** Install and open Decider.app. It downloads the model (~5.8 GB) into `~/Library/Caches/ai.perplexity.decider/models`.
 
@@ -96,3 +96,4 @@ For a scan running with an optional dependency missing, slow, or downloading:
 - Whether the UI distinguishes "stage skipped for missing ffmpeg" from "stage ran, zero matches" anywhere beyond the diagnostics warnings was not confirmed.
 
 Verified against dedupe commit `2a6cede`.
+Edited-copy and Decider fallback descriptions updated from the 2026-11-06 working tree; missing-dependency behavior has not been rechecked by hand.

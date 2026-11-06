@@ -8,9 +8,58 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from .image_detail import aligned_detail_matches
+
+
+def is_aligned_image_copy(left_path: str, right_path: str) -> bool:
+    """Verify ordinary/rescaled/turned copies when feature alignment is unavailable.
+
+    This uses the same regional and fine-detail gates as perceptual matching,
+    so an embedding or a language-model verdict cannot bypass local changes.
+    The caller must clear the run-scoped comparison caches between scans.
+    """
+    from PIL import Image
+
+    from .similar_image import (
+        MIN_ASPECT_RATIO_SIMILARITY,
+        ORIENTATIONS,
+        QUARTER_TURN_ORIENTATIONS,
+        is_dense_match,
+        is_near_identical,
+        probe_image_dimensions,
+    )
+
+    try:
+        dimensions_a = probe_image_dimensions(left_path)
+        dimensions_b = probe_image_dimensions(right_path)
+        with Image.open(left_path) as left, Image.open(right_path) as right:
+            animated = (getattr(left, "is_animated", False)
+                        or getattr(right, "is_animated", False))
+        orientations = (None,) if animated else (None, *ORIENTATIONS)
+        for orientation in orientations:
+            width_a, height_a = dimensions_a
+            width_b, height_b = dimensions_b
+            if not all((width_a, height_a, width_b, height_b)):
+                return False
+            if orientation in QUARTER_TURN_ORIENTATIONS:
+                width_a, height_a = height_a, width_a
+            aspect_a, aspect_b = width_a * height_b, width_b * height_a
+            if min(aspect_a, aspect_b) / max(aspect_a, aspect_b) < MIN_ASPECT_RATIO_SIMILARITY:
+                continue
+            if is_near_identical(
+                left_path, right_path,
+                dimensions_a=dimensions_a, dimensions_b=dimensions_b,
+                orientation_a=orientation,
+            ) and is_dense_match(left_path, right_path, orientation_a=orientation):
+                return True
+    except Exception:
+        # Unsupported formats and decoder errors leave a candidate unverified.
+        pass
+    return False
+
 
 @lru_cache(maxsize=32)
-def _features(path: str, size: int, mtime_ns: int):
+def _features(path: str, size: int, mtime_ns: int, ctime_ns: int):
     # Identity keys invalidate cached pixels after a source changes. Keep at
     # most 32 downscaled frames/descriptors, rather than a whole photo library.
     import cv2
@@ -35,7 +84,7 @@ def edited_copy_verdict(left_path: str, right_path: str) -> bool | None:
 
         def features(path):
             stat = Path(path).stat()
-            return _features(path, stat.st_size, stat.st_mtime_ns)
+            return _features(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
         left, kp_a, desc_a = features(left_path)
         right, kp_b, desc_b = features(right_path)
@@ -83,8 +132,13 @@ def edited_copy_verdict(left_path: str, right_path: str) -> bool | None:
                 if valid.size and valid.mean() > 0.8:
                     tile_errors.append(float(residual[y:y + height // 8,
                                                       x:x + width // 8][valid].mean()))
-        return bool(len(tile_errors) >= 16 and max(tile_errors) <= 0.075
-                    and np.mean(tile_errors) <= 0.035)
+        if not (len(tile_errors) >= 16 and max(tile_errors) <= 0.075
+                and np.mean(tile_errors) <= 0.035):
+            return False
+        # A shared background can align perfectly while a mouth, eye, or lock
+        # of hair has moved. Coarse tile means dilute those changes; require
+        # the fine-scale check on the aligned overlap as well.
+        return aligned_detail_matches(warped, right, valid=overlap)
     except (ImportError, OSError, ValueError):
         return None
     except Exception:
