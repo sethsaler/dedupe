@@ -7,10 +7,10 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 ## Features
 
 - **Exact duplicates** — size → partial hash → SHA-256
-- **Similar media** — perceptual hashing for images/GIFs; ffmpeg frame sampling for videos
+- **Similar media** — perceptual hashing plus local-detail verification for images/GIFs, including small expression, pose, and hair changes; ffmpeg frame sampling for videos
 - **Protected libraries** — compare cleanup folders against an archive whose files cannot be removed or moved; use **Compare against a protected library** or repeat `--protect-folder PATH`
 - **Video clips & versions** — optional `--video-versions` pass finds overlapping footage and compares sampled audio; approximate matching ranges align pair playback, and these suggestions require manual selection
-- **Sets and semantic look-alikes** — optional layer that embeds images and GIFs with Google DeepMind's EmbeddingGemma 2, run through [DigUp](https://github.com/ARahim3/DigUp)'s installed helper (no extra Python deps). A **Sets** tab groups images of one subject or shoot for browsing and one-click trash, and near-identical crops, flips, and re-saves the hashes missed join Similar with a "% look-alike" score (never preselected): `dedupe scan --semantic`, or *Sets & look-alikes (DigUp)* in the scan options. Add `--decider` (or *Verify look-alikes with Decider*) to let Perplexity's Decider.app judge each candidate pair OpenCV can't confirm
+- **Sets and semantic look-alikes** — optional layer that embeds images and GIFs with Google DeepMind's EmbeddingGemma 2, run through [DigUp](https://github.com/ARahim3/DigUp)'s installed helper (no extra Python deps). A **Sets** tab groups images of one subject or shoot for browsing and one-click trash. Crops, flips, and re-saves the hashes missed can join Similar after local-detail verification, with a "% look-alike" score (never preselected): `dedupe scan --semantic`, or *Sets & look-alikes (DigUp)* in the scan options. Add `--decider` (or *Verify look-alikes with Decider*) for an additional model check; a model score alone cannot establish a duplicate or override a detected local difference
 - **Low-resolution review** — surfaces images, GIFs, and videos below configurable per-type megapixel bounds as independent deletion suggestions
 - **Random 50 review** — every scan draws a fresh sample of up to 50 media files for a fast Keep/Delete check with the arrow keys
 - **Non-Human media** — optional OpenCV review surfaces images, GIFs, and sampled videos where no person was detected; one click (or `d`) moves a file to Trash, with Undo on the toast
@@ -282,7 +282,7 @@ Requires `--execute` to write folders (otherwise dry-run only).
 | Kind | Method |
 | --- | --- |
 | Exact | Same size → matching first 64KB hash → matching full SHA-256 |
-| Similar images/GIFs | Global pHash + dHash candidates, then **regional tile pHash** to reject pose/composition changes (default Hamming ≤ 6, tile max ≤ 8) |
+| Similar images/GIFs | Global pHash + dHash candidates, then regional tile pHash, color/transparency checks, and finer local-detail verification for small expression/pose changes (default Hamming ≤ 6, tile max ≤ 8) |
 | Similar videos | Ordered pHashes from direct ffmpeg timeline seeks, compared at normalized positions (default mean Hamming ≤ 8) |
 | Video clips & versions (opt-in) | Denser sampled footage alignment with approximate overlapping ranges and sampled-audio evidence; always manual review |
 | Low resolution | Display-oriented dimensions below the pre-scan megapixel bound for that media type (1 MP by default); candidates remain unselected until reviewed |
@@ -346,7 +346,18 @@ recall, runtime, errors, and per-pair decisions. Use representative private medi
 repository does not ship personal benchmark photos. For cleanup safety, optimize Similar
 matching for low false-positive rates before increasing recall.
 
-**Near-identical only** — same photo at different quality/export/resolution. Different poses of the same person (or burst frames that actually move) are filtered out by comparing pHash across image quadrants + center crop.
+**Near-identical only** — Similar is intended for copies of one photograph at different
+quality, export, or resolution. After coarse hashing, overlapping fine-detail patches
+check for small expression, pose, and hair changes. Global exposure changes are accounted
+for so they cannot hide a local difference. Semantic search applies the same local-detail
+requirement after aligning edited copies; subject similarity alone belongs in **Sets**.
+Ambiguous pairs can be left out of Similar, including some heavily edited true copies.
+
+These checks run again on cached scans. After updating, run a new scan to reassess old
+matches; **Resume saved review** restores the earlier groups without reclassifying them.
+Keep using the image comparison before removal. Synthetic changes to the repository's
+photo fixture check regressions, but do not measure accuracy on your own burst photos,
+small faces, or low-resolution images.
 
 **Video clips & versions** adds a separate review pass for trims, offsets, and
 soundtrack changes. It samples at most 96 video positions and requires at least

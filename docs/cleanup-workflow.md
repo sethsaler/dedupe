@@ -7,12 +7,12 @@ Exact copies appear for review; scanning never automatically trashes them.
 confirmation sheet. **Custom settings** retains individual controls.
 
 Choose **Find duplicates and edited copies** to add the optional DigUp semantic
-engine at a 94% candidate threshold. Below 97%, candidates must pass OpenCV
-geometric verification: distributed matching details, consistent alignment,
-sufficient overlap, and low residual differences across image tiles. A local
-content change can reject a candidate even if most of the background matches.
-If either dependency is absent, this deeper capability is unavailable. Standard
-matching continues to work. Semantic matches stay manual review suggestions;
+engine at a 94% candidate threshold. Candidates must pass local image verification:
+OpenCV can align cropped or filtered copies, then check their overlapping detail.
+If alignment is unavailable, the ordinary orientation, regional, and fine-detail
+checks must establish the match. A local content change rejects a candidate even
+if most of the background matches or a model rates it highly. Without DigUp,
+standard matching continues to work. Semantic matches stay manual review suggestions;
 no semantic score is a probability or proof of duplication. Related subjects
 remain in Sets. Animations do not use the new still-image geometry verifier.
 
@@ -167,7 +167,7 @@ Evaluate a labeled corpus using:
 ```bash
 .venv/bin/dedupe benchmark-similarity pairs.json --json /tmp/accuracy.json
 # Add --semantic --semantic-duplicate-threshold 0.94 for edited copies,
-# or --decider to also judge unconfirmed candidates with Decider.app.
+# or --decider for an additional model check; local image evidence is still required.
 ```
 
 Reports include precision, recall, errors, individual missed/wrong pairs, timings,
@@ -180,8 +180,12 @@ For reproducible smoke data (not a substitute for your library):
 .venv/bin/python scripts/create_similarity_corpus.py /tmp/new-corpus
 ```
 
-This generates eight labeled pairs from the repository's existing licensed
+This generates 24 labeled pairs from the repository's existing licensed
 astronaut fixture: resize, JPEG compression, rotation, crop, brightness,
-grayscale, unrelated content, and a localized edit. The output directory must
-not already exist. Preserve independent negative examples when tuning thresholds;
-optimizing only known duplicates can silently increase false positives.
+grayscale, unrelated content, a localized edit, and smaller synthetic changes
+around the smile, hair, eyes, and pose. The small-change cases include compressed
+and brighter exports, paired both with the unchanged original (distinct) and with
+their own edited source (a true copy). The output directory must not already
+exist. Preserve independent negative examples when tuning thresholds; optimizing
+only known duplicates can silently increase false positives. These synthetic
+cases do not measure accuracy on a real portrait or burst-photo library.

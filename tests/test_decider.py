@@ -129,6 +129,24 @@ def test_verdicts_are_cached_until_a_file_changes(
     assert len(fake_decider.requests) == 2
 
 
+def test_prompt_revision_invalidates_old_verdicts(
+    tmp_path: Path, fake_decider: FakeDecider
+) -> None:
+    from dedupe.decider import VerdictCache
+
+    cache_path = tmp_path / "cache.sqlite3"
+    a = _record(tmp_path / "a.png", (200, 20, 20))
+    b = _record(tmp_path / "b.png", (20, 200, 20))
+    cache = VerdictCache(cache_path)
+    try:
+        cache.put(a, b, "pplx-decider-flash-v1.2|q1|s768", 1.0)
+    finally:
+        cache.close()
+    with DeciderJudge(cache_path=cache_path) as judge:
+        assert judge(a, b) == pytest.approx(0.9)
+    assert len(fake_decider.requests) == 1
+
+
 def test_unreadable_media_skips_one_pair_but_a_dead_server_stops_judging(
     tmp_path: Path, fake_decider: FakeDecider
 ) -> None:

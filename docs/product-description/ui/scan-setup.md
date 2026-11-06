@@ -98,7 +98,7 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 - Identical resolved paths share one stream. Overlapping streams may examine the same file, but their combined inventory and identical review groups are shown only once.
 - A scan of a folder that yields zero media files completes normally with an empty group list.
 - Exclusion patterns are strings, still not validated at scan time — a typo simply matches nothing. The **Check** button beside the field is how a dead glob is caught before the scan starts.
-- Changing the similarity threshold regroups cached fingerprints on the next scan; unchanged files do not need to be fingerprinted again.
+- Changing the similarity threshold regroups cached fingerprints on the next scan; unchanged files do not need to be fingerprinted again, but candidate pairs still undergo the current local-detail checks. After a matching update, use a new scan to reassess earlier groups; **Resume saved review** restores the earlier groups without rerunning similarity classification.
 
 ## Saved jobs and protected libraries
 
@@ -111,3 +111,4 @@ The setup includes Saved cleanup jobs and Compare against a protected library. P
 
 Verified against the post-improvement working tree (2026-09 UX phase + the Delete All Exact Duplicates button, commit `a3f94a8`; pinned at `2a6cede` plus later improvement commits).
 Quick-cleanup launch defaults, overriding saved Sets/custom detection, combined-folder matching, and retained non-detection preferences are covered by browser regressions in the 2026-11-05 working tree.
+Rescan guidance updated for fine-detail verification in the 2026-11-06 working tree; no new hand-verification pass was performed.

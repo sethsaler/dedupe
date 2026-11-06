@@ -7,11 +7,13 @@ question per candidate pair: is the second image a copy of the first?
 
 It is a pairwise judge, not an embedding model, so it cannot find candidates
 in a library by itself. EmbeddingGemma (DigUp) still proposes the pairs; the
-judge decides the ones OpenCV's geometric check cannot confirm. In
+judge can veto candidates with local image evidence that OpenCV's geometric
+check cannot confirm. In
 measurements on real photos, crops, grayscale, filters and recompression
 scored 0.85-0.99, unrelated photos 0.00, mirrored copies 0.57-0.78, and burst
 shots a second or two apart 0.85-0.94: the judge reads near-identical bursts
-as the same picture, so they join Similar too (never preselected).
+as the same picture. A positive model score alone therefore cannot put a pair
+in Similar; the local image verification must agree.
 
 Protocol::
 
@@ -48,17 +50,19 @@ DEFAULT_MIN_PROBABILITY = 0.8
 # Longest side sent to the model. Larger images cost more vision tokens
 # without separating edits from other photos any better.
 PREPARE_MAX_SIDE = 768
-PROMPT_VERSION = "q1"
+PROMPT_VERSION = "q2"
 HEALTH_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 120.0
 CRITERIA = {
     "same": (
         "The same photograph: one image is a copy of the other, possibly cropped, "
-        "mirrored, resized, recompressed, or color/filter edited"
+        "mirrored, resized, recompressed, or color/filter edited. Facial expression, "
+        "teeth visibility, eyes, pose, and hair position are unchanged"
     ),
     "burst": (
         "The same scene or subject, but a separately taken photo "
-        "(different moment, pose, or angle)"
+        "(different moment, pose, or angle), including tiny changes in a smile, "
+        "visible teeth, blinking, head or body position, or strands of hair"
     ),
     "different": "Different scenes or subjects",
 }
