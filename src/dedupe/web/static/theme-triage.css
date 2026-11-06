@@ -332,7 +332,8 @@
 }
 
 .results .detail-body:has(> #members.triage-grid) #memberSort,
-.results .detail-body:has(> #members.triage-grid) #memberModified {
+.results .detail-body:has(> #members.triage-grid) #memberModified,
+.results .detail-body:has(> #members.triage-grid) #memberPeople {
   min-height: 32px;
   padding: 5px 30px 5px 10px;
   border: 1px solid var(--lt-sleeve);

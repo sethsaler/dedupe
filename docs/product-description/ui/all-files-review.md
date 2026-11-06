@@ -43,7 +43,13 @@ The review becomes consequential at the first per-candidate trash: the file is p
 
 **No selection semantics.** The category has no checkboxes, no smart-select rules, and no bulk operations: bulk selection and the selection rules leave Files groups untouched, and no [action sheet](action-sheet.md) scope covers them. Files leave the view through one-click trash, or through their membership in another category — an executed exact/similar Trash or low-res/random Quarantine removes the moved files from the Files group too.
 
-**Sorting.** The card pager's sort control offers four orders: Folder order (path) — the default, following the folder tree — Largest first, Newest first, and Oldest first. Largest first surfaces the space hogs immediately, which is usually the point of a deletion sift. The lightbox steps in the same order as the grid.
+**Sorting.** The card pager's sort control offers five orders: Folder order (path) — the default, following the folder tree — Largest first, Newest first, Oldest first, and Fewest people first. Largest first surfaces the space hogs immediately; Fewest people first puts the files least likely to show a person at the top, which is where most deletion sifts want to start. The lightbox steps in the same order as the grid.
+
+**People likelihood.** Choosing Fewest people first, or a people filter, gives every file in the open folder a [people score](../glossary.md) — 0–100%, how likely it is to show a person. Files without a current score are scored on demand: the pager reads "Ranking by people likelihood… N/M" while the folder is scored, then the grid re-sorts. Scores are cached per file and reused in later scans and sessions until the file changes, so a second visit is instant. Each scored card shows a "People N%" chip ("<1%" for the lowest). Files that cannot be decoded stay unscored and sort last. The score is advice for ordering only: nothing is selected, reviewed, or trashed because of it.
+
+> Technical note: the score is the highest "person" confidence from the bundled YOLOX-tiny detector, run once per image at 512 px (videos: five sampled frames; GIFs: first, middle, last). Scoring needs OpenCV; without it the people options are absent. A scan in progress refuses scoring ("people scoring waits until the scan finishes"), and only one folder is scored at a time.
+
+**People filter.** A third control narrows the cards to **Probably no people** (score ≤ 5%) or **Maybe no people** (score ≤ 20%), or back to **People: any**. Unscored files never pass an active people filter. It combines with the modified filter and with any sort; when nothing passes, the pane says "No files here probably show no people." (or names the modified window as well).
 
 **Modified filter.** Beside the sort control, a time filter narrows the cards to files modified in the last hour, day, week, or month (a month counts as 30 days), or back to any time. It applies instantly to the cards, the page count, and the lightbox order; when nothing in the folder falls in the window, the pane says so instead of showing cards.
 
@@ -60,7 +66,8 @@ There is no completion goal; the category exists to be sifted, not exhausted. Wh
 | Modifier | Set at the start | Changed while extended |
 | --- | --- | --- |
 | Multiple scanned folders | One Files group per folder; the sidebar row names the folder. | Fixed for these results; the next scan re-partitions. |
-| Member sort (path / largest / newest / oldest) | Folder order (path) is the default; the choice is per category and lasts the session. | Reorders the grid and the lightbox's step order together; the page resets to the first. |
+| Member sort (path / largest / newest / oldest / fewest people) | Folder order (path) is the default; the choice is per category and lasts the session. | Reorders the grid and the lightbox's step order together; the page resets to the first. Fewest people first scores unscored files first, then re-sorts. |
+| People filter (any / probably none / maybe none) | Any is the default; the choice lasts the session and applies to every category that offers it. | Narrows the grid and the lightbox order; scores unscored files first. |
 | Media-type and hidden-file scan options | Define what "every file" means — only inventoried media appears. | Fixed for these results. |
 | Keyboard vs mouse | Equivalent paths to the same trash; `←`/`→` move card focus (or step inside the lightbox); `d` / `Delete` / `Backspace` trash the current file. | Fully interchangeable mid-review. |
 | Saved review session | Sessions predate the view gain their Files groups on load; trashed-file state and undo controls restore with the session. | Every trash and undo saves it again. |

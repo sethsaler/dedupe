@@ -159,7 +159,7 @@ function renderSwipeReview(g) {
     video.load();
   });
   box.classList.remove("triage-grid");
-  for (const id of ["memberPagination", "memberPaginationBottom", "memberSort", "memberModified"]) {
+  for (const id of ["memberPagination", "memberPaginationBottom", "memberSort", "memberModified", "memberPeople"]) {
     const el = $(id);
     if (el) el.hidden = true;
   }

@@ -56,22 +56,122 @@ $("members").addEventListener("click", (event) => {
 
 // The member sort select is kind-aware: each listed kind gets its own option
 // set, and its first option is the server order (no client re-sort).
+// "people-asc" orders by the people-likelihood score (least likely to show
+// people first); missing scores are computed on demand for the open group.
+const PEOPLE_SORT = "people-asc";
+const PEOPLE_SORT_OPTION = [PEOPLE_SORT, "Fewest people first"];
 const MEMBER_SORT_OPTIONS = {
   faces: [
     ["faces-desc", "Most faces first"],
     ["faces-asc", "Fewest faces first"],
     ["newest", "Newest first"],
+    PEOPLE_SORT_OPTION,
   ],
   all_files: [
     ["path", "Folder order (path)"],
     ["largest", "Largest first"],
     ["newest", "Newest first"],
     ["oldest", "Oldest first"],
+    PEOPLE_SORT_OPTION,
+  ],
+  no_humans: [
+    ["newest", "Newest first"],
+    PEOPLE_SORT_OPTION,
   ],
 };
 
-function memberSortFor(kind) {
+function memberSortOptions(kind) {
   const options = MEMBER_SORT_OPTIONS[kind];
+  if (!options || state.capabilities?.people_score !== false) return options || null;
+  return options.filter(([value]) => value !== PEOPLE_SORT);
+}
+
+// People-likelihood filter cutoffs, calibrated on a labeled COCO sample:
+// ≤ 0.05 kept ~80% of people-free photos with 2–4% containing (tiny) people;
+// ≤ 0.20 kept ~93% with 5–9%. Unscored files never pass an active filter.
+const PEOPLE_FILTER_MAX = { "probably-none": 0.05, "maybe-none": 0.2 };
+const PEOPLE_FILTER_LABELS = {
+  "probably-none": "probably show no people",
+  "maybe-none": "may show no people",
+};
+
+function peopleFilterFor(kind) {
+  if (!memberSortOptions(kind)?.some(([value]) => value === PEOPLE_SORT)) return null;
+  return PEOPLE_FILTER_MAX[state.memberPeople] ?? null;
+}
+
+// Least likely to show people first; unscored files last; then folder order.
+function byPeopleScore(a, b) {
+  const aMissing = a.people_score == null;
+  const bMissing = b.people_score == null;
+  if (aMissing !== bMissing) return aMissing ? 1 : -1;
+  return (a.people_score || 0) - (b.people_score || 0) || a.path.localeCompare(b.path);
+}
+
+// On-demand scoring: one request per group per scan, then poll for progress.
+const peopleScoreRequested = new Set();
+let peopleScoringPoll = null;
+
+function peopleScoringSummary(scoring) {
+  return `Ranking by people likelihood… ${scoring.done}/${scoring.total}`;
+}
+
+function showPeopleScoringProgress(scoring) {
+  for (const id of ["memberPagination", "memberPaginationBottom"]) {
+    const summary = $(id)?.querySelector(".member-page-summary");
+    if (summary && !$(id).hidden) summary.textContent = peopleScoringSummary(scoring);
+  }
+}
+
+function followPeopleScoring(groupId) {
+  if (peopleScoringPoll) clearTimeout(peopleScoringPoll);
+  const tick = async () => {
+    peopleScoringPoll = null;
+    let scoring;
+    try {
+      scoring = await api("/api/people-scores");
+    } catch {
+      return;
+    }
+    state.peopleScoring = scoring;
+    if (scoring.running) {
+      if (state.currentId === groupId) showPeopleScoringProgress(scoring);
+      peopleScoringPoll = setTimeout(tick, 400);
+      return;
+    }
+    if (scoring.error) toast(scoring.error, "error");
+    if (state.currentId === groupId) await selectGroup(groupId, { silent: true });
+  };
+  peopleScoringPoll = setTimeout(tick, 200);
+}
+
+async function ensurePeopleScores(g) {
+  if (state.capabilities?.people_score === false || state.scanning) return;
+  const key = `${state.scanId}:${g.id}`;
+  if (peopleScoreRequested.has(key)) return;
+  const deleted = new Set(g.deleted_paths || []);
+  if (!(g.members || []).some((m) => m.people_score == null && !deleted.has(m.path))) return;
+  peopleScoreRequested.add(key);
+  try {
+    const scoring = await api("/api/people-scores", {
+      method: "POST",
+      body: JSON.stringify({ scan_id: state.scanId, group_id: g.id }),
+    });
+    state.peopleScoring = scoring;
+    if (scoring.running) {
+      showPeopleScoringProgress(scoring);
+      followPeopleScoring(g.id);
+    } else if (state.currentId === g.id) {
+      await selectGroup(g.id, { silent: true });
+    }
+  } catch (error) {
+    peopleScoreRequested.delete(key);
+    toast(error.message || "Could not rank by people likelihood", "error");
+  }
+}
+
+function memberSortFor(kind) {
+  const options = memberSortOptions(kind);
   if (!options) return null;
   const saved = state.memberSortByKind[kind];
   return options.some(([value]) => value === saved) ? saved : options[0][0];
@@ -425,14 +525,21 @@ function renderMembers(g, { append = false } = {}) {
   const deletedPaths = new Set(g.deleted_paths || []);
   let allMembers = g.members || [];
   const memberSort = memberSortFor(g.kind);
-  if (g.kind === "faces" && memberSort !== "faces-desc") {
+  const peopleMax = peopleFilterFor(g.kind);
+  if (memberSort === PEOPLE_SORT || peopleMax != null) ensurePeopleScores(g);
+  if (peopleMax != null) {
+    allMembers = allMembers.filter((m) => m.people_score != null && m.people_score <= peopleMax);
+  }
+  if (memberSort === PEOPLE_SORT) {
+    allMembers = [...allMembers].sort(byPeopleScore);
+  } else if (g.kind === "faces" && memberSort !== "faces-desc") {
     allMembers = [...allMembers].sort(
       memberSort === "newest"
         ? (a, b) => (b.mtime || 0) - (a.mtime || 0)
         : (a, b) => (a.face_count || 0) - (b.face_count || 0),
     );
   }
-  if (g.kind === "all_files" && memberSort !== "path") {
+  if (g.kind === "all_files" && memberSort !== "path" && memberSort !== PEOPLE_SORT) {
     const byPath = (a, b) => a.path.localeCompare(b.path);
     allMembers = [...allMembers].sort(
       memberSort === "largest"
@@ -473,7 +580,11 @@ function renderMembers(g, { append = false } = {}) {
     : gridPaged
     ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
     : allMembers;
-  const summaryText = allMembers.length
+  const scoring = state.peopleScoring;
+  const summaryText = (memberSort === PEOPLE_SORT || peopleMax != null)
+    && scoring?.running && scoring.group_id === g.id
+    ? peopleScoringSummary(scoring)
+    : allMembers.length
     ? singleReview
       ? `${pageStart + 1} of ${allMembers.length}`
       : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
@@ -489,15 +600,24 @@ function renderMembers(g, { append = false } = {}) {
   }
   const sortSelect = $("memberSort");
   if (sortSelect) {
-    const options = MEMBER_SORT_OPTIONS[g.kind] || null;
+    const options = memberSortOptions(g.kind);
     sortSelect.hidden = !options;
-    if (options && sortSelect.dataset.kind !== g.kind) {
+    const optionsKey = options ? `${g.kind}:${options.length}` : "";
+    if (options && sortSelect.dataset.kind !== optionsKey) {
       sortSelect.replaceChildren(
         ...options.map(([value, label]) => new Option(label, value)),
       );
-      sortSelect.dataset.kind = g.kind;
+      sortSelect.dataset.kind = optionsKey;
     }
     if (options) sortSelect.value = memberSortFor(g.kind);
+  }
+  const peopleSelect = $("memberPeople");
+  if (peopleSelect) {
+    const showPeople = Boolean(memberSortOptions(g.kind)?.some(([value]) => value === PEOPLE_SORT));
+    peopleSelect.hidden = !showPeople;
+    if (showPeople) {
+      peopleSelect.value = PEOPLE_FILTER_MAX[state.memberPeople] != null ? state.memberPeople : "any";
+    }
   }
   const modifiedSelect = $("memberModified");
   if (modifiedSelect) {
@@ -522,9 +642,15 @@ function renderMembers(g, { append = false } = {}) {
   if (triage && !members.length) {
     const hiddenDeleted = !state.showDeleted && deletedPaths.size;
     const modifiedWindow = g.kind === "all_files" ? MODIFIED_LABELS[state.memberModified] : null;
+    const peopleLabel = peopleMax != null ? PEOPLE_FILTER_LABELS[state.memberPeople] : null;
+    const scoringNow = scoring?.running && scoring.group_id === g.id;
     box.innerHTML = `<div class="triage-empty">${
       hiddenDeleted
         ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`
+        : peopleLabel && scoringNow
+          ? "Ranking by people likelihood…"
+        : peopleLabel
+          ? `No ${modifiedWindow ? `files modified in ${modifiedWindow}` : "files"} here ${peopleLabel}.`
         : modifiedWindow
           ? `No files in this folder were modified in ${modifiedWindow}.`
           : "Nothing left in this review pile."
@@ -639,6 +765,7 @@ function renderMembers(g, { append = false } = {}) {
               <span class="file-extra" title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
               <span class="media-kind">${escapeHtml(m.media_type)}</span>
               ${m.face_count != null ? `<span class="face-count ${m.face_count > 1 ? "multi" : ""}" title="Faces detected by OpenCV (heuristic)">${m.face_count === 0 ? "No faces" : `${m.face_count} face${m.face_count === 1 ? "" : "s"}`}</span>` : ""}
+              ${m.people_score != null ? `<span class="face-count people-score" title="How likely this shows a person (YOLOX person detector). Advice for ordering only.">People ${m.people_score < 0.01 ? "<1" : Math.round(m.people_score * 100)}%</span>` : ""}
               ${(m.male_face_count || 0) > 0 ? `<span class="face-count multi" title="Male faces estimated by InsightFace genderage (heuristic)">${m.male_face_count} male${m.male_face_count === 1 ? "" : "s"}</span>` : ""}
             </div>
             <div class="evidence">${escapeHtml(evidence)}</div>
@@ -1130,10 +1257,17 @@ document.querySelectorAll(".member-next").forEach((btn) => {
 
 $("memberSort")?.addEventListener("change", (event) => {
   const current = currentGroup();
-  if (current && MEMBER_SORT_OPTIONS[current.kind]) {
+  if (current && memberSortOptions(current.kind)) {
     state.memberSortByKind[current.kind] = event.target.value;
   }
   restartMemberList();
+  if (current) renderMembers(current);
+});
+
+$("memberPeople")?.addEventListener("change", (event) => {
+  state.memberPeople = event.target.value;
+  restartMemberList();
+  const current = currentGroup();
   if (current) renderMembers(current);
 });
 

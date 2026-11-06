@@ -53,6 +53,11 @@ from ..models import (
     SmartRule,
     effective_selected_paths,
 )
+from ..people_score import (
+    has_current_people_score,
+    people_scoring_available,
+    score_people,
+)
 from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
@@ -72,7 +77,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 28
+WEB_API_VERSION = 29
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
@@ -450,6 +455,7 @@ def detect_capabilities() -> dict:
         "ffprobe": shutil.which("ffprobe") is not None,
         "semantic": semantic_available(),
         "decider": decider_available(),
+        "people_score": people_scoring_available()[0],
     }
 
 
@@ -520,6 +526,15 @@ def create_app(
         # Similar groups dissolved by a whole-group distinct review, keyed by
         # group id, so /api/similar/restore-group can undo the review.
         "dissolved_similar": {},
+        # On-demand people-likelihood scoring for one group's members.
+        "people_scoring": {
+            "running": False,
+            "scan_id": None,
+            "group_id": None,
+            "done": 0,
+            "total": 0,
+            "error": None,
+        },
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -616,6 +631,10 @@ def create_app(
 
     def group_payload(group) -> dict:
         payload = group.to_dict()
+        for member, member_payload in zip(group.members, payload["members"], strict=True):
+            # A score from an older model would sort against current ones.
+            if not has_current_people_score(member):
+                member_payload["people_score"] = None
         if group.kind == GroupKind.SETS:
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 score = group.match_scores.get(member.path)
@@ -1194,6 +1213,100 @@ def create_app(
                 if g.id == group_id:
                     return jsonify(group_payload(g))
         return jsonify({"error": "not found"}), 404
+
+    def people_scoring_payload_locked() -> dict:
+        return dict(state["people_scoring"])
+
+    @app.get("/api/people-scores")
+    def api_people_scores_status():
+        with lock:
+            return jsonify(people_scoring_payload_locked())
+
+    @app.post("/api/people-scores")
+    def api_people_scores_start():
+        """Score one group's members for "least likely to show people" ordering.
+
+        Scoring only reads files and writes advice (a 0–1 score per file) to
+        the records, the hash cache, and the review session. It never selects
+        or moves anything, so it is not an action and holds no action lock;
+        it is refused during scans because the result is about to be replaced.
+        """
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        with lock:
+            if not capabilities.get("people_score"):
+                return jsonify({"error": people_scoring_available()[1]}), 400
+            if state["scanning"]:
+                return jsonify({"error": "people scoring waits until the scan finishes"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            if result is None:
+                return jsonify({"error": "no scan"}), 404
+            group = next((g for g in result.groups if g.id == group_id), None)
+            if group is None:
+                return jsonify({"error": "not found"}), 404
+            scoring = state["people_scoring"]
+            if scoring["running"]:
+                if scoring["group_id"] == group_id and scoring["scan_id"] == state["scan_id"]:
+                    return jsonify(people_scoring_payload_locked())
+                return jsonify({"error": "another folder is still being scored"}), 409
+            pending = [m for m in group.members if not has_current_people_score(m)]
+            scan_id = state["scan_id"]
+            state["people_scoring"] = {
+                "running": bool(pending),
+                "scan_id": scan_id,
+                "group_id": group_id,
+                "done": 0,
+                "total": len(pending),
+                "error": None,
+            }
+            if not pending:
+                return jsonify(people_scoring_payload_locked())
+
+        def still_current() -> bool:
+            with lock:
+                return state["scan_id"] == scan_id and not state["scanning"]
+
+        def progress(done: int, _total: int) -> None:
+            with lock:
+                if state["people_scoring"]["scan_id"] == scan_id:
+                    state["people_scoring"]["done"] = done
+
+        def work() -> None:
+            error = None
+            scored: list = []
+            try:
+                scored = score_people(
+                    pending,
+                    progress=progress,
+                    cancelled=lambda: not still_current(),
+                )
+            except InterruptedError:
+                error = "scoring stopped because the results changed"
+            except Exception as exc:  # model failure: report, never crash the server
+                error = f"people scoring failed: {exc}"
+            if scored:
+                cache = None
+                try:
+                    cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+                    cache.store_all([record for record in scored if record.people_score is not None])
+                except (OSError, sqlite3.Error):
+                    pass  # scores still apply to this session; they just are not cached
+                finally:
+                    if cache is not None:
+                        cache.close()
+            with lock:
+                if state["people_scoring"]["scan_id"] == scan_id:
+                    state["people_scoring"]["running"] = False
+                    state["people_scoring"]["error"] = error
+                    state["people_scoring"]["done"] = state["people_scoring"]["total"]
+            if error is None and still_current():
+                schedule_persist()
+
+        threading.Thread(target=work, name="dedupe-people-scores", daemon=True).start()
+        with lock:
+            return jsonify(people_scoring_payload_locked()), 202
 
     @app.post("/api/scan")
     def api_scan():

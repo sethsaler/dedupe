@@ -123,6 +123,9 @@ class FileRecord:
     female_face_count: int | None = None
     face_detector: str | None = None
     face_detection_signature: str | None = None
+    # 0–1 "shows a person" likelihood for least-likely-first ordering.
+    people_score: float | None = None
+    people_score_signature: str | None = None
     error: str | None = None
     keeper_preference: int = 0
     capture_metadata: bool | None = None
@@ -194,6 +197,8 @@ class FileRecord:
             female_face_count=data.get("female_face_count"),
             face_detector=data.get("face_detector"),
             face_detection_signature=data.get("face_detection_signature"),
+            people_score=data.get("people_score"),
+            people_score_signature=data.get("people_score_signature"),
             error=data.get("error"),
         )
 

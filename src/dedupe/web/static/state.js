@@ -21,6 +21,11 @@ const state = {
   memberSortByKind: { faces: "faces-desc", all_files: "path" },
   // Modified-time window for the Files tab's member list ("any" = no filtering).
   memberModified: "any",
+  // Latest /api/people-scores status while a group is being ranked by people
+  // likelihood ({ running, group_id, done, total, error }).
+  peopleScoring: null,
+  // People-likelihood filter for kinds with the people sort ("any" = off).
+  memberPeople: "any",
   reviewView: "gallery",
   lightboxItems: [],
   lightboxIndex: 0,
