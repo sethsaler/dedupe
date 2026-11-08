@@ -321,12 +321,22 @@ def build_faces_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
     return _build_independent_group(GroupKind.FACES, matching)
 
 
-def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
-    """Build one review collection of images with a black-border crop suggestion.
+def crop_review_order(member: FileRecord, box) -> tuple:
+    """Sort key for the Crop review.
 
-    Members are ordered most border first (the largest share of the frame
-    the crop would remove), so the clearest cases lead the review.
+    Screenshots whose interface (status bar, navigation bar, menu bar) would
+    be cropped lead the review, since those are the crops to deal with
+    first; then the rest, most border first (the largest share of the frame
+    the crop would remove), so the clearest cases come before the subtle ones.
     """
+    if box is None:
+        return (2, 0.0, member.path)
+    return (0 if box.chrome else 1, -box.removed_fraction, member.path)
+
+
+def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
+    """Build one review collection of images with a crop suggestion,
+    ordered by :func:`crop_review_order`."""
     from .borders import suggested_crop
 
     suggestions = [
@@ -334,7 +344,7 @@ def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
         for member in members
         if (box := suggested_crop(member)) is not None
     ]
-    suggestions.sort(key=lambda item: (-item[1].removed_fraction, item[0].path))
+    suggestions.sort(key=lambda item: crop_review_order(*item))
     return _build_independent_group(GroupKind.CROP, [member for member, _ in suggestions])
 
 
@@ -417,6 +427,58 @@ def build_set_group(
         match_basis="semantic",
         match_scores=dict(scores),
     )
+
+
+def refresh_crop_groups(result: ScanResult, *, workers: int = 4) -> list[FileRecord]:
+    """Bring a saved Crop review up to the current border detector.
+
+    Suggestions saved by an older detector are measured again; files it no
+    longer suggests cropping leave the review, cropped files stay (their
+    crop is on disk and can still be undone), and the review is put back in
+    :func:`crop_review_order`. Returns the records measured again, so the
+    caller can remember the new verdicts.
+    """
+    from .borders import BORDER_SIGNATURE, CropBox, analyze_borders, suggested_crop
+
+    measured: list[FileRecord] = []
+    kept_groups = []
+    for group in result.groups:
+        if group.kind != GroupKind.CROP:
+            kept_groups.append(group)
+            continue
+        cropped = group.match_details.get("cropped") or {}
+        stale = [
+            member
+            for member in group.members
+            if member.path not in cropped and member.border_signature != BORDER_SIGNATURE
+        ]
+        if stale:
+            analyze_borders(stale, workers=workers)
+            measured.extend(stale)
+
+        boxes = {
+            member.path: (
+                CropBox.decode(cropped[member.path]["box"])
+                if member.path in cropped
+                else suggested_crop(member)
+            )
+            for member in group.members
+        }
+        ordered = sorted(
+            (
+                (member, boxes[member.path])
+                for member in group.members
+                if boxes[member.path] is not None
+            ),
+            key=lambda item: crop_review_order(*item),
+        )
+        group.members = [member for member, _ in ordered]
+        kept = {member.path for member in group.members}
+        group.reviewed_paths = [path for path in group.reviewed_paths if path in kept]
+        if group.members:
+            kept_groups.append(group)
+    result.groups = kept_groups
+    return measured
 
 
 def ensure_all_files_groups(result: ScanResult) -> None:

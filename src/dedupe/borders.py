@@ -37,8 +37,8 @@ from .parallel import map_parallel
 
 # Bump when the detection rules change so cached verdicts are recomputed.
 # A user's dismissal under an earlier signature still stands.
-BORDER_SIGNATURE = "black-borders-v2"
-LEGACY_BORDER_SIGNATURES = frozenset({"black-borders-v1"})
+BORDER_SIGNATURE = "black-borders-v3"
+LEGACY_BORDER_SIGNATURES = frozenset({"black-borders-v1", "black-borders-v2"})
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
 
@@ -56,13 +56,23 @@ CROPPABLE_EXTENSIONS = {
     ".heif",
 }
 
-# A pixel at or below this luma (0–255) counts as black. JPEG ringing and
-# sensor noise keep "black" bars a few levels above zero.
+# A bar is black: its level (the median of the outermost line) is at or
+# below this luma (0–255). JPEG ringing and sensor noise keep "black" bars a
+# few levels above zero.
 DARK_LUMA = 28
-# A row or column belongs to a border only when nearly every pixel is black
-# and the line as a whole is very dark.
-DARK_LINE_FRACTION = 0.985
-DARK_LINE_MEAN = 18.0
+# A bar is one flat level. A line belongs to the bar only when nearly every
+# pixel sits within BAR_TOLERANCE of the bar's level. Dark hair, a shadowed
+# limb or a dark backdrop has texture and drifts above the level, so it
+# stops the bar instead of being swallowed by it.
+BAR_TOLERANCE = 12
+BAR_LINE_FRACTION = 0.995
+# A bar ends at a hard edge: within BAR_EDGE_LINES past it, some line must
+# be clearly picture, with at least this share of it off the bar's level.
+# Black headroom that fades into a dark subject, or a night scene darkening
+# toward the frame, changes a few pixels per line instead and is left alone:
+# a missed crop costs nothing, a crop through someone's hair does.
+BAR_EDGE_LINES = 4
+BAR_EDGE_FRACTION = 0.2
 # Ignore slivers: a bar must be at least this many pixels and this share of
 # the image's dimension along that axis.
 MIN_BORDER_PIXELS = 2
@@ -249,13 +259,25 @@ def _luma(image):
     return np.asarray(image.convert("L"))
 
 
-def _edge_run(dark_lines) -> int:
-    """Number of consecutive border lines from the start of ``dark_lines``."""
+def _edge_bar(lines) -> int:
+    """Thickness of the black bar at the start of ``lines`` (ordered from the edge).
+
+    ``lines`` is a 2-D luma array, one row per line running parallel to the
+    edge. Returns 0 when the edge is not a flat black band ending in a hard
+    edge against the picture.
+    """
     import numpy as np
 
-    if dark_lines.all():
-        return int(dark_lines.size)
-    return int(np.argmin(dark_lines))
+    level = float(np.median(lines[0]))
+    if level > DARK_LUMA:
+        return 0
+    near = np.abs(lines.astype(np.int16) - level) <= BAR_TOLERANCE
+    flat = near.mean(axis=1) >= BAR_LINE_FRACTION
+    run = int(flat.size) if flat.all() else int(np.argmin(flat))
+    if run == 0 or run >= len(lines):
+        return run
+    off = 1.0 - near[run : run + BAR_EDGE_LINES].mean(axis=1)
+    return run if off.max() >= BAR_EDGE_FRACTION else 0
 
 
 def detect_borders_in_array(luma) -> tuple[int, int, int, int] | None:
@@ -269,18 +291,16 @@ def detect_borders_in_array(luma) -> tuple[int, int, int, int] | None:
     height, width = luma.shape[:2]
     if height < 8 or width < 8:
         return None
-    dark = luma <= DARK_LUMA
-    row_dark = dark.mean(axis=1) >= DARK_LINE_FRACTION
-    row_dark &= luma.mean(axis=1) <= DARK_LINE_MEAN
-    col_dark = dark.mean(axis=0) >= DARK_LINE_FRACTION
-    col_dark &= luma.mean(axis=0) <= DARK_LINE_MEAN
-
-    top = _edge_run(row_dark)
+    # A bar never reaches past the share the picture must keep, so only that
+    # much of each edge is examined.
+    reach_rows = height - int(np.ceil(height * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
+    reach_cols = width - int(np.ceil(width * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
+    top = _edge_bar(luma[:reach_rows])
     if top >= height:
         return None  # the whole frame is black
-    bottom = _edge_run(row_dark[::-1])
-    left = _edge_run(col_dark)
-    right = _edge_run(col_dark[::-1])
+    bottom = _edge_bar(luma[::-1][:reach_rows])
+    left = _edge_bar(luma.T[:reach_cols])
+    right = _edge_bar(luma.T[::-1][:reach_cols])
 
     min_rows = max(MIN_BORDER_PIXELS, int(np.ceil(height * MIN_BORDER_FRACTION)))
     min_cols = max(MIN_BORDER_PIXELS, int(np.ceil(width * MIN_BORDER_FRACTION)))
