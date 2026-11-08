@@ -586,3 +586,175 @@ def test_cancelled_neighbor_pass_does_not_publish_incomplete_coverage(
     full = semantic_neighbors(vectors, 0.5)
     retried = semantic_neighbors(vectors, 0.5, use_cache=True, cache_path=cache)
     assert retried == full
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS background policy")
+def test_helper_runs_under_the_macos_background_policy(
+    tmp_path: Path, fake_helper: Path,
+) -> None:
+    from dedupe.semantic import TASKPOLICY
+
+    with EmbeddingWorker() as worker:
+        assert worker._process.args[:2] == [TASKPOLICY, "-b"]
+        # taskpolicy execs in place: the tracked pid is the helper itself.
+        policy = os.popen(f"/bin/ps -o comm= -p {worker._process.pid}").read()
+        assert TASKPOLICY not in policy
+        vectors, _errors = worker.embed_images([str(_image(tmp_path / "a.jpg", (9, 9, 9), False))])
+    assert vectors[0] is not None
+
+
+def test_thermal_pause_is_a_duty_cycle() -> None:
+    from dedupe.semantic import THERMAL_PAUSE_MIN, thermal_pause_seconds, thermal_pressure
+
+    assert thermal_pause_seconds(0, 5.0) == 0
+    assert thermal_pause_seconds(1, 5.0) == 5.0
+    assert thermal_pause_seconds(1, 0.1) == THERMAL_PAUSE_MIN
+    assert thermal_pause_seconds(2, 5.0) == 15.0
+    assert thermal_pause_seconds(4, 1.0) > thermal_pause_seconds(2, 1.0)
+    assert thermal_pressure() >= 0  # readable (or 0) on this machine
+
+
+def test_embedding_pauses_under_thermal_pressure_and_still_finishes(
+    tmp_path: Path, fake_helper: Path, monkeypatch,
+) -> None:
+    from dedupe import semantic
+
+    monkeypatch.setattr(semantic, "REQUEST_BATCH", 1)
+    monkeypatch.setattr(semantic, "THERMAL_PAUSE_MIN", 0.05)
+    monkeypatch.setattr(semantic, "thermal_pressure", lambda: 1)
+    phases: list[str] = []
+    vectors, errors = embed_records(
+        _records(_media(tmp_path / "media")), use_cache=False,
+        progress=lambda phase, _done, _total: phases.append(phase),
+    )
+    assert len(vectors) == 3 and errors == []
+    # Paused after the first and second batches, never after the last.
+    assert phases.count("semantic-embed-cooling") == 2
+    assert phases[-1] == "semantic-embed"
+
+
+def test_cancel_during_a_thermal_pause_stops_promptly(
+    tmp_path: Path, fake_helper: Path, monkeypatch,
+) -> None:
+    from dedupe import semantic
+
+    monkeypatch.setattr(semantic, "REQUEST_BATCH", 1)
+    monkeypatch.setattr(semantic, "THERMAL_PAUSE_MIN", 30.0)
+    monkeypatch.setattr(semantic, "thermal_pressure", lambda: 2)
+    cancelled = threading.Event()
+
+    def progress(phase: str, _done: int, _total: int) -> None:
+        if phase == "semantic-embed-cooling":
+            threading.Timer(0.1, cancelled.set).start()
+
+    started = time.monotonic()
+    with pytest.raises(InterruptedError):
+        embed_records(
+            _records(_media(tmp_path / "media")), use_cache=False,
+            progress=progress, cancelled=cancelled.is_set,
+        )
+    assert time.monotonic() - started < 5
+
+
+def test_embedding_starts_before_image_hashing_finishes(
+    tmp_path: Path, fake_helper: Path, monkeypatch,
+) -> None:
+    from dedupe import engine
+
+    embedding_started = threading.Event()
+    real_embed = engine.embed_records
+    real_similar = engine.find_similar_image_groups
+    overlapped: list[bool] = []
+
+    def embed(*args, **kwargs):
+        embedding_started.set()
+        return real_embed(*args, **kwargs)
+
+    def similar(*args, **kwargs):
+        # Before, embedding waited for this stage; now it runs alongside it.
+        overlapped.append(embedding_started.wait(timeout=10))
+        return real_similar(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "embed_records", embed)
+    monkeypatch.setattr(engine, "find_similar_image_groups", similar)
+    root = _media(tmp_path / "media")
+    result = run_scan([root], semantic=True, cache_path=tmp_path / "cache.sqlite3")
+    assert overlapped == [True]
+    assert [g for g in result.groups if g.kind == GroupKind.SETS]
+    assert not result.diagnostics.stages["semantic"].warnings
+
+
+def test_fully_cached_scan_never_starts_the_helper(
+    tmp_path: Path, fake_helper: Path, monkeypatch,
+) -> None:
+    starts = tmp_path / "starts.log"
+    script = tmp_path / "fake_digup.py"
+    script.write_text(script.read_text().replace(
+        'print("llama.cpp chatter',
+        'open(os.environ["FAKE_DIGUP_STARTS"], "a").write("start\\n")\nprint("llama.cpp chatter',
+    ))
+    monkeypatch.setenv("FAKE_DIGUP_STARTS", str(starts))
+    root = _media(tmp_path / "media")
+    cache = tmp_path / "cache.sqlite3"
+
+    first, _ = embed_records(_records(root), cache_path=cache)
+    again, errors = embed_records(_records(root), cache_path=cache)
+    assert again == first and errors == []
+    assert starts.read_text().splitlines() == ["start"]  # loaded the model once
+
+    _image(root / "new.jpg", (200, 30, 30), stripes=False)
+    vectors, _ = embed_records(_records(root), cache_path=cache)
+    assert len(vectors) == 4 and len(starts.read_text().splitlines()) == 2
+    assert len(fake_helper.read_text().splitlines()) == 4  # only the new file embedded
+
+
+def test_a_changed_helper_reporting_a_new_model_reembeds(
+    tmp_path: Path, fake_helper: Path,
+) -> None:
+    root = _media(tmp_path / "media")
+    cache = tmp_path / "cache.sqlite3"
+    embed_records(_records(root), cache_path=cache)
+    # An app update replaces the helper; its model revision changed too.
+    script = tmp_path / "fake_digup.py"
+    script.write_text(script.read_text().replace('"revision": "abc"', '"revision": "def"'))
+    helper = tmp_path / "digup"
+    helper.write_text(helper.read_text() + "\n# updated\n")
+    vectors, errors = embed_records(_records(root), cache_path=cache)
+    assert len(vectors) == 3 and errors == []
+    assert len(fake_helper.read_text().splitlines()) == 6  # all three embedded again
+
+
+def test_full_speed_option_reaches_the_helper_launch(tmp_path: Path, monkeypatch) -> None:
+    import dedupe.web.app as web
+    from dedupe.semantic import TASKPOLICY, _worker_command
+
+    assert _worker_command("/x/digup", background=False) == ["/x/digup", "worker"]
+    if sys.platform == "darwin":
+        assert _worker_command("/x/digup")[:2] == [TASKPOLICY, "-b"]
+
+    seen: list[dict] = []
+    monkeypatch.setattr(web, "run_scan", lambda roots, **kw: seen.append(kw) or ScanResult(
+        roots=[str(r) for r in roots], files=[], groups=[]))
+    app = create_app(None)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    for body, expected in (
+        ({"semantic": True, "semantic_full_speed": True}, True),
+        ({"semantic": False, "semantic_full_speed": True}, False),  # needs look-alikes
+        ({"semantic": True}, False),  # cool by default
+    ):
+        seen.clear()
+        response = client.post(
+            "/api/scan", json={"paths": [str(tmp_path)], "parallel": False, **body},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        for _ in range(200):
+            if seen:
+                break
+            time.sleep(0.01)
+        assert seen[0]["semantic_full_speed"] is expected
+        for _ in range(200):
+            if client.get("/api/status").get_json().get("state") != "running":
+                break
+            time.sleep(0.01)

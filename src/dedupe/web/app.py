@@ -1497,6 +1497,8 @@ def create_app(
                     "semantic_duplicate_threshold": _cosine(
                         data.get("semantic_duplicate_threshold"), 0.97
                     ),
+                    "semantic_full_speed": bool(data.get("semantic", False))
+                    and bool(data.get("semantic_full_speed", False)),
                     "decider": bool(data.get("semantic", False))
                     and bool(data.get("decider", False)),
                     "find_no_humans": bool(data.get("find_no_humans", False)),

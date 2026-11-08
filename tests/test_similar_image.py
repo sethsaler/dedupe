@@ -853,3 +853,42 @@ def test_transparent_reexport_still_matches(tmp_path):
     original.save(tmp_path / "reexport.webp", lossless=True)
 
     assert len(find_similar_image_groups(inventory([tmp_path]), workers=1)) == 1
+
+
+@pytest.mark.parametrize("extension", ["jpg", "png", "webp", "tiff", "heic"])
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_header_dimensions_match_the_decoded_transpose(
+    tmp_path: Path, extension: str, orientation: int,
+) -> None:
+    """The header-only probe answers exactly what exif_transpose decodes to."""
+    from PIL import ImageOps
+
+    import dedupe.similar_image as module
+
+    module._register_heif()
+    path = tmp_path / f"o{orientation}.{extension}"
+    exif = Image.Exif()
+    exif[module.EXIF_ORIENTATION] = orientation
+    try:
+        Image.new("RGB", (60, 40), (90, 120, 30)).save(path, exif=exif.tobytes())
+    except (KeyError, OSError):
+        pytest.skip(f"no {extension} encoder")
+    with Image.open(path) as img:
+        expected = ImageOps.exif_transpose(img).size
+    assert module.probe_image_dimensions(path) == expected
+
+
+def test_verification_decodes_each_file_once_for_every_orientation(tmp_path: Path) -> None:
+    import dedupe.similar_image as module
+
+    a, b = tmp_path / "a.jpg", tmp_path / "b.jpg"
+    _soft_photo(a, size=(300, 200))
+    _soft_photo(b, size=(300, 200))
+    module.clear_image_comparison_cache()
+    for orientation in (None, *module.ORIENTATIONS):
+        module._tile_phashes_for_path(str(a), module.TILE_NORMALIZE, orientation)
+        module._dense_thumbs_for_path(str(a), orientation)
+    module.is_dense_match(str(a), str(b))
+    info = module._hash_samples_for_path.cache_info()
+    assert info.misses == 2  # one decode per file serves tiles and dense thumbnails
+    module.clear_image_comparison_cache()

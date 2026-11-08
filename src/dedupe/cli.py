@@ -91,6 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cosine similarity for --semantic duplicates added to Similar (default 0.97)",
     )
     scan.add_argument(
+        "--semantic-full-speed",
+        action="store_true",
+        help=(
+            "Embed new --semantic images at full GPU speed instead of macOS background "
+            "priority: about a third less embedding time, but the Mac runs warmer"
+        ),
+    )
+    scan.add_argument(
         "--decider",
         action="store_true",
         help=(
@@ -518,6 +526,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "semantic": args.semantic or args.decider,
         "semantic_threshold": args.semantic_threshold,
         "semantic_duplicate_threshold": args.semantic_duplicate_threshold,
+        "semantic_full_speed": args.semantic_full_speed,
         "decider": args.decider,
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,

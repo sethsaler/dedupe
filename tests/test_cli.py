@@ -526,3 +526,17 @@ def test_undo_resolves_a_receipt_id(tmp_path: Path, capsys) -> None:
 def test_undo_reports_unknown_receipt(tmp_path: Path, capsys) -> None:
     assert cli.main(["undo", "missing-receipt", "--log-dir", str(tmp_path / "logs")]) == 2
     assert "no receipt matching" in capsys.readouterr().err
+
+
+def test_semantic_full_speed_flag_reaches_the_engine(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_scan(paths, **kwargs):
+        captured.update(kwargs)
+        return ScanResult(roots=[str(path) for path in paths], files=[], groups=[])
+
+    monkeypatch.setattr(cli, "run_scan", fake_run_scan)
+    assert cli.main([str(tmp_path), "--semantic"]) == 0
+    assert captured["semantic_full_speed"] is False
+    assert cli.main([str(tmp_path), "--semantic", "--semantic-full-speed"]) == 0
+    assert captured["semantic_full_speed"] is True
