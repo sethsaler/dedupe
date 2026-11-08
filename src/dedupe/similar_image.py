@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .cache import DistinctReviews
 from .grouping import cluster_around_best
+from .image_frames import is_animated_image
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_IMAGE_WORKERS_CAP, map_parallel, resolve_workers
 
@@ -52,6 +53,8 @@ DEFAULT_DENSE_CONCENTRATION = 8.0
 # 32-level allowance retains re-exports/moderate exposure edits, not different
 # colors or substantially different transparency.
 DEFAULT_DENSE_COLOR_MEAN_MAX = 32.0
+# Channel means within this many levels of their average: a grayscale image.
+MONOCHROME_BALANCE_MAX = 3.0
 # A cached animation contains eight RGB thumbnails, up to 64 KB each in
 # Pillow's storage; keep the worst-case thumbnail cache near 64 MB.
 DENSE_CACHE_SIZE = 128
@@ -148,7 +151,7 @@ def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
-        if getattr(img, "is_animated", False):
+        if is_animated_image(img):
             width, height = img.size
         elif img.format in HEADER_ORIENTATION_FORMATS:
             # The header and EXIF orientation give the size exif_transpose
@@ -208,7 +211,7 @@ def compute_image_fingerprint(
 
     path = Path(path)
     with Image.open(path) as img:
-        animated = bool(getattr(img, "is_animated", False))
+        animated = is_animated_image(img)
         if not animated:
             img = ImageOps.exif_transpose(img)
         # Capture original dimensions before draft (draft can shrink reported size).
@@ -279,7 +282,7 @@ def _orient(img, orientation: str | None):
 
 def _hash_frames(img, *, preserve_alpha: bool = False, max_side: int = HASH_MAX_SIDE) -> list:
     """Sample animations in playback order and time, independent of frame rate."""
-    if not getattr(img, "is_animated", False):
+    if not is_animated_image(img):
         return [_downscale_for_hash(img, max_side, preserve_alpha=preserve_alpha)]
     starts = []
     duration = 0.0
@@ -352,7 +355,7 @@ def _hash_samples_for_path(path: str):
 
     try:
         with Image.open(path) as img:
-            if not getattr(img, "is_animated", False):
+            if not is_animated_image(img):
                 img = ImageOps.exif_transpose(img)
             try:
                 img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
@@ -516,7 +519,7 @@ def _detail_frames_cached(path: str, size: int, mtime_ns: int, ctime_ns: int):
     try:
         with Image.open(path) as img:
             img.draft("RGB", (DETAIL_MAX_SIDE, DETAIL_MAX_SIDE))
-            if not getattr(img, "is_animated", False):
+            if not is_animated_image(img):
                 img = ImageOps.exif_transpose(img)
             return tuple(frame.convert("L") for frame in _hash_frames(img, max_side=DETAIL_MAX_SIDE))
     except (OSError, ValueError):
@@ -606,6 +609,29 @@ def is_dense_match(
             if worst > local_max and mean > 0 and worst / mean > concentration:
                 return False
     return _fine_detail_matches(path_a, path_b, orientation_a)
+
+
+def _color_balance_agrees(path_a: str, path_b: str) -> bool:
+    """Whole-image color balance, independent of crop and alignment.
+
+    Feature alignment compares grayscale, so it cannot see a recolored
+    subject. Each channel's mean is taken relative to the image's own overall
+    mean, so exposure changes cancel. A monochrome side passes: black-and-white
+    conversion is an edit of the same photo.
+    """
+    import numpy as np
+
+    balances = []
+    for path in (path_a, path_b):
+        frames = _dense_thumbs_for_path(path)
+        if not frames:
+            return False
+        means = np.asarray(frames[0], dtype=np.float32)[:, :, :3].reshape(-1, 3).mean(axis=0)
+        balance = means - means.mean()
+        if float(np.abs(balance).max()) < MONOCHROME_BALANCE_MAX:
+            return True
+        balances.append(balance)
+    return float(np.abs(balances[0] - balances[1]).max()) <= DEFAULT_DENSE_COLOR_MEAN_MAX
 
 
 def encode_tile_phashes(values: tuple[str, ...]) -> str:
@@ -830,6 +856,7 @@ def find_similar_image_groups(
     positions = {record.path: i for i, record in enumerate(hashed)}
 
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
+    near_misses: list[tuple[FileRecord, FileRecord]] = []
 
     def verified(rec: FileRecord, other: FileRecord, orientation: str | None) -> bool:
         """Regional + dense verification of rec (turned by orientation) against other."""
@@ -906,11 +933,41 @@ def find_similar_image_groups(
                 if distinct and distinct.is_distinct(rec, other):
                     continue
                 if not verified(rec, other, orientation):
+                    if (
+                        orientation is None
+                        and rec.media_type == MediaType.IMAGE
+                        and other.media_type == MediaType.IMAGE
+                    ):
+                        near_misses.append((rec, other))
                     continue
                 adjacency[rec.path].add(other.path)
                 adjacency[other.path].add(rec.path)
             if progress and (i + 1) % 20 == 0:
                 progress("image-cluster", i + 1, len(hashed))
+
+        # A crop, border, or color edit misaligns the regional checks above
+        # even when the global hash agrees. Feature alignment verifies those
+        # copies with the same fine-detail bar, so poses stay separate.
+        unique = {(rec.path, other.path): (rec, other) for rec, other in near_misses}
+        pending = [
+            (rec, other) for rec, other in unique.values()
+            if other.path not in adjacency[rec.path]
+        ]
+        if pending:
+            from .edited_copy import verify_edited_copy
+
+            verdicts = map_parallel(
+                lambda pair: _color_balance_agrees(pair[0].path, pair[1].path)
+                and verify_edited_copy(pair[0].path, pair[1].path),
+                pending,
+                workers=n_workers,
+                backend="thread",
+                cancelled=cancelled,
+            )
+            for (rec, other), same in zip(pending, verdicts, strict=True):
+                if same:
+                    adjacency[rec.path].add(other.path)
+                    adjacency[other.path].add(rec.path)
 
         if progress:
             progress("image-cluster", len(hashed), len(hashed))
@@ -927,6 +984,10 @@ def clear_image_comparison_cache() -> None:
     _tile_phashes_for_path.cache_clear()
     _dense_thumbs_for_path.cache_clear()
     _detail_frames_cached.cache_clear()
+    from .edited_copy import _color_frame, _features
+
+    _features.cache_clear()
+    _color_frame.cache_clear()
 
 
 def _bruteforce_groups(

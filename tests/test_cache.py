@@ -472,3 +472,32 @@ def test_cache_round_trips_orientation_hashes(tmp_path: Path) -> None:
     assert cache.hydrate([same]) == 1
     assert same.orientation_phashes == original.orientation_phashes
     cache.close()
+
+
+def test_cache_drops_animation_hashes_stored_for_a_jpeg(tmp_path: Path) -> None:
+    # Multi-picture JPEGs were once hashed as two-frame animations.
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    stale = _record(tmp_path / "phone.jpg", inode=10)
+    stale.dhash = "1" * 16
+    stale.tile_phashes = "t3:" + ",".join(["0" * 16] * 10)
+    still = _record(tmp_path / "still.jpg", inode=11)
+    still.dhash = "1" * 16
+    still.tile_phashes = "t3:" + ",".join(["0" * 16] * 5)
+    gif = _record(tmp_path / "loop.gif", inode=12)
+    gif.extension = ".gif"
+    gif.media_type = MediaType.GIF
+    gif.dhash = "1" * 16
+    gif.tile_phashes = stale.tile_phashes
+    cache.store_all([stale, still, gif])
+
+    fresh = [_record(tmp_path / name, inode=inode) for name, inode in
+             (("phone.jpg", 10), ("still.jpg", 11), ("loop.gif", 12))]
+    fresh[2].extension, fresh[2].media_type = ".gif", MediaType.GIF
+    for record in fresh:
+        record.phash = None
+    cache.hydrate(fresh)
+
+    assert (fresh[0].phash, fresh[0].dhash, fresh[0].tile_phashes) == (None, None, None)
+    assert fresh[1].tile_phashes == still.tile_phashes and fresh[1].phash == "0" * 16
+    assert fresh[2].tile_phashes == gif.tile_phashes
+    cache.close()

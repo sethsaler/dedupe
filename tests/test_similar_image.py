@@ -892,3 +892,74 @@ def test_verification_decodes_each_file_once_for_every_orientation(tmp_path: Pat
     info = module._hash_samples_for_path.cache_info()
     assert info.misses == 2  # one decode per file serves tiles and dense thumbnails
     module.clear_image_comparison_cache()
+
+
+ASTRONAUT = Path(__file__).parent / "fixtures" / "astronaut.png"
+
+
+def _multi_picture_jpeg(path: Path, primary: Image.Image, *, truncate: int = 0) -> None:
+    """A phone-style MPO: the photo plus a small gain/depth map after it."""
+    auxiliary = primary.convert("L").resize((primary.width // 4, primary.height // 4))
+    primary.save(path, format="MPO", save_all=True, append_images=[auxiliary.convert("RGB")],
+                 quality=92)
+    if truncate:
+        # Apps that re-save photos often cut the auxiliary image short.
+        data = path.read_bytes()
+        path.write_bytes(data[:-truncate])
+
+
+@pytest.mark.parametrize("truncate", [0, 2000])
+def test_multi_picture_jpeg_matches_plain_copy_of_its_photo(tmp_path: Path, truncate: int) -> None:
+    photo = Image.open(ASTRONAUT).convert("RGB")
+    mpo = tmp_path / "phone.jpg"
+    plain = tmp_path / "saved.jpg"
+    _multi_picture_jpeg(mpo, photo, truncate=truncate)
+    photo.save(plain, format="JPEG", quality=92)
+    with Image.open(mpo) as opened:
+        assert opened.format == "MPO" and opened.n_frames == 2
+
+    phash, dhash, width, height, tiles = compute_image_hashes_with_tiles(mpo)
+    assert phash and dhash and (width, height) == photo.size
+    assert len(tiles) == 5  # one still frame, not an animation
+
+    records = [_rec_for(mpo), _rec_for(plain)]
+    groups = find_similar_image_groups(records)
+    assert [sorted(r.path for r in group) for group in groups] == [
+        sorted(r.path for r in records)
+    ]
+    assert not any(r.error for r in records)
+
+
+def test_multi_picture_jpeg_counts_as_one_frame(tmp_path: Path) -> None:
+    from dedupe.image_frames import animation_frame_count, is_animated_image
+
+    mpo = tmp_path / "phone.jpg"
+    gif = tmp_path / "loop.gif"
+    _multi_picture_jpeg(mpo, Image.open(ASTRONAUT).convert("RGB"), truncate=2000)
+    frames = [Image.new("RGB", (32, 32), color) for color in ("red", "blue", "green")]
+    frames[0].save(gif, save_all=True, append_images=frames[1:], duration=100)
+    with Image.open(mpo) as still, Image.open(gif) as animation:
+        assert not is_animated_image(still) and animation_frame_count(still) == 1
+        assert is_animated_image(animation) and animation_frame_count(animation) == 3
+
+
+def test_cropped_copy_within_hash_range_is_verified_by_alignment(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
+    photo = Image.open(ASTRONAUT).convert("RGB")
+    source, cropped, smiling = tmp_path / "source.jpg", tmp_path / "cropped.jpg", tmp_path / "smile.jpg"
+    photo.save(source, quality=92)
+    photo.crop((12, 12, 500, 500)).save(cropped, quality=85)
+    changed = photo.copy()
+    ImageDraw.Draw(changed).line(
+        [(204, 145), (213, 147), (225, 147), (239, 144)], fill=(110, 66, 56), width=3,
+    )
+    changed.save(smiling, quality=92)
+    # The crop moves every region, so the aligned regional check alone rejects it.
+    assert not is_near_identical(str(source), str(cropped))
+
+    records = [_rec_for(source), _rec_for(cropped), _rec_for(smiling)]
+    groups = find_similar_image_groups(records, workers=1)
+
+    assert [sorted(Path(r.path).name for r in group) for group in groups] == [
+        ["cropped.jpg", "source.jpg"]
+    ]

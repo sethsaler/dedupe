@@ -18,6 +18,17 @@ STORE_BATCH_SIZE = 1000
 # Records per hydration query batch; each path/device+inode pair is one bind
 # variable and SQLite's default variable limit is 999.
 HYDRATE_BATCH_SIZE = 400
+# Regional tile hashes per still frame: four quadrants and the center.
+TILES_PER_FRAME = 5
+JPEG_EXTS = frozenset({".jpg", ".jpeg"})
+
+
+def _is_multi_frame_jpeg_hash(rec: FileRecord) -> bool:
+    """A JPEG is never an animation, so cached tiles for several frames are stale."""
+    if rec.extension not in JPEG_EXTS or not rec.tile_phashes:
+        return False
+    values = rec.tile_phashes.split(":", 1)[-1]
+    return len([part for part in values.split(",") if part]) > TILES_PER_FRAME
 
 _UPSERT_SQL = """
     INSERT INTO hashes (
@@ -676,6 +687,10 @@ class HashCache:
         rec.dhash = row["dhash"] or rec.dhash
         rec.tile_phashes = row["tile_phashes"] or rec.tile_phashes
         rec.orientation_phashes = row["orientation_phashes"] or rec.orientation_phashes
+        if _is_multi_frame_jpeg_hash(rec):
+            # Earlier versions hashed a multi-picture JPEG's gain or depth map
+            # as animation frames. Rehash it as the still photo it is.
+            rec.phash = rec.dhash = rec.tile_phashes = rec.orientation_phashes = None
         rec.video_fingerprint = row["video_fingerprint"] or rec.video_fingerprint
         rec.duration = row["duration"] if row["duration"] is not None else rec.duration
         rec.human_detection_status = (

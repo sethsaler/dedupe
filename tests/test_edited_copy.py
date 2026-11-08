@@ -85,3 +85,44 @@ def test_feature_cache_not_reused_after_edit_with_preserved_size_and_mtime(tmp_p
     assert edited.stat().st_size == before.st_size
     assert edited.stat().st_mtime_ns == before.st_mtime_ns
     assert edited_copy_verdict(str(original), str(edited)) is False
+
+
+def _black_and_white(image, weights, gamma=1.0):
+    import numpy as np
+
+    mixed = np.asarray(image, dtype=float) @ np.array(weights)
+    toned = 255 * (np.clip(mixed, 0, 255) / 255) ** gamma
+    return Image.fromarray(toned.astype("uint8")).convert("RGB")
+
+
+@pytest.mark.parametrize(
+    "weights,gamma",
+    [((0.299, 0.587, 0.114), 1.0), ((0.8, 0.2, 0.0), 1.0), ((0.1, 0.3, 0.6), 1.4)],
+    ids=["standard", "red-filter", "blue-filter-with-contrast"],
+)
+def test_black_and_white_conversion_matches_its_color_photo(tmp_path, weights, gamma):
+    pytest.importorskip("cv2")
+    with Image.open(FIXTURE) as source:
+        image = source.convert("RGB")
+    color, mono = tmp_path / "color.jpg", tmp_path / "mono.jpg"
+    image.save(color, quality=92)
+    _black_and_white(image.crop((10, 10, 502, 502)), weights, gamma).save(mono, quality=88)
+    clear_image_comparison_cache()
+    assert edited_copy_verdict(str(color), str(mono)) is True
+    assert edited_copy_verdict(str(mono), str(color)) is True
+
+
+def test_black_and_white_channel_fit_cannot_hide_a_local_change(tmp_path):
+    pytest.importorskip("cv2")
+    with Image.open(FIXTURE) as source:
+        image = source.convert("RGB")
+    color, mono = tmp_path / "color.jpg", tmp_path / "mono.jpg"
+    image.save(color, quality=92)
+    changed = image.crop((10, 10, 502, 502))
+    ImageDraw.Draw(changed).line(
+        [(194, 135), (203, 137), (215, 137), (229, 134)], fill=(110, 66, 56), width=3,
+    )
+    _black_and_white(changed, (0.8, 0.2, 0.0)).save(mono, quality=88)
+    clear_image_comparison_cache()
+    assert edited_copy_verdict(str(color), str(mono)) is False
+    assert edited_copy_verdict(str(mono), str(color)) is False
