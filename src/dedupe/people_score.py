@@ -32,6 +32,7 @@ from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 
+from .image_frames import animation_frame_count
 from .models import FileRecord, MediaType
 from .parallel import map_parallel, resolve_workers
 
@@ -147,7 +148,7 @@ def _image_frames(path: Path, max_frames: int):
         pass
     with Image.open(path) as image:
         image.draft("RGB", (PEOPLE_DECODE_MAX_SIDE, PEOPLE_DECODE_MAX_SIDE))
-        count = int(getattr(image, "n_frames", 1))
+        count = animation_frame_count(image)
         indexes = sorted({0, count // 2, count - 1})[:max_frames] if count > 1 else [0]
         for index in indexes:
             image.seek(index)

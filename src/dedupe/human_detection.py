@@ -17,6 +17,7 @@ from .human_policy import (
     MANUALLY_CONFIRMED_HUMAN_STATUS,
     may_enter_no_person_review,
 )
+from .image_frames import animation_frame_count
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
 from .similar_video import (
@@ -403,7 +404,7 @@ def _pil_frames(path: Path, *, max_side: int = DETECT_MAX_SIDE, max_frames: int 
         # faster on high-resolution photos. Retain the requested detail for
         # regional detection; other formats ignore the hint. Apply EXIF next.
         image.draft("RGB", (max_side, max_side))
-        frame_count = int(getattr(image, "n_frames", 1))
+        frame_count = animation_frame_count(image)
         count = min(frame_count, max_frames)
         indexes = (
             [0] if count <= 1

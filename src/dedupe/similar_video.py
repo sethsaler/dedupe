@@ -30,6 +30,9 @@ from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
 ProgressCb = Callable[[str, int, int, str | None], None]
 
 DEFAULT_THRESHOLD = 8  # Mean Hamming distance across aligned 64-bit frame hashes
+# Pairs up to this multiple of the threshold get a second, offset-aligned
+# frame check instead of rejection. Unrelated clips score about 22–34.
+VERIFY_DISTANCE_FACTOR = 2
 
 # Error-kind prefix; engine diagnostics classify on it.
 ERROR_VIDEO_FINGERPRINT_FAILED = "video fingerprint failed"
@@ -650,6 +653,7 @@ def find_similar_video_groups(
         if record.duration is None or record.duration <= 0
     }
     max_frame_distance = max(threshold * 2, 4)
+    to_verify: list[tuple[FileRecord, FileRecord]] = []
 
     for i, a in enumerate(hashed):
         if cancelled and cancelled():
@@ -690,22 +694,53 @@ def find_similar_video_groups(
             if not distances:
                 continue
             mean_distance = sum(distances) / len(distances)
-            if mean_distance > threshold or max(distances) > max_frame_distance:
-                continue
             # Near-identical: durations should be close when both known
             if a.duration and b.duration and a.duration > 0 and b.duration > 0:
                 ratio = min(a.duration, b.duration) / max(a.duration, b.duration)
                 if ratio < 0.9:
                     continue
+            if mean_distance > threshold or max(distances) > max_frame_distance:
+                if mean_distance <= threshold * VERIFY_DISTANCE_FACTOR:
+                    to_verify.append((a, b))
+                continue
             adjacency[a.path].add(b.path)
             adjacency[b.path].add(a.path)
         if progress and (i + 1) % 5 == 0:
             progress("video-cluster", i + 1, len(hashed), "")
 
+    for a, b in to_verify:
+        if _same_footage_after_reframing(a, b, cancelled):
+            adjacency[a.path].add(b.path)
+            adjacency[b.path].add(a.path)
+
     if progress:
         progress("video-cluster", len(hashed), len(hashed), "")
 
     return cluster_around_best(hashed, adjacency, distinct)
+
+
+def _same_footage_after_reframing(
+    a: FileRecord, b: FileRecord, cancelled: Callable[[], bool] | None,
+) -> bool:
+    """Verify a near-miss pair at its start- and end-aligned offsets.
+
+    A slight crop or re-encode moves every 32×32 frame hash a little, and a
+    few frames added or cut at one end shift the proportional samples. Both
+    can push a copy just past the fingerprint threshold. The offset check
+    samples the overlap again and requires nearly every frame to agree, so a
+    different take of the same scene stays separate.
+    """
+    if not a.duration or not b.duration:
+        return False
+    for offset in sorted({0.0, round(float(b.duration) - float(a.duration), 3)}, key=abs):
+        try:
+            if _verify_video_offset(a, b, offset, cancelled):
+                return True
+        except InterruptedError:
+            raise
+        except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
+            continue
+    return False
 
 
 # The optional version pass is independent of the v3 hashes. Its denser cache

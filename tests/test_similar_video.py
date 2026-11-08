@@ -577,3 +577,53 @@ def test_current_fingerprint_with_too_many_samples_is_refreshed(monkeypatch) -> 
     assert [{record.path for record in group} for group in groups] == [
         {"normal.mp4", "oversized.mp4"}
     ]
+
+
+def _ffmpeg(*args: str) -> None:
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args, "-threads", "1"],
+                   capture_output=True, check=True)
+
+
+def test_near_miss_copy_is_verified_at_its_trimmed_offset(tmp_path: Path) -> None:
+    """A slightly trimmed, cropped re-export lands just past the fingerprint threshold."""
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    source, copy, other = (tmp_path / name for name in ("source.mp4", "copy.mp4", "other.mp4"))
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-t", "8", str(source))
+    _ffmpeg("-ss", "0.16", "-i", str(source), "-vf", "crop=iw*0.97:ih,scale=310:240",
+            "-crf", "28", str(copy))
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-ss", "3", "-t", "8",
+            str(other))
+    records = inventory([source, copy, other])
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    by_name = {Path(record.path).name: record for record in records}
+    distances = video_fingerprint_distances(
+        by_name["source.mp4"].video_fingerprint, by_name["copy.mp4"].video_fingerprint
+    )
+    assert 8 < sum(distances) / len(distances) <= 16  # fingerprint alone rejects it
+    assert [{Path(record.path).name for record in group} for group in groups] == [
+        {"source.mp4", "copy.mp4"}
+    ]
+
+
+def test_near_miss_pair_that_fails_offset_check_stays_separate(tmp_path: Path) -> None:
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    source, reframed = tmp_path / "source.mp4", tmp_path / "reframed.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "mandelbrot=size=320x240:rate=12", "-t", "6", str(source))
+    # A deeper crop of a constantly zooming image changes every sampled frame.
+    _ffmpeg("-i", str(source), "-vf", "crop=iw*0.88:ih*0.88,scale=300:226", "-crf", "28",
+            str(reframed))
+    records = inventory([source, reframed])
+
+    groups = find_similar_video_groups(records, workers=1)
+
+    distances = video_fingerprint_distances(*(record.video_fingerprint for record in records))
+    assert 8 < sum(distances) / len(distances) <= 16
+    assert groups == []
