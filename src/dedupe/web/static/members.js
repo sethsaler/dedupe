@@ -1,6 +1,7 @@
 // The detail pane: member cards, review flows, per-candidate trash/undo.
 
 import { api } from "./api.js";
+import { renderCropReview } from "./crop.js";
 import { renderExactReview } from "./exact.js";
 import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
@@ -9,7 +10,7 @@ import { boardActive, refreshBoardRow } from "./board.js";
 import { renderSwipeReview, swipeActive } from "./swipe.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
-import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast } from "./util.js";
+import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast, withMediaVersion } from "./util.js";
 
 const MEMBER_PAGE_SIZE = 50;
 let renderedGroupSnapshot = "";
@@ -411,6 +412,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     random_review: "Random review",
     faces: "Faces",
     sets: "Set · same subject or shoot",
+    crop: "Crop · borders & screen bars",
     similar: "Similar",
     all_files: `All files${g.root ? ` · ${basename(g.root)}` : ""}`,
   }[g.kind] || g.kind;
@@ -424,6 +426,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // In swipe mode the deck decides one pair at a time; the whole-group
   // distinct button only belongs to the list view.
   $("btnMarkDistinct").hidden = g.kind !== "similar" || swipeMode;
+  $("btnCropAll").hidden = g.kind !== "crop";
   updateSimilarViewToggle(g);
   $("nonHumanBanner").hidden = g.kind !== "no_humans";
   syncDeletedToggle(g);
@@ -509,6 +512,7 @@ function renderMembers(g, { append = false } = {}) {
   $("previewSizeWrap").hidden = singleReview || swipeActive();
   $("reviewToolbar").hidden = isDecisionReview(g) || swipeActive();
   box.classList.toggle("focus-review", singleReview);
+  if (g.kind !== "crop") box.classList.remove("crop-grid");
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
   if (g.kind === "similar" && state.similarView !== "grid") {
@@ -518,6 +522,10 @@ function renderMembers(g, { append = false } = {}) {
   }
   if (g.kind === "exact") {
     renderExactReview(g);
+    return;
+  }
+  if (g.kind === "crop") {
+    renderCropReview(g);
     return;
   }
   const selected = new Set(g.selected_for_removal || []);
@@ -675,7 +683,7 @@ function renderMembers(g, { append = false } = {}) {
       const previewDimensions = hasDimensions
         ? ` data-preview-width="${mediaWidth}" data-preview-height="${mediaHeight}"`
         : "";
-      const thumb = `/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`;
+      const thumb = withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`, m.path);
       const memberIndex = singleReview ? state.memberFocus : i;
       const focused = singleReview || i === state.memberFocus ? "focused" : "";
       const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);

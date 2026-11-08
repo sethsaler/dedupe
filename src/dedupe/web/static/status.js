@@ -306,6 +306,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     $("countRandomReview").textContent = s.summary.random_review_files || 0;
     $("countNoHumans").textContent = s.summary.no_human_files || 0;
     $("countFaces").textContent = s.summary.faces_files || 0;
+    $("countCrop").textContent = s.summary.crop_files || 0;
     // All-Files groups hold every scanned file; file_count is the same number.
     $("countAllFiles").textContent = s.summary.file_count || 0;
     markEmptyTabs();

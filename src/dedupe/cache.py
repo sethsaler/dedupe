@@ -26,8 +26,10 @@ _UPSERT_SQL = """
         tile_phashes, orientation_phashes, video_fingerprint, duration,
         human_detection_status, human_detector, human_detection_signature,
         human_frames_analyzed, human_max_confidence, face_count, face_detector,
-        face_detection_signature, ctime_ns, people_score, people_score_signature
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        face_detection_signature, ctime_ns, people_score, people_score_signature,
+        border_crop, border_signature
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
@@ -56,7 +58,9 @@ _UPSERT_SQL = """
         face_detector=excluded.face_detector,
         face_detection_signature=excluded.face_detection_signature,
         people_score=excluded.people_score,
-        people_score_signature=excluded.people_score_signature
+        people_score_signature=excluded.people_score_signature,
+        border_crop=excluded.border_crop,
+        border_signature=excluded.border_signature
 """
 
 
@@ -91,6 +95,8 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.ctime_ns,
         rec.people_score,
         rec.people_score_signature,
+        rec.border_crop,
+        rec.border_signature,
     )
 
 
@@ -242,7 +248,9 @@ class HashCache:
                 face_detector TEXT,
                 face_detection_signature TEXT,
                 people_score REAL,
-                people_score_signature TEXT
+                people_score_signature TEXT,
+                border_crop TEXT,
+                border_signature TEXT
             )
             """
         )
@@ -299,6 +307,8 @@ class HashCache:
             "face_detection_signature": "TEXT",
             "people_score": "REAL",
             "people_score_signature": "TEXT",
+            "border_crop": "TEXT",
+            "border_signature": "TEXT",
         }
         for column, declaration in migrations.items():
             if column not in existing:
@@ -695,6 +705,9 @@ class HashCache:
         if row.get("people_score") is not None and row.get("people_score_signature"):
             rec.people_score = row["people_score"]
             rec.people_score_signature = row["people_score_signature"]
+        if row.get("border_signature") and row.get("border_crop") is not None:
+            rec.border_crop = row["border_crop"]
+            rec.border_signature = row["border_signature"]
         if row["media_type"]:
             try:
                 rec.media_type = MediaType(row["media_type"])
@@ -787,6 +800,7 @@ class HashCache:
                 or has_person_decision
                 or has_face_count
                 or (rec.people_score is not None and bool(rec.people_score_signature))
+                or (rec.border_crop is not None and bool(rec.border_signature))
             ):
                 rows.append(_upsert_row(rec))
         # One statement per batch instead of one round trip per record.

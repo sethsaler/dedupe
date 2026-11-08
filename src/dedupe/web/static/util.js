@@ -160,4 +160,17 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-export { $, hideToast, toast, trapTabKey, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml };
+// Files rewritten in place (a crop) keep their path, and thumbnails are served
+// with immutable cache headers. A per-path version busts the browser cache.
+const mediaVersions = new Map();
+
+function noteMediaVersion(path, version) {
+  mediaVersions.set(path, String(version));
+}
+
+function withMediaVersion(url, path) {
+  const version = mediaVersions.get(path);
+  return version ? `${url}&v=${encodeURIComponent(version)}` : url;
+}
+
+export { $, hideToast, toast, trapTabKey, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml, noteMediaVersion, withMediaVersion };

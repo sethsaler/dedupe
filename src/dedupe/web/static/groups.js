@@ -61,6 +61,7 @@ function renderTabCounts() {
   $("countRandomReview").textContent = memberCount("random_review");
   $("countNoHumans").textContent = memberCount("no_humans");
   $("countFaces").textContent = memberCount("faces");
+  $("countCrop").textContent = memberCount("crop");
   const countAllFiles = $("countAllFiles");
   if (countAllFiles) countAllFiles.textContent = memberCount("all_files");
   markEmptyTabs();
@@ -284,10 +285,13 @@ function groupItemHtml(g) {
     random_review: "random",
     faces: "faces",
     sets: "set",
+    crop: "crop",
   }[g.kind] || (g.kind === "all_files" ? "all files" : g.kind);
   // All-Files groups are per scanned folder: name the folder so the sidebar
   // row doubles as the folder picker.
   const folderLabel = g.kind === "all_files" && g.root ? basename(g.root) : null;
+  // The crop review is one list of unrelated images; its first file is not its name.
+  const nameLabel = g.kind === "crop" ? "Crop suggestions" : g.members?.[0]?.path ? basename(g.members[0].path) : "";
   const reviewed = (g.reviewed_paths || []).length;
   const groupSummary = isIndependentReview(g)
     ? `${reviewed}/${g.member_count} reviewed${sel ? ` · ${sel} delete` : ""}`
@@ -301,7 +305,7 @@ function groupItemHtml(g) {
   const stateGlyph = attention ? "●" : suggestedOnly ? "◐" : "✔";
   return `
         <button class="group-item ${active} ${attention ? "attention" : "done"}" data-id="${g.id}" id="gopt-${g.id}" type="button" aria-current="${active ? "true" : "false"}">
-          ${!folderLabel && g.members?.[0]?.path ? `<div class="g-name">${escapeHtml(basename(g.members[0].path))}</div>` : ""}
+          ${!folderLabel && nameLabel ? `<div class="g-name">${escapeHtml(nameLabel)}</div>` : ""}
           <div class="g-top">
             <span>${folderLabel ? `${escapeHtml(folderLabel)} · ` : ""}${g.member_count} files${isIndependentReview(g) ? "" : ` · ${escapeHtml(g.media_type)}`}</span>
             <span class="badge ${g.kind}">${badgeLabel}</span>

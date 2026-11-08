@@ -1,0 +1,145 @@
+/* Scoped theme (crop): the Crop review's contact sheet.
+   Each print sits on a square loupe mat; the picture keeps its own aspect
+   ratio inside it, so the suggested crop box can be drawn in image
+   coordinates. Shaded pencil marks what the crop removes. */
+
+#members.crop-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--tile-size, 360px) * 0.75)), 1fr));
+  gap: 22px 16px;
+}
+
+#members.crop-grid .crop-card {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  overflow: visible;
+  transform: none;
+}
+
+#members.crop-grid .crop-card:hover {
+  box-shadow: none;
+  transform: none;
+}
+
+#members.crop-grid .crop-thumb {
+  aspect-ratio: 1 / 1;
+  max-height: none;
+  background: var(--lt-loupe);
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+#members.crop-grid .crop-card.focused .crop-thumb {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 3px;
+}
+
+/* The picture at its own aspect ratio, contained in the square mat. */
+#members.crop-grid .crop-frame {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: var(--crop-aspect, 4 / 3);
+  overflow: hidden;
+}
+
+#members.crop-grid .crop-frame.portrait {
+  width: auto;
+  height: 100%;
+}
+
+#members.crop-grid .crop-frame .crop-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+}
+
+/* Everything outside the box is shaded; the box itself is the new frame. */
+#members.crop-grid .crop-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px dashed var(--lt-pencil);
+  box-shadow: 0 0 0 100vmax rgba(232, 54, 31, 0.32);
+  pointer-events: none;
+}
+
+#members.crop-grid .crop-card.skipped .crop-box {
+  border-color: var(--lt-faint);
+  box-shadow: 0 0 0 100vmax rgba(120, 120, 120, 0.25);
+}
+
+#members.crop-grid .crop-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+#members.crop-grid .crop-badge.skipped {
+  background: var(--lt-sleeve);
+  color: var(--lt-ink);
+}
+
+#members.crop-grid .crop-card .card-body {
+  padding: 8px 0 0;
+}
+
+#members.crop-grid .crop-card .name {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#members.crop-grid .crop-card .path,
+#members.crop-grid .crop-card .card-meta {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-graphite);
+}
+
+#members.crop-grid .crop-card .evidence {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--lt-graphite);
+  background: none;
+  border: 0;
+  padding: 2px 0 0;
+}
+
+#members.crop-grid .crop-card.pending .evidence {
+  color: var(--lt-ink);
+}
+
+#members.crop-grid .crop-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+}
+
+#members.crop-grid .crop-actions .btn {
+  min-height: 30px;
+  padding: 0 14px;
+}
+
+#members.crop-grid .crop-actions .reveal {
+  margin-left: auto;
+}

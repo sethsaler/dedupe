@@ -1,6 +1,7 @@
 // Global keyboard map.
 
 import { boardActive, handleBoardKey } from "./board.js";
+import { handleCropKey } from "./crop.js";
 import { openHelp, closeHelp } from "./help.js";
 import { closeLightbox, openLightbox } from "./lightbox.js";
 import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
@@ -130,6 +131,11 @@ document.addEventListener("keydown", async (e) => {
     && e.target?.tagName === "BUTTON"
     && !onMemberThumb
   ) return;
+
+  if (handleCropKey(e)) {
+    e.preventDefault();
+    return;
+  }
 
   if (e.key === "j" || e.key === "ArrowDown") {
     // In a decision review, ↓ steps to the next candidate without deciding;
