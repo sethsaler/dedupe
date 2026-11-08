@@ -69,11 +69,13 @@ function cardHtml(g, member, index) {
   const name = basename(member.path);
   const state_ = member.crop_state || "pending";
   const crop = member.crop;
-  // A cropped file is shown as it is now; otherwise the suggestion is drawn
-  // over the original.
+  // The frame always has the original's proportions, so applying or undoing
+  // a crop never resizes the card: a cropped file is drawn inside the box it
+  // was cut to and the bars it lost are left empty; otherwise the suggestion
+  // is drawn over the original.
   const showsCrop = Boolean(crop) && state_ !== "cropped";
-  const width = state_ === "cropped" ? crop?.crop_width : crop?.width;
-  const height = state_ === "cropped" ? crop?.crop_height : crop?.height;
+  const width = crop?.width || member.width;
+  const height = crop?.height || member.height;
   const badge = state_ === "cropped"
     ? '<span class="crop-badge done">Cropped</span>'
     : state_ === "skipped"
@@ -103,7 +105,7 @@ function cardHtml(g, member, index) {
           <span>${formatBytes(member.size)}</span>
           <span>${member.width && member.height ? `${member.width}×${member.height}` : "—"}</span>
         </div>
-        <div class="evidence">${escapeHtml(evidenceFor(member))}</div>
+        <div class="evidence" title="${escapeHtml(evidenceFor(member))}">${escapeHtml(evidenceFor(member))}</div>
         <div class="card-actions crop-actions">
           ${primary}
           <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
@@ -122,14 +124,94 @@ function layoutCard(card, member) {
     frame.style.setProperty("--crop-aspect", `${width} / ${height}`);
     frame.classList.toggle("portrait", height > width);
   }
-  const box = card.querySelector(".crop-box");
   const crop = member.crop;
-  if (box && crop) {
-    box.style.left = `${(crop.left / crop.width) * 100}%`;
-    box.style.top = `${(crop.top / crop.height) * 100}%`;
-    box.style.width = `${(crop.crop_width / crop.width) * 100}%`;
-    box.style.height = `${(crop.crop_height / crop.height) * 100}%`;
+  if (!crop) return;
+  const box = card.querySelector(".crop-box");
+  if (box) placeInFrame(box, crop);
+  const image = card.querySelector(".crop-image");
+  if (image && member.crop_state === "cropped") placeInFrame(image, crop);
+}
+
+// Position an element over the crop rectangle, in the original's coordinates.
+function placeInFrame(element, crop) {
+  element.style.left = `${(crop.left / crop.width) * 100}%`;
+  element.style.top = `${(crop.top / crop.height) * 100}%`;
+  element.style.width = `${(crop.crop_width / crop.width) * 100}%`;
+  element.style.height = `${(crop.crop_height / crop.height) * 100}%`;
+}
+
+// What a card shows; a card is rebuilt only when this changes.
+function cardSignature(member) {
+  const crop = member.crop;
+  return [
+    member.crop_state || "pending",
+    member.protected ? 1 : 0,
+    member.crop_undo_available ? 1 : 0,
+    member.size,
+    crop ? [crop.left, crop.top, crop.right, crop.bottom, crop.width, crop.height].join(",") : "",
+  ].join("|");
+}
+
+function buildCard(g, member, index) {
+  const template = document.createElement("template");
+  template.innerHTML = cardHtml(g, member, index).trim();
+  const card = template.content.firstElementChild;
+  card.dataset.signature = cardSignature(member);
+  layoutCard(card, member);
+  bindCard(card);
+  return card;
+}
+
+// Swap a changed card in place. The previous picture stays on screen until
+// the new one has loaded, so the card never flashes empty.
+function replaceCard(previous, card) {
+  const fresh = card.querySelector(".crop-image");
+  const shown = previous.querySelector(".crop-image");
+  const url = fresh?.getAttribute("src");
+  if (fresh && shown && shown.complete && shown.naturalWidth && url !== shown.getAttribute("src")) {
+    const placeholder = shown.cloneNode(false);
+    placeholder.removeAttribute("loading");
+    fresh.replaceWith(placeholder);
+    const loader = new Image();
+    const swap = () => {
+      if (placeholder.isConnected) placeholder.replaceWith(fresh);
+    };
+    loader.addEventListener("load", swap, { once: true });
+    loader.addEventListener("error", swap, { once: true });
+    loader.src = url;
   }
+  previous.replaceWith(card);
+}
+
+function bindCard(card) {
+  card.addEventListener("click", (event) => {
+    if (event.target.closest("button, a, input, label")) return;
+    focusCard(Number(card.dataset.index));
+  });
+  card.querySelector(".crop-thumb")?.addEventListener("click", () => {
+    state.memberFocus = Number(card.dataset.index);
+    openLightbox(state.memberFocus);
+  });
+  card.querySelector(".crop-apply")?.addEventListener("click", (event) => {
+    applyCrop(currentGroup(), event.currentTarget.dataset.path);
+  });
+  card.querySelector(".crop-skip")?.addEventListener("click", (event) => {
+    skipCrop(currentGroup(), event.currentTarget.dataset.path, true);
+  });
+  card.querySelector(".crop-unskip")?.addEventListener("click", (event) => {
+    skipCrop(currentGroup(), event.currentTarget.dataset.path, false);
+  });
+  card.querySelector(".crop-undo")?.addEventListener("click", (event) => {
+    undoCrop(currentGroup(), event.currentTarget.dataset.path);
+  });
+  card.querySelector(".reveal")?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await api(`/api/reveal?path=${encodeURIComponent(event.currentTarget.dataset.path)}&open=1`);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  });
 }
 
 function updateCropMeta(g) {
@@ -164,55 +246,53 @@ function renderCropReview(g) {
   updateCropMeta(g);
   if (!members.length) {
     box.innerHTML = '<div class="triage-empty">No images to crop.</div>';
+    delete box.dataset.cropGroup;
     return;
   }
-  box.innerHTML = members.map((member, index) => cardHtml(g, member, index)).join("");
-  box.querySelectorAll(".crop-card").forEach((card) => {
-    const member = members[Number(card.dataset.index)];
-    layoutCard(card, member);
-    card.addEventListener("click", (event) => {
-      if (event.target.closest("button, a, input, label")) return;
-      focusCard(Number(card.dataset.index));
-    });
-  });
-  box.querySelectorAll(".crop-thumb").forEach((thumb) => {
-    thumb.addEventListener("click", () => {
-      const index = Number(thumb.closest(".crop-card").dataset.index);
-      state.memberFocus = index;
-      openLightbox(index);
-    });
-  });
-  box.querySelectorAll(".crop-apply").forEach((button) => {
-    button.addEventListener("click", () => applyCrop(currentGroup(), button.dataset.path));
-  });
-  box.querySelectorAll(".crop-skip").forEach((button) => {
-    button.addEventListener("click", () => skipCrop(currentGroup(), button.dataset.path, true));
-  });
-  box.querySelectorAll(".crop-unskip").forEach((button) => {
-    button.addEventListener("click", () => skipCrop(currentGroup(), button.dataset.path, false));
-  });
-  box.querySelectorAll(".crop-undo").forEach((button) => {
-    button.addEventListener("click", () => undoCrop(currentGroup(), button.dataset.path));
-  });
-  box.querySelectorAll(".reveal").forEach((button) => {
-    button.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      try {
-        await api(`/api/reveal?path=${encodeURIComponent(button.dataset.path)}&open=1`);
-      } catch (error) {
-        toast(error.message, "error");
+  // Re-rendering the same review (after a crop, a skip, an undo, a status
+  // poll) patches only the cards that changed. Rebuilding the whole grid
+  // would reload every picture and let the page jump while they arrive.
+  const cards = [...box.querySelectorAll(":scope > .crop-card")];
+  const samePile = box.dataset.cropGroup === g.id
+    && cards.length === members.length
+    && cards.every((card, index) => card.dataset.path === members[index].path);
+  if (samePile) {
+    cards.forEach((card, index) => {
+      const member = members[index];
+      if (card.dataset.signature !== cardSignature(member)) {
+        replaceCard(card, buildCard(g, member, index));
       }
     });
+    markFocused();
+    return;
+  }
+  box.replaceChildren(...members.map((member, index) => buildCard(g, member, index)));
+  box.dataset.cropGroup = g.id;
+}
+
+function markFocused() {
+  $("members").querySelectorAll(":scope > .crop-card").forEach((card) => {
+    card.classList.toggle("focused", Number(card.dataset.index) === state.memberFocus);
   });
 }
 
-function focusCard(index) {
-  const cards = [...$("members").querySelectorAll(".crop-card")];
+// Only keyboard moves scroll, and only when the card is out of view: a click
+// must never move the grid out from under the pointer.
+function focusCard(index, { reveal = false } = {}) {
+  const cards = [...$("members").querySelectorAll(":scope > .crop-card")];
   if (!cards.length) return;
   state.memberFocus = Math.max(0, Math.min(cards.length - 1, index));
-  cards.forEach((card) => card.classList.remove("focused"));
-  const card = cards[state.memberFocus];
-  card.classList.add("focused");
+  markFocused();
+  if (reveal) revealCard(cards[state.memberFocus]);
+}
+
+function revealCard(card) {
+  const rect = card.getBoundingClientRect();
+  const view = card.closest("main")?.getBoundingClientRect()
+    ?? { top: 0, bottom: window.innerHeight };
+  const thumb = card.querySelector(".crop-thumb")?.getBoundingClientRect() ?? rect;
+  // Enough of the picture is showing to work on it: leave the scroll alone.
+  if (thumb.top >= view.top && thumb.top + thumb.height / 2 <= view.bottom) return;
   card.scrollIntoView({ block: "nearest" });
 }
 
@@ -243,12 +323,12 @@ async function post(path, body) {
 
 // After a decision the next undecided image takes focus, so c / x can run
 // down the pile without the mouse.
-function advanceFocus(updated, path) {
+function advanceFocus(updated, path, { reveal = false } = {}) {
   const members = updated.members || [];
   const from = members.findIndex((member) => member.path === path);
   const next = members.findIndex((member, index) => index > from && member.crop_state === "pending");
   const fallback = members.findIndex((member) => member.crop_state === "pending");
-  focusCard(next >= 0 ? next : fallback >= 0 ? fallback : from);
+  focusCard(next >= 0 ? next : fallback >= 0 ? fallback : from, { reveal });
 }
 
 // The sticky "Cropped … · Undo" toast goes stale once that crop is undone or
@@ -265,13 +345,13 @@ function dismissCropUndoToast(path = null) {
   if (!$("toast").hidden && $("toastMessage")?.textContent === cropUndoMessage(shown)) hideToast();
 }
 
-async function applyCrop(g, path) {
+async function applyCrop(g, path, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
   busy.add(path);
   try {
     const updated = await post("/api/crop/apply", { group_id: g.id, path, scan_id: state.scanId });
     applyUpdate(updated);
-    advanceFocus(updated, path);
+    advanceFocus(updated, path, { reveal: fromKeyboard });
     dismissCropUndoToast();
     toast(cropUndoMessage(path), "ok", {
       actionLabel: "Undo",
@@ -285,13 +365,13 @@ async function applyCrop(g, path) {
   }
 }
 
-async function skipCrop(g, path, skip) {
+async function skipCrop(g, path, skip, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
   busy.add(path);
   try {
     const updated = await post("/api/crop/skip", { group_id: g.id, path, scan_id: state.scanId, skip });
     applyUpdate(updated);
-    if (skip) advanceFocus(updated, path);
+    if (skip) advanceFocus(updated, path, { reveal: fromKeyboard });
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -354,15 +434,15 @@ function handleCropKey(event) {
   const members = g.members || [];
   const member = members[state.memberFocus];
   if (event.key === "c" && member?.crop_state === "pending") {
-    applyCrop(g, member.path);
+    applyCrop(g, member.path, { fromKeyboard: true });
     return true;
   }
   if (event.key === "x" && member?.crop_state === "pending") {
-    skipCrop(g, member.path, true);
+    skipCrop(g, member.path, true, { fromKeyboard: true });
     return true;
   }
   if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
-    focusCard(state.memberFocus + (event.key === "ArrowRight" ? 1 : -1));
+    focusCard(state.memberFocus + (event.key === "ArrowRight" ? 1 : -1), { reveal: true });
     return true;
   }
   return false;

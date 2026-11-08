@@ -2734,6 +2734,77 @@ def test_review_goal_scans_only_its_detector_and_opens_its_tab(
 
 
 @pytest.mark.e2e
+def test_cropping_keeps_the_crop_grid_still(page, live_dedupe_server: str, tmp_path: Path) -> None:
+    """Applying or undoing a crop must not resize the picture, reload the
+    other cards, or scroll the page."""
+    media = tmp_path / "framed"
+    media.mkdir()
+    for index in range(12):
+        width, height = (640, 480) if index % 2 else (480, 640)
+        bar = 40 + 8 * index
+        canvas = Image.new("RGB", (width, height), (0, 0, 0))
+        noise = Image.effect_noise((width, height - 2 * bar), 60).convert("RGB")
+        canvas.paste(noise, (0, bar))
+        canvas.save(media / f"img{index:02d}.png")
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#scanPreset").select_option("crop")
+    page.locator("#paths").fill(str(media))
+    page.locator("#btnScan").click()
+    cards = page.locator("#members .crop-card")
+    expect(cards).to_have_count(12, timeout=20_000)
+    page.mouse.move(700, 500)
+    page.mouse.wheel(0, 500)
+    page.wait_for_timeout(300)
+
+    measure = """() => {
+      const main = document.querySelector('main');
+      const cards = [...document.querySelectorAll('#members .crop-card')];
+      const card = cards[4];
+      const frame = card.querySelector('.crop-frame').getBoundingClientRect();
+      const image = card.querySelector('.crop-image').getBoundingClientRect();
+      return {
+        scroll: main.scrollTop,
+        frame: [frame.width, frame.height].map(Math.round),
+        image: [image.left - frame.left, image.top - frame.top, image.width, image.height]
+          .map(Math.round),
+        heights: cards.map((c) => Math.round(c.getBoundingClientRect().height)),
+        untouched: cards.filter((c, i) => i !== 4)
+          .every((c) => c.querySelector('.crop-image').dataset.probe === 'kept'),
+      };
+    }"""
+    page.evaluate("""() => document.querySelectorAll('#members .crop-image')
+        .forEach((img) => { img.dataset.probe = 'kept'; })""")
+    before = page.evaluate(measure)
+    assert before["scroll"] > 0
+
+    cards.nth(4).locator(".crop-apply").click()
+    expect(cards.nth(4)).to_have_class(re.compile(r"\bcropped\b"))
+    page.wait_for_timeout(300)
+    cropped = page.evaluate(measure)
+    assert cropped["scroll"] == before["scroll"]
+    assert cropped["frame"] == before["frame"]
+    assert cropped["heights"] == before["heights"]
+    assert cropped["untouched"]
+    # The cropped picture sits inside the frame where the crop box was.
+    left, top, width, height = cropped["image"]
+    assert left == 0 and top > 0 and width == before["frame"][0]
+    assert height < before["frame"][1]
+
+    cards.nth(4).locator(".crop-undo").click()
+    expect(cards.nth(4)).to_have_class(re.compile(r"\bpending\b"))
+    page.wait_for_timeout(300)
+    undone = page.evaluate(measure)
+    assert undone["scroll"] == before["scroll"]
+    assert undone["frame"] == before["frame"]
+    assert undone["image"] == [0, 0, *before["frame"]]
+    assert undone["untouched"]
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_full_speed_embedding_is_a_remembered_look_alike_option(
     page, live_dedupe_server, tmp_path
 ):

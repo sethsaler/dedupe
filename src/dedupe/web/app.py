@@ -57,6 +57,7 @@ from ..grouping import (
     apply_smart_select,
     apply_smart_select_all,
     ensure_all_files_groups,
+    refresh_crop_groups,
 )
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
@@ -580,6 +581,21 @@ def create_app(
     }
     app.extensions["dedupe_state"] = state
 
+    def remember_border_verdicts(records) -> None:
+        """Cache crop verdicts measured again for a resumed review."""
+        current = [record for record in records if record.border_signature == BORDER_SIGNATURE]
+        if not current:
+            return
+        cache = None
+        try:
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            cache.store_all(current)
+        except (OSError, sqlite3.Error):
+            pass  # the review is still up to date; the next scan measures again
+        finally:
+            if cache is not None:
+                cache.close()
+
     def persist_result() -> bool:
         """Persist the active completed result, recording errors for status APIs."""
         with lock:
@@ -872,6 +888,7 @@ def create_app(
             # it, so marked groups do not resurface (and are not saved back).
             drop_marked_distinct_groups(initial_result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(initial_result)
+            remember_border_verdicts(refresh_crop_groups(initial_result))
             state["result"] = initial_result
             initial_result.recompute_stats()
             state["progress"] = ScanProgress(
@@ -1167,6 +1184,7 @@ def create_app(
             # an earlier --load): covered groups never reach the review list.
             drop_marked_distinct_groups(report.result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(report.result)
+            remember_border_verdicts(refresh_crop_groups(report.result))
             state["result"] = report.result
             state["last_scan_settings"] = report.result.scan_settings
             state["scan_id"] = secrets.token_hex(12)

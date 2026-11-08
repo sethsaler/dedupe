@@ -161,6 +161,67 @@ def test_transparent_margins_are_not_black(tmp_path: Path) -> None:
     assert detect_black_borders(path) is None
 
 
+def _studio_portrait(*, hair_top: int, seed: int = 3) -> np.ndarray:
+    """A person against a black studio backdrop: dark textured hair over a
+    lit face, framed in the middle of an 800×1000 portrait."""
+    rng = np.random.default_rng(seed)
+    height, width = 1000, 800
+    luma = rng.integers(0, 7, size=(height, width)).astype(np.uint8)  # backdrop
+    yy, xx = np.mgrid[0:height, 0:width]
+    head = ((xx - 400) / 230) ** 2 + ((yy - (hair_top + 300)) / 300) ** 2 <= 1
+    # Black hair: mostly under the old "black" cut-off of 28, with strands
+    # catching a little light.
+    hair = rng.integers(8, 34, size=(height, width)).astype(np.uint8)
+    hair[rng.random((height, width)) < 0.01] = 70
+    luma[head] = hair[head]
+    face = ((xx - 400) / 170) ** 2 + ((yy - (hair_top + 380)) / 220) ** 2 <= 1
+    luma[face] = rng.integers(140, 200, size=(height, width)).astype(np.uint8)[face]
+    # Shoulders: a rounded shape running off the bottom, never a straight edge.
+    body = ((xx - 400) / 340) ** 2 + ((yy - (hair_top + 1000)) / 420) ** 2 <= 1
+    luma[body] = rng.integers(90, 160, size=(height, width)).astype(np.uint8)[body]
+    return luma
+
+
+def test_dark_hair_against_a_black_backdrop_is_not_a_bar() -> None:
+    # The hair runs off the top of the frame: the old detector read the hair
+    # rows as a black bar and cut the top of the head off.
+    assert detect_borders_in_array(_studio_portrait(hair_top=-80)) is None
+
+
+def test_black_headroom_above_dark_hair_is_not_a_bar() -> None:
+    # Black backdrop above the head fades into dark hair with no hard edge;
+    # cropping it would trim down to (and into) the hair.
+    assert detect_borders_in_array(_studio_portrait(hair_top=120)) is None
+
+
+def test_letterbox_stops_at_dark_hair_instead_of_cutting_into_it() -> None:
+    luma = _studio_portrait(hair_top=40)
+    luma[:60] = 2
+    luma[-60:] = 2
+    found = detect_borders_in_array(luma)
+    # Either the bars are left alone or the crop stops at the bar; it never
+    # runs into the hair below row 60.
+    assert found is None or (found[0] <= 60 and found[1] <= 60)
+
+
+def test_limb_reaching_the_edge_is_not_cut_off() -> None:
+    rng = np.random.default_rng(5)
+    luma = rng.integers(0, 7, size=(900, 1200)).astype(np.uint8)
+    yy, xx = np.mgrid[0:900, 0:1200]
+    body = ((xx - 550) / 250) ** 2 + ((yy - 500) / 300) ** 2 <= 1
+    luma[body] = rng.integers(90, 200, size=(900, 1200)).astype(np.uint8)[body]
+    luma[420:428, 800:1200] = 160  # a thin arm out to the right edge (<1% of a column)
+    luma[600:900, 900:1200] = rng.integers(8, 30, size=(300, 300))  # a dark sleeve
+    assert detect_borders_in_array(luma) is None
+
+
+def test_a_real_bar_beside_a_dark_subject_still_has_a_hard_edge(tmp_path: Path) -> None:
+    # Pillarboxed video frame whose picture is mid-tone: still found exactly.
+    path = _save(_framed(1280, 720, left=160, right=160, bar_value=16), tmp_path / "pillar.png")
+    box = detect_black_borders(path)
+    assert box is not None and (box.left, box.right) == (160, 1120)
+
+
 def test_box_follows_exif_orientation(tmp_path: Path) -> None:
     # Stored landscape with bars on the left/right; orientation 6 rotates it
     # 90° clockwise for display, so the bars sit on top/bottom on screen.
@@ -802,3 +863,64 @@ def test_earlier_dismissals_survive_the_new_detector(tmp_path: Path) -> None:
     assert record.border_crop == BORDER_DISMISSED
     assert record.border_signature == BORDER_SIGNATURE
     assert suggested_crop(stale) is not None  # re-checked with the new rules
+
+
+# --- review order and resumed reviews ---------------------------------------
+
+
+def _suggested(path: Path) -> FileRecord:
+    record = _record(path)
+    box = detect_black_borders(path)
+    record.border_crop = box.encode() if box else ""
+    record.border_signature = BORDER_SIGNATURE
+    return record
+
+
+def test_screenshots_with_interface_bars_lead_the_crop_review(tmp_path: Path) -> None:
+    from dedupe.grouping import build_crop_groups
+
+    letterbox = _suggested(_save(_framed(640, 480, top=120, bottom=120), tmp_path / "movie.png"))
+    screenshot = _suggested(_iphone_light(tmp_path / "IMG_0042.PNG"))
+    pillar = _suggested(_save(_framed(640, 480, left=40, right=40), tmp_path / "pillar.png"))
+    # The letterbox removes far more of its frame, but the screenshot comes first.
+    group = build_crop_groups([letterbox, pillar, screenshot])[0]
+    assert [Path(m.path).name for m in group.members] == [
+        "IMG_0042.PNG", "movie.png", "pillar.png",
+    ]
+
+
+def test_resumed_crop_review_is_measured_again(tmp_path: Path) -> None:
+    from dedupe.grouping import _build_independent_group, refresh_crop_groups
+    from dedupe.models import ScanResult
+
+    portrait = tmp_path / "portrait.png"
+    Image.fromarray(_studio_portrait(hair_top=-80)).save(portrait)
+    letterbox = _save(_framed(640, 480, top=60, bottom=60), tmp_path / "movie.png")
+    screenshot = _iphone_light(tmp_path / "IMG_0042.PNG")
+    done = _save(_framed(640, 480, top=30, bottom=30), tmp_path / "done.png")
+
+    records = [_record(path) for path in (portrait, letterbox, screenshot, done)]
+    # Saved by the previous detector, which cut the top of the head off.
+    records[0].border_crop = "0,80,800,1000,800,1000"
+    records[1].border_crop = "0,60,640,420,640,480"
+    records[2].border_crop = "0,0,1170,2400,1170,2532"
+    records[3].border_crop = "0,30,640,450,640,480"
+    for record in records:
+        record.border_signature = "black-borders-v2"
+    (group,) = _build_independent_group(GroupKind.CROP, records)
+    group.reviewed_paths = [str(portrait), str(done)]
+    group.match_details["cropped"] = {str(done): {"box": "0,30,640,450,640,480"}}
+    result = ScanResult(roots=[str(tmp_path)], files=records, groups=[group])
+
+    measured = refresh_crop_groups(result)
+
+    assert {Path(r.path).name for r in measured} == {"portrait.png", "movie.png", "IMG_0042.PNG"}
+    assert all(r.border_signature == BORDER_SIGNATURE for r in measured)
+    (refreshed,) = result.groups
+    # The portrait no longer has a suggestion and leaves; the screenshot
+    # leads; the cropped file stays so its crop can still be undone.
+    assert [Path(m.path).name for m in refreshed.members] == [
+        "IMG_0042.PNG", "movie.png", "done.png",
+    ]
+    assert refreshed.reviewed_paths == [str(done)]
+    assert suggested_crop(refreshed.members[1]).top == 60

@@ -512,7 +512,10 @@ function renderMembers(g, { append = false } = {}) {
   $("previewSizeWrap").hidden = singleReview || swipeActive();
   $("reviewToolbar").hidden = isDecisionReview(g) || swipeActive();
   box.classList.toggle("focus-review", singleReview);
-  if (g.kind !== "crop") box.classList.remove("crop-grid");
+  if (g.kind !== "crop") {
+    box.classList.remove("crop-grid");
+    delete box.dataset.cropGroup;
+  }
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
   if (g.kind === "similar" && state.similarView !== "grid") {

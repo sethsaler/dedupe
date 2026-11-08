@@ -68,6 +68,19 @@
   pointer-events: none;
 }
 
+/* A cropped picture sits inside the box it was cut to, at the same scale as
+   before, so applying a crop never resizes the print; the bars it lost read
+   as an empty, faintly hatched margin. */
+#members.crop-grid .crop-card.cropped .crop-frame {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0 6px,
+    rgba(120, 120, 120, 0.14) 6px 7px
+  );
+  outline: 1px dashed var(--lt-faint);
+  outline-offset: -1px;
+}
+
 #members.crop-grid .crop-card.skipped .crop-box {
   border-color: var(--lt-faint);
   box-shadow: 0 0 0 100vmax rgba(120, 120, 120, 0.25);
@@ -120,6 +133,18 @@
   background: none;
   border: 0;
   padding: 2px 0 0;
+}
+
+/* With file details showing, evidence keeps at least two lines (at most
+   three) so the shorter text after a crop, skip or undo does not shrink the
+   card and shift the rows below it. */
+.detail-body.show-file-details #members.crop-grid .crop-card .evidence {
+  min-height: calc(1.4em * 2);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
 }
 
 #members.crop-grid .crop-card.pending .evidence {
