@@ -47,6 +47,7 @@ export function collectScanSettings() {
         exact: $("optExact").checked,
         similar: $("optSimilar").checked,
         semantic: $("optSemantic").checked,
+        semantic_full_speed: $("optSemantic").checked && $("optSemanticFast").checked,
         decider: $("optSemantic").checked && $("optDecider").checked,
         semantic_threshold: Number($("semanticSetThreshold").value) / 100,
         semantic_duplicate_threshold: Number($("semanticDuplicateThreshold").value) / 100,

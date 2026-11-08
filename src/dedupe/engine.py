@@ -50,7 +50,14 @@ from .parallel import map_parallel, resolve_workers, split_cpu_budget
 from .scanner import inventory, is_in_photos_library
 from .semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 from .semantic import DEFAULT_THRESHOLD as SEMANTIC_THRESHOLD
-from .semantic import SEMANTIC_MEDIA_TYPES, find_semantic_groups, semantic_available
+from .semantic import PREPARE_WORKERS as SEMANTIC_PREPARE_WORKERS
+from .semantic import (
+    SEMANTIC_MEDIA_TYPES,
+    embed_records,
+    group_semantic_vectors,
+    semantic_available,
+)
+from .semantic import VERIFY_WORKERS as SEMANTIC_VERIFY_WORKERS
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import (
     ERROR_IMAGE_HASH_FAILED,
@@ -155,6 +162,7 @@ def run_scan(
     semantic: bool = False,
     semantic_threshold: float = SEMANTIC_THRESHOLD,
     semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
+    semantic_full_speed: bool = False,
     decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
@@ -681,7 +689,12 @@ def run_scan(
                 video_done.set()
 
         def semantic_progress(phase: str, processed: int, total: int) -> None:
-            label = "clustering" if "cluster" in phase else "embedding"
+            if "cluster" in phase:
+                label = "clustering"
+            elif "cooling" in phase:
+                label = "paused while the Mac cools"
+            else:
+                label = "embedding"
             # Clustering reuses the embedded count so combined totals stay put.
             done = semantic_count if "cluster" in phase else processed
             _stage_progress(
@@ -696,9 +709,33 @@ def run_scan(
             # one subject or shoot for browsing. Duplicates add near-identical
             # pairs the hashes missed to Similar; perceptual Similar groups
             # claim their files first so a file never lands in two of them.
+            #
+            # Embedding is GPU work in DigUp's helper, so it starts with the
+            # scan and overlaps the CPU-bound hash stages. Only grouping waits
+            # for the exact and perceptual groups it defers to.
+            started_at = time.monotonic()
+            try:
+                vectors, errors = embed_records(
+                    records,
+                    use_cache=use_cache,
+                    cache_path=cache_path,
+                    workers=min(cpu_workers, SEMANTIC_PREPARE_WORKERS),
+                    progress=semantic_progress,
+                    cancelled=cancelled,
+                    background=not semantic_full_speed,
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
+                _stage_progress("semantic", "Look-alikes unavailable", 0, 0)
+                return time.monotonic() - started_at
+            waiting_since = time.monotonic()
             exact_done.wait()
             image_done.wait()
-            started_at = time.monotonic()
+            check_cancelled()
+            # The recorded duration leaves out the wait for the hash stages.
+            started_at += time.monotonic() - waiting_since
             with publish_lock:
                 claimed = {
                     member.path
@@ -716,8 +753,9 @@ def run_scan(
                 except Exception as exc:
                     stage_errors["decider"].append(f"Decider verification skipped: {exc}")
             try:
-                set_lists, duplicate_lists, errors = find_semantic_groups(
+                set_lists, duplicate_lists = group_semantic_vectors(
                     records,
+                    vectors,
                     set_threshold=semantic_threshold,
                     duplicate_threshold=semantic_duplicate_threshold,
                     distinct=distinct,
@@ -725,10 +763,10 @@ def run_scan(
                     exact_path_sets=exact_sets,
                     use_cache=use_cache,
                     cache_path=cache_path,
-                    workers=cpu_workers,
                     progress=semantic_progress,
                     cancelled=cancelled,
                     judge=judge,
+                    workers=min(cpu_workers, SEMANTIC_VERIFY_WORKERS),
                 )
             except InterruptedError:
                 raise
@@ -1331,6 +1369,7 @@ def run_scans_parallel(
     semantic: bool = False,
     semantic_threshold: float = SEMANTIC_THRESHOLD,
     semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
+    semantic_full_speed: bool = False,
     decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
@@ -1470,6 +1509,7 @@ def run_scans_parallel(
             semantic=semantic,
             semantic_threshold=semantic_threshold,
             semantic_duplicate_threshold=semantic_duplicate_threshold,
+            semantic_full_speed=semantic_full_speed,
             decider=decider,
             find_no_humans=find_no_humans,
             count_faces=count_faces,

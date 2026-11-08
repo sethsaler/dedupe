@@ -2731,3 +2731,24 @@ def test_review_goal_scans_only_its_detector_and_opens_its_tab(
     expect(page.locator("#members .crop-card")).to_have_count(1, timeout=20_000)
     page.locator("#toast").filter(has_text="Done — 1 to crop").wait_for(state="visible")
     assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_full_speed_embedding_is_a_remembered_look_alike_option(
+    page, live_dedupe_server, tmp_path
+):
+    (tmp_path / "a.png").write_bytes(b"")
+    page.goto(live_dedupe_server)
+    page.evaluate("""() => localStorage.setItem('dedupe.scanSettings.v1', JSON.stringify({
+        folderScopeVersion: 2, optSemanticFast: true
+    }))""")
+    page.reload()
+    page.locator("#optsToggle").click()
+    fast = page.locator("#optSemanticFast")
+    expect(fast).to_be_checked()  # a speed preference, not reset by the launch preset
+    assert page.locator("#semanticFields #optSemanticFast").count() == 1
+    page.locator("#paths").fill(str(tmp_path))
+    with page.expect_request("**/api/scan") as request:
+        page.locator("#btnScan").click()
+    sent = request.value.post_data_json
+    assert sent["semantic"] is False and sent["semantic_full_speed"] is False

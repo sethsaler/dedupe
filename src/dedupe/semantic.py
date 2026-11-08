@@ -30,6 +30,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -65,8 +66,69 @@ HELPER_ENV = "DEDUPE_DIGUP_HELPER"
 STARTUP_TIMEOUT = 180.0
 REQUEST_TIMEOUT = 120.0
 MAX_REPLY_BYTES = 8 * 1024 * 1024
+# The helper is GPU-bound: one decode thread keeps up with it, a second covers
+# slow HEIC and very large files. More would only take CPU from other stages.
+PREPARE_WORKERS = 2
+# Threads verifying look-alike candidates against the image evidence.
+VERIFY_WORKERS = 3
+# macOS: start the helper under the darwin background policy. Its GPU and CPU
+# work then yields to the apps in use and runs at a lower power state. On an
+# M3 Max that embeds ~1.5x slower (120 vs 80 ms per image), but cooler.
+TASKPOLICY = "/usr/sbin/taskpolicy"
+# Under macOS thermal pressure, idle after each batch for this multiple of the
+# batch's own time (at least THERMAL_PAUSE_MIN seconds) so the GPU can cool.
+THERMAL_PAUSE_MIN = 2.0
+THERMAL_PAUSE_FACTOR = {1: 1.0, 2: 3.0}
+THERMAL_PAUSE_FACTOR_MAX = 6.0
 
 ProgressCb = Callable[[str, int, int], None]
+
+
+def _worker_command(helper: str, background: bool = True) -> list[str]:
+    if background and sys.platform == "darwin" and os.access(TASKPOLICY, os.X_OK):
+        # taskpolicy applies the policy, then execs the helper in place, so
+        # the Popen pid and process group stay the helper's own.
+        return [TASKPOLICY, "-b", helper, "worker"]
+    return [helper, "worker"]
+
+
+_thermal_token: int | None = None
+
+
+def thermal_pressure() -> int:
+    """macOS thermal pressure level: 0 nominal, 1 moderate, 2 heavy, 3+ critical.
+
+    Read from the ``com.apple.system.thermalpressurelevel`` notification state,
+    the level behind ``NSProcessInfo.thermalState``. 0 off macOS or when the
+    level cannot be read.
+    """
+    global _thermal_token
+    if sys.platform != "darwin":
+        return 0
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        if _thermal_token is None:
+            token = ctypes.c_int()
+            if lib.notify_register_check(
+                b"com.apple.system.thermalpressurelevel", ctypes.byref(token)
+            ):
+                return 0
+            _thermal_token = token.value
+        state = ctypes.c_uint64()
+        if lib.notify_get_state(ctypes.c_int(_thermal_token), ctypes.byref(state)):
+            return 0
+        return int(state.value)
+    except Exception:
+        return 0
+
+
+def thermal_pause_seconds(level: int, batch_seconds: float) -> float:
+    if level <= 0:
+        return 0.0
+    factor = THERMAL_PAUSE_FACTOR.get(level, THERMAL_PAUSE_FACTOR_MAX)
+    return max(THERMAL_PAUSE_MIN, batch_seconds) * factor
 
 
 def find_digup_helper() -> str | None:
@@ -96,6 +158,7 @@ class EmbeddingWorker:
         cancelled: Callable[[], bool] | None = None,
         startup_timeout: float | None = None,
         request_timeout: float | None = None,
+        background: bool = True,
     ) -> None:
         self._cancelled = cancelled
         self._request_timeout = REQUEST_TIMEOUT if request_timeout is None else request_timeout
@@ -110,7 +173,7 @@ class EmbeddingWorker:
             )
         # llama.cpp logs freely to stderr; discard it so the pipe never fills.
         self._process = subprocess.Popen(
-            [helper, "worker"],
+            _worker_command(helper, background),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -265,6 +328,12 @@ class EmbeddingCache:
                 PRIMARY KEY (content_hash, signature)
             )"""
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS semantic_helper_signatures (
+                helper TEXT PRIMARY KEY,
+                signature TEXT NOT NULL
+            )"""
+        )
         self._digests: dict[str, str] = {}
         self._identities: dict[str, str] = {}
         self._conn.commit()
@@ -355,8 +424,31 @@ class EmbeddingCache:
             )
         self._conn.commit()
 
+    def helper_signature(self, helper: str) -> str | None:
+        """The model signature this exact helper binary reported last time."""
+        row = self._conn.execute(
+            "SELECT signature FROM semantic_helper_signatures WHERE helper = ?", (helper,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def remember_helper_signature(self, helper: str, signature: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO semantic_helper_signatures VALUES (?, ?)", (helper, signature)
+        )
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
+
+
+def _helper_identity(helper: str) -> str | None:
+    """Path and file identity of the helper binary (an app update changes it)."""
+    try:
+        real = os.path.realpath(helper)
+        stat = os.stat(real)
+    except OSError:
+        return None
+    return f"{real}|{stat.st_size}|{stat.st_mtime_ns}"
 
 
 def prepare_image(path: str, out_dir: str) -> str:
@@ -388,8 +480,13 @@ def embed_records(
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
     helper: str | None = None,
+    background: bool = True,
 ) -> tuple[dict[str, bytes], list[str]]:
-    """Embed images and GIFs (first frame). Returns vectors by path and errors."""
+    """Embed images and GIFs (first frame). Returns vectors by path and errors.
+
+    ``background`` runs the helper under the macOS background policy (cooler,
+    ~1.5x slower); thermal-pressure pauses apply either way.
+    """
     candidates = [r for r in records if r.media_type in SEMANTIC_MEDIA_TYPES]
     vectors: dict[str, bytes] = {}
     errors: list[str] = []
@@ -403,10 +500,30 @@ def embed_records(
     total = len(candidates)
     cache = EmbeddingCache(cache_path) if use_cache else None
     try:
-        with EmbeddingWorker(helper, cancelled=cancelled) as worker:
+        # Starting the helper loads the ~865 MB model onto the GPU. When the
+        # same helper binary already embedded every file, the signature it
+        # reported then finds them all and the helper never starts.
+        helper = helper or find_digup_helper()
+        helper_key = _helper_identity(helper) if helper else None
+        remembered = (
+            cache.helper_signature(helper_key) if cache is not None and helper_key else None
+        )
+        if remembered:
+            vectors.update(cache.get_many(candidates, remembered, cancelled))
+            if len(vectors) == total:
+                if progress:
+                    progress("semantic-embed", total, total)
+                return vectors, errors
+        with EmbeddingWorker(helper, cancelled=cancelled, background=background) as worker:
             signature = worker.signature
             if cache is not None:
-                vectors.update(cache.get_many(candidates, signature, cancelled))
+                if helper_key:
+                    cache.remember_helper_signature(helper_key, signature)
+                if signature != remembered:
+                    # The model changed under an unchanged binary path/size/
+                    # mtime, or nothing was remembered: look up afresh.
+                    vectors.clear()
+                    vectors.update(cache.get_many(candidates, signature, cancelled))
             pending = [r for r in candidates if r.path not in vectors]
             done = total - len(pending)
             if progress:
@@ -425,11 +542,22 @@ def embed_records(
                         errors.append(message[:300])
                         return None
 
-                for start in range(0, len(pending), REQUEST_BATCH):
+                starts = range(0, len(pending), REQUEST_BATCH)
+
+                def submit(start: int) -> list:
+                    return [pool.submit(prepare, r) for r in pending[start : start + REQUEST_BATCH]]
+
+                # Decode the next batch while the helper embeds this one, so
+                # the GPU never waits on Pillow.
+                upcoming = submit(0) if pending else []
+                for start in starts:
                     check_cancelled()
                     batch = pending[start : start + REQUEST_BATCH]
-                    prepared = list(pool.map(prepare, batch))
+                    prepared = [future.result() for future in upcoming]
+                    following = start + REQUEST_BATCH
+                    upcoming = submit(following) if following < len(pending) else []
                     ready = [(r, p) for r, p in zip(batch, prepared, strict=True) if p]
+                    batch_started = time.monotonic()
                     if ready:
                         try:
                             rows, row_errors = worker.embed_images([p for _r, p in ready])
@@ -461,10 +589,38 @@ def embed_records(
                     done += len(batch)
                     if progress:
                         progress("semantic-embed", done, total)
+                    if ready and done < total:
+                        _cool_down(
+                            time.monotonic() - batch_started, done, total,
+                            progress, check_cancelled,
+                        )
     finally:
         if cache is not None:
             cache.close()
     return vectors, errors
+
+
+def _cool_down(
+    batch_seconds: float, done: int, total: int,
+    progress: ProgressCb | None, check_cancelled: Callable[[], None],
+) -> None:
+    """Under macOS thermal pressure, idle after a batch so the GPU can cool.
+
+    One pause per batch is a duty cycle (50% at moderate pressure, 25% at
+    heavy), so embedding still advances on a Mac that never returns to
+    nominal.
+    """
+    pause = thermal_pause_seconds(thermal_pressure(), batch_seconds)
+    if not pause:
+        return
+    if progress:
+        progress("semantic-embed-cooling", done, total)
+    deadline = time.monotonic() + pause
+    while (remaining := deadline - time.monotonic()) > 0:
+        check_cancelled()
+        time.sleep(min(0.25, remaining))
+    if progress:
+        progress("semantic-embed", done, total)
 
 
 def semantic_neighbors(
@@ -677,6 +833,49 @@ def find_semantic_groups(
         cancelled=cancelled,
         helper=helper,
     )
+    sets, duplicates = group_semantic_vectors(
+        records,
+        vectors,
+        set_threshold=set_threshold,
+        duplicate_threshold=duplicate_threshold,
+        distinct=distinct,
+        exclude_from_duplicates=exclude_from_duplicates,
+        exact_path_sets=exact_path_sets,
+        use_cache=use_cache,
+        cache_path=cache_path,
+        progress=progress,
+        cancelled=cancelled,
+        judge=judge,
+        judge_min=judge_min,
+    )
+    return sets, duplicates, errors
+
+
+def group_semantic_vectors(
+    records: list[FileRecord],
+    vectors: dict[str, bytes],
+    *,
+    set_threshold: float = DEFAULT_THRESHOLD,
+    duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
+    distinct: DistinctReviews | None = None,
+    exclude_from_duplicates: set[str] | None = None,
+    exact_path_sets: list[set[str]] | None = None,
+    use_cache: bool = True,
+    cache_path: str | Path | None = None,
+    progress: ProgressCb | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    judge: Callable[[FileRecord, FileRecord], float | None] | None = None,
+    judge_min: float = 0.8,
+    workers: int = VERIFY_WORKERS,
+) -> tuple[
+    list[tuple[list[FileRecord], dict[str, float]]],
+    list[tuple[list[FileRecord], dict[str, float]]],
+]:
+    """The grouping half of :func:`find_semantic_groups`, from embedded vectors.
+
+    Separate so a scan can embed while the hash stages are still running and
+    group once the exact and perceptual groups it defers to exist.
+    """
     same_set: dict[str, int] = {}
     for index, paths in enumerate(exact_path_sets or []):
         for path in paths:
@@ -716,32 +915,68 @@ def find_semantic_groups(
     sets = build(restrict(lambda _a, _b, score: score >= set_threshold), None)
 
     excluded = exclude_from_duplicates or set()
-    def duplicate_pair(a: str, b: str, score: float) -> bool:
+
+    def local_verdict(a: str, b: str) -> bool | None:
+        """Image evidence alone: True/False, or None when aligned but undecided."""
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
-        if score < duplicate_threshold or a in excluded or b in excluded:
-            return False
         # Broader discovery must establish image correspondence, not just
         # matching subject matter or a similar brightness distribution.
         verdict = edited_copy_verdict(a, b)
         if verdict is not None:
             return verdict
-        if not is_aligned_image_copy(a, b):
-            return False
-        if judge is not None:
-            if cancelled and cancelled():
-                raise InterruptedError("scan cancelled")
-            probability = judge(by_path[a], by_path[b])
-            if probability is not None:
-                return probability >= judge_min
-        return True
+        return None if is_aligned_image_copy(a, b) else False
+
+    def verify_run(run: list[tuple[str, str]]) -> list[bool | None]:
+        return [local_verdict(a, b) for a, b in run]
+
+    candidates = sorted(
+        pair for pair, score in scores.items()
+        if score >= duplicate_threshold and pair[0] not in excluded and pair[1] not in excluded
+    )
+    # Sorted pairs come in runs that share their first file. A run is verified
+    # by one thread, so that file's decoded pixels and features stay in the
+    # bounded comparison caches (sorted order alone was ~25% faster than
+    # arbitrary order; threads add OpenCV/Pillow work that releases the GIL).
+    runs: list[list[tuple[str, str]]] = []
+    for pair in candidates:
+        if runs and runs[-1][0][0] == pair[0]:
+            runs[-1].append(pair)
+        else:
+            runs.append([pair])
 
     from .similar_image import clear_image_comparison_cache
 
     clear_image_comparison_cache()
     try:
-        duplicates = build(restrict(duplicate_pair), distinct)
+        verdicts: dict[tuple[str, str], bool] = dict.fromkeys(scores, False)
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(workers, len(runs) or 1)),
+            thread_name_prefix="semantic-verify",
+        ) as pool:
+            futures = [pool.submit(verify_run, run) for run in runs]
+            try:
+                for run, future in zip(runs, futures, strict=True):
+                    for pair, verdict in zip(run, future.result(), strict=True):
+                        if verdict is None:
+                            # Aligned, but only ordinary evidence. Decider runs
+                            # on this thread (its verdict cache is a sqlite
+                            # connection) and may veto; it can never approve
+                            # a pair the local checks rejected.
+                            verdict = True
+                            if judge is not None:
+                                if cancelled and cancelled():
+                                    raise InterruptedError("scan cancelled")
+                                probability = judge(by_path[pair[0]], by_path[pair[1]])
+                                if probability is not None:
+                                    verdict = probability >= judge_min
+                        verdicts[pair] = verdict
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        duplicates = build(restrict(lambda a, b, _score: verdicts[(a, b)]), distinct)
     finally:
         clear_image_comparison_cache()
     del adjacency
-    return sets, duplicates, errors
+    return sets, duplicates

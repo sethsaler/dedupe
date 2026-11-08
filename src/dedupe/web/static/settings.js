@@ -100,6 +100,7 @@ const settingIds = [
   "optExact",
   "optSimilar",
   "optSemantic",
+  "optSemanticFast",
   "optDecider",
   "optNoHumans",
   "optCountFaces",

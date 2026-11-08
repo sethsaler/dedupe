@@ -92,6 +92,16 @@ ORIENTATIONS = (
 # Orientations that swap width and height.
 QUARTER_TURN_ORIENTATIONS = frozenset({"ROTATE_90", "ROTATE_270", "TRANSPOSE", "TRANSVERSE"})
 ORIENTATION_HASH_VERSION = "o1"
+# EXIF Orientation tag and the values whose transpose swaps width and height.
+EXIF_ORIENTATION = 0x0112
+QUARTER_TURN_EXIF_ORIENTATIONS = frozenset({5, 6, 7, 8})
+# Formats whose header orientation is verified to equal exif_transpose's
+# (tests/test_similar_image.py); others take the decoding path.
+HEADER_ORIENTATION_FORMATS = frozenset({"JPEG", "MPO", "PNG", "WEBP", "HEIF", "GIF"})
+# Verification decodes a file once per scan and derives every orientation,
+# comparison size, and dense thumbnail from those frames. A still holds about
+# 1.8 MB (RGB and RGBA at 512 px); sorted pair order keeps the hit rate high.
+SAMPLE_CACHE_SIZE = 16
 # A process pool sidesteps GIL contention in the pHash/dHash/tile math (small
 # numpy/scipy ops hold the GIL even though Pillow's decoder releases it), but
 # costs an interpreter spawn plus Pillow/imagehash imports per worker. Only
@@ -138,9 +148,19 @@ def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
-        if not getattr(img, "is_animated", False):
-            img = ImageOps.exif_transpose(img)
-        width, height = img.size
+        if getattr(img, "is_animated", False):
+            width, height = img.size
+        elif img.format in HEADER_ORIENTATION_FORMATS:
+            # The header and EXIF orientation give the size exif_transpose
+            # would produce, without its full-resolution decode. (Pillow's
+            # getexif() loads by itself where EXIF follows the pixels: PNG.)
+            width, height = img.size
+            if img.getexif().get(EXIF_ORIENTATION, 1) in QUARTER_TURN_EXIF_ORIENTATIONS:
+                width, height = height, width
+        else:
+            # Elsewhere the orientation can depend on decoding (TIFF reads it
+            # from tags at load), so match the hashing pass exactly.
+            width, height = ImageOps.exif_transpose(img).size
         return int(width), int(height)
 
 
@@ -319,14 +339,12 @@ def _tile_phashes_from_image(img, comparison_side: int = TILE_NORMALIZE) -> list
     return [imagehash.phash(canvas.crop(box)) for box in regions]
 
 
-@lru_cache(maxsize=TILE_CACHE_SIZE)
-def _tile_phashes_for_path(
-    path: str, comparison_side: int = TILE_NORMALIZE, orientation: str | None = None
-) -> tuple[str, ...] | None:
-    """Run-cached tile hashes for records that carry no stored tile hashes.
+@lru_cache(maxsize=SAMPLE_CACHE_SIZE)
+def _hash_samples_for_path(path: str):
+    """One decode per file for verification: ``(rgb_frames, rgba_frames)``.
 
-    ``orientation`` turns every frame first, for verifying a rotated or
-    mirrored pair; those hashes are never stored on the record.
+    Same decode ladder as the hashing pass, so derived tiles are identical to
+    stored ones. Either entry is None when that conversion fails.
     """
     _ensure_image_deps()
     _register_heif()
@@ -336,17 +354,41 @@ def _tile_phashes_for_path(
         with Image.open(path) as img:
             if not getattr(img, "is_animated", False):
                 img = ImageOps.exif_transpose(img)
-            # Same decode ladder as the hashing pass so lazily computed tiles
-            # are identical to the ones stored during hashing.
             try:
                 img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
             except Exception:
                 pass
-            tiles = [
-                tile for frame in _hash_frames(img)
-                for tile in _tile_phashes_from_image(_orient(frame, orientation), comparison_side)
-            ]
-            return tuple(str(t) for t in tiles)
+            try:
+                rgb = tuple(_hash_frames(img))
+            except Exception:
+                rgb = None
+            try:
+                rgba = tuple(_hash_frames(img, preserve_alpha=True))
+            except Exception:
+                rgba = None
+            return rgb, rgba
+    except Exception:
+        return None, None
+
+
+@lru_cache(maxsize=TILE_CACHE_SIZE)
+def _tile_phashes_for_path(
+    path: str, comparison_side: int = TILE_NORMALIZE, orientation: str | None = None
+) -> tuple[str, ...] | None:
+    """Run-cached tile hashes for records that carry no stored tile hashes.
+
+    ``orientation`` turns every frame first, for verifying a rotated or
+    mirrored pair; those hashes are never stored on the record.
+    """
+    frames, _rgba = _hash_samples_for_path(path)
+    if frames is None:
+        return None
+    try:
+        tiles = [
+            tile for frame in frames
+            for tile in _tile_phashes_from_image(_orient(frame, orientation), comparison_side)
+        ]
+        return tuple(str(t) for t in tiles)
     except Exception:
         return None
 
@@ -430,22 +472,16 @@ def _dense_thumbs_for_path(path: str, orientation: str | None = None):
     if orientation is not None:
         upright = _dense_thumbs_for_path(path)
         return None if upright is None else tuple(_orient(frame, orientation) for frame in upright)
-    _ensure_image_deps()
-    _register_heif()
-    from PIL import Image, ImageOps
+    from PIL import Image
 
+    _rgb, frames = _hash_samples_for_path(path)
+    if frames is None:
+        return None
     try:
-        with Image.open(path) as img:
-            if not getattr(img, "is_animated", False):
-                img = ImageOps.exif_transpose(img)
-            try:
-                img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
-            except Exception:
-                pass
-            return tuple(
-                frame.resize((DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR)
-                for frame in _hash_frames(img, preserve_alpha=True)
-            )
+        return tuple(
+            frame.resize((DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR)
+            for frame in frames
+        )
     except Exception:
         return None
 
@@ -887,6 +923,7 @@ def find_similar_image_groups(
 
 def clear_image_comparison_cache() -> None:
     """Release comparison pixels and path-only hashes at a scan boundary."""
+    _hash_samples_for_path.cache_clear()
     _tile_phashes_for_path.cache_clear()
     _dense_thumbs_for_path.cache_clear()
     _detail_frames_cached.cache_clear()
@@ -943,6 +980,7 @@ def _bruteforce_groups(
         if progress and (i + 1) % 20 == 0:
             progress("image-cluster", i + 1, len(hashed))
 
+    _hash_samples_for_path.cache_clear()
     _tile_phashes_for_path.cache_clear()
     _dense_thumbs_for_path.cache_clear()
 
