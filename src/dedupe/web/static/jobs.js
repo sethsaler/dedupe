@@ -10,7 +10,7 @@ import { $, escapeHtml, toast } from "./util.js";
 let jobs = [];
 let lastCompletedScan = null;
 const fields = {
-  exact: "optExact", similar: "optSimilar", semantic: "optSemantic", decider: "optDecider",
+  exact: "optExact", similar: "optSimilar", semantic: "optSemantic", semantic_full_speed: "optSemanticFast", decider: "optDecider",
   video_versions: "optVideoVersions", find_no_humans: "optNoHumans", count_faces: "optCountFaces",
   find_low_resolution: "optLowResolution", low_resolution_images: "optLowResolutionImages",
   low_resolution_gifs: "optLowResolutionGifs", low_resolution_videos: "optLowResolutionVideos",

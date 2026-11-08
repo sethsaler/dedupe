@@ -40,7 +40,7 @@ Dedupe's core — finding exact and similar images, reviewing groups, moving fil
 
 ## DigUp (EmbeddingGemma 2)
 
-**What needs it.** The Sets review and semantic look-alike duplicates ([Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works)). Dedupe does not bundle a model runtime: it starts DigUp's `digup worker` helper, a llama.cpp build of EmbeddingGemma 2 that speaks JSON lines on stdin/stdout, and reuses the model files DigUp already downloaded (~865 MB). Dedupe adds no Python packages for this layer.
+**What needs it.** The Sets review and semantic look-alike duplicates ([Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works)). Dedupe does not bundle a model runtime: it starts DigUp's `digup worker` helper, a llama.cpp build of EmbeddingGemma 2 that speaks JSON lines on stdin/stdout, and reuses the model files DigUp already downloaded (~865 MB). Dedupe adds no Python packages for this layer. On macOS the helper runs at background priority, and embedding pauses under thermal pressure ([Scan pipeline](../foundations/scan-pipeline.md#how-each-detection-works)).
 
 **Where Dedupe looks.** `$DEDUPE_DIGUP_HELPER` if it is set (only there), then `/Applications/DigUp.app/Contents/Helpers/digup`, `~/Applications/DigUp.app/Contents/Helpers/digup`, then `digup` on `PATH`.
 
