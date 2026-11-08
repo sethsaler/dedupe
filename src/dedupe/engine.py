@@ -8,6 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
+from .borders import analyze_borders, is_croppable
 from .cache import DistinctReviews, HashCache
 from .decider import DeciderJudge
 from .exact import (
@@ -19,6 +20,7 @@ from .face_detection import FACE_MEDIA_TYPES, count_faces_in_files
 from .grouping import (
     DEFAULT_RANDOM_REVIEW_COUNT,
     LOW_RESOLUTION_MAX_PIXELS,
+    build_crop_groups,
     build_faces_groups,
     build_low_resolution_groups,
     build_no_human_groups,
@@ -164,6 +166,7 @@ def run_scan(
     decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
+    find_black_borders: bool = False,
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -227,6 +230,7 @@ def run_scan(
         "decider": [],
         "human_detection": [],
         "face_detection": [],
+        "black_borders": [],
         "low_resolution": [],
     }
     cache_hits = 0
@@ -392,6 +396,10 @@ def run_scan(
     run_dimensions = find_low_resolution and bool(records)
     run_human = find_no_humans and bool(records)
     run_faces = count_faces and bool(records)
+    border_records = (
+        [record for record in records if is_croppable(record)] if find_black_borders else []
+    )
+    run_borders = bool(border_records)
     run_any_stage = (
         run_exact
         or run_similar
@@ -399,6 +407,7 @@ def run_scan(
         or run_dimensions
         or run_human
         or run_faces
+        or run_borders
         or _build_review_groups
     )
 
@@ -442,6 +451,7 @@ def run_scan(
                 1 if run_similar and image_count else 0,
                 1 if run_human and normalized_human_backend == "opencv" else 0,
                 1 if run_faces else 0,
+                1 if run_borders else 0,
             )
         )
         cpu_workers = split_cpu_budget(n_workers, cpu_stage_count)
@@ -474,6 +484,7 @@ def run_scan(
                     stage_text.get("dims"),
                     stage_text.get("human"),
                     stage_text.get("face"),
+                    stage_text.get("borders"),
                 )
                 if text
             )
@@ -525,6 +536,9 @@ def run_scan(
             if run_faces:
                 stage_text["face"] = "Counting faces (OpenCV)…"
                 stage_counts["face"] = (0, len(face_candidates))
+            if run_borders:
+                stage_text["borders"] = "Looking for crops…"
+                stage_counts["borders"] = (0, len(border_records))
             _emit_stages_locked()
 
         def exact_progress(phase: str, processed: int, total: int) -> None:
@@ -958,6 +972,36 @@ def run_scan(
                 )
             return duration
 
+        def _border_stage() -> float:
+            started_at = time.monotonic()
+
+            def border_progress(processed: int, total: int) -> None:
+                _stage_progress(
+                    "borders",
+                    f"Crops {processed}/{total}",
+                    processed,
+                    total,
+                )
+
+            stage_errors["black_borders"] = analyze_borders(
+                border_records,
+                workers=cpu_workers,
+                progress=border_progress,
+                cancelled=cancelled,
+            )
+            crop_groups = build_crop_groups(border_records)
+            crop_count = sum(len(group.members) for group in crop_groups)
+            _stage_progress(
+                "borders",
+                f"Found {crop_count} image{'' if crop_count == 1 else 's'} "
+                "to crop",
+                0,
+                0,
+            )
+            duration = time.monotonic() - started_at
+            publish_prebuilt(crop_groups)
+            return duration
+
         stage_jobs: dict[str, Callable[[], float]] = {}
         if run_exact:
             stage_jobs["exact"] = _exact_stage
@@ -981,6 +1025,8 @@ def run_scan(
             human_done.set()
         if run_faces:
             stage_jobs["face"] = _face_stage
+        if run_borders:
+            stage_jobs["borders"] = _border_stage
         if _build_review_groups:
             stage_jobs["review"] = _review_stage
 
@@ -1050,6 +1096,8 @@ def run_scan(
                 for record in face_candidates
                 if record.face_count is None
             ]
+        if run_borders:
+            stage_durations["black_borders"] = stage_results["borders"]
 
     cache_errors: list[str] = []
     if cache is not None:
@@ -1207,6 +1255,21 @@ def run_scan(
                 else []
             ),
         ),
+        "black_borders": StageDiagnostics(
+            attempted=len(border_records),
+            succeeded=len(border_records) - len(stage_errors["black_borders"]),
+            failed=len(stage_errors["black_borders"]),
+            skipped=len(records) - len(border_records),
+            duration_seconds=stage_durations.get("black_borders", 0.0),
+            warnings=(
+                [
+                    f"{len(stage_errors['black_borders'])} image(s) could not be "
+                    + "checked for crops"
+                ]
+                if stage_errors["black_borders"]
+                else []
+            ),
+        ),
         "low_resolution": StageDiagnostics(
             attempted=len(resolution_records) if find_low_resolution else 0,
             succeeded=(len(resolution_records) - len(resolution_failures))
@@ -1264,7 +1327,8 @@ def run_scan(
         f"Done — {result.exact_groups} exact, {result.similar_groups} similar groups, "
         f"{result.low_resolution_files} low-resolution, "
         f"{result.random_review_files} random review, {result.no_human_files} non-human"
-        + (f", {result.faces_files} faces" if count_faces else " ")
+        + (f", {result.faces_files} faces" if count_faces else "")
+        + (f", {result.crop_files} to crop" if find_black_borders else "")
         + f" ({len(records)} files)"
     )
     prog.elapsed_seconds = total_duration
@@ -1309,6 +1373,7 @@ def run_scans_parallel(
     decider: bool = False,
     find_no_humans: bool = False,
     count_faces: bool = False,
+    find_black_borders: bool = False,
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -1448,6 +1513,7 @@ def run_scans_parallel(
             decider=decider,
             find_no_humans=find_no_humans,
             count_faces=count_faces,
+            find_black_borders=find_black_borders,
             find_low_resolution=find_low_resolution,
             low_resolution_images=low_resolution_images,
             low_resolution_gifs=low_resolution_gifs,

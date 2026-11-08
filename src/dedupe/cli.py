@@ -113,6 +113,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Count faces in images and GIFs with OpenCV (stored per file)",
     )
     scan.add_argument(
+        "--find-black-borders",
+        dest="find_black_borders",
+        action="store_true",
+        help=(
+            "Find images framed by black bars, and screenshots with a status bar "
+            "or navigation bar at the edges, and suggest a crop "
+            "(apply crops in `dedupe ui`, Crop tab)"
+        ),
+    )
+    scan.add_argument(
         "--no-low-resolution",
         action="store_true",
         help="Disable low-resolution review",
@@ -530,6 +540,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "decider": args.decider,
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,
+        "find_black_borders": args.find_black_borders,
         "find_low_resolution": not args.no_low_resolution,
         "low_resolution_images": "images" in args.low_resolution_types,
         "low_resolution_gifs": "gifs" in args.low_resolution_types,
@@ -585,6 +596,29 @@ def cmd_scan(args: argparse.Namespace) -> int:
             f"Faces: {with_faces} file(s) with faces, "
             f"{multi_face} with more than one face ({len(counted)} analyzed)"
         )
+    if args.find_black_borders:
+        from .borders import suggested_crop
+
+        crop_members = [
+            member
+            for group in result.groups
+            if group.kind == GroupKind.CROP
+            for member in group.members
+        ]
+        print(
+            f"Crops: {len(crop_members)} image(s) could be cropped "
+            "(review and apply crops in `dedupe ui`, Crop tab)"
+        )
+        for member in crop_members[:10]:
+            box = suggested_crop(member)
+            if box is not None:
+                print(
+                    f"  {member.path}: {box.width}×{box.height} -> "
+                    f"{box.crop_width}×{box.crop_height}"
+                    + (" (screenshot bars)" if box.chrome else "")
+                )
+        if len(crop_members) > 10:
+            print(f"  … +{len(crop_members) - 10} more")
     if args.semantic or args.decider:
         sets = [g for g in result.groups if g.kind == GroupKind.SETS]
         print(

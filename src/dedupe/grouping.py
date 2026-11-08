@@ -321,6 +321,23 @@ def build_faces_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
     return _build_independent_group(GroupKind.FACES, matching)
 
 
+def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
+    """Build one review collection of images with a black-border crop suggestion.
+
+    Members are ordered most border first (the largest share of the frame
+    the crop would remove), so the clearest cases lead the review.
+    """
+    from .borders import suggested_crop
+
+    suggestions = [
+        (member, box)
+        for member in members
+        if (box := suggested_crop(member)) is not None
+    ]
+    suggestions.sort(key=lambda item: (-item[1].removed_fraction, item[0].path))
+    return _build_independent_group(GroupKind.CROP, [member for member, _ in suggestions])
+
+
 def build_all_files_groups(
     members: list[FileRecord],
     roots: list[str | Path],
@@ -443,9 +460,10 @@ def _build_independent_group(
 
 def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
     """Mutate selected_for_removal. Always keeps at least one file."""
-    if group.kind in (GroupKind.ALL_FILES, GroupKind.SETS):
+    if group.kind in (GroupKind.ALL_FILES, GroupKind.SETS, GroupKind.CROP):
         # All-Files and Sets browse groups have no selection semantics: those
         # reviews trash one click at a time, so rules must not touch them.
+        # Crop suggestions are applied one click at a time and never delete.
         return
     members = group.members
     if not members:

@@ -6,7 +6,7 @@ import { loadGroups, renderGroupList, rememberFocusedGroup, resetGroupListWindow
 import { selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
 import { groupNeedsAttention } from "./model.js";
-import { collapseScanPanel, lowResolutionMaxPixels, saveRecent } from "./settings.js";
+import { collapseScanPanel, lowResolutionMaxPixels, presetResultsTab, saveRecent } from "./settings.js";
 import { state } from "./state.js";
 import { refreshStatus, renderSession, startStatusPolling } from "./status.js";
 import { $, toast } from "./util.js";
@@ -53,6 +53,7 @@ export function collectScanSettings() {
         semantic_duplicate_threshold: Number($("semanticDuplicateThreshold").value) / 100,
         find_no_humans: $("optNoHumans").checked,
         count_faces: $("optCountFaces").checked,
+        find_black_borders: $("optBlackBorders").checked,
         find_low_resolution: $("optLowResolution").checked,
         low_resolution_images: $("optLowResolutionImages").checked,
         low_resolution_gifs: $("optLowResolutionGifs").checked,
@@ -119,6 +120,7 @@ export async function startScan(overrides = {}) {
     $("countRandomReview").textContent = "0";
     $("countNoHumans").textContent = "0";
     $("countFaces").textContent = "0";
+    $("countCrop").textContent = "0";
     $("countAllFiles").textContent = "0";
     state.groups = [];
     state.allGroups = [];
@@ -139,6 +141,10 @@ export async function startScan(overrides = {}) {
     // Fold the setup form into its slim bar so the streaming results get
     // the screen; the bar shows the scanned paths and re-opens on click.
     collapseScanPanel(raw);
+    // A review goal (crops, faces, …) streams its results straight into its
+    // own tab rather than leaving the user on an empty duplicates list.
+    const goalTab = tabButtons.find((tab) => tab.dataset.kind === presetResultsTab());
+    if (goalTab && !goalTab.classList.contains("active")) activateTab(goalTab);
     // SSE status/group events drive the UI from here; polling is the
     // fallback and stands down as soon as the stream delivers.
     startStatusPolling();

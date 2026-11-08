@@ -27,6 +27,7 @@ class GroupKind(str, Enum):
     FACES = "faces"
     ALL_FILES = "all_files"
     SETS = "sets"
+    CROP = "crop"
 
 
 class ReviewPolicy(str, Enum):
@@ -126,6 +127,11 @@ class FileRecord:
     # 0–1 "shows a person" likelihood for least-likely-first ordering.
     people_score: float | None = None
     people_score_signature: str | None = None
+    # Suggested black-border crop "left,top,right,bottom,width,height" in
+    # display orientation; "" when checked and clean, "dismissed" when the
+    # user declined the suggestion. Valid only with the current signature.
+    border_crop: str | None = None
+    border_signature: str | None = None
     error: str | None = None
     keeper_preference: int = 0
     capture_metadata: bool | None = None
@@ -199,6 +205,8 @@ class FileRecord:
             face_detection_signature=data.get("face_detection_signature"),
             people_score=data.get("people_score"),
             people_score_signature=data.get("people_score_signature"),
+            border_crop=data.get("border_crop"),
+            border_signature=data.get("border_signature"),
             error=data.get("error"),
         )
 
@@ -235,6 +243,7 @@ class ReviewGroup:
             GroupKind.FACES,
             GroupKind.ALL_FILES,
             GroupKind.SETS,
+            GroupKind.CROP,
         ):
             return ReviewPolicy.INDEPENDENT_CANDIDATES
         return ReviewPolicy.KEEP_ONE
@@ -360,7 +369,9 @@ def effective_selected_paths(
     protected: set[str] = set()
     for group in protection_source:
         protected.update(member.path for member in group.members if member.protected)
-        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES and group.kind != GroupKind.CROP:
+            # A crop decision (cropped or skipped) says nothing about keeping
+            # the file, so only the other reviews' decisions protect it.
             protected.update(set(group.reviewed_paths) - set(group.selected_for_removal))
     ordered: list[str] = []
     sizes: dict[str, int] = {}
@@ -486,6 +497,7 @@ class ScanResult:
     low_resolution_files: int = 0
     random_review_files: int = 0
     faces_files: int = 0
+    crop_files: int = 0
     reclaimable_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
@@ -508,6 +520,9 @@ class ScanResult:
         self.faces_files = sum(
             len(g.members) for g in self.groups if g.kind == GroupKind.FACES
         )
+        self.crop_files = sum(
+            len(g.members) for g in self.groups if g.kind == GroupKind.CROP
+        )
         sizes = {member.path: member.size for group in self.groups for member in group.members}
         self.reclaimable_bytes = sum(
             sizes.get(path, 0) for path in effective_selected_paths(self.groups)
@@ -525,6 +540,7 @@ class ScanResult:
             "low_resolution_files": self.low_resolution_files,
             "random_review_files": self.random_review_files,
             "faces_files": self.faces_files,
+            "crop_files": self.crop_files,
             "reclaimable_bytes": self.reclaimable_bytes,
             "file_count": len(self.files),
             "group_count": len(self.groups),

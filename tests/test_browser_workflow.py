@@ -2694,6 +2694,46 @@ def test_files_review_sorts_and_filters_by_people_likelihood(page, tmp_path: Pat
 
 
 @pytest.mark.e2e
+def test_review_goal_scans_only_its_detector_and_opens_its_tab(
+    page, live_dedupe_server: str, tmp_path: Path
+) -> None:
+    media = tmp_path / "framed"
+    media.mkdir()
+    canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+    canvas.paste(Image.effect_noise((320, 180), 60).convert("RGB"), (0, 30))
+    canvas.save(media / "letterbox.png")
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    page.locator("#scanPreset").select_option("crop")
+    expect(page.locator("#presetHint")).to_contain_text("black bars")
+    page.locator("#optsToggle").click()
+    expect(page.locator("#optBlackBorders")).to_be_checked()
+    for selector in ("#optExact", "#optSimilar", "#optCountFaces", "#optNoHumans",
+                     "#optLowResolution", "#optRandomReview"):
+        expect(page.locator(selector)).not_to_be_checked()
+
+    # Any change afterwards makes it a custom scan; picking the goal again resets it.
+    page.locator("#optLowResolution").check(force=True)
+    expect(page.locator("#scanPreset")).to_have_value("custom")
+    page.locator("#scanPreset").select_option("crop")
+    expect(page.locator("#optLowResolution")).not_to_be_checked()
+
+    page.locator("#paths").fill(str(media))
+    with page.expect_request("**/api/scan") as request:
+        page.locator("#btnScan").click()
+    sent = request.value.post_data_json
+    assert sent["find_black_borders"] is True
+    assert sent["exact"] is False and sent["similar"] is False
+
+    expect(page.locator(".tab.active")).to_have_attribute("data-kind", "crop")
+    expect(page.locator("#members .crop-card")).to_have_count(1, timeout=20_000)
+    page.locator("#toast").filter(has_text="Done — 1 to crop").wait_for(state="visible")
+    assert page_errors == []
+
+
+@pytest.mark.e2e
 def test_full_speed_embedding_is_a_remembered_look_alike_option(
     page, live_dedupe_server, tmp_path
 ):

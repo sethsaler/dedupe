@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { reviewCandidate, setMemberSelected, trashReviewCandidate } from "./members.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
-import { $, formatBytes, formatMtime, toast } from "./util.js";
+import { $, formatBytes, formatMtime, toast, withMediaVersion } from "./util.js";
 
 const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
 
@@ -19,11 +19,11 @@ let zoomed = false;
 // Lightbox images use the 2560px cached "preview" variant instead of the
 // untouched original: stepping through 20 MP originals is needlessly slow.
 function previewUrl(path) {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}&variant=preview`;
+  return withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(path)}&variant=preview`, path);
 }
 
 function fullUrl(path) {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}&variant=full`;
+  return withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(path)}&variant=full`, path);
 }
 
 function openLightbox(index) {

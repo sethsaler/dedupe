@@ -104,6 +104,7 @@ const settingIds = [
   "optDecider",
   "optNoHumans",
   "optCountFaces",
+  "optBlackBorders",
   "humanBackend",
   "optLowResolution",
   "optLowResolutionImages",
@@ -176,26 +177,119 @@ function syncSemanticVisibility() {
 $("optSemantic").addEventListener("change", syncSemanticVisibility);
 syncSemanticVisibility();
 
+// —— Scan goals ——
+// Each goal is a starting point: it sets which detectors run and which tab
+// the results open on. Review goals skip duplicate hashing entirely, so a
+// crop or people pass over a large library is not slowed by it. Changing any
+// option afterwards turns the goal into "Custom settings".
+const GOAL_DETECTORS = [
+  "optExact",
+  "optSimilar",
+  "optSemantic",
+  "optVideoVersions",
+  "optDecider",
+  "optNoHumans",
+  "optCountFaces",
+  "optBlackBorders",
+  "optLowResolution",
+  "optRandomReview",
+  "optParallel",
+];
+const DUPLICATES_HINT =
+  "Find exact copies and similar versions, including resized or lightly edited media, across all folders.";
+const SCAN_PRESETS = {
+  cleanup: { on: ["optExact", "optSimilar"], tab: null, hint: DUPLICATES_HINT },
+  deep: {
+    on: ["optExact", "optSimilar", "optSemantic", "optVideoVersions"],
+    optional: ["optSemantic", "optVideoVersions"],
+    tab: null,
+    hint: "Includes edited-copy discovery with DigUp; each look-alike needs review.",
+  },
+  crop: {
+    on: ["optBlackBorders"],
+    tab: "crop",
+    hint: "Find images framed by black bars, and screenshots with a status bar or navigation bar at the edges, and suggest a crop for each. Duplicates are not checked.",
+  },
+  faces: {
+    on: ["optCountFaces"],
+    tab: "faces",
+    hint: "Find images with faces, group shots first. Sort and filter them by how many faces appear.",
+  },
+  no_humans: {
+    on: ["optNoHumans"],
+    tab: "no_humans",
+    hint: "Find photos and videos with no person in them, for review one at a time.",
+  },
+  low_resolution: {
+    on: ["optLowResolution"],
+    tab: "low_resolution",
+    hint: "Find media below the low-resolution bounds in Options (1 MP by default).",
+  },
+  random_review: {
+    on: ["optRandomReview"],
+    tab: "random_review",
+    hint: "Pick 50 files at random for a quick spot check of the library.",
+  },
+  checkup: {
+    on: ["optExact", "optSimilar", "optNoHumans", "optCountFaces", "optBlackBorders", "optLowResolution"],
+    optional: ["optNoHumans", "optCountFaces"],
+    tab: null,
+    hint: "Duplicates, crops, faces, photos without people, and low-resolution media in one pass. Slower.",
+  },
+};
+
+// Inputs a goal cannot run without, and why (from the dependency gates).
+function goalBlocker(preset) {
+  const spec = SCAN_PRESETS[preset];
+  if (!spec) return null;
+  const optional = new Set(spec.optional || []);
+  const missing = spec.on.find((id) => !optional.has(id) && $(id).disabled);
+  if (!missing) return null;
+  const wrap = $(`${missing}Wrap`);
+  return (wrap && wrap.title) || $(missing).title || "A required detector is not installed";
+}
+
+function presetResultsTab() {
+  return SCAN_PRESETS[$("scanPreset").value]?.tab || null;
+}
+
 function applyScanPreset(preset) {
-  if (preset === "custom") return;
-  const deep = preset === "deep";
-  for (const id of ["optExact", "optSimilar"]) $(id).checked = true;
-  for (const id of ["optNoHumans", "optCountFaces", "optLowResolution", "optRandomReview", "optParallel"]) {
-    $(id).checked = false;
+  const spec = SCAN_PRESETS[preset];
+  if (!spec) return;
+  const blocker = goalBlocker(preset);
+  if (blocker) {
+    $("presetHint").textContent = `${blocker}.`;
+    return;
   }
-  $("optSemantic").checked = deep && !$("optSemantic").disabled;
-  $("optVideoVersions").checked = deep && !$("optVideoVersions").disabled;
-  $("optDecider").checked = false;
-  if (deep) { $("semanticDuplicateThreshold").value = "94"; syncSemanticLabels(); }
-  $("presetHint").textContent = deep && $("optSemantic").disabled
+  const on = new Set(spec.on);
+  for (const id of GOAL_DETECTORS) $(id).checked = on.has(id) && !$(id).disabled;
+  if (preset === "deep") { $("semanticDuplicateThreshold").value = "94"; syncSemanticLabels(); }
+  const skipped = (spec.optional || []).filter((id) => $(id).disabled);
+  $("presetHint").textContent = preset === "deep" && $("optSemantic").disabled
     ? "Edited-copy search needs the optional DigUp helper. Standard duplicate detection is ready."
-    : deep ? "Includes edited-copy discovery with DigUp; each look-alike needs review."
-    : "Find exact copies and similar versions, including resized or lightly edited media, across all folders.";
+    : skipped.length
+      ? `${spec.hint} Some checks are unavailable here: run dedupe doctor for setup.`
+      : spec.hint;
   syncSemanticVisibility();
   syncHumanBackendVisibility();
   syncCrossFolderHint();
   saveScanSettings();
 }
+
+// Goals whose detectors are missing are listed but disabled, with the reason.
+function syncPresetAvailability() {
+  const select = $("scanPreset");
+  for (const option of select.options) {
+    const blocker = goalBlocker(option.value);
+    option.disabled = Boolean(blocker);
+    option.title = blocker || "";
+  }
+  if (select.selectedOptions[0]?.disabled) {
+    select.value = "cleanup";
+    applyScanPreset("cleanup");
+  }
+}
+
 $("scanPreset").addEventListener("change", () => applyScanPreset($("scanPreset").value));
 // Every launch starts with the fast duplicate pass, even after a Sets or custom
 // scan. Keep saved keeper preferences, exclusions, media types, and thresholds.
@@ -407,6 +501,7 @@ function applyCapabilities(caps) {
       if (firstReady) backend.value = firstReady.value;
     }
   }
+  syncPresetAvailability();
   const hint = $("depHint");
   if (hint) {
     const missing = [];
@@ -464,4 +559,4 @@ function lowResolutionMaxPixels(id) {
   return Math.round(megapixels * 1_000_000);
 }
 
-export { updateWorkersUI, workersEl, saveRecent, renderRecent, lowResolutionMaxPixels, collapseScanPanel, applyCapabilities, syncCrossFolderHint };
+export { updateWorkersUI, workersEl, saveRecent, renderRecent, lowResolutionMaxPixels, collapseScanPanel, applyCapabilities, syncCrossFolderHint, presetResultsTab };
