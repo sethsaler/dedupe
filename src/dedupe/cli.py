@@ -117,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="find_black_borders",
         action="store_true",
         help=(
-            "Find images framed by black bars, and screenshots with a status bar "
-            "or navigation bar at the edges, and suggest a crop "
+            "Find images framed by black bars, and screenshots with interface at the "
+            "edges (status bar, app header, navigation bar, reply field), and suggest a crop "
             "(apply crops in `dedupe ui`, Crop tab)"
         ),
     )
@@ -615,7 +615,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 print(
                     f"  {member.path}: {box.width}×{box.height} -> "
                     f"{box.crop_width}×{box.crop_height}"
-                    + (" (screenshot bars)" if box.chrome else "")
+                    + (" (screenshot interface)" if box.chrome else "")
                 )
         if len(crop_members) > 10:
             print(f"  … +{len(crop_members) - 10} more")

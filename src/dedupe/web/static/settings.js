@@ -208,7 +208,7 @@ const SCAN_PRESETS = {
   crop: {
     on: ["optBlackBorders"],
     tab: "crop",
-    hint: "Find images framed by black bars, and screenshots with a status bar or navigation bar at the edges, and suggest a crop for each. Duplicates are not checked.",
+    hint: "Find images framed by black bars, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop for each. Duplicates are not checked.",
   },
   faces: {
     on: ["optCountFaces"],

@@ -25,12 +25,19 @@ function pendingMembers(g) {
   return (g.members || []).filter((member) => member.crop_state === "pending" && !member.protected);
 }
 
-// Interface bars are named for what they are on screen; other edges are bars.
-const CHROME_NAMES = { top: "status bar", bottom: "navigation bar" };
+function hasBlackBars(crop) {
+  const chrome = crop.chrome || [];
+  return (crop.left > 0) || (crop.right < crop.width)
+    || (crop.top > 0 && !chrome.includes("top"))
+    || (crop.bottom < crop.height && !chrome.includes("bottom"));
+}
 
+// Each removed edge with its rows; when interface and black bars mix, each
+// edge says which it is.
 function barsLabel(crop) {
   if (!crop) return "";
   const chrome = new Set(crop.chrome || []);
+  const mixed = chrome.size > 0 && hasBlackBars(crop);
   const sides = [
     ["top", crop.top],
     ["bottom", crop.height - crop.bottom],
@@ -38,17 +45,17 @@ function barsLabel(crop) {
     ["right", crop.width - crop.right],
   ].filter(([, px]) => px > 0);
   return sides
-    .map(([side, px]) => (chrome.has(side) ? `${px}px ${CHROME_NAMES[side]} (${side})` : `${px}px ${side}`))
+    .map(([side, px]) => {
+      if (!mixed) return `${px}px ${side}`;
+      return chrome.has(side) ? `${px}px interface (${side})` : `${px}px black (${side})`;
+    })
     .join(" · ");
 }
 
 function cropKind(crop) {
   const chrome = crop.chrome || [];
   if (!chrome.length) return "Black bars";
-  const blackSides = (crop.left > 0) || (crop.right < crop.width)
-    || (crop.top > 0 && !chrome.includes("top"))
-    || (crop.bottom < crop.height && !chrome.includes("bottom"));
-  return blackSides ? "Screenshot bars and black bars" : "Screenshot bars";
+  return hasBlackBars(crop) ? "Screenshot interface and black bars" : "Screenshot interface";
 }
 
 function evidenceFor(member) {
