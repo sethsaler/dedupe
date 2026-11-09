@@ -7,7 +7,9 @@ Images that look like screenshots are also checked for interface at the top
 and bottom edges: a phone's status bar (clock, battery, notification icons),
 a home indicator or navigation bar, a desktop menu bar or taskbar, and the
 rows an app stacks between those and the picture — its header, the row naming
-a post's author, a reply field, an action row.
+a post's author, a reply field, an action row — along with a gallery's filmstrip
+of other photos under the picture and a media viewer's counter or page dots
+alone on its black bands.
 Applying a suggestion rewrites the file at its original path; the untouched
 original goes to the system Trash first, so every crop can be undone.
 
@@ -38,9 +40,9 @@ from .parallel import map_parallel
 
 # Bump when the detection rules change so cached verdicts are recomputed.
 # A user's dismissal under an earlier signature still stands.
-BORDER_SIGNATURE = "black-borders-v4"
+BORDER_SIGNATURE = "black-borders-v5"
 LEGACY_BORDER_SIGNATURES = frozenset(
-    {"black-borders-v1", "black-borders-v2", "black-borders-v3"}
+    {"black-borders-v1", "black-borders-v2", "black-borders-v3", "black-borders-v4"}
 )
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
@@ -90,6 +92,9 @@ BAR_SPECK_INK = 0.25
 # toward the frame, changes a few pixels per line instead and is left alone:
 # a missed crop costs nothing, a crop through someone's hair does.
 BAR_EDGE_LINES = 4
+# A JPEG codes pixels in blocks this many rows tall; an edge inside one rings
+# into the rows around it.
+JPEG_BLOCK = 8
 BAR_EDGE_FRACTION = 0.2
 # Ignore slivers: a bar must be at least this many pixels and this share of
 # the image's dimension along that axis.
@@ -191,6 +196,17 @@ CHROME_ONE_INK = 0.85
 # A timeline post sets its picture in the words' column: its side within this
 # share of the width of where the name and words begin.
 CHROME_COLUMN_ALIGN = 0.02
+# A gallery's filmstrip — thumbnails of the photos around the one shown, in a
+# row under it — reaches at most this share of the height in from where it
+# starts to the picture, and holds at least CHROME_STRIP_TILES thumbnails,
+# each within CHROME_STRIP_TILE of the width. Its band may darken toward the
+# edge, so it is followed row by row within CHROME_STRIP_DRIFT of the row before.
+CHROME_STRIP_ROWS = 0.1
+CHROME_STRIP_TILES = 4
+CHROME_STRIP_TILE = (0.02, 0.15)
+CHROME_STRIP_DRIFT = 2 * CHROME_TOLERANCE
+# A media viewer's counter ("3 / 20") is no wider than this share of the width.
+CHROME_COUNTER_WIDTH = 0.25
 CHROME_MIN_FRACTION = 0.012
 CHROME_SAMPLE_COLUMNS = 480
 
@@ -209,15 +225,20 @@ class ChromeEdge:
     pill: bool
     # A carousel's page dots sit under the picture, so only at this edge.
     dots: bool
+    # A gallery's filmstrip of other photos sits under the picture too.
+    strip: bool
 
 
 # Status bar or menu bar, then an app's header and the row naming a post's author.
 CHROME_TOP = ChromeEdge(
-    max_fraction=0.22, first_ink_max=0.07, cluster_max=0.045, pill=False, dots=False
+    max_fraction=0.22, first_ink_max=0.07, cluster_max=0.045, pill=False, dots=False,
+    strip=False,
 )
-# Home indicator, navigation buttons, tab bar, taskbar, reply field, action row.
+# Home indicator, navigation buttons, tab bar, taskbar, reply field, action
+# row, a gallery's filmstrip.
 CHROME_BOTTOM = ChromeEdge(
-    max_fraction=0.30, first_ink_max=0.06, cluster_max=0.08, pill=True, dots=True
+    max_fraction=0.30, first_ink_max=0.06, cluster_max=0.08, pill=True, dots=True,
+    strip=True,
 )
 
 
@@ -718,7 +739,8 @@ class _Cluster:
 
 
 def _looks_like_a_bar(rows, start: int, end: int, height: int, edge: ChromeEdge, *,
-                      center_empty: bool, pill_allowed: bool, busy_min: int) -> str | None:
+                      center_empty: bool, pill_allowed: bool, busy_min: int,
+                      words: bool = False) -> str | None:
     """How the first cluster in from the edge reads as a bar: ``"glyphs"`` (a
     clock and icons, buttons across the width), ``"pill"`` (a home indicator),
     or ``None`` when it reads as content or picture."""
@@ -753,9 +775,11 @@ def _looks_like_a_bar(rows, start: int, end: int, height: int, edge: ChromeEdge,
     spread = rows.sides[start:end].any(axis=0).all()
     runs = float(np.median(rows.runs[inked]))
     # Three buttons after a blank margin are a navigation bar; three shapes
-    # touching the edge are drawer knobs or rounded corners.
+    # touching the edge are drawer knobs or rounded corners. A word across
+    # the row is neither: a reply field an earlier crop cut into, its words
+    # between its two sides.
     bar_runs = CHROME_BAR_RUNS - 1 if start >= height * CHROME_BAR_MARGIN else CHROME_BAR_RUNS
-    if glyphs and spread and runs >= bar_runs:
+    if glyphs and spread and (runs >= bar_runs or words):
         return "glyphs"  # a clock on one side, icons on the other; buttons across
     if not pill_allowed:
         return None
@@ -763,6 +787,60 @@ def _looks_like_a_bar(rows, start: int, end: int, height: int, edge: ChromeEdge,
     if runs <= 2 and 0.15 <= longest <= 0.6 and 0.4 <= middle <= 0.6:
         return "pill"
     return None
+
+
+def _is_dark(colour) -> bool:
+    """Whether an RGB colour is as dark as a black bar."""
+    import numpy as np
+
+    return float(np.dot(colour, (0.299, 0.587, 0.114))) <= DARK_LUMA
+
+
+def _marks_a_dark_band(rows, start: int, end: int, height: int, band, edge: ChromeEdge, *,
+                       scale: float) -> bool:
+    """Whether the first cluster on a black band is a media viewer's marks
+    rather than a bar: page dots under the picture, or a counter ("3 / 20"),
+    a few letters tall enough to read, close together, no wider than a
+    short word. A moon, a star or a light in a night sky is one mark or too
+    small; the caller still asks that the band end at the picture's edge."""
+    import numpy as np
+
+    if not _is_dark(band):
+        return False
+    if edge.dots and _is_dots(rows, start, end, height, scale):
+        return True
+    tall = end - start
+    if tall < max(4, int(height * CHROME_GLYPH_ROWS)) or tall > height * edge.cluster_max:
+        return False
+    if int((rows.two_tone | rows.busy)[start:end].sum()) > max(2, int(0.1 * tall)):
+        return False
+    glyph = np.flatnonzero(rows.glyph[start:end]) + start
+    if glyph.size < 0.5 * tall:
+        return False
+    if float(rows.span[glyph, 1].max() - rows.span[glyph, 0].min()) > CHROME_COUNTER_WIDTH:
+        return False
+    if float(np.median(rows.longest[glyph])) > CHROME_LETTER_WIDTH:
+        return False
+    return float(np.median(rows.runs[glyph])) >= 3
+
+
+def _hard_edge(rows, row: int, band) -> bool:
+    """Whether the picture begins at ``row`` with a straight edge across the
+    width, as a letterboxed picture does: the band up to within a JPEG block
+    of the row (an edge inside a block rings into the rows beside it), and
+    half the width or more far off the band within a few rows. A sky that
+    brightens into the scene below crosses the band's tolerance at some row,
+    but not by far."""
+    import numpy as np
+
+    before = range(row - 1, max(-1, row - 1 - JPEG_BLOCK), -1)
+    if not any(
+        rows.one_colour[r] and float(np.abs(rows.medians[r] - band).max()) <= CHROME_TOLERANCE
+        for r in before
+    ):
+        return False
+    off = np.abs(rows.pixels[row : row + BAR_EDGE_LINES] - band).max(axis=2) >= CHROME_CONTRAST
+    return bool((off.mean(axis=1) >= 0.5).any())
 
 
 def _is_content(rows, start: int, end: int) -> bool:
@@ -876,6 +954,79 @@ def _is_dots(rows, start: int, end: int, height: int, scale: float) -> bool:
     odd = np.abs(cores - np.median(cores, axis=0)).max(axis=1)
     marked = odd > CHROME_DOT_MARK
     return int(marked.sum()) == 1 and float(odd[~marked].max()) <= CHROME_DOT_MARK / 2
+
+
+def _strip_end(rows, start: int, height: int, band, busy_min: int) -> int | None:
+    """Where the picture begins past a gallery's filmstrip starting at row
+    ``start``, or ``None`` when the rows there are no filmstrip.
+
+    A filmstrip is a row of thumbnails — little pictures of the photos
+    around the one shown — a gap of the band apart: rows each holding
+    several runs of ink a thumbnail wide, with the gaps between them
+    standing in the same columns down the strip. Past it, beyond the
+    thumbnails' rounded tops, rows of the band (or of the current photo's
+    taller thumbnail alone) set it apart from the picture, which begins at
+    the first row holding more. Its band may darken toward the edge, so
+    each row's band is the colour near the last one's."""
+    import numpy as np
+
+    pixels = rows.pixels
+    columns = pixels.shape[1]
+    reach = min(len(pixels), start + int(height * CHROME_STRIP_ROWS) + 1)
+    low, high = CHROME_STRIP_TILE
+    level = np.asarray(band, dtype=np.float64)
+    offs, tiles, quiet = [], [], []
+    for row in range(start, reach):
+        line = pixels[row]
+        distance = np.abs(line - level).max(axis=1)
+        near = distance <= CHROME_STRIP_DRIFT
+        if near.sum() >= 0.02 * columns:
+            # Follow a gradient, a level or two a row; a jump is the picture.
+            drifted = np.median(line[near], axis=0)
+            if float(np.abs(drifted - level).max()) <= CHROME_TOLERANCE / 3:
+                level = drifted
+                distance = np.abs(line - level).max(axis=1)
+        off = distance > CHROME_TOLERANCE
+        starts, ends = _runs_of(off)
+        widths = (ends - starts) / columns
+        sized = (widths >= low) & (widths <= high)
+        offs.append(off)
+        tiles.append(int(sized.sum()) >= CHROME_STRIP_TILES and widths[sized].sum() >= 0.5 * widths.sum())
+        # The band, or the current photo's taller thumbnail alone.
+        quiet.append(bool(off.mean() <= 0.12 and not (widths > high).any()))
+    tiles, quiet = np.array(tiles, dtype=bool), np.array(quiet, dtype=bool)
+    tiled = np.flatnonzero(tiles)
+    near_rows = max(3, int(height * 0.03))
+    if tiled.size == 0 or tiled[0] > near_rows:
+        return None
+    # The rows of tiles, but for a row or two that compression or a
+    # thumbnail's dark patch breaks.
+    end = int(tiled[0])
+    for row in tiled[1:]:
+        if row - end > 3:
+            break
+        end = int(row)
+    block = tiled[tiled <= end]
+    if block.size < height * 0.02:
+        return None
+    if int(rows.busy[start + int(block[0]) : start + end + 1].sum()) < busy_min:
+        return None  # icons or a field, not little pictures
+    # Past the thumbnails' rounded tops, the band sets the strip apart.
+    gap = np.flatnonzero(quiet[end + 1 :]) + end + 1
+    if gap.size == 0:
+        return None
+    held = np.flatnonzero(~quiet[gap[0] :]) + gap[0]
+    if held.size == 0:
+        return None
+    # The tiles stand in columns: the gaps between them run down the strip
+    # (but for a row or two of compression ringing).
+    banded = (~np.array([offs[row] for row in block])).sum(axis=0)
+    starts, ends = _runs_of(banded < 0.9 * block.size)
+    widths = (ends - starts) / columns
+    sized = (widths >= low) & (widths <= high)
+    if int(sized.sum()) < CHROME_STRIP_TILES or widths[sized].sum() < 0.5 * widths.sum():
+        return None
+    return start + int(held[0])
 
 
 def _avatar_at(rows, start: int, end: int):
@@ -1110,9 +1261,12 @@ def _edge_chrome(strip, height: int, edge: ChromeEdge, *, center_empty: bool,
     lookahead = int(height * CHROME_LOOKAHEAD)
     window = strip[: limit + lookahead + 2].astype(np.int16)
     rows = _measure_rows(window)
-    if rows.ink[0] > 1.0 - CHROME_EDGE_FLAT:
-        return 0  # the picture runs to the edge; anything there is drawn over it
     gap = max(2, int(height * 0.004))
+    # An earlier crop may have cut through a shape — a reply field's border —
+    # that fills the edge row or more; the band is the first plain row past it.
+    plain = np.flatnonzero(rows.one_colour[: gap + 1])
+    if rows.ink[0] > 1.0 - CHROME_EDGE_FLAT and not plain.size:
+        return 0  # the picture runs to the edge; anything there is drawn over it
     band_min = max(3, int(height * 0.003))
     busy_min = max(3, int(height * CHROME_BUSY_ROWS))
     cluster_rows = int(height * edge.cluster_max)
@@ -1125,7 +1279,7 @@ def _edge_chrome(strip, height: int, edge: ChromeEdge, *, center_empty: bool,
         after = rows.medians[min(row + 1, count - 1)]
         return float(np.abs(after - before).max()) > CHROME_TOLERANCE
 
-    band = rows.medians[0]
+    band = rows.medians[int(plain[0])] if plain.size else rows.medians[0]
     position = 0  # the band holds from this row on
     clusters: list[_Cluster] = []
     first_kind = None
@@ -1179,6 +1333,19 @@ def _edge_chrome(strip, height: int, edge: ChromeEdge, *, center_empty: bool,
                 break
             busy = int(rows.busy[look].sum())
             two_tone = int(rows.two_tone[look].sum())
+            if edge.strip and busy >= busy_min and (clusters or start <= height * edge.first_ink_max):
+                # A gallery's filmstrip of the photos around this one is
+                # interface, however busy its thumbnails; the picture
+                # begins past it.
+                beyond = _strip_end(rows, start, height, band, busy_min)
+                if beyond is not None:
+                    clusters.append(_Cluster(
+                        start, beyond, content=False, words=False, text=False, line=False,
+                        letters=beyond - start, left=0.0, right=1.0, hole=0.0, ink=0.0,
+                    ))
+                    first_kind = first_kind or "strip"
+                    picture = beyond
+                    break
             if busy >= busy_min or two_tone > cluster_rows:
                 # The picture starts at its first solid row. Glyphs sitting
                 # on it across a gap belong to the interface, and faint rows
@@ -1220,7 +1387,13 @@ def _edge_chrome(strip, height: int, edge: ChromeEdge, *, center_empty: bool,
                 first_kind = _looks_like_a_bar(
                     rows, start, end, height, edge,
                     center_empty=center_empty, pill_allowed=edge.pill, busy_min=busy_min,
+                    # A reply field's words, on a story viewer's black surround.
+                    words=_is_dark(band) and _has_words(rows, start, end, scale),
                 )
+                if first_kind is None and _marks_a_dark_band(
+                    rows, start, end, height, band, edge, scale=scale
+                ):
+                    first_kind = "marks"
                 if first_kind is None:
                     return 0
                 later = other.copy()
@@ -1251,6 +1424,14 @@ def _edge_chrome(strip, height: int, edge: ChromeEdge, *, center_empty: bool,
         picture = switches[-1]
         if settled:
             del clusters[settled:]  # the sky's own birds, not words to keep
+
+    # A media viewer's black band holds its marks and nothing else, and ends
+    # at the picture's straight edge.
+    if first_kind == "marks" and not (
+        picture is not None and len(clusters) == 1 and not switches
+        and _hard_edge(rows, picture, band)
+    ):
+        return 0
 
     first = clusters[0]
     if picture is not None:

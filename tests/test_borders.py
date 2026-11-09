@@ -2800,3 +2800,169 @@ def test_paragraphs_of_one_size_in_two_inks_are_kept(tmp_path: Path) -> None:
     box = detect_black_borders(path)
     assert box is not None and box.chrome == ("top",)
     assert 197 <= box.top <= 240
+
+
+# --- galleries, media viewers and stories -------------------------------------
+
+
+def _gallery(*, gap: bool = True, seed: int = 5) -> Image.Image:
+    """An Android gallery: the photo, its rounded bottom on a navy band that
+    darkens toward the edge, and a filmstrip of the photos around it under it,
+    the current one taller. Without ``gap`` the photo runs into the strip."""
+    from PIL import ImageDraw
+
+    width, height = 1080, 2099
+    canvas = np.zeros((height, width, 3), np.uint8)
+    fade = np.linspace(0.0, 1.0, height - 1920)[:, None]
+    canvas[1920:] = (np.array([14, 17, 23]) * (1 - fade) + np.array([2, 3, 5]) * fade)[:, None]
+    end = 1920 if gap else 1940
+    canvas[:end] = _picture(width, end, seed)
+    image = Image.fromarray(canvas)
+    for index, x in enumerate(range(-40, 700, 90)):
+        current = index == 6
+        y0, y1, wide = (1928, 2094, 92) if current else (1942, 2074, 65)
+        mask = Image.new("L", (wide, y1 - y0), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, wide - 1, y1 - y0 - 1], radius=8, fill=255)
+        image.paste(Image.fromarray(_picture(wide, y1 - y0, seed + index + 1)), (x, y0), mask)
+    return image
+
+
+def test_a_gallerys_filmstrip_is_cropped_to_the_photo(tmp_path: Path) -> None:
+    """The thumbnails of the photos around the one shown, in a row under it,
+    are the gallery's: the cut falls at the photo's bottom edge."""
+    path = tmp_path / "2VkmCbgLL3o9lxGp.jpeg"
+    _gallery().save(path, quality=85)
+    with Image.open(path) as opened:
+        assert borders.screenshot_evidence(path, opened) == "shape"
+
+    box = detect_black_borders(path)
+    assert box is not None and box.chrome == ("bottom",)
+    assert abs(box.bottom - 1920) <= 4
+
+
+def test_a_row_of_things_running_into_the_photo_is_no_filmstrip(tmp_path: Path) -> None:
+    """Tiles with none of the band between them and the photo above — a
+    fence, a shelf of books at the bottom of a picture — are its own."""
+    path = tmp_path / "2VkmCbgLL3o9lxGp.jpeg"
+    _gallery(gap=False).save(path, quality=85)
+
+    assert detect_black_borders(path) is None
+
+
+def _media_viewer(*, seed: int = 7) -> Image.Image:
+    """A media viewer on black: a counter ("13 / 20") high in the top band,
+    the photo, and page dots low in the bottom band, deeper than a bar."""
+    from PIL import ImageDraw
+
+    width, height = 1080, 2107
+    image = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    for x in (958, 972, 996, 1008, 1020):
+        draw.rectangle([x, 150, x + 9, 172], fill=(255, 255, 255))
+    image.paste(Image.fromarray(_picture(width, 1441, seed)), (0, 328))  # rows 328-1769
+    for index, x in enumerate(range(466, 590, 20)):
+        radius = 3 if index in (0, 6) else 6
+        fill = (255, 255, 255) if index == 3 else (110, 110, 110)
+        draw.ellipse([x - radius, 1912 - radius, x + radius, 1912 + radius], fill=fill)
+    return image
+
+
+def test_a_media_viewers_counter_and_dots_are_cropped(tmp_path: Path) -> None:
+    """A counter or page dots alone on a black band, which ends at the
+    photo's straight edge, are the viewer's: both bands go."""
+    path = tmp_path / "BGrjIeOp1a0yT59p.jpeg"
+    _media_viewer().save(path, quality=85)
+
+    box = detect_black_borders(path)
+    assert box is not None and box.chrome == ("top", "bottom")
+    assert abs(box.top - 328) <= 4
+    assert abs(box.bottom - 1769) <= 4
+
+
+def test_lights_in_a_sky_that_brightens_into_the_scene_are_kept(tmp_path: Path) -> None:
+    """Small lights high in a night sky look like a counter, but the sky
+    brightens into the scene below it with no edge: it is the picture."""
+    from PIL import ImageDraw
+
+    width, height = 1080, 2107
+    canvas = np.zeros((height, width, 3), np.uint8)
+    ramp = np.clip(np.arange(height - 328) / 240.0, 0.0, 1.0)[:, None, None]
+    canvas[328:] = (_picture(width, height - 328, seed=13) * ramp).astype(np.uint8)
+    image = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(image)
+    for x in (958, 972, 996, 1008, 1020):
+        draw.rectangle([x, 150, x + 9, 172], fill=(255, 255, 255))
+    path = tmp_path / "BGrjIeOp1a0yT59p.jpeg"
+    image.save(path, quality=85)
+
+    box = detect_black_borders(path)
+    assert box is None or box.top == 0
+
+
+@pytest.mark.parametrize("right", [925, 692])  # a send button; or more buttons, a narrower field
+def test_a_reply_field_an_earlier_crop_cut_through_is_cropped(tmp_path: Path, right: int) -> None:
+    """A story's reply field that an earlier crop cut at its bottom border:
+    the border fills the edge rows, or much of them, so the band is the
+    first plain row past it, and the field's words make it interface though
+    most of its rows hold no more than its two sides."""
+    from PIL import ImageDraw
+
+    width, height = 1080, 2063
+    image = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    mask = Image.new("L", (width, 1920), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, -40, width - 1, 1919], radius=30, fill=255)
+    image.paste(Image.fromarray(_picture(width, 1920, seed=9)), (0, 0), mask)
+    # The field's flat bottom border is the last rows, grey across most of
+    # the width; its words; a send button beside it.
+    draw.rounded_rectangle([22, 1932, right, height - 1], radius=63, outline=(101, 101, 101), width=3)
+    _text_rows(draw, 69, 400, 1985, 2015, line=30, gap=0, fill=(255, 255, 255))
+    for x in range(right + 50, width - 50, 120):
+        draw.polygon([(x, 1980), (x + 57, 1980), (x + 25, 2030)], outline=(255, 255, 255), width=4)
+    path = tmp_path / "ThueoHCziZcVzeht.jpg"
+    image.save(path, quality=85)
+
+    box = detect_black_borders(path)
+    assert box is not None and box.chrome == ("bottom",)
+    assert abs(box.bottom - 1920) <= 4
+
+
+def test_ringing_beside_rounded_corners_on_a_light_band_is_no_word(tmp_path: Path) -> None:
+    """A story card's rounded corners on a light band, with a JPEG's faint
+    ringing beside them: the specks sit close like letters, but only a black
+    surround holds a reply field. The caption under them is kept."""
+
+    width, height = 1170, 2074
+    band = (207, 202, 197)
+    image, draw = _shot(width, height, band)
+    radius = 30
+    draw.rectangle([0, 0, radius, radius], fill=(20, 20, 20))
+    draw.rectangle([width - radius, 0, width, radius], fill=(20, 20, 20))
+    draw.ellipse([0, 0, 2 * radius, 2 * radius], fill=band)
+    draw.ellipse([width - 2 * radius, 0, width, 2 * radius], fill=band)
+    for y in (2, 6, 10):
+        for x in range(width - 54, width - 30, 6):
+            draw.rectangle([x, y, x + 1, y], fill=(190, 185, 180))
+    _text_rows(draw, 60, 820, 264, 304, line=40, gap=0)
+    image.paste(Image.fromarray(_picture(width, height - 409, seed=11)), (0, 409))
+    path = tmp_path / "34sBUynJv0XHUFW5.png"
+    image.save(path)
+
+    assert detect_black_borders(path) is None
+
+
+def test_tiles_that_do_not_stand_in_columns_are_no_filmstrip(tmp_path: Path) -> None:
+    """A brick wall's courses, each set half a brick along from the last,
+    hold as many tile-sized runs as a filmstrip, but its gaps do not run
+    down the strip: the wall is the picture's."""
+    width, height = 1080, 2099
+    canvas = np.zeros((height, width, 3), np.uint8)
+    canvas[:] = (14, 17, 23)
+    canvas[:1920] = _picture(width, 1920, seed=21)
+    for course, y in enumerate(range(1950, 2080, 21)):  # to 2095, thin mortar between
+        for x in range(45 * (course % 2), width - 65, 90):
+            canvas[y : y + 19, x : x + 65] = _picture(65, 19, seed=course * 20 + x)
+    path = tmp_path / "2VkmCbgLL3o9lxGp.jpeg"
+    _save(canvas, path, quality=85)
+
+    assert detect_black_borders(path) is None
