@@ -86,6 +86,11 @@
   box-shadow: 0 0 0 100vmax rgba(120, 120, 120, 0.25);
 }
 
+/* Zone toggled off: the untouched picture, with nothing shaded away. */
+#members.crop-grid .crop-card.crop-zone-hidden .crop-box {
+  display: none;
+}
+
 #members.crop-grid .crop-badge {
   position: absolute;
   top: 8px;

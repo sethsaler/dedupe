@@ -427,6 +427,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // distinct button only belongs to the list view.
   $("btnMarkDistinct").hidden = g.kind !== "similar" || swipeMode;
   $("btnCropAll").hidden = g.kind !== "crop";
+  $("btnToggleCropZones").hidden = g.kind !== "crop";
   updateSimilarViewToggle(g);
   $("nonHumanBanner").hidden = g.kind !== "no_humans";
   syncDeletedToggle(g);
