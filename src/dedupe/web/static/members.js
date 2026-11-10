@@ -412,7 +412,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     random_review: "Random review",
     faces: "Faces",
     sets: "Set · same subject or shoot",
-    crop: "Crop · borders & screen bars",
+    crop: "Crop · images & videos · borders & screen bars",
     similar: "Similar",
     all_files: `All files${g.root ? ` · ${basename(g.root)}` : ""}`,
   }[g.kind] || g.kind;

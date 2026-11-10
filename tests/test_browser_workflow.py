@@ -2708,6 +2708,9 @@ def test_review_goal_scans_only_its_detector_and_opens_its_tab(
 
     page.locator("#scanPreset").select_option("crop")
     expect(page.locator("#presetHint")).to_contain_text("black bars")
+    # The goal crops videos as well as images; its label and hint say so.
+    expect(page.locator('#scanPreset option[value="crop"]')).to_contain_text("videos")
+    expect(page.locator("#presetHint")).to_contain_text("videos")
     page.locator("#optsToggle").click()
     expect(page.locator("#optBlackBorders")).to_be_checked()
     for selector in ("#optExact", "#optSimilar", "#optCountFaces", "#optNoHumans",

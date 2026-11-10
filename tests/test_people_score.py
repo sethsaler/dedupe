@@ -18,6 +18,7 @@ from dedupe.models import FileRecord, MediaType, ScanResult
 from dedupe.people_score import (
     PEOPLE_MODEL_PATH,
     PEOPLE_MODEL_SHA256,
+    PeopleScorer,
     has_current_people_score,
     least_likely_first_key,
     people_score_signature,
@@ -71,6 +72,24 @@ def test_a_person_scores_far_above_a_people_free_photo(media: Path) -> None:
 
     assert scores["astronaut.png"] > 0.5
     assert scores["still-life.png"] < 0.1
+
+
+def test_person_boxes_hug_the_person(tmp_path: Path) -> None:
+    """Box geometry behind the score: the crop guard keeps people whole
+    with these, so the decoded box must actually cover the person."""
+    import numpy as np
+
+    scorer = PeopleScorer()
+    with Image.open(ASTRONAUT) as image:
+        boxes = scorer.person_boxes(np.asarray(image.convert("RGB")))
+    assert boxes
+    x0, y0, x1, y1 = boxes[0]
+    # The astronaut stands left-of-centre, head at the top, full height.
+    assert x0 < 0.1 and y0 < 0.1 and 0.55 < x1 < 0.9 and y1 > 0.9
+
+    still = _no_people_image(tmp_path / "still.png")
+    with Image.open(still) as image:
+        assert scorer.person_boxes(np.asarray(image.convert("RGB"))) == []
 
 
 def test_least_likely_first_ordering_puts_unscored_files_last() -> None:

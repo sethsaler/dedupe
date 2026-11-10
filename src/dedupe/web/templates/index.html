@@ -103,7 +103,7 @@
               <option value="deep">Find duplicates and edited copies</option>
             </optgroup>
             <optgroup label="Review">
-              <option value="crop">Find images to crop (black bars, screenshot interface)</option>
+              <option value="crop">Find images &amp; videos to crop (black bars, screenshot interface)</option>
               <option value="faces">Find photos with faces</option>
               <option value="no_humans">Find photos without people</option>
               <option value="low_resolution">Find low-resolution media</option>
@@ -138,7 +138,7 @@
             <label class="chip-check" id="optSemanticWrap" title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp"><input type="checkbox" id="optSemantic" /><span>Sets &amp; look-alikes (DigUp)</span></label>
             <label class="chip-check" id="optNoHumansWrap"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
-            <label class="chip-check" id="optBlackBordersWrap" title="Find images framed by black bars, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop"><input type="checkbox" id="optBlackBorders" /><span>Crops (black bars, screenshot interface)</span></label>
+            <label class="chip-check" id="optBlackBordersWrap" title="Find images and MP4/MOV videos framed by black bars, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop"><input type="checkbox" id="optBlackBorders" /><span>Crops — images &amp; videos (black bars, screenshot interface)</span></label>
             <span class="thresh-hint" id="depHint" hidden></span>
           </div>
           <label class="field-row" for="preferredFolders">Preferred keeper folders (one per line, highest priority first)
@@ -300,7 +300,7 @@
           <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
           <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
           <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
-          <button class="tab" data-kind="crop" type="button" role="tab" aria-selected="false" tabindex="-1" title="Images framed by black bars or screenshot interface, with a suggested crop">Crop <span class="tab-count" id="countCrop">0</span></button>
+          <button class="tab" data-kind="crop" type="button" role="tab" aria-selected="false" tabindex="-1" title="Images and videos framed by black bars or screenshot interface, with a suggested crop">Crop <span class="tab-count" id="countCrop">0</span></button>
           <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">All files <span class="tab-count" id="countAllFiles">0</span></button>
         </div>
       <aside class="sidebar">
@@ -689,7 +689,7 @@
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
         <div><dt><kbd>a</kbd> / <kbd>A</kbd> / <kbd>D</kbd></dt><dd>Preview Trash for selected exact / similar / Low-res + Random review files</dd></div>
         <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · Same (Trash) / Different in Similar swipe · otherwise previous / next card · navigate in the lightbox</dd></div>
-        <div><dt><kbd>c</kbd> / <kbd>x</kbd></dt><dd>Crop the focused image in the Crop review (original to Trash, undo from the toast) / skip its suggestion</dd></div>
+        <div><dt><kbd>c</kbd> / <kbd>x</kbd></dt><dd>Crop the focused image or video in the Crop review (original to Trash, undo from the toast) / skip its suggestion</dd></div>
         <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, or Files file to Trash (one click, undo from the toast) · ⌫ undoes the last Similar swipe · in the lightbox, toggles removal for exact/similar files</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>Reveal the focused card's file in Finder · in the lightbox: reveal the current file</dd></div>
         <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
