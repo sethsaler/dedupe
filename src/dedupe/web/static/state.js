@@ -36,6 +36,7 @@ const state = {
   autoWorkers: 0,
   capabilities: null,
   keepDecisionsError: null,
+  decisionLogError: null,
   trashUndoClearedNotified: false,
   dismissedSessionKey: "",
   emptyResumeNotified: false,

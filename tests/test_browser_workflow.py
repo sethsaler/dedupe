@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -955,6 +956,152 @@ def test_all_files_review_trashes_uncategorized_files_from_the_lightbox(
         page.locator("#toast").filter(has_text="restored").wait_for()
         assert victim.exists()
         expect(page.locator("#members .card.deleted")).to_have_count(0)
+
+
+@pytest.mark.e2e
+def test_clicking_a_triage_picture_trashes_it_and_its_trash_button_enlarges(
+    page, tmp_path: Path
+) -> None:
+    """In the All tab's triage grids the picture itself is the one-click
+    Trash; the button that used to say Trash now opens the lightbox."""
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index, color in enumerate(((36, 128, 72), (110, 92, 28), (180, 60, 60))):
+        path = media / f"plain-{index}.png"
+        Image.new("RGB", (48, 32), color).save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+            )
+        )
+    result = ScanResult(roots=[str(media)], files=records, groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        # The All tab is where a finished scan lands; stay on it.
+        expect(page.locator(".tab.active")).to_have_attribute("data-kind", "all")
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+        assert page.locator("#members .card").count() == 3
+
+        # The former Trash button is now the way to enlarge a picture.
+        expect(page.locator("#members .card-actions .enlarge-candidate")).to_have_count(3)
+        expect(page.locator("#members .card-actions .enlarge-candidate").first).to_have_text(
+            "Enlarge"
+        )
+        expect(page.locator("#members .card-actions .delete-candidate")).to_have_count(0)
+        page.locator("#members .card-actions .enlarge-candidate").first.click()
+        page.locator("#lightbox").wait_for(state="visible")
+        expect(page.locator("#lbCounter")).to_have_text("1 / 3")
+        page.keyboard.press("Escape")
+        page.locator("#lightbox").wait_for(state="hidden")
+
+        # Clicking the picture moves that file to Trash, undoably.
+        victim = Path(page.locator("#members .card").first.get_attribute("data-path"))
+        page.locator("#members .thumb-wrap").first.click()
+        expect(page.locator("#modalBackdrop")).to_be_hidden()
+        expect(page.locator("#lightbox")).to_be_hidden()
+        page.locator("#toast").filter(has_text="Moved").wait_for()
+        assert not victim.exists()
+        expect(page.locator("#members .card.deleted")).to_have_count(1)
+
+        page.locator("#toastAction").click()
+        page.locator("#toast").filter(has_text="restored").wait_for()
+        assert victim.exists()
+        expect(page.locator("#members .card.deleted")).to_have_count(0)
+
+
+@pytest.mark.e2e
+def test_crop_zone_toggles_per_card_and_for_the_whole_review(
+    page, tmp_path: Path
+) -> None:
+    """A suggested crop zone can be hidden to see the untouched picture and
+    shown again, one card at a time or for every card together."""
+    from dedupe.borders import BORDER_SIGNATURE
+    from dedupe.grouping import build_crop_groups
+
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index in range(2):
+        path = media / f"framed-{index}.png"
+        canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+        canvas.paste(Image.effect_noise((320, 180), 60).convert("RGB"), (0, 30))
+        canvas.save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                width=320,
+                height=240,
+                border_crop="0,30,320,210,320,240",
+                border_signature=BORDER_SIGNATURE,
+            )
+        )
+    result = ScanResult(
+        roots=[str(media)], files=records, groups=build_crop_groups(records)
+    )
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="crop"]').click()
+        page.locator(".group-item").first.click()
+        cards = page.locator("#members .crop-card")
+        expect(cards).to_have_count(2)
+        expect(cards.nth(0).locator(".crop-box")).to_be_visible()
+        expect(cards.nth(1).locator(".crop-box")).to_be_visible()
+
+        # Per-card: hide one zone; its neighbour keeps showing what goes.
+        toggle = cards.nth(0).locator(".crop-zone-toggle")
+        expect(toggle).to_have_text("Hide zone")
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        toggle.click()
+        expect(cards.nth(0).locator(".crop-box")).to_be_hidden()
+        expect(cards.nth(1).locator(".crop-box")).to_be_visible()
+        expect(toggle).to_have_text("Show zone")
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+        toggle.click()
+        expect(cards.nth(0).locator(".crop-box")).to_be_visible()
+
+        # Keyboard: v toggles the focused card's zone.
+        cards.nth(1).locator(".name").click()
+        page.keyboard.press("v")
+        expect(cards.nth(1).locator(".crop-box")).to_be_hidden()
+        page.keyboard.press("v")
+        expect(cards.nth(1).locator(".crop-box")).to_be_visible()
+
+        # Whole review: one header toggle hides and restores every zone.
+        expect(page.locator("#btnToggleCropZones")).to_have_text("Hide crop zones")
+        page.locator("#btnToggleCropZones").click()
+        expect(cards.nth(0).locator(".crop-box")).to_be_hidden()
+        expect(cards.nth(1).locator(".crop-box")).to_be_hidden()
+        expect(page.locator("#btnToggleCropZones")).to_have_text("Show crop zones")
+        page.locator("#btnToggleCropZones").click()
+        expect(cards.nth(0).locator(".crop-box")).to_be_visible()
+        expect(cards.nth(1).locator(".crop-box")).to_be_visible()
+        expect(page.locator("#btnToggleCropZones")).to_have_text("Hide crop zones")
 
 
 @pytest.mark.e2e
@@ -2805,6 +2952,44 @@ def test_cropping_keeps_the_crop_grid_still(page, live_dedupe_server: str, tmp_p
     assert undone["image"] == [0, 0, *before["frame"]]
     assert undone["untouched"]
     assert page_errors == []
+
+
+@pytest.mark.e2e
+def test_skipped_crop_reason_is_logged(page, live_dedupe_server: str, tmp_path: Path) -> None:
+    """A skip lands in one click; the optional reason picked afterwards is
+    recorded with the rejected suggestion in the decision log."""
+    media = tmp_path / "framed"
+    media.mkdir()
+    for index in range(2):
+        canvas = Image.new("RGB", (640, 480), (0, 0, 0))
+        canvas.paste(Image.effect_noise((640, 400), 60).convert("RGB"), (0, 40))
+        canvas.save(media / f"img{index}.png")
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+    page.locator("#scanPreset").select_option("crop")
+    page.locator("#paths").fill(str(media))
+    page.locator("#btnScan").click()
+    cards = page.locator("#members .crop-card")
+    expect(cards).to_have_count(2, timeout=20_000)
+
+    cards.nth(0).locator(".crop-skip").click()
+    expect(cards.nth(0)).to_have_class(re.compile(r"\bskipped\b"))
+    why = cards.nth(0).locator(".crop-skip-why")
+    why.locator("summary").click()
+    why.locator(".crop-skip-reason[data-reason='bars_intentional']").click()
+    expect(cards.nth(0).locator(".crop-skip-why summary")).to_have_text(
+        "Skipped: Bars are intentional"
+    )
+    note = cards.nth(0).locator(".crop-skip-note")
+    note.fill("director's letterbox")
+    note.press("Tab")
+
+    log = tmp_path / "xdg-state" / "dedupe" / "decision-log.jsonl"
+    page.wait_for_timeout(500)
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [event["decision"] for event in events] == ["skipped", "annotated", "annotated"]
+    assert events[0]["suggestion"]["top"] == 40
+    assert events[1]["reason"] == "bars_intentional"
+    assert events[2]["note"] == "director's letterbox"
 
 
 @pytest.mark.e2e

@@ -318,7 +318,7 @@ $("btnMarkDistinct").addEventListener("click", async () => {
   try {
     await api("/api/similar/mark-distinct", {
       method: "POST",
-      body: JSON.stringify({ group_id: groupId, scan_id: state.scanId }),
+      body: JSON.stringify({ group_id: groupId, scan_id: state.scanId, source: "list" }),
     });
     await loadGroups();
     toast("Marked as distinct — this group won't come back", "ok", {

@@ -11,6 +11,7 @@ Dedupe is careful with the user's media and comparatively free with its own book
 | Hash cache | `~/.cache/dedupe/hashes.sqlite3` | End of every scan; distinct and manual-review marks as they happen | Yes — next scan redoes the work; learned decisions are lost |
 | Review session | `~/.local/state/dedupe/review-session.json` | Scan completion; every persisted selection change; resume-time pruning | Yes — the app starts clean; the current review is lost |
 | Keep decisions | `~/.local/state/dedupe/keep-decisions.json` | Low-resolution review decisions (Keep) | Yes — kept low-res files resurface in future scans |
+| Decision log | `~/.local/state/dedupe/decision-log.jsonl` | Every crop apply/skip/reconsider/undo and mark/unmark-distinct review | Yes — only detector-tuning history is lost; no scan reads it |
 | Receipts | `~/.cache/dedupe/logs/` | Every executed trash/quarantine action, and every undo | With care — deleting a receipt removes the undo path for that action |
 | Quarantine directory | User-chosen (remembered in the browser) | When a Quarantine action executes | No — it holds quarantined files until undo |
 | `_Dedupe Quarantine` | Beside the scanned root | When a Trash action includes low-res/random selections | No — it holds those files |
@@ -48,6 +49,12 @@ See [The review session](../foundations/review-session.md) for the full resume s
 ## The keep-decisions file
 
 A small durable store of explicit *Keep decisions*: low-resolution candidates the user reviewed and left unselected. Each decision is recorded against the file's identity; if the file changes, the decision stops applying. The file is read when low-resolution groups are built (kept files are skipped) and written as review decisions land — a Keep adds a decision, selecting the file for removal or withdrawing the review clears it. The store is treated as a convenience: a failure to write it never fails the selection request. Deleting the file is safe; the consequence is that kept low-resolution files resurface in the next scan.
+
+## The decision log
+
+An append-only JSON-lines record of two reviews' decisions, kept for tuning the detectors that produced them: every crop applied, skipped, reconsidered, annotated, or undone, and every pair marked or unmarked distinct. Each line carries what the user was looking at when they decided — the suggested crop box with its detector signature, or the pair's stored hash distances and match basis — plus how the decision was made (single or bulk crop; swipe, board, or list for distinct; and whether a distinct pair was actually decided together, expanded from a whole group, or backfilled unseen when its group dissolved). A skipped crop can carry an optional one-tap reason (cuts real content, cuts a person, leaves bars behind, bars are intentional, keep the interface, not bars, other) and a short note, added after the skip from the skipped card; the skip itself never waits for one.
+
+This history exists because the working stores keep only the latest verdict: a crop receipt names the file but not the box, skipping a crop overwrites the suggestion with a dismissal, and undoing a distinct mark deletes its pair row. Reversals are events here, not deletions. `dedupe decisions summary` rolls the log up (crop acceptance by kind, media type, removed fraction, and detector signature; skip reasons; distinct-pair distance distribution), `export-benchmark` writes standing distinct pairs as a `benchmark-similarity` manifest (negatives only, so it measures false-positive grouping, never recall), and `export-crops` writes the standing crop verdicts. A write failure never blocks the decision it describes; it surfaces once in the UI status instead. The file is private (`0600` in a `0700` directory), holds paths and hashes but never file bytes, honours `XDG_STATE_HOME`, and can be relocated with `DEDUPE_DECISION_LOG_PATH`.
 
 ## Receipts
 
