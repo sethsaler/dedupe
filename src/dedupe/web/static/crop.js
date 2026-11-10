@@ -1,6 +1,8 @@
 // Crop review: images and videos framed by black bars or screenshot interface.
 // Each card shows the picture (a video's poster frame) with the suggested crop
 // drawn on it — the bars that would go are shaded — and one click applies it.
+// A card's zone can be toggled off to see the untouched picture (and every
+// zone at once from the header), then back on to see what a crop removes.
 // The file is rewritten in place (videos are re-encoded) and the untouched
 // original goes to the Trash, so every crop has an Undo. Skip declines a
 // suggestion; it is remembered so the same file is not suggested again.
@@ -17,6 +19,14 @@ import {
 } from "./util.js";
 
 const busy = new Set();
+
+// Paths whose suggested crop zone is currently hidden, so the untouched
+// picture can be compared against what a crop would remove. Visual only.
+const hiddenZones = new Set();
+
+const zoneToggleTitle = (hidden) => (hidden
+  ? "Show the suggested crop zone — the shaded part is what a crop removes (v)"
+  : "Hide the suggested crop zone to see the full picture (v)");
 // Skip-reason panels left open, by path: annotating rebuilds the card, and
 // the panel (with its note field) must not collapse out from under the user.
 const openWhy = new Set();
@@ -110,6 +120,7 @@ function cardHtml(g, member, index) {
   // was cut to and the bars it lost are left empty; otherwise the suggestion
   // is drawn over the original.
   const showsCrop = Boolean(crop) && state_ !== "cropped";
+  const zoneHidden = showsCrop && hiddenZones.has(member.path);
   const width = crop?.width || member.width;
   const height = crop?.height || member.height;
   const badge = state_ === "cropped"
@@ -126,7 +137,7 @@ function cardHtml(g, member, index) {
         : `<button class="btn primary crop-apply" data-path="${escapeHtml(member.path)}" type="button" title="Crop now — the original goes to the Trash (c)">Crop</button>
            <button class="btn ghost crop-skip" data-path="${escapeHtml(member.path)}" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>`;
   return `
-    <article class="card crop-card ${state_} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
+    <article class="card crop-card ${state_} ${zoneHidden ? "crop-zone-hidden" : ""} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
       <button class="thumb-wrap crop-thumb" type="button" data-path="${escapeHtml(member.path)}" aria-label="Open ${escapeHtml(name)} in the lightbox">
         <span class="crop-frame" data-width="${width || ""}" data-height="${height || ""}">
           <img class="crop-image" src="${thumbUrl(member)}" alt="Preview of ${escapeHtml(name)}" loading="lazy" decoding="async" />
@@ -145,6 +156,7 @@ function cardHtml(g, member, index) {
         <div class="evidence" title="${escapeHtml(evidenceFor(member))}">${escapeHtml(evidenceFor(member))}</div>
         <div class="card-actions crop-actions">
           ${primary}
+          ${showsCrop ? `<button class="btn ghost crop-zone-toggle" data-path="${escapeHtml(member.path)}" type="button" aria-pressed="${!zoneHidden}" title="${zoneToggleTitle(zoneHidden)}">${zoneHidden ? "Show zone" : "Hide zone"}</button>` : ""}
           <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
         </div>
         ${skipWhyHtml(g, member)}
@@ -188,6 +200,7 @@ function cardSignature(member) {
     member.size,
     member.crop_skip_reason || "",
     member.crop_skip_note || "",
+    hiddenZones.has(member.path) ? 1 : 0,
     crop ? [crop.left, crop.top, crop.right, crop.bottom, crop.width, crop.height].join(",") : "",
   ].join("|");
 }
@@ -244,6 +257,9 @@ function bindCard(card) {
   card.querySelector(".crop-undo")?.addEventListener("click", (event) => {
     undoCrop(currentGroup(), event.currentTarget.dataset.path);
   });
+  card.querySelector(".crop-zone-toggle")?.addEventListener("click", (event) => {
+    toggleCropZone(event.currentTarget.dataset.path);
+  });
   const path = card.dataset.path;
   card.querySelector(".crop-skip-why")?.addEventListener("toggle", (event) => {
     if (event.currentTarget.open) openWhy.add(path);
@@ -273,6 +289,63 @@ function bindCard(card) {
   });
 }
 
+// Members still showing a suggested zone (cropped files have none to hide).
+function zonedMembers(g) {
+  return (g?.members || []).filter(
+    (member) => member.crop && (member.crop_state || "pending") !== "cropped",
+  );
+}
+
+// Reflect one card's zone visibility without rebuilding it (no image reload).
+function syncZoneCard(card, member) {
+  const hidden = hiddenZones.has(member.path);
+  card.classList.toggle("crop-zone-hidden", hidden);
+  const toggle = card.querySelector(".crop-zone-toggle");
+  if (toggle) {
+    toggle.textContent = hidden ? "Show zone" : "Hide zone";
+    toggle.setAttribute("aria-pressed", String(!hidden));
+    toggle.title = zoneToggleTitle(hidden);
+  }
+  card.dataset.signature = cardSignature(member);
+}
+
+function syncCropZonesButton(g) {
+  const btn = $("btnToggleCropZones");
+  if (!btn) return;
+  const zoned = zonedMembers(g);
+  btn.hidden = !g || g.kind !== "crop" || !zoned.length;
+  if (btn.hidden) return;
+  const anyVisible = zoned.some((member) => !hiddenZones.has(member.path));
+  btn.textContent = anyVisible ? "Hide crop zones" : "Show crop zones";
+  btn.setAttribute("aria-pressed", String(anyVisible));
+}
+
+function toggleCropZone(path) {
+  if (!path) return;
+  if (hiddenZones.has(path)) hiddenZones.delete(path);
+  else hiddenZones.add(path);
+  const member = (currentGroup()?.members || []).find((m) => m.path === path);
+  const card = document.querySelector(`.crop-card[data-path="${CSS.escape(path)}"]`);
+  if (card && member) syncZoneCard(card, member);
+  syncCropZonesButton(currentGroup());
+}
+
+function toggleAllCropZones() {
+  const g = currentGroup();
+  if (!g || g.kind !== "crop") return;
+  const zoned = zonedMembers(g);
+  const hideAll = zoned.some((member) => !hiddenZones.has(member.path));
+  for (const member of zoned) {
+    if (hideAll) hiddenZones.add(member.path);
+    else hiddenZones.delete(member.path);
+    const card = document.querySelector(`.crop-card[data-path="${CSS.escape(member.path)}"]`);
+    if (card) syncZoneCard(card, member);
+  }
+  syncCropZonesButton(g);
+}
+
+$("btnToggleCropZones")?.addEventListener("click", toggleAllCropZones);
+
 function updateCropMeta(g) {
   const members = g.members || [];
   const cropped = members.filter((m) => m.crop_state === "cropped").length;
@@ -283,10 +356,14 @@ function updateCropMeta(g) {
   const all = $("btnCropAll");
   all.hidden = pending === 0;
   all.textContent = `Crop all ${pending} remaining`;
+  syncCropZonesButton(g);
 }
 
 function renderCropReview(g) {
   const box = $("members");
+  // Hidden zones belong to the review on screen; a different pile starts
+  // with every zone showing.
+  if (box.dataset.cropGroup && box.dataset.cropGroup !== g.id) hiddenZones.clear();
   box.classList.remove("triage-grid", "focus-review");
   box.classList.add("crop-grid");
   $("memberPagination").hidden = true;
@@ -514,7 +591,8 @@ async function cropAllRemaining() {
 
 $("btnCropAll")?.addEventListener("click", cropAllRemaining);
 
-// Keyboard: c crops the focused file, x skips it, ←/→ move between cards.
+// Keyboard: c crops the focused file, x skips it, v toggles its crop
+// zone, ←/→ move between cards.
 function handleCropKey(event) {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return false;
@@ -526,6 +604,10 @@ function handleCropKey(event) {
   }
   if (event.key === "x" && member?.crop_state === "pending") {
     skipCrop(g, member.path, true, { fromKeyboard: true });
+    return true;
+  }
+  if (event.key === "v" && member?.crop && member.crop_state !== "cropped") {
+    toggleCropZone(member.path);
     return true;
   }
   if (event.key === "ArrowRight" || event.key === "ArrowLeft") {

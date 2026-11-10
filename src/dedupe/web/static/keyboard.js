@@ -226,6 +226,10 @@ document.addEventListener("keydown", async (e) => {
       if (cb) {
         cb.checked = !cb.checked;
         cb.dispatchEvent(new Event("change"));
+      } else if (card.querySelector(".thumb-wrap")?.dataset.clickTrash && card.dataset.path) {
+        // Space runs a triage picture's click (Trash); Enter still enlarges.
+        const group = currentGroup();
+        if (group) trashReviewCandidate(group, card.dataset.path);
       }
     }
     e.preventDefault();

@@ -46,9 +46,15 @@ function closeLightbox() {
   $("lbVideo").removeAttribute("src");
   $("lbVideo").load();
   $("lightbox").hidden = true;
+  // Return to the control that opened the lightbox: an Enlarge button stays
+  // an Enlarge button (its card's picture is the Trash now, so landing focus
+  // there would arm the wrong key), anything else to the picture as before.
+  const focusTarget = previousFocus?.classList?.contains("enlarge-candidate")
+    ? ".enlarge-candidate"
+    : ".thumb-wrap";
   const refreshedMember = previousFocusPath
     ? $("members").querySelector(
-      `.card[data-path="${CSS.escape(previousFocusPath)}"] .thumb-wrap`,
+      `.card[data-path="${CSS.escape(previousFocusPath)}"] ${focusTarget}`,
     )
     : null;
   // A Similar board row repaints on every toggle made in the lightbox, so its

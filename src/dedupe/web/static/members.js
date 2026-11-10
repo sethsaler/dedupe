@@ -313,21 +313,21 @@ function updateDetailMeta(g) {
     const reviewed = new Set(g.reviewed_paths || []);
     const deleted = (g.deleted_paths || []).length;
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${deleted} in Trash · deletions are undoable`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${deleted} in Trash · click a picture to Trash it · Enlarge opens it · deletions are undoable`;
     return;
   }
   if (g.kind === "no_humans") {
     const reviewed = new Set(g.reviewed_paths || []);
     const selected = new Set(g.selected_for_removal || []);
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · detection can miss people`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · click a picture to Trash it · Enlarge opens it · detection can miss people`;
     return;
   }
   if (g.kind === "faces") {
     const reviewed = new Set(g.reviewed_paths || []);
     const selected = new Set(g.selected_for_removal || []);
     $("detailMeta").textContent =
-      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · face counts are estimates`;
+      `${reviewed.size} of ${g.member_count} reviewed · ${selected.size} selected · click a picture to Trash it · Enlarge opens it · face counts are estimates`;
     return;
   }
   if (isDecisionReview(g)) {
@@ -427,6 +427,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // distinct button only belongs to the list view.
   $("btnMarkDistinct").hidden = g.kind !== "similar" || swipeMode;
   $("btnCropAll").hidden = g.kind !== "crop";
+  $("btnToggleCropZones").hidden = g.kind !== "crop";
   updateSimilarViewToggle(g);
   $("nonHumanBanner").hidden = g.kind !== "no_humans";
   syncDeletedToggle(g);
@@ -734,18 +735,24 @@ function renderMembers(g, { append = false } = {}) {
       const mediaPreview = m.media_type === "video"
         ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${thumb}" ${singleReview ? 'controls src' : 'data-src'}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
         : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
-      const overlayDelete = isPagedIndependentReview(g) && !deleted && !m.protected
-        ? `<button class="thumb-delete delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click, undo from the toast" aria-label="Move ${escapeHtml(fileName)} to Trash">Trash</button>`
+      // In the triage grids the picture itself is the one-click Trash, and
+      // the buttons that used to say Trash enlarge it instead. A focus-view
+      // video is the exception: its click belongs to the playback controls,
+      // so its card keeps an explicit Trash button below.
+      const clickTrash = isPagedIndependentReview(g) && !deleted && !m.protected
+        && !(singleReview && m.media_type === "video");
+      const overlayEnlarge = clickTrash
+        ? `<button class="thumb-enlarge inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button>`
         : "";
       const preview = deleted
         ? `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
         : `<div class="thumb-stack">
-            <${singleReview && m.media_type === "video" ? "div" : 'button type="button"'} class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${previewDimensions} aria-label="Open preview for ${escapeHtml(fileName)}">
+            <${singleReview && m.media_type === "video" ? "div" : 'button type="button"'} class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${clickTrash ? ' data-click-trash="1" title="Move to Trash — one click, undo from the toast"' : ""}${previewDimensions} aria-label="${clickTrash ? `Move ${escapeHtml(fileName)} to Trash` : `Open preview for ${escapeHtml(fileName)}`}">
               ${badge}
               ${mediaPreview}
               ${["video", "gif"].includes(m.media_type) && !singleReview ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
             </${singleReview && m.media_type === "video" ? "div" : "button"}>
-            ${singleReview ? "" : overlayDelete}
+            ${singleReview ? "" : overlayEnlarge}
           </div>`;
       const actions = m.protected
         ? `<span class="protected-label">Protected library</span><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
@@ -755,7 +762,11 @@ function renderMembers(g, { append = false } = {}) {
               <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
             </div>`
         : isPagedIndependentReview(g)
-        ? `<button class="btn ${deleted ? "ghost undo-delete" : "danger delete-candidate"}" data-path="${escapeHtml(m.path)}" type="button" title="${deleted ? "Restore from Trash" : "Move to Trash — one click"}">${deleted ? "Undo" : "Trash"}</button>${deleted ? "" : `<button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`}`
+        ? (deleted
+          ? `<button class="btn ghost undo-delete" data-path="${escapeHtml(m.path)}" type="button" title="Restore from Trash">Undo</button>`
+          : clickTrash
+            ? `<button class="btn ghost enlarge-candidate inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
+            : `<button class="btn danger delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click">Trash</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`)
         : `<label class="selection-control">
                 <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
                 <span class="selection-copy">
@@ -782,7 +793,7 @@ function renderMembers(g, { append = false } = {}) {
             <div class="evidence">${escapeHtml(evidence)}</div>
             <div class="card-actions">
               ${actions}
-              ${singleReview && !deleted ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}
+              ${singleReview && !deleted && !clickTrash ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}
             </div>
           </div>
         </article>
@@ -934,13 +945,23 @@ function renderMembers(g, { append = false } = {}) {
 
   rendered.querySelectorAll("button.thumb-wrap").forEach((el) => {
     el.addEventListener("click", () => {
-      const i = Number(el.dataset.index);
       state.memberFocus = Number(el.closest(".card")?.dataset.index || 0);
-      openLightbox(i);
+      // Triage pictures trash on click; enlarging lives on their Enlarge
+      // button. Every other card's picture still opens the lightbox.
+      if (el.dataset.clickTrash) {
+        trashReviewCandidate(g, el.dataset.path);
+        return;
+      }
+      openLightbox(Number(el.dataset.index));
     });
   });
   rendered.querySelectorAll(".inspect-media").forEach((button) => {
-    button.addEventListener("click", () => openLightbox(Number(button.dataset.index)));
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const cardIndex = Number(button.closest(".card")?.dataset.index);
+      if (Number.isFinite(cardIndex)) state.memberFocus = cardIndex;
+      openLightbox(Number(button.dataset.index));
+    });
   });
 
   rendered.querySelectorAll(".card").forEach((card) => {

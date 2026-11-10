@@ -426,16 +426,19 @@
             <button class="btn primary-soft" id="btnCropAll" type="button" hidden>
               Crop all remaining
             </button>
+            <button class="btn ghost" id="btnToggleCropZones" type="button" hidden aria-pressed="true" title="Hide every suggested crop zone to see the untouched pictures; show them again to see what a crop removes">
+              Hide crop zones
+            </button>
             <details class="non-human-banner popover guide-popover" id="nonHumanBanner" hidden>
               <summary title="About Non-Human review">? Guide</summary>
               <div class="popover-body">
                 <div>
                   <strong>Independent Non-Human candidates</strong>
-                  <span>One click — or <kbd>d</kbd> / <kbd>⌫</kbd> — moves a file to Trash. Undo from the toast or the card. Detection can miss people.</span>
+                  <span>Click a picture — or <kbd>d</kbd> / <kbd>⌫</kbd> — to move that file to Trash. Its Enlarge button opens the lightbox. Undo from the toast or the card. Detection can miss people.</span>
                 </div>
                 <div class="triage-guide" aria-label="Triage shortcuts">
-                  <span class="delete-key"><kbd>d</kbd> Trash</span>
-                  <span class="keep-key">Lightbox <kbd>Enter</kbd></span>
+                  <span class="delete-key">Click picture · Trash</span>
+                  <span class="keep-key">Enlarge · lightbox</span>
                 </div>
               </div>
             </details>
@@ -683,13 +686,13 @@
         <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group · in Low-res and Random review, ↓ steps to the next candidate without deciding</dd></div>
         <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group · in Low-res and Random review, ↑ goes back to the previous candidate</dd></div>
         <div><dt><kbd>[</kbd> / <kbd>]</kbd></dt><dd>Previous / next group needing attention</dd></div>
-        <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card</dd></div>
+        <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card · on a Non-Human, Faces, Files, or Sets picture, move it to Trash (same as clicking it)</dd></div>
         <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
         <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
         <div><dt><kbd>a</kbd> / <kbd>A</kbd> / <kbd>D</kbd></dt><dd>Preview Trash for selected exact / similar / Low-res + Random review files</dd></div>
         <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · Same (Trash) / Different in Similar swipe · otherwise previous / next card · navigate in the lightbox</dd></div>
-        <div><dt><kbd>c</kbd> / <kbd>x</kbd></dt><dd>Crop the focused image or video in the Crop review (original to Trash, undo from the toast) / skip its suggestion</dd></div>
+        <div><dt><kbd>c</kbd> / <kbd>x</kbd> / <kbd>v</kbd></dt><dd>Crop the focused image or video in the Crop review (original to Trash, undo from the toast) / skip its suggestion / show or hide its suggested crop zone</dd></div>
         <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, or Files file to Trash (one click, undo from the toast) · ⌫ undoes the last Similar swipe · in the lightbox, toggles removal for exact/similar files</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>Reveal the focused card's file in Finder · in the lightbox: reveal the current file</dd></div>
         <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
