@@ -1290,9 +1290,9 @@ def test_crop_zone_can_be_dragged_resized_reset_and_applied(
 
         # Keyboard: a focused zone moves with arrows and resizes with
         # Shift+arrows (the restored zone is the applied 208x156 one).
-        zone = card.locator(".crop-box").bounding_box()
-        assert zone
-        page.mouse.click(zone["x"] + zone["width"] / 2, zone["y"] + zone["height"] / 2)
+        # Undo can still be settling the frame layout. Use a real, hit-tested
+        # pointer click rather than coordinates sampled before that movement.
+        card.locator(".crop-box").click()
         with page.expect_response("**/api/crop/adjust") as saved:
             for _ in range(3):
                 page.keyboard.press("ArrowRight")
@@ -1435,6 +1435,12 @@ def test_results_scroll_batches_and_single_group_next(page, tmp_path: Path, kind
         page.locator("#results").wait_for(state="visible", timeout=10_000)
         page.locator(f'.tab[data-kind="{kind}"]').click()
         page.locator(".group-item").first.click()
+        # The tab may already display this group's first batch. Wait for the
+        # explicit selection to finish before testing scroll-only DOM identity.
+        page.wait_for_function("""async () => {
+          const {state} = await import('/static/state.js');
+          return state.pendingGroupFocus === null;
+        }""")
         if kind == "similar":
             page.locator("#btnSimilarView").click()
         page.locator("#members .card").first.wait_for(state="visible")
