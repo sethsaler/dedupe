@@ -993,7 +993,7 @@ def run_scan(
             crop_count = sum(len(group.members) for group in crop_groups)
             _stage_progress(
                 "borders",
-                f"Found {crop_count} image{'' if crop_count == 1 else 's'} "
+                f"Found {crop_count} file{'' if crop_count == 1 else 's'} "
                 "to crop",
                 0,
                 0,
@@ -1263,7 +1263,7 @@ def run_scan(
             duration_seconds=stage_durations.get("black_borders", 0.0),
             warnings=(
                 [
-                    f"{len(stage_errors['black_borders'])} image(s) could not be "
+                    f"{len(stage_errors['black_borders'])} file(s) could not be "
                     + "checked for crops"
                 ]
                 if stage_errors["black_borders"]

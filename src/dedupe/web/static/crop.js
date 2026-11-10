@@ -1,6 +1,7 @@
-// Crop review: images framed by black bars or screenshot interface. Each card shows the picture with
-// the suggested crop drawn on it — the bars that would go are shaded — and
-// one click applies it. The file is rewritten in place and the untouched
+// Crop review: images and videos framed by black bars or screenshot interface.
+// Each card shows the picture (a video's poster frame) with the suggested crop
+// drawn on it — the bars that would go are shaded — and one click applies it.
+// The file is rewritten in place (videos are re-encoded) and the untouched
 // original goes to the Trash, so every crop has an Undo. Skip declines a
 // suggestion; it is remembered so the same file is not suggested again.
 
@@ -69,7 +70,9 @@ function evidenceFor(member) {
   if (member.crop_state === "skipped") {
     return `Skipped · ${size} would remove ${removed}% of the frame`;
   }
-  return `${cropKind(crop)}: ${barsLabel(crop)} · ${size} (removes ${removed}%)`;
+  // A video crop re-encodes the whole clip; say so before the click, not after.
+  const reencode = member.media_type === "video" ? " · cropping re-encodes the video" : "";
+  return `${cropKind(crop)}: ${barsLabel(crop)} · ${size} (removes ${removed}%)${reencode}`;
 }
 
 function cardHtml(g, member, index) {
@@ -95,7 +98,7 @@ function cardHtml(g, member, index) {
       : state_ === "skipped"
         ? `<button class="btn ghost crop-unskip" data-path="${escapeHtml(member.path)}" type="button" title="Suggest this crop again">Reconsider</button>`
         : `<button class="btn primary crop-apply" data-path="${escapeHtml(member.path)}" type="button" title="Crop now — the original goes to the Trash (c)">Crop</button>
-           <button class="btn ghost crop-skip" data-path="${escapeHtml(member.path)}" type="button" title="Leave this image as it is and stop suggesting it (x)">Skip</button>`;
+           <button class="btn ghost crop-skip" data-path="${escapeHtml(member.path)}" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>`;
   return `
     <article class="card crop-card ${state_} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
       <button class="thumb-wrap crop-thumb" type="button" data-path="${escapeHtml(member.path)}" aria-label="Open ${escapeHtml(name)} in the lightbox">
@@ -111,6 +114,7 @@ function cardHtml(g, member, index) {
         <div class="card-meta">
           <span>${formatBytes(member.size)}</span>
           <span>${member.width && member.height ? `${member.width}×${member.height}` : "—"}</span>
+          ${member.media_type === "video" ? `<span>▶ Video${member.duration != null ? ` · ${Number(member.duration).toFixed(1)}s` : ""}</span>` : ""}
         </div>
         <div class="evidence" title="${escapeHtml(evidenceFor(member))}">${escapeHtml(evidenceFor(member))}</div>
         <div class="card-actions crop-actions">
@@ -252,7 +256,7 @@ function renderCropReview(g) {
   }));
   updateCropMeta(g);
   if (!members.length) {
-    box.innerHTML = '<div class="triage-empty">No images to crop.</div>';
+    box.innerHTML = '<div class="triage-empty">No files to crop.</div>';
     delete box.dataset.cropGroup;
     return;
   }
@@ -352,9 +356,20 @@ function dismissCropUndoToast(path = null) {
   if (!$("toast").hidden && $("toastMessage")?.textContent === cropUndoMessage(shown)) hideToast();
 }
 
+// A video crop re-encodes the whole clip and can take minutes; the button
+// says so while it runs instead of looking idle.
+function markCropping(path, cropping) {
+  const card = document.querySelector(`.crop-card[data-path="${CSS.escape(path)}"]`);
+  const button = card?.querySelector(".crop-apply");
+  if (!button) return;
+  button.disabled = cropping;
+  button.textContent = cropping ? "Cropping…" : "Crop";
+}
+
 async function applyCrop(g, path, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
   busy.add(path);
+  markCropping(path, true);
   try {
     const updated = await post("/api/crop/apply", { group_id: g.id, path, scan_id: state.scanId });
     applyUpdate(updated);
@@ -366,9 +381,10 @@ async function applyCrop(g, path, { fromKeyboard = false } = {}) {
     });
     cropUndoToastPath = path;
   } catch (error) {
-    toast(error.message || "Could not crop that image", "error");
+    toast(error.message || "Could not crop that file", "error");
   } finally {
     busy.delete(path);
+    markCropping(path, false);
   }
 }
 
@@ -407,9 +423,10 @@ async function cropAllRemaining() {
   if (!g || g.kind !== "crop") return;
   const pending = pendingMembers(g);
   if (!pending.length) return;
+  const videos = pending.filter((member) => member.media_type === "video").length;
   const ok = await confirmModal({
-    title: `Crop ${pending.length} image${pending.length === 1 ? "" : "s"}?`,
-    body: `<p>Each image is cropped to its suggested frame and rewritten in place. The originals go to the Trash, and each crop can be undone from its card.</p><p class="muted">Skipped and already cropped images are left alone.</p>`,
+    title: `Crop ${pending.length} file${pending.length === 1 ? "" : "s"}?`,
+    body: `<p>Each file is cropped to its suggested frame and rewritten in place. The originals go to the Trash, and each crop can be undone from its card.</p>${videos ? `<p>${videos} video${videos === 1 ? "" : "s"} will be re-encoded, which can take a while.</p>` : ""}<p class="muted">Skipped and already cropped files are left alone.</p>`,
     confirmLabel: `Crop ${pending.length}`,
     danger: false,
   });
@@ -421,7 +438,7 @@ async function cropAllRemaining() {
     dismissCropUndoToast();
     const failed = (updated.failures || []).length;
     toast(
-      `Cropped ${updated.cropped_count} image${updated.cropped_count === 1 ? "" : "s"}`
+      `Cropped ${updated.cropped_count} file${updated.cropped_count === 1 ? "" : "s"}`
         + (failed ? ` · ${failed} could not be cropped (${updated.failures[0].error})` : ""),
       failed ? "error" : "ok",
     );
@@ -434,7 +451,7 @@ async function cropAllRemaining() {
 
 $("btnCropAll")?.addEventListener("click", cropAllRemaining);
 
-// Keyboard: c crops the focused image, x skips it, ←/→ move between cards.
+// Keyboard: c crops the focused file, x skips it, ←/→ move between cards.
 function handleCropKey(event) {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return false;

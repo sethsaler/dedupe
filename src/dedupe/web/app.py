@@ -96,7 +96,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 30
+WEB_API_VERSION = 32
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
@@ -2200,7 +2200,8 @@ def create_app(
             for name in (
                 "size", "mtime", "mtime_ns", "ctime_ns", "device", "inode",
                 "width", "height", "sha256", "partial_hash", "phash", "dhash",
-                "tile_phashes", "orientation_phashes",
+                "tile_phashes", "orientation_phashes", "video_fingerprint",
+                "duration",
             )
         }
 
@@ -2300,6 +2301,7 @@ def create_app(
             "dhash": None,
             "tile_phashes": None,
             "orientation_phashes": None,
+            "video_fingerprint": None,
             "border_crop": "",
             "border_signature": BORDER_SIGNATURE,
         })
@@ -2318,7 +2320,7 @@ def create_app(
 
     @app.post("/api/crop/apply")
     def api_crop_apply():
-        """Crop one image in place: the original goes to the system Trash."""
+        """Crop one file in place: the original goes to the system Trash."""
         data = request.get_json(silent=True) or {}
         path = data.get("path")
         with lock:
@@ -2357,7 +2359,7 @@ def create_app(
 
     @app.post("/api/crop/apply-all")
     def api_crop_apply_all():
-        """Crop every image in the review that has no decision yet."""
+        """Crop every file in the review that has no decision yet."""
         data = request.get_json(silent=True) or {}
         with lock:
             group, refusal = begin_crop_work(data)

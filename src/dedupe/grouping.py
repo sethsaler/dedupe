@@ -335,7 +335,7 @@ def crop_review_order(member: FileRecord, box) -> tuple:
 
 
 def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
-    """Build one review collection of images with a crop suggestion,
+    """Build one review collection of files with a crop suggestion,
     ordered by :func:`crop_review_order`."""
     from .borders import suggested_crop
 

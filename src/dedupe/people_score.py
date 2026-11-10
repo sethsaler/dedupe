@@ -108,16 +108,23 @@ class PeopleScorer:
             self.net = cv2.dnn.readNet(str(PEOPLE_MODEL_PATH))
         except cv2.error as exc:
             raise RuntimeError(f"the person-detection model could not start: {exc}") from exc
-        # Only scores are read (no boxes), so the anchor grid matters only as
-        # a shape check that the bundled model is the one this code expects.
-        self._anchor_count = sum((PEOPLE_INPUT_SIZE // stride) ** 2 for stride in _STRIDES)
+        # The anchor grid both shape-checks the bundled model and decodes
+        # box geometry for person_boxes().
+        grids = []
+        strides = []
+        for stride in _STRIDES:
+            cells = PEOPLE_INPUT_SIZE // stride
+            xv, yv = np.meshgrid(np.arange(cells), np.arange(cells))
+            grids.append(np.stack((xv, yv), 2).reshape(-1, 2))
+            strides.extend([stride] * (cells * cells))
+        self._grid = np.concatenate(grids).astype(np.float32)
+        self._stride = np.array(strides, dtype=np.float32)[:, None]
+        self._anchor_count = len(strides)
 
-    def score_rgb(self, rgb) -> float:
-        """Highest person confidence (objectness × class) in one RGB frame."""
+    def _forward(self, rgb):
+        """One network pass; returns ``(output, letterbox_ratio)``."""
         cv2, np = self.cv2, self.np
         height, width = rgb.shape[:2]
-        if not height or not width:
-            return 0.0
         size = PEOPLE_INPUT_SIZE
         ratio = min(size / height, size / width)
         resized = cv2.resize(
@@ -132,8 +139,58 @@ class PeopleScorer:
         output = self.net.forward(self.net.getUnconnectedOutLayersNames())[0][0]
         if output.shape[0] != self._anchor_count:
             raise RuntimeError("unexpected person-detection model output")
+        return output, ratio
+
+    def score_rgb(self, rgb) -> float:
+        """Highest person confidence (objectness × class) in one RGB frame."""
+        if not rgb.shape[0] or not rgb.shape[1]:
+            return 0.0
+        output, _ratio = self._forward(rgb)
         scores = output[:, 4] * output[:, _PERSON_COLUMN]
         return float(max(0.0, min(1.0, scores.max())))
+
+    def person_boxes(
+        self, rgb, *, threshold: float = 0.3
+    ) -> list[tuple[float, float, float, float]]:
+        """Person boxes in ``rgb`` as fractions ``(x0, y0, x1, y1)``.
+
+        YOLOX rows are grid-relative: centers decode as
+        ``(raw + grid) * stride`` and sizes as ``exp(raw) * stride`` in
+        letterboxed input pixels, then scale back by the letterbox ratio.
+        Overlapping duplicates are merged with standard NMS.
+        """
+        cv2, np = self.cv2, self.np
+        height, width = rgb.shape[:2]
+        if not height or not width:
+            return []
+        output, ratio = self._forward(rgb)
+        scores = output[:, 4] * output[:, _PERSON_COLUMN]
+        keep = scores >= threshold
+        if not keep.any():
+            return []
+        xy = (output[:, :2] + self._grid) * self._stride
+        wh = np.exp(output[:, 2:4]) * self._stride
+        corners = np.stack(
+            [
+                (xy[:, 0] - wh[:, 0] / 2) / ratio,
+                (xy[:, 1] - wh[:, 1] / 2) / ratio,
+                wh[:, 0] / ratio,
+                wh[:, 1] / ratio,
+            ],
+            axis=1,
+        )[keep]
+        kept_scores = scores[keep]
+        chosen = cv2.dnn.NMSBoxes(corners.tolist(), kept_scores.tolist(), threshold, 0.45)
+        boxes = []
+        for index in np.ravel(chosen):
+            x, y, w, h = (float(value) for value in corners[index])
+            boxes.append((
+                min(1.0, max(0.0, x / width)),
+                min(1.0, max(0.0, y / height)),
+                min(1.0, max(0.0, (x + w) / width)),
+                min(1.0, max(0.0, (y + h) / height)),
+            ))
+        return boxes
 
 
 def _image_frames(path: Path, max_frames: int):

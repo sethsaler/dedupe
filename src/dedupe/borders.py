@@ -1,8 +1,11 @@
-"""Black-border detection and in-place cropping for still images.
+"""Black-border detection and in-place cropping for images and videos.
 
 A scan with border detection enabled looks along each edge of every
 croppable image for solid black bars — letterboxing, pillarboxing, scanner
 margins, screenshots of videos — and suggests the crop that removes them.
+MP4-family videos get the same treatment on sampled frames: a bar counts
+when most sampled frames carry it, and a human guard pulls every suggested
+crop back wherever it would cut a detected person.
 Images that look like screenshots are also checked for interface at the top
 and bottom edges: a phone's status bar (clock, battery, notification icons),
 a home indicator or navigation bar, a desktop menu bar or taskbar, and the
@@ -25,11 +28,14 @@ import ctypes
 import ctypes.util
 import errno
 import functools
+import json
 import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -40,15 +46,16 @@ from .parallel import map_parallel
 
 # Bump when the detection rules change so cached verdicts are recomputed.
 # A user's dismissal under an earlier signature still stands.
-BORDER_SIGNATURE = "black-borders-v5"
+BORDER_SIGNATURE = "black-borders-v6"
 LEGACY_BORDER_SIGNATURES = frozenset(
-    {"black-borders-v1", "black-borders-v2", "black-borders-v3", "black-borders-v4"}
+    {"black-borders-v1", "black-borders-v2", "black-borders-v3", "black-borders-v4",
+     "black-borders-v5"}
 )
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
 
 # Formats Pillow can both read and write back without changing the file type.
-# RAW, GIF (animation), and video are deliberately excluded.
+# RAW and GIF (animation) are deliberately excluded.
 CROPPABLE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -60,6 +67,10 @@ CROPPABLE_EXTENSIONS = {
     ".heic",
     ".heif",
 }
+# Containers ffmpeg can re-encode back into themselves with the H.264/HEVC
+# encoders below while stream-copying the soundtrack. Wider container
+# support (MKV, WebM, …) means more encoder/codec combinations to get right.
+VIDEO_CROPPABLE_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 
 # A bar is black: its level (the median of the outermost line) is at or
 # below this luma (0–255). JPEG ringing and sensor noise keep "black" bars a
@@ -107,6 +118,54 @@ MIN_CONTENT_FRACTION = 0.2
 # First-pass decode size. JPEGs decode at a reduced DCT scale for the quick
 # check; only images that show bars are decoded again at full resolution.
 SCREEN_MAX_SIDE = 1024
+
+# --- videos -------------------------------------------------------------------
+# Frame positions (shares of the duration) sampled for bars. The ends are
+# avoided: fades and black intros/outros live there. An edge is suggested at
+# the median thickness of the frames that carry it, when a majority do.
+VIDEO_SAMPLE_FRACTIONS = (0.08, 0.27, 0.5, 0.73, 0.92)
+# Frames carrying a picture needed before any bar is trusted.
+VIDEO_MIN_USABLE_FRAMES = 3
+# A frame with less than this share of pixels above the black-bar level is a
+# fade or a black frame: it says nothing about bars and neither vetoes nor
+# supports a crop.
+VIDEO_BLACK_FRAME_FRACTION = 0.001
+# Cropping a video means re-encoding it; there is no lossless crop. These
+# CRF values keep the generation loss small (the original stays in the Trash).
+VIDEO_H264_CRF = 18
+VIDEO_HEVC_CRF = 22
+
+# --- aggressive bars ----------------------------------------------------------
+# The strict detector above is deliberately timid: a bar must be flat to
+# 99.5% and end in a hard edge, so caption text burned into a bar, encoder
+# noise in the blacks, or a dark-gray bar all defeat it — and real libraries
+# are full of those. The aggressive pass measures the same edges with loose
+# rules: a line belongs to the bar while most of it sits near the bar's
+# level, sparse ink (captions, subtitles, watermarks) inside the bar is
+# cropped with it, and no hard edge is required. What keeps this safe is not
+# timidity but the human guard below: an aggressive edge never removes a
+# detected face or body, and where the guard cannot run (no OpenCV), the
+# aggressive pass does not contribute at all.
+AGGRESSIVE_DARK_LUMA = 48
+AGGRESSIVE_TOLERANCE = 20
+# Share of a line that must sit near the bar's level; the rest may be ink.
+AGGRESSIVE_LINE_FRACTION = 0.85
+# A line at most this near the level is clearly picture and ends the bar;
+# lines between the two (a big watermark's rows) are tolerated gaps.
+AGGRESSIVE_PICTURE_FRACTION = 0.5
+# Consecutive gap lines a bar may jump, as a share of the dimension.
+AGGRESSIVE_GAP_FRACTION = 0.02
+# A video edge is suggested when more than this share of pictured frames
+# carry it (mixed boxed/full-frame clips: the majority wins).
+VIDEO_MAJORITY = 0.5
+# Guard frames are shrunk to this side before detection; the detectors
+# downscale internally anyway.
+GUARD_MAX_SIDE = 960
+# Face boxes grow by these shares of their size before guarding, so hair
+# above a forehead and shoulders beside a face are kept too.
+GUARD_FACE_EXPAND = (0.35, 0.6, 0.35, 0.35)  # left, top, right, bottom
+GUARD_BODY_EXPAND = 0.05
+GUARD_PERSON_CONFIDENCE = 0.3
 
 JPEG_SAVE_QUALITY = 95
 LOSSY_SAVE_QUALITY = 92
@@ -319,9 +378,11 @@ class CropBox:
 
 
 def is_croppable(record: FileRecord) -> bool:
+    suffix = Path(record.path).suffix.lower()
     return (
-        record.media_type == MediaType.IMAGE
-        and Path(record.path).suffix.lower() in CROPPABLE_EXTENSIONS
+        record.media_type == MediaType.IMAGE and suffix in CROPPABLE_EXTENSIONS
+    ) or (
+        record.media_type == MediaType.VIDEO and suffix in VIDEO_CROPPABLE_EXTENSIONS
     )
 
 
@@ -460,6 +521,207 @@ def detect_borders_in_array(
     if width - left - right < width * MIN_CONTENT_FRACTION:
         return None
     return top, bottom, left, right
+
+
+def _aggressive_edge_bar(lines) -> int:
+    """Thickness of a dark bar at the start of ``lines``, loosely measured.
+
+    A line belongs to the bar while at least ``AGGRESSIVE_LINE_FRACTION`` of
+    it sits near the bar's level — caption glyphs and encoder noise ride
+    along — and short stretches of heavier ink (a watermark) are jumped.
+    The bar ends at clearly-picture lines; no hard edge is required, but
+    picture must actually follow within reach, so a frame that is dark all
+    the way through yields its whole length and is rejected by the caller.
+    """
+    import numpy as np
+
+    level = float(np.median(lines[0]))
+    if level > AGGRESSIVE_DARK_LUMA:
+        return 0
+    near = (np.abs(lines.astype(np.int16) - level) <= AGGRESSIVE_TOLERANCE).mean(axis=1)
+    gap_allowed = max(4, int(len(lines) * AGGRESSIVE_GAP_FRACTION))
+    last = -1
+    gap = 0
+    for index, fraction in enumerate(near):
+        if fraction >= AGGRESSIVE_LINE_FRACTION:
+            last, gap = index, 0
+        elif fraction <= AGGRESSIVE_PICTURE_FRACTION:
+            break
+        else:
+            gap += 1
+            if gap > gap_allowed:
+                break
+    run = last + 1
+    if run == 0 or run >= len(lines):
+        return run
+    lookahead = near[run : run + max(BAR_EDGE_LINES * 3, gap_allowed)]
+    return run if lookahead.size and float(lookahead.min()) <= AGGRESSIVE_PICTURE_FRACTION else 0
+
+
+def detect_borders_aggressive(luma) -> tuple[int, int, int, int] | None:
+    """Loose black-bar thickness ``(top, bottom, left, right)`` for a luma array.
+
+    The aggressive counterpart of :func:`detect_borders_in_array`: same size
+    and content limits, but bars may be dark gray, noisy, and hold sparse
+    ink. Callers must run the human guard before suggesting these bars.
+    """
+    import numpy as np
+
+    height, width = luma.shape[:2]
+    if height < 8 or width < 8:
+        return None
+    reach_rows = height - int(np.ceil(height * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
+    reach_cols = width - int(np.ceil(width * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
+    top = _aggressive_edge_bar(luma[:reach_rows])
+    if top >= height:
+        return None
+    bottom = _aggressive_edge_bar(luma[::-1][:reach_rows])
+    left = _aggressive_edge_bar(luma.T[:reach_cols])
+    right = _aggressive_edge_bar(luma.T[::-1][:reach_cols])
+    min_rows = max(MIN_BORDER_PIXELS, int(np.ceil(height * MIN_BORDER_FRACTION)))
+    min_cols = max(MIN_BORDER_PIXELS, int(np.ceil(width * MIN_BORDER_FRACTION)))
+    top = top if top >= min_rows else 0
+    bottom = bottom if bottom >= min_rows else 0
+    left = left if left >= min_cols else 0
+    right = right if right >= min_cols else 0
+    if not (top or bottom or left or right):
+        return None
+    if height - top - bottom < height * MIN_CONTENT_FRACTION:
+        return None
+    if width - left - right < width * MIN_CONTENT_FRACTION:
+        return None
+    return top, bottom, left, right
+
+
+def _combined_bars(luma, *, speck=False, aggressive: bool = True):
+    """Per-edge maximum of the strict and (when allowed) aggressive bars."""
+    height, width = luma.shape[:2]
+    strict = detect_borders_in_array(luma, speck=speck)
+    if not aggressive:
+        return strict
+    loose = detect_borders_aggressive(luma)
+    if loose is None:
+        return strict
+    if strict is None:
+        return loose
+    combined = tuple(max(a, b) for a, b in zip(strict, loose))
+    if height - combined[0] - combined[1] < height * MIN_CONTENT_FRACTION:
+        return loose
+    if width - combined[2] - combined[3] < width * MIN_CONTENT_FRACTION:
+        return loose
+    return combined
+
+
+# --- human guard --------------------------------------------------------------
+# Faces (bundled YuNet) plus bodies (bundled YOLOX, the people-score model),
+# one detector set per thread. Only files with a crop suggestion are ever
+# guarded, so the cost stays on the candidate pile. Any failure to start the
+# guard disables the aggressive pass entirely; the strict detector's
+# timidity is the fallback. (HOG body detection was tried first and fired
+# dozens of frame-spanning false boxes on ordinary footage.)
+
+_guard_local = threading.local()
+
+
+def _get_guard():
+    """``(face_counter, people_scorer)`` for this thread, or ``None``."""
+    cached = getattr(_guard_local, "guard", False)
+    if cached is not False:
+        return cached
+    guard = None
+    try:
+        from .face_detection import _YuNetFaceCounter
+        from .people_score import PeopleScorer
+
+        guard = (_YuNetFaceCounter(), PeopleScorer())
+    except Exception:
+        guard = None
+    _guard_local.guard = guard
+    return guard
+
+
+def _human_guard_available() -> bool:
+    return _get_guard() is not None
+
+
+def _guard_shrunk(rgb):
+    """``rgb`` (a numpy frame) shrunk to the guard's working size."""
+    import cv2
+
+    height, width = rgb.shape[:2]
+    longest = max(width, height)
+    if longest <= GUARD_MAX_SIDE:
+        return rgb
+    scale = GUARD_MAX_SIDE / longest
+    return cv2.resize(
+        rgb,
+        (max(1, round(width * scale)), max(1, round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def _human_guard_boxes(rgb) -> list[tuple[float, float, float, float]] | None:
+    """Face and body boxes in ``rgb`` as fractions ``(x0, y0, x1, y1)``.
+
+    ``None`` when the guard cannot run; an empty list when it ran and found
+    nobody. Face boxes are expanded so hair and shoulders are kept too.
+    """
+    guard = _get_guard()
+    if guard is None:
+        return None
+    counter, scorer = guard
+    cv2 = counter.cv2
+    try:
+        frame = _guard_shrunk(rgb)
+        boxes: list[tuple[float, float, float, float]] = []
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        faces, candidate = counter._detect_best(bgr)
+        if faces is not None and len(faces):
+            cand_h, cand_w = candidate.shape[:2]
+            expand_x0, expand_y0, expand_x1, expand_y1 = GUARD_FACE_EXPAND
+            for face in faces:
+                x, y, w, h = (float(value) for value in face[:4])
+                boxes.append((
+                    max(0.0, (x - expand_x0 * w) / cand_w),
+                    max(0.0, (y - expand_y0 * h) / cand_h),
+                    min(1.0, (x + w + expand_x1 * w) / cand_w),
+                    min(1.0, (y + h + expand_y1 * h) / cand_h),
+                ))
+        for x0, y0, x1, y1 in scorer.person_boxes(frame, threshold=GUARD_PERSON_CONFIDENCE):
+            grow_x = GUARD_BODY_EXPAND * (x1 - x0)
+            grow_y = GUARD_BODY_EXPAND * (y1 - y0)
+            boxes.append((
+                max(0.0, x0 - grow_x),
+                max(0.0, y0 - grow_y),
+                min(1.0, x1 + grow_x),
+                min(1.0, y1 + grow_y),
+            ))
+        return boxes
+    except Exception:
+        return None
+
+
+def _guarded_bars(bars, boxes, width: int, height: int):
+    """Pull each bar back so no ``boxes`` person loses a pixel to the crop."""
+    top, bottom, left, right = bars
+    for x0, y0, x1, y1 in boxes:
+        top = min(top, int(y0 * height))
+        bottom = min(bottom, height - int(y1 * height + 0.999))
+        left = min(left, int(x0 * width))
+        right = min(right, width - int(x1 * width + 0.999))
+    return (max(0, top), max(0, bottom), max(0, left), max(0, right))
+
+
+def _guard_floor(combined, strict, boxes, width: int, height: int):
+    """Guarded bars, never below what the strict detector already proved.
+
+    A strict bar is flat with a hard edge against the picture, so a person
+    cannot be hiding in it; the guard only arbitrates the aggressive
+    extension past it. This also keeps a detector false positive (HOG fires
+    on some textures) from erasing a proven bar.
+    """
+    guarded = _guarded_bars(combined, boxes, width, height)
+    return tuple(max(kept, proven) for kept, proven in zip(guarded, strict))
 
 
 def _flattened(image):
@@ -1511,22 +1773,41 @@ def _box_for(upright, *, chrome: tuple[int, int] = (0, 0), speck: bool = False) 
     """Combine interface bars with black bars inside them into one crop.
 
     Where the walk took interface at an edge it took the status bar, where a
-    privacy dot sits, so a speck past it is the picture's own.
+    privacy dot sits, so a speck past it is the picture's own. Black bars are
+    the strict and aggressive passes combined; the total crop is then pulled
+    back by the human guard so no detected person is cut. Where the guard
+    cannot run, only the strict bars contribute.
     """
+    import numpy as np
+
     width, height = upright.size
     chrome_top, chrome_bottom = chrome
     luma = _luma(upright)[chrome_top : height - chrome_bottom]
     specks = (speck and not chrome_top, speck and not chrome_bottom)
-    bars = detect_borders_in_array(luma, speck=specks) or (0, 0, 0, 0)
+    boxes = _human_guard_boxes(np.asarray(_flattened(upright)))
+    strict = detect_borders_in_array(luma, speck=specks) or (0, 0, 0, 0)
+    bars = _combined_bars(luma, speck=specks, aggressive=boxes is not None) or (0, 0, 0, 0)
     top = chrome_top + bars[0]
     bottom = chrome_bottom + bars[1]
     left, right = bars[2], bars[3]
     if not (top or bottom or left or right):
         return None
+    if boxes:
+        proven = (chrome_top + strict[0], chrome_bottom + strict[1], strict[2], strict[3])
+        top, bottom, left, right = _guard_floor(
+            (top, bottom, left, right), proven, boxes, width, height
+        )
+        if not (top or bottom or left or right):
+            return None
     if height - top - bottom < height * MIN_CONTENT_FRACTION:
         return None
     edges = tuple(
-        name for name, rows in (("top", chrome_top), ("bottom", chrome_bottom)) if rows
+        name
+        for name, rows, kept in (
+            ("top", chrome_top, top),
+            ("bottom", chrome_bottom, bottom),
+        )
+        if rows and kept >= rows
     )
     box = CropBox(
         left=left,
@@ -1558,7 +1839,9 @@ def detect_black_borders(path: str | Path) -> CropBox | None:
         chrome = detect_screenshot_chrome(screened, certain=evidence != "shape")
         if any(chrome):
             return _box_for(screened, chrome=chrome, speck=True)
-    if detect_borders_in_array(_luma(screened), speck=speck) is None:
+    if _combined_bars(
+        _luma(screened), speck=speck, aggressive=_human_guard_available()
+    ) is None:
         return None
 
     upright = screened
@@ -1568,6 +1851,261 @@ def detect_black_borders(path: str | Path) -> CropBox | None:
             upright = ImageOps.exif_transpose(source)
             upright.load()
     return _box_for(upright, speck=speck)
+
+
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _probe_video_stream(path: str | Path) -> dict | None:
+    """The first video stream's facts, in display orientation.
+
+    ``width``/``height`` are the displayed size: a quarter-turn in the
+    stream's rotation side data (or a legacy ``rotate`` tag) swaps the coded
+    dimensions, matching what ffmpeg's auto-rotation produces on decode —
+    the video counterpart of an image's EXIF transpose.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries",
+                ("format=duration:stream=duration,width,height,codec_name,pix_fmt"
+                 ":stream_tags=rotate:stream_side_data=rotation"),
+                "-of", "json", str(path),
+            ],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    streams = data.get("streams") or []
+    if not streams:
+        return None
+    stream = streams[0]
+    try:
+        width, height = int(stream["width"]), int(stream["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    duration = None
+    for raw in (stream.get("duration"), (data.get("format") or {}).get("duration")):
+        try:
+            candidate = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if candidate > 0:
+            duration = candidate
+            break
+    rotation = 0
+    for side in stream.get("side_data_list") or []:
+        if isinstance(side, dict) and side.get("rotation") is not None:
+            try:
+                rotation = round(float(side["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    if not rotation:
+        try:
+            rotation = round(float((stream.get("tags") or {}).get("rotate", 0)))
+        except (TypeError, ValueError):
+            rotation = 0
+    if rotation % 360 in (90, 270):
+        width, height = height, width
+    return {
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "codec_name": stream.get("codec_name") or "",
+        "pix_fmt": stream.get("pix_fmt") or "",
+    }
+
+
+def _video_frame_luma(path: str | Path, timestamp: float):
+    """One frame's luma at native (display) size, or ``None`` when unreadable.
+
+    Decoding honours the stream's rotation, as every player does, so the
+    frame is upright and bars are measured where the viewer sees them.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    from .similar_video import _hwaccel_args
+
+    hwaccel = _hwaccel_args()
+    for accel in (hwaccel, ()) if hwaccel else ((),):
+        command = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            *accel, "-ss", f"{timestamp:.6f}", "-threads", "1",
+            "-i", str(path), "-an", "-sn", "-frames:v", "1",
+            "-c:v", "ppm", "-f", "image2pipe", "pipe:1",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=60, check=False)
+        except Exception:
+            return None
+        if result.returncode == 0 and result.stdout.startswith(b"P6"):
+            try:
+                with Image.open(BytesIO(result.stdout)) as frame:
+                    return _luma(frame)
+            except Exception:
+                return None
+    return None
+
+
+def _video_frame_rgb(path: str | Path, timestamp: float):
+    """One frame as a guard-sized RGB array (boxes are fractions, so the
+    downscale loses nothing the guard needs)."""
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    from .similar_video import _hwaccel_args
+
+    hwaccel = _hwaccel_args()
+    for accel in (hwaccel, ()) if hwaccel else ((),):
+        command = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            *accel, "-ss", f"{timestamp:.6f}", "-threads", "1",
+            "-i", str(path), "-an", "-sn", "-frames:v", "1",
+            "-vf", f"scale='min({GUARD_MAX_SIDE},iw)':-2",
+            "-c:v", "ppm", "-f", "image2pipe", "pipe:1",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=60, check=False)
+        except Exception:
+            return None
+        if result.returncode == 0 and result.stdout.startswith(b"P6"):
+            try:
+                with Image.open(BytesIO(result.stdout)) as frame:
+                    return np.asarray(frame.convert("RGB"))
+            except Exception:
+                return None
+    return None
+
+
+def _majority_bars(per_frame) -> tuple[int, int, int, int] | None:
+    """Bars the majority of pictured frames carry, at their median thickness.
+
+    ``per_frame`` holds one bar tuple (or ``None`` for a black/unreadable
+    frame) per sampled position. Mixed clips — boxed main content with a
+    full-frame intro or tail — take the majority's bars; a minority of
+    full-frame segments is cropped into, which the human guard then checks
+    frame by frame. Fewer than ``VIDEO_MIN_USABLE_FRAMES`` pictured frames
+    prove nothing.
+    """
+    import numpy as np
+
+    pictured = [bars for bars in per_frame if bars is not None]
+    if len(pictured) < VIDEO_MIN_USABLE_FRAMES:
+        return None
+    edges = []
+    for edge in range(4):
+        positives = [bars[edge] for bars in pictured if bars[edge] > 0]
+        if len(positives) > len(pictured) * VIDEO_MAJORITY:
+            edges.append(int(np.median(positives)))
+        else:
+            edges.append(0)
+    return tuple(edges) if any(edges) else None
+
+
+def _frame_bars(lumas, *, aggressive: bool):
+    """Per-frame bar tuples; ``None`` where a frame is black or unreadable."""
+    import numpy as np
+
+    per_frame = []
+    for luma in lumas:
+        if luma is None or (
+            float(np.mean(luma > DARK_LUMA + BAR_TOLERANCE)) < VIDEO_BLACK_FRAME_FRACTION
+        ):
+            per_frame.append(None)
+        else:
+            per_frame.append(_combined_bars(luma, aggressive=aggressive) or (0, 0, 0, 0))
+    return per_frame
+
+
+def _screened(luma):
+    """``luma`` shrunk to the quick-check size, like an image's first pass."""
+    import numpy as np
+    from PIL import Image
+
+    height, width = luma.shape[:2]
+    longest = max(width, height)
+    if longest <= SCREEN_MAX_SIDE:
+        return luma
+    scale = SCREEN_MAX_SIDE / longest
+    shrunk = Image.fromarray(luma).resize(
+        (max(8, round(width * scale)), max(8, round(height * scale)))
+    )
+    return np.asarray(shrunk)
+
+
+def detect_video_borders(path: str | Path) -> CropBox | None:
+    """Suggest the crop for a video: the bars most sampled frames carry.
+
+    The box is in display orientation (rotation applied, as players show the
+    clip), pulled back by the human guard wherever a sampled frame puts a
+    person in the removed strips, and pulled in to even offsets and
+    dimensions, which the 4:2:0 encoders used to apply the crop require.
+    Without the guard only strict, majority bars are suggested.
+    """
+    if not _ffmpeg_available():
+        return None
+    probe = _probe_video_stream(path)
+    if probe is None or not probe["duration"]:
+        return None
+    width, height = probe["width"], probe["height"]
+    timestamps = [probe["duration"] * fraction for fraction in VIDEO_SAMPLE_FRACTIONS]
+    frames = [_video_frame_luma(path, stamp) for stamp in timestamps]
+    frames = [
+        frame if frame is not None and frame.shape[:2] == (height, width) else None
+        for frame in frames
+    ]
+    aggressive = _human_guard_available()
+    if _majority_bars(_frame_bars(
+        [_screened(frame) if frame is not None else None for frame in frames],
+        aggressive=aggressive,
+    )) is None:
+        return None
+    bars = _majority_bars(_frame_bars(frames, aggressive=aggressive))
+    if bars is None:
+        return None
+    if aggressive:
+        boxes: list[tuple[float, float, float, float]] = []
+        for stamp, frame in zip(timestamps, frames):
+            if frame is None:
+                continue
+            rgb = _video_frame_rgb(path, stamp)
+            found = _human_guard_boxes(rgb) if rgb is not None else None
+            if found:
+                boxes.extend(found)
+        if boxes:
+            proven = _majority_bars(_frame_bars(frames, aggressive=False)) or (0, 0, 0, 0)
+            bars = _guard_floor(bars, proven, boxes, width, height)
+            if not any(bars):
+                return None
+    top, bottom, left, right = bars
+    # Even offsets and sizes, always inward: at most one picture line is
+    # given up per edge, and no black line is ever brought back.
+    box = CropBox(
+        left=left + left % 2,
+        top=top + top % 2,
+        right=width - right - (width - right) % 2,
+        bottom=height - bottom - (height - bottom) % 2,
+        width=width,
+        height=height,
+    )
+    if not box.is_valid():
+        return None
+    if box.crop_height < height * MIN_CONTENT_FRACTION:
+        return None
+    if box.crop_width < width * MIN_CONTENT_FRACTION:
+        return None
+    return box
 
 
 def analyze_borders(
@@ -1588,10 +2126,15 @@ def analyze_borders(
             and record.border_crop == BORDER_DISMISSED
         ):
             record.border_signature = BORDER_SIGNATURE  # "no crop" still stands
+    # Without ffmpeg a video cannot be checked; leaving its verdict unset
+    # (rather than "clean") keeps it eligible once ffmpeg is installed.
+    videos_ok = _ffmpeg_available()
     pending = [
         record
         for record in records
-        if is_croppable(record) and record.border_signature != BORDER_SIGNATURE
+        if is_croppable(record)
+        and record.border_signature != BORDER_SIGNATURE
+        and (record.media_type != MediaType.VIDEO or videos_ok)
     ]
     if not pending:
         return []
@@ -1600,7 +2143,11 @@ def analyze_borders(
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
         try:
-            box = detect_black_borders(record.path)
+            box = (
+                detect_video_borders(record.path)
+                if record.media_type == MediaType.VIDEO
+                else detect_black_borders(record.path)
+            )
         except Exception as exc:
             return f"border check failed for {record.path}: {exc}"
         record.border_crop = box.encode() if box else ""
@@ -1690,6 +2237,110 @@ def write_cropped_copy(path: Path, box: CropBox, destination: Path) -> tuple[int
             f"cropped file has unexpected dimensions {written[0]}×{written[1]}"
         )
     return written
+
+
+@functools.cache
+def _ffmpeg_encoders() -> frozenset[str]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return frozenset()
+    names = set()
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("V"):
+            names.add(parts[1])
+    return frozenset(names)
+
+
+def _video_encoder_args(probe: dict) -> list[str]:
+    """Encoder options keeping the source's codec family and bit depth.
+
+    HEVC sources (and anything 10-bit, where H.264 would silently drop to
+    8-bit) re-encode as HEVC tagged ``hvc1`` for Apple players; everything
+    else becomes H.264. Audio and subtitles are stream-copied by the caller.
+    """
+    pix_fmt = probe["pix_fmt"]
+    ten_bit = "10" in pix_fmt or "12" in pix_fmt
+    if probe["codec_name"] == "hevc" or ten_bit:
+        encoder, crf = "libx265", VIDEO_HEVC_CRF
+        args = ["-tag:v", "hvc1"]
+        pixel = "yuv420p10le" if ten_bit else "yuv420p"
+    else:
+        encoder, crf, args, pixel = "libx264", VIDEO_H264_CRF, [], "yuv420p"
+    if encoder not in _ffmpeg_encoders():
+        raise RuntimeError(f"ffmpeg encoder {encoder} is not available")
+    return [
+        "-c:v", encoder, "-crf", str(crf), "-preset", "medium",
+        "-pix_fmt", pixel, *args,
+    ]
+
+
+def write_cropped_video_copy(path: Path, box: CropBox, destination: Path) -> tuple[int, int]:
+    """Write ``path`` re-encoded cropped to ``box`` at ``destination``.
+
+    The crop runs on the decoded (auto-rotated) frames, so the output is
+    upright with no rotation tag left to apply — just as a cropped image is
+    saved upright. Frame timing is passed through untouched (phone clips are
+    variable-frame-rate; forcing constant rate would duplicate frames and
+    drift against the copied soundtrack), container metadata carries over,
+    and the written file is probed before it may replace anything.
+    """
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg/ffprobe not available")
+    probe = _probe_video_stream(path)
+    if probe is None:
+        raise ValueError("could not read the video stream")
+    if (probe["width"], probe["height"]) != (box.width, box.height):
+        raise ValueError(
+            "video dimensions changed since the scan "
+            f"({box.width}×{box.height} -> {probe['width']}×{probe['height']})"
+        )
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+        "-vf", f"crop={box.crop_width}:{box.crop_height}:{box.left}:{box.top}",
+        "-fps_mode", "passthrough",
+        *_video_encoder_args(probe),
+        "-c:a", "copy", "-c:s", "copy",
+        "-map_metadata", "0", "-movflags", "+faststart",
+        "-y", str(destination),
+    ]
+    # Re-encoding runs at best a few times realtime; allow generously for
+    # slow 4K encodes rather than kill a nearly-finished crop.
+    timeout = max(600.0, (probe["duration"] or 60.0) * 30 + 300)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                                check=False)
+        if result.returncode != 0 and "fps_mode" in (result.stderr or ""):
+            # An ffmpeg too old for -fps_mode rejects it before encoding.
+            legacy = [part for part in command if part not in ("-fps_mode", "passthrough")]
+            result = subprocess.run(legacy, capture_output=True, text=True, timeout=timeout,
+                                    check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("video re-encode timed out") from exc
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()
+        detail = tail[-1] if tail else f"ffmpeg exited {result.returncode}"
+        raise RuntimeError(f"ffmpeg could not crop the video: {detail}")
+    written = _probe_video_stream(destination)
+    if written is None:
+        raise ValueError("cropped video could not be read back")
+    if (written["width"], written["height"]) != (box.crop_width, box.crop_height):
+        raise ValueError(
+            "cropped file has unexpected dimensions "
+            f"{written['width']}×{written['height']}"
+        )
+    if (
+        probe["duration"] and written["duration"]
+        and abs(written["duration"] - probe["duration"]) > max(2.0, probe["duration"] * 0.05)
+    ):
+        raise ValueError("cropped video has an unexpected duration")
+    return written["width"], written["height"]
 
 
 # --- locked files and file metadata ---------------------------------------
@@ -1888,7 +2539,10 @@ def crop_file_in_place(
             f".{original.stem}.dedupe-crop-{uuid.uuid4().hex[:8]}{original.suffix}"
         )
         try:
-            width, height = write_cropped_copy(original, box, temp)
+            if record.media_type == MediaType.VIDEO:
+                width, height = write_cropped_video_copy(original, box, temp)
+            else:
+                width, height = write_cropped_copy(original, box, temp)
             copy_xattrs(original, temp)
             os.chmod(temp, stat.S_IMODE(before.st_mode))
             os.utime(temp, ns=(before.st_atime_ns, before.st_mtime_ns))
