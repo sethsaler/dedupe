@@ -1000,6 +1000,15 @@ def test_clicking_a_triage_picture_trashes_it_and_its_trash_button_enlarges(
         page.locator("#members .triage-card").first.wait_for(state="visible")
         assert page.locator("#members .card").count() == 3
 
+        # The picture trashes rather than enlarges, so hovering it shows the
+        # plain click pointer, not the zoom-in magnifying glass.
+        thumb_cursor = page.evaluate(
+            "getComputedStyle("
+            "document.querySelector('#members .thumb-wrap[data-click-trash]')"
+            ").cursor"
+        )
+        assert thumb_cursor == "pointer"
+
         # The former Trash button is now the way to enlarge a picture.
         expect(page.locator("#members .card-actions .enlarge-candidate")).to_have_count(3)
         expect(page.locator("#members .card-actions .enlarge-candidate").first).to_have_text(

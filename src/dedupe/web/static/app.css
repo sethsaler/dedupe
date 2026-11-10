@@ -1615,6 +1615,10 @@ kbd {
   cursor: zoom-in;
 }
 
+/* Triage pictures move to Trash on click instead of enlarging, so they take
+   the plain click pointer rather than the magnifying glass. */
+.thumb-wrap[data-click-trash] { cursor: pointer; }
+
 /* Tall originals should fit on screen without scrolling through the preview. */
 .card:not(.triage-card) .thumb-wrap { max-height: 58vh; }
 
