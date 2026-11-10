@@ -49,6 +49,20 @@ const CROP_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 // The smallest zone a drag can make, in picture pixels per side.
 const MIN_CROP_PX = 8;
 
+// Aggressiveness levels: every candidate was measured at all three in one
+// pass. The level on show is the suggestion Crop (and Crop all) cuts.
+const CROP_LEVELS = ["conservative", "balanced", "aggressive"];
+const CROP_LEVEL_LABELS = {
+  conservative: "Conservative",
+  balanced: "Balanced",
+  aggressive: "Aggressive",
+};
+const CROP_LEVEL_TITLES = {
+  conservative: "Conservative — only flat black bars with a hard edge",
+  balanced: "Balanced — also bars holding captions or encoder noise",
+  aggressive: "Aggressive — also dark-gray, noisier and thinner bars",
+};
+
 // Paths whose suggested crop zone is currently hidden, so the untouched
 // picture can be compared against what a crop would remove. Visual only.
 const hiddenZones = new Set();
@@ -66,6 +80,12 @@ function thumbUrl(member) {
 
 function pendingMembers(g) {
   return (g.members || []).filter((member) => member.crop_state === "pending" && !member.protected);
+}
+
+// Pending files a Crop all click would actually cut: the level on show (or
+// a dragged zone) gives them a box. The rest stay undecided.
+function croppableMembers(g) {
+  return pendingMembers(g).filter((member) => effectiveBox(member));
 }
 
 function edgesOf(box) {
@@ -178,7 +198,10 @@ function cropKind(crop) {
 }
 
 function evidenceFor(member, crop = effectiveBox(member)) {
-  if (!crop) return "No crop suggestion";
+  if (!crop) {
+    const label = CROP_LEVEL_LABELS[member.crop_level] || "Balanced";
+    return `No crop suggested at the ${label} level`;
+  }
   const removed = Math.round((crop.removed_fraction || 0) * 100);
   const size = `${crop.width}×${crop.height} → ${crop.crop_width}×${crop.crop_height}`;
   if (member.crop_state === "cropped") {
@@ -229,6 +252,23 @@ function cropBoxHtml(member, name, editable) {
   return `<span class="crop-box editable" tabindex="0" role="group" aria-label="${escapeHtml(cropBoxLabel(name))}" title="Drag to move · drag an edge or corner to resize">${handles}</span>`;
 }
 
+// The level switch under a card's evidence line. Every level is offered —
+// switching to one that suggested nothing shows the untouched picture —
+// and the one on show names the box a Crop click cuts.
+function levelSwitchHtml(member, name) {
+  if ((member.crop_state || "pending") === "cropped") return "";
+  const levels = member.crop_levels || {};
+  if (!CROP_LEVELS.some((level) => levels[level])) return "";
+  const current = member.crop_level || "balanced";
+  const buttons = CROP_LEVELS.map((level, index) => {
+    const title = `${CROP_LEVEL_TITLES[level]}${levels[level] ? "" : " (no suggestion at this level)"} (${index + 1})`;
+    return `<button class="crop-level-btn ${level === current ? "chosen" : ""}" type="button"
+      data-level="${level}" data-path="${escapeHtml(member.path)}"
+      aria-pressed="${level === current}" title="${escapeHtml(title)}">${CROP_LEVEL_LABELS[level]}</button>`;
+  }).join("");
+  return `<div class="crop-levels" role="group" aria-label="Crop aggressiveness for ${escapeHtml(name)}">${buttons}</div>`;
+}
+
 function cardHtml(g, member, index) {
   const name = basename(member.path);
   const state_ = member.crop_state || "pending";
@@ -254,7 +294,7 @@ function cardHtml(g, member, index) {
       ? `<button class="btn ghost crop-undo" data-path="${escapeHtml(member.path)}" type="button" ${member.crop_undo_available ? "" : "disabled title=\"The original's place in the Trash is unknown\""}>Undo crop</button>`
       : state_ === "skipped"
         ? `<button class="btn ghost crop-unskip" data-path="${escapeHtml(member.path)}" type="button" title="Suggest this crop again">Reconsider</button>`
-        : `<button class="btn primary crop-apply" data-path="${escapeHtml(member.path)}" type="button" title="Crop now — the original goes to the Trash (c)">Crop</button>
+        : `<button class="btn primary crop-apply" data-path="${escapeHtml(member.path)}" type="button" ${crop ? 'title="Crop now — the original goes to the Trash (c)"' : "disabled title=\"The level on show suggests no crop for this file\""}>Crop</button>
            <button class="btn ghost crop-skip" data-path="${escapeHtml(member.path)}" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>`;
   return `
     <article class="card crop-card ${state_} ${zoneHidden ? "crop-zone-hidden" : ""} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
@@ -274,6 +314,7 @@ function cardHtml(g, member, index) {
           ${member.media_type === "video" ? `<span>▶ Video${member.duration != null ? ` · ${Number(member.duration).toFixed(1)}s` : ""}</span>` : ""}
         </div>
         <div class="evidence" title="${escapeHtml(evidenceFor(member))}">${escapeHtml(evidenceFor(member))}</div>
+        ${levelSwitchHtml(member, name)}
         <div class="card-actions crop-actions">
           ${primary}
           ${adjusted ? `<button class="btn ghost crop-reset" data-path="${escapeHtml(member.path)}" type="button" title="Put the suggested crop zone back">Reset zone</button>` : ""}
@@ -315,8 +356,16 @@ function placeInFrame(element, crop) {
 function cardSignature(member) {
   const crop = effectiveBox(member);
   const suggested = member.crop_suggested;
+  const levels = CROP_LEVELS
+    .map((level) => {
+      const box = (member.crop_levels || {})[level];
+      return box ? [box.left, box.top, box.right, box.bottom].join(",") : "";
+    })
+    .join(";");
   return [
     member.crop_state || "pending",
+    member.crop_level || "balanced",
+    levels,
     member.protected ? 1 : 0,
     member.crop_undo_available ? 1 : 0,
     member.size,
@@ -378,6 +427,11 @@ function bindCard(card) {
     }
     state.memberFocus = Number(card.dataset.index);
     openLightbox(state.memberFocus);
+  });
+  card.querySelectorAll(".crop-level-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      chooseCropLevel(currentGroup(), button.dataset.path, button.dataset.level);
+    });
   });
   card.querySelector(".crop-apply")?.addEventListener("click", (event) => {
     applyCrop(currentGroup(), event.currentTarget.dataset.path);
@@ -679,11 +733,16 @@ function updateCropMeta(g) {
   const cropped = members.filter((m) => m.crop_state === "cropped").length;
   const skipped = members.filter((m) => m.crop_state === "skipped").length;
   const pending = pendingMembers(g).length;
+  const croppable = croppableMembers(g).length;
   $("detailMeta").textContent =
     `${pending} to review · ${cropped} cropped · ${skipped} skipped · originals go to the Trash, so every crop can be undone`;
   const all = $("btnCropAll");
-  all.hidden = pending === 0;
-  all.textContent = `Crop all ${pending} remaining`;
+  all.hidden = croppable === 0;
+  all.textContent = `Crop all ${croppable} remaining`;
+  const levelAll = $("cropLevelAll");
+  if (levelAll && document.activeElement !== levelAll) {
+    levelAll.value = g.crop_level || "balanced";
+  }
   syncCropZonesButton(g);
 }
 
@@ -867,6 +926,33 @@ async function applyCrop(g, path, { fromKeyboard = false } = {}) {
   }
 }
 
+// Show one file at another level — or, without a path, the whole review.
+// The server stores the choice with the group; a dragged zone survives it.
+async function chooseCropLevel(g, path, level) {
+  if (!g || !CROP_LEVELS.includes(level)) return;
+  if (path && busy.has(path)) return;
+  const member = path
+    ? (g.members || []).find((m) => m.path === path)
+    : null;
+  if (member && (member.crop_level || "balanced") === level) return;
+  if (path) busy.add(path);
+  try {
+    const updated = await post("/api/crop/level", {
+      group_id: g.id, scan_id: state.scanId, level, ...(path ? { path } : {}),
+    });
+    applyUpdate(updated);
+  } catch (error) {
+    toast(error.message || "Could not change the crop level", "error");
+    if (!path) updateCropMeta(g); // put the header select back
+  } finally {
+    if (path) busy.delete(path);
+  }
+}
+
+$("cropLevelAll")?.addEventListener("change", (event) => {
+  chooseCropLevel(currentGroup(), null, event.currentTarget.value);
+});
+
 async function skipCrop(g, path, skip, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
   busy.add(path);
@@ -915,7 +1001,7 @@ async function undoCrop(g, path) {
 async function cropAllRemaining() {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return;
-  const pending = pendingMembers(g);
+  const pending = croppableMembers(g);
   if (!pending.length) return;
   const videos = pending.filter((member) => member.media_type === "video").length;
   const ok = await confirmModal({
@@ -963,8 +1049,9 @@ async function cropAllRemaining() {
 $("btnCropAll")?.addEventListener("click", cropAllRemaining);
 
 // Keyboard: c crops the focused file, x skips it, v toggles its crop
-// zone, ←/→ move between cards. On a focused zone itself, arrows move the
-// zone and Shift+arrows resize it instead.
+// zone, 1/2/3 switch its aggressiveness level, ←/→ move between cards.
+// On a focused zone itself, arrows move the zone and Shift+arrows resize
+// it instead.
 function handleCropKey(event) {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return false;
@@ -984,6 +1071,10 @@ function handleCropKey(event) {
   }
   if (event.key === "v" && member?.crop && member.crop_state !== "cropped") {
     toggleCropZone(member.path);
+    return true;
+  }
+  if (["1", "2", "3"].includes(event.key) && member && member.crop_state !== "cropped") {
+    chooseCropLevel(g, member.path, CROP_LEVELS[Number(event.key) - 1]);
     return true;
   }
   if (event.key === "ArrowRight" || event.key === "ArrowLeft") {

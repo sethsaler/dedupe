@@ -54,6 +54,31 @@ LEGACY_BORDER_SIGNATURES = frozenset(
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
 
+# --- crop aggressiveness levels ----------------------------------------------
+# Every measurement computes one suggested box per level in a single pass:
+# conservative keeps only what the strict detector (plus screenshot
+# interface) proves, balanced is the detector exactly as it behaved before
+# levels existed (strict + guarded aggressive pass), and aggressive loosens
+# the aggressive pass further — darker-gray bars, more ink and noise
+# tolerated, thinner bars surfaced — still behind the human guard. The
+# balanced box keeps living in ``border_crop`` under BORDER_SIGNATURE, so
+# verdicts cached before levels existed stay valid; the other two boxes are
+# stamped with their own signature, bumped when their rules change.
+CROP_LEVELS = ("conservative", "balanced", "aggressive")
+DEFAULT_CROP_LEVEL = "balanced"
+BORDER_LEVELS_SIGNATURE = "crop-levels-v1"
+
+
+def validate_crop_level(level: str | None) -> str:
+    """``level`` as a known crop aggressiveness level (default balanced)."""
+    if level is None:
+        return DEFAULT_CROP_LEVEL
+    if level not in CROP_LEVELS:
+        raise ValueError(
+            f"unknown crop aggressiveness {level!r}; choose one of: {', '.join(CROP_LEVELS)}"
+        )
+    return level
+
 # Formats Pillow can both read and write back without changing the file type.
 # RAW and GIF (animation) are deliberately excluded.
 CROPPABLE_EXTENSIONS = {
@@ -155,6 +180,46 @@ AGGRESSIVE_LINE_FRACTION = 0.85
 AGGRESSIVE_PICTURE_FRACTION = 0.5
 # Consecutive gap lines a bar may jump, as a share of the dimension.
 AGGRESSIVE_GAP_FRACTION = 0.02
+# The aggressive *level* runs this pass looser still: bars may be a clear
+# dark gray, noisier, hold heavier ink, and be jumped across wider gaps,
+# and thinner bars surface. The human guard arbitrates it exactly as it
+# does the balanced pass; where the guard cannot run, neither contributes.
+AGGRESSIVE_LEVEL_DARK_LUMA = 64
+AGGRESSIVE_LEVEL_TOLERANCE = 28
+AGGRESSIVE_LEVEL_LINE_FRACTION = 0.70
+AGGRESSIVE_LEVEL_PICTURE_FRACTION = 0.35
+AGGRESSIVE_LEVEL_GAP_FRACTION = 0.04
+AGGRESSIVE_LEVEL_MIN_FRACTION = 0.002
+
+
+@dataclass(frozen=True)
+class _LooseRules:
+    """Thresholds for one run of the loose (aggressive) bar pass."""
+
+    dark_luma: int
+    tolerance: int
+    line_fraction: float
+    picture_fraction: float
+    gap_fraction: float
+    min_fraction: float
+
+
+_BALANCED_LOOSE = _LooseRules(
+    dark_luma=AGGRESSIVE_DARK_LUMA,
+    tolerance=AGGRESSIVE_TOLERANCE,
+    line_fraction=AGGRESSIVE_LINE_FRACTION,
+    picture_fraction=AGGRESSIVE_PICTURE_FRACTION,
+    gap_fraction=AGGRESSIVE_GAP_FRACTION,
+    min_fraction=MIN_BORDER_FRACTION,
+)
+_AGGRESSIVE_LOOSE = _LooseRules(
+    dark_luma=AGGRESSIVE_LEVEL_DARK_LUMA,
+    tolerance=AGGRESSIVE_LEVEL_TOLERANCE,
+    line_fraction=AGGRESSIVE_LEVEL_LINE_FRACTION,
+    picture_fraction=AGGRESSIVE_LEVEL_PICTURE_FRACTION,
+    gap_fraction=AGGRESSIVE_LEVEL_GAP_FRACTION,
+    min_fraction=AGGRESSIVE_LEVEL_MIN_FRACTION,
+)
 # A video edge is suggested when more than this share of pictured frames
 # carry it (mixed boxed/full-frame clips: the majority wins).
 VIDEO_MAJORITY = 0.5
@@ -386,11 +451,32 @@ def is_croppable(record: FileRecord) -> bool:
     )
 
 
-def suggested_crop(record: FileRecord) -> CropBox | None:
-    """The record's current crop suggestion, or ``None`` (none, dismissed, stale)."""
-    if record.border_signature != BORDER_SIGNATURE:
+def suggested_crop(
+    record: FileRecord, level: str = DEFAULT_CROP_LEVEL
+) -> CropBox | None:
+    """The record's crop suggestion at ``level``, or ``None``.
+
+    ``None`` covers no suggestion at that level, a dismissal (which covers
+    every level), and a stale or never-measured verdict. The balanced box
+    is valid under ``BORDER_SIGNATURE`` alone, so records cached before
+    levels existed still answer it; the other levels need the levels
+    signature.
+    """
+    level = validate_crop_level(level)
+    if record.border_crop == BORDER_DISMISSED:
         return None
-    return CropBox.decode(record.border_crop)
+    if level == "balanced":
+        if record.border_signature != BORDER_SIGNATURE:
+            return None
+        return CropBox.decode(record.border_crop)
+    if record.border_levels_signature != BORDER_LEVELS_SIGNATURE:
+        return None
+    encoded = (
+        record.border_crop_conservative
+        if level == "conservative"
+        else record.border_crop_aggressive
+    )
+    return CropBox.decode(encoded)
 
 
 def adjust_crop_box(suggestion: CropBox, edges, *, video: bool = False) -> CropBox:
@@ -568,10 +654,10 @@ def detect_borders_in_array(
     return top, bottom, left, right
 
 
-def _aggressive_edge_bar(lines) -> int:
+def _aggressive_edge_bar(lines, rules: _LooseRules = _BALANCED_LOOSE) -> int:
     """Thickness of a dark bar at the start of ``lines``, loosely measured.
 
-    A line belongs to the bar while at least ``AGGRESSIVE_LINE_FRACTION`` of
+    A line belongs to the bar while at least ``rules.line_fraction`` of
     it sits near the bar's level — caption glyphs and encoder noise ride
     along — and short stretches of heavier ink (a watermark) are jumped.
     The bar ends at clearly-picture lines; no hard edge is required, but
@@ -581,16 +667,16 @@ def _aggressive_edge_bar(lines) -> int:
     import numpy as np
 
     level = float(np.median(lines[0]))
-    if level > AGGRESSIVE_DARK_LUMA:
+    if level > rules.dark_luma:
         return 0
-    near = (np.abs(lines.astype(np.int16) - level) <= AGGRESSIVE_TOLERANCE).mean(axis=1)
-    gap_allowed = max(4, int(len(lines) * AGGRESSIVE_GAP_FRACTION))
+    near = (np.abs(lines.astype(np.int16) - level) <= rules.tolerance).mean(axis=1)
+    gap_allowed = max(4, int(len(lines) * rules.gap_fraction))
     last = -1
     gap = 0
     for index, fraction in enumerate(near):
-        if fraction >= AGGRESSIVE_LINE_FRACTION:
+        if fraction >= rules.line_fraction:
             last, gap = index, 0
-        elif fraction <= AGGRESSIVE_PICTURE_FRACTION:
+        elif fraction <= rules.picture_fraction:
             break
         else:
             gap += 1
@@ -600,10 +686,12 @@ def _aggressive_edge_bar(lines) -> int:
     if run == 0 or run >= len(lines):
         return run
     lookahead = near[run : run + max(BAR_EDGE_LINES * 3, gap_allowed)]
-    return run if lookahead.size and float(lookahead.min()) <= AGGRESSIVE_PICTURE_FRACTION else 0
+    return run if lookahead.size and float(lookahead.min()) <= rules.picture_fraction else 0
 
 
-def detect_borders_aggressive(luma) -> tuple[int, int, int, int] | None:
+def detect_borders_aggressive(
+    luma, rules: _LooseRules = _BALANCED_LOOSE
+) -> tuple[int, int, int, int] | None:
     """Loose black-bar thickness ``(top, bottom, left, right)`` for a luma array.
 
     The aggressive counterpart of :func:`detect_borders_in_array`: same size
@@ -617,14 +705,14 @@ def detect_borders_aggressive(luma) -> tuple[int, int, int, int] | None:
         return None
     reach_rows = height - int(np.ceil(height * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
     reach_cols = width - int(np.ceil(width * MIN_CONTENT_FRACTION)) + BAR_EDGE_LINES
-    top = _aggressive_edge_bar(luma[:reach_rows])
+    top = _aggressive_edge_bar(luma[:reach_rows], rules)
     if top >= height:
         return None
-    bottom = _aggressive_edge_bar(luma[::-1][:reach_rows])
-    left = _aggressive_edge_bar(luma.T[:reach_cols])
-    right = _aggressive_edge_bar(luma.T[::-1][:reach_cols])
-    min_rows = max(MIN_BORDER_PIXELS, int(np.ceil(height * MIN_BORDER_FRACTION)))
-    min_cols = max(MIN_BORDER_PIXELS, int(np.ceil(width * MIN_BORDER_FRACTION)))
+    bottom = _aggressive_edge_bar(luma[::-1][:reach_rows], rules)
+    left = _aggressive_edge_bar(luma.T[:reach_cols], rules)
+    right = _aggressive_edge_bar(luma.T[::-1][:reach_cols], rules)
+    min_rows = max(MIN_BORDER_PIXELS, int(np.ceil(height * rules.min_fraction)))
+    min_cols = max(MIN_BORDER_PIXELS, int(np.ceil(width * rules.min_fraction)))
     top = top if top >= min_rows else 0
     bottom = bottom if bottom >= min_rows else 0
     left = left if left >= min_cols else 0
@@ -638,13 +726,13 @@ def detect_borders_aggressive(luma) -> tuple[int, int, int, int] | None:
     return top, bottom, left, right
 
 
-def _combined_bars(luma, *, speck=False, aggressive: bool = True):
-    """Per-edge maximum of the strict and (when allowed) aggressive bars."""
+def _combined_bars(luma, *, speck=False, aggressive: bool = True, rules=_BALANCED_LOOSE):
+    """Per-edge maximum of the strict and (when allowed) loose bars."""
     height, width = luma.shape[:2]
     strict = detect_borders_in_array(luma, speck=speck)
     if not aggressive:
         return strict
-    loose = detect_borders_aggressive(luma)
+    loose = detect_borders_aggressive(luma, rules)
     if loose is None:
         return strict
     if strict is None:
@@ -655,6 +743,37 @@ def _combined_bars(luma, *, speck=False, aggressive: bool = True):
     if width - combined[2] - combined[3] < width * MIN_CONTENT_FRACTION:
         return loose
     return combined
+
+
+def _level_bars(luma, *, speck=False, loose_allowed: bool = True):
+    """Bar tuples per aggressiveness level, ``None`` where a level declines.
+
+    Conservative is the strict pass alone; balanced combines strict with the
+    balanced loose pass exactly as before levels existed; aggressive takes
+    the per-edge maximum of balanced and the looser level pass, so each
+    level crops at least as much as the one below it by construction. The
+    loose passes contribute only when ``loose_allowed`` (the human guard
+    can run); the caller still guards the result before suggesting it.
+    """
+    height, width = luma.shape[:2]
+    strict = detect_borders_in_array(luma, speck=speck)
+    if not loose_allowed:
+        return {"conservative": strict, "balanced": strict, "aggressive": strict}
+    balanced = _combined_bars(luma, speck=speck)
+    loose = detect_borders_aggressive(luma, _AGGRESSIVE_LOOSE)
+    if loose is None or balanced is None:
+        aggressive = loose if balanced is None else balanced
+        if aggressive is None:
+            aggressive = strict
+    else:
+        combined = tuple(max(a, b) for a, b in zip(balanced, loose))
+        if (
+            height - combined[0] - combined[1] < height * MIN_CONTENT_FRACTION
+            or width - combined[2] - combined[3] < width * MIN_CONTENT_FRACTION
+        ):
+            combined = balanced
+        aggressive = combined
+    return {"conservative": strict, "balanced": balanced, "aggressive": aggressive}
 
 
 # --- human guard --------------------------------------------------------------
@@ -1814,14 +1933,19 @@ def detect_screenshot_chrome(image, *, certain: bool = True) -> tuple[int, int]:
     return top, bottom
 
 
-def _box_for(upright, *, chrome: tuple[int, int] = (0, 0), speck: bool = False) -> CropBox | None:
-    """Combine interface bars with black bars inside them into one crop.
+def _boxes_for(
+    upright, *, chrome: tuple[int, int] = (0, 0), speck: bool = False
+) -> dict[str, CropBox | None]:
+    """Combine interface bars with black bars inside them, one box per level.
 
     Where the walk took interface at an edge it took the status bar, where a
-    privacy dot sits, so a speck past it is the picture's own. Black bars are
-    the strict and aggressive passes combined; the total crop is then pulled
-    back by the human guard so no detected person is cut. Where the guard
-    cannot run, only the strict bars contribute.
+    privacy dot sits, so a speck past it is the picture's own. Black bars
+    are measured per level (strict alone for conservative, combined with
+    the loose pass for balanced, looser still for aggressive); every
+    level's total crop is then pulled back by the human guard so no
+    detected person is cut, never below what interface + strict proved.
+    Where the guard cannot run, only the strict bars contribute, so all
+    levels agree.
     """
     import numpy as np
 
@@ -1830,44 +1954,63 @@ def _box_for(upright, *, chrome: tuple[int, int] = (0, 0), speck: bool = False) 
     luma = _luma(upright)[chrome_top : height - chrome_bottom]
     specks = (speck and not chrome_top, speck and not chrome_bottom)
     boxes = _human_guard_boxes(np.asarray(_flattened(upright)))
-    strict = detect_borders_in_array(luma, speck=specks) or (0, 0, 0, 0)
-    bars = _combined_bars(luma, speck=specks, aggressive=boxes is not None) or (0, 0, 0, 0)
-    top = chrome_top + bars[0]
-    bottom = chrome_bottom + bars[1]
-    left, right = bars[2], bars[3]
-    if not (top or bottom or left or right):
-        return None
-    if boxes:
-        proven = (chrome_top + strict[0], chrome_bottom + strict[1], strict[2], strict[3])
-        top, bottom, left, right = _guard_floor(
-            (top, bottom, left, right), proven, boxes, width, height
-        )
+    levels = _level_bars(luma, speck=specks, loose_allowed=boxes is not None)
+    strict = levels["conservative"] or (0, 0, 0, 0)
+    proven = (chrome_top + strict[0], chrome_bottom + strict[1], strict[2], strict[3])
+
+    def finish(bars) -> CropBox | None:
+        bars = bars or (0, 0, 0, 0)
+        top = chrome_top + bars[0]
+        bottom = chrome_bottom + bars[1]
+        left, right = bars[2], bars[3]
         if not (top or bottom or left or right):
             return None
-    if height - top - bottom < height * MIN_CONTENT_FRACTION:
-        return None
-    edges = tuple(
-        name
-        for name, rows, kept in (
-            ("top", chrome_top, top),
-            ("bottom", chrome_bottom, bottom),
+        if boxes:
+            top, bottom, left, right = _guard_floor(
+                (top, bottom, left, right), proven, boxes, width, height
+            )
+            if not (top or bottom or left or right):
+                return None
+        if height - top - bottom < height * MIN_CONTENT_FRACTION:
+            return None
+        if width - left - right < width * MIN_CONTENT_FRACTION:
+            return None
+        edges = tuple(
+            name
+            for name, rows, kept in (
+                ("top", chrome_top, top),
+                ("bottom", chrome_bottom, bottom),
+            )
+            if rows and kept >= rows
         )
-        if rows and kept >= rows
-    )
-    box = CropBox(
-        left=left,
-        top=top,
-        right=width - right,
-        bottom=height - bottom,
-        width=width,
-        height=height,
-        chrome=edges,
-    )
-    return box if box.is_valid() else None
+        box = CropBox(
+            left=left,
+            top=top,
+            right=width - right,
+            bottom=height - bottom,
+            width=width,
+            height=height,
+            chrome=edges,
+        )
+        return box if box.is_valid() else None
+
+    return _order_level_boxes({name: finish(levels[name]) for name in CROP_LEVELS})
 
 
-def detect_black_borders(path: str | Path) -> CropBox | None:
-    """Suggest the crop for ``path``: black bars, plus interface bars on screenshots."""
+def _box_for(upright, *, chrome: tuple[int, int] = (0, 0), speck: bool = False) -> CropBox | None:
+    """The balanced box of :func:`_boxes_for`."""
+    return _boxes_for(upright, chrome=chrome, speck=speck)["balanced"]
+
+
+def detect_crop_levels(path: str | Path) -> dict[str, CropBox | None]:
+    """Suggest the crop for ``path`` at every aggressiveness level.
+
+    Black bars, plus interface bars on screenshots. The balanced entry is
+    exactly what the pre-levels detector suggested: the quick reduced-size
+    pass still gates it, so a bar only the aggressive level's loose rules
+    catch at screening size never resurrects a balanced (or conservative)
+    suggestion at full resolution.
+    """
     from PIL import Image, ImageOps
 
     _register_heif()
@@ -1883,11 +2026,12 @@ def detect_black_borders(path: str | Path) -> CropBox | None:
     if evidence is not None:
         chrome = detect_screenshot_chrome(screened, certain=evidence != "shape")
         if any(chrome):
-            return _box_for(screened, chrome=chrome, speck=True)
-    if _combined_bars(
-        _luma(screened), speck=speck, aggressive=_human_guard_available()
-    ) is None:
-        return None
+            return _boxes_for(screened, chrome=chrome, speck=True)
+    screen = _level_bars(
+        _luma(screened), speck=speck, loose_allowed=_human_guard_available()
+    )
+    if screen["aggressive"] is None:
+        return {name: None for name in CROP_LEVELS}
 
     upright = screened
     if reduced:
@@ -1895,7 +2039,16 @@ def detect_black_borders(path: str | Path) -> CropBox | None:
         with Image.open(path) as source:
             upright = ImageOps.exif_transpose(source)
             upright.load()
-    return _box_for(upright, speck=speck)
+    boxes = _boxes_for(upright, speck=speck)
+    if screen["balanced"] is None:
+        boxes["balanced"] = None
+        boxes["conservative"] = None
+    return boxes
+
+
+def detect_black_borders(path: str | Path) -> CropBox | None:
+    """Suggest the crop for ``path``: black bars, plus interface bars on screenshots."""
+    return detect_crop_levels(path)["balanced"]
 
 
 def _ffmpeg_available() -> bool:
@@ -2058,19 +2211,92 @@ def _majority_bars(per_frame) -> tuple[int, int, int, int] | None:
     return tuple(edges) if any(edges) else None
 
 
-def _frame_bars(lumas, *, aggressive: bool):
-    """Per-frame bar tuples; ``None`` where a frame is black or unreadable."""
+def _black_frame(luma) -> bool:
     import numpy as np
 
-    per_frame = []
+    return luma is None or (
+        float(np.mean(luma > DARK_LUMA + BAR_TOLERANCE)) < VIDEO_BLACK_FRAME_FRACTION
+    )
+
+
+def _frame_bars(lumas, *, aggressive: bool):
+    """Per-frame bar tuples; ``None`` where a frame is black or unreadable."""
+    return [
+        None if _black_frame(luma) else _combined_bars(luma, aggressive=aggressive) or (0, 0, 0, 0)
+        for luma in lumas
+    ]
+
+
+def _frame_level_bars(lumas, *, loose_allowed: bool):
+    """Per-level majority bars over the pictured frames.
+
+    Each level takes its own majority, then the per-edge maximum with the
+    level below, so a higher level never crops less than a lower one even
+    where their majorities form over different frame subsets.
+    """
+    per_level: dict[str, list] = {name: [] for name in CROP_LEVELS}
     for luma in lumas:
-        if luma is None or (
-            float(np.mean(luma > DARK_LUMA + BAR_TOLERANCE)) < VIDEO_BLACK_FRAME_FRACTION
-        ):
-            per_frame.append(None)
-        else:
-            per_frame.append(_combined_bars(luma, aggressive=aggressive) or (0, 0, 0, 0))
-    return per_frame
+        if _black_frame(luma):
+            for frames in per_level.values():
+                frames.append(None)
+            continue
+        levels = _level_bars(luma, loose_allowed=loose_allowed)
+        for name in CROP_LEVELS:
+            per_level[name].append(levels[name] or (0, 0, 0, 0))
+    bars: dict[str, tuple[int, int, int, int] | None] = {
+        name: _majority_bars(per_level[name]) for name in CROP_LEVELS
+    }
+    # Balanced stays exactly the pre-levels majority; only the aggressive
+    # level is raised to at least it. (Conservative is capped at balanced
+    # when boxes are ordered — a median over the strict positives can
+    # otherwise exceed the balanced median on an edge.)
+    if bars["balanced"] is not None:
+        bars["aggressive"] = (
+            bars["balanced"]
+            if bars["aggressive"] is None
+            else tuple(max(a, b) for a, b in zip(bars["aggressive"], bars["balanced"]))
+        )
+    return bars
+
+
+def _order_level_boxes(boxes: dict[str, CropBox | None]) -> dict[str, CropBox | None]:
+    """Enforce conservative ⊆ balanced ⊆ aggressive on finished boxes.
+
+    Balanced is never touched. Conservative is capped edge by edge at
+    balanced (a majority median or a content-fraction fallback can
+    otherwise put it past balanced); aggressive is raised to at least
+    balanced, falling back to it when its own box was declined.
+    """
+    balanced = boxes["balanced"]
+    if balanced is None:
+        return boxes
+    conservative = boxes["conservative"]
+    if conservative is not None:
+        capped = CropBox(
+            left=min(conservative.left, balanced.left),
+            top=min(conservative.top, balanced.top),
+            right=max(conservative.right, balanced.right),
+            bottom=max(conservative.bottom, balanced.bottom),
+            width=conservative.width,
+            height=conservative.height,
+            chrome=conservative.chrome,
+        )
+        boxes["conservative"] = capped if capped.is_valid() else None
+    aggressive = boxes["aggressive"]
+    if aggressive is None:
+        boxes["aggressive"] = balanced
+    else:
+        raised = CropBox(
+            left=max(aggressive.left, balanced.left),
+            top=max(aggressive.top, balanced.top),
+            right=min(aggressive.right, balanced.right),
+            bottom=min(aggressive.bottom, balanced.bottom),
+            width=aggressive.width,
+            height=aggressive.height,
+            chrome=aggressive.chrome,
+        )
+        boxes["aggressive"] = raised if raised.is_valid() else balanced
+    return boxes
 
 
 def _screened(luma):
@@ -2089,21 +2315,23 @@ def _screened(luma):
     return np.asarray(shrunk)
 
 
-def detect_video_borders(path: str | Path) -> CropBox | None:
-    """Suggest the crop for a video: the bars most sampled frames carry.
+def detect_video_crop_levels(path: str | Path) -> dict[str, CropBox | None]:
+    """Suggest the crop for a video at every level: majority bars per level.
 
-    The box is in display orientation (rotation applied, as players show the
-    clip), pulled back by the human guard wherever a sampled frame puts a
-    person in the removed strips, with even offsets and dimensions as the
-    4:2:0 encoders require. Guarded edges round outward to keep people whole.
-    Without a successful guard on every sampled frame, only strict, majority
-    bars are suggested; any people found still take precedence over them.
+    Each box is in display orientation (rotation applied, as players show
+    the clip), pulled back by the human guard wherever a sampled frame puts
+    a person in the removed strips, with even offsets and dimensions as
+    the 4:2:0 encoders require. Guarded edges round outward to keep people
+    whole. Without a successful guard on every sampled frame, only strict,
+    majority bars are suggested (every level agrees); any people found
+    still take precedence over them.
     """
+    empty = {name: None for name in CROP_LEVELS}
     if not _ffmpeg_available():
-        return None
+        return empty
     probe = _probe_video_stream(path)
     if probe is None or not probe["duration"]:
-        return None
+        return empty
     width, height = probe["width"], probe["height"]
     timestamps = [probe["duration"] * fraction for fraction in VIDEO_SAMPLE_FRACTIONS]
     frames = [_video_frame_luma(path, stamp) for stamp in timestamps]
@@ -2111,17 +2339,22 @@ def detect_video_borders(path: str | Path) -> CropBox | None:
         frame if frame is not None and frame.shape[:2] == (height, width) else None
         for frame in frames
     ]
-    aggressive = _human_guard_available()
-    if _majority_bars(_frame_bars(
+    loose_allowed = _human_guard_available()
+    screened = _frame_level_bars(
         [_screened(frame) if frame is not None else None for frame in frames],
-        aggressive=aggressive,
-    )) is None:
-        return None
-    bars = _majority_bars(_frame_bars(frames, aggressive=aggressive))
-    if bars is None:
-        return None
+        loose_allowed=loose_allowed,
+    )
+    if screened["aggressive"] is None:
+        return empty
+    level_bars = _frame_level_bars(frames, loose_allowed=loose_allowed)
+    if screened["balanced"] is None:
+        # The quick pass gates balanced exactly as before levels existed.
+        level_bars["balanced"] = None
+        level_bars["conservative"] = None
+    if level_bars["aggressive"] is None:
+        return empty
     boxes: list[tuple[float, float, float, float]] = []
-    if aggressive:
+    if loose_allowed:
         guard_failed = False
         for stamp, frame in zip(timestamps, frames):
             if frame is None:
@@ -2134,50 +2367,90 @@ def detect_video_borders(path: str | Path) -> CropBox | None:
             else:
                 boxes.extend(found)
         if guard_failed:
-            bars = _majority_bars(_frame_bars(frames, aggressive=False))
-            if bars is None:
-                return None
+            level_bars = _frame_level_bars(frames, loose_allowed=False)
+            if level_bars["aggressive"] is None:
+                return empty
         if boxes:
             # Strict bars in a majority of frames say nothing about people
             # in other segments. Unlike an image, they cannot be a floor.
-            bars = _guarded_bars(bars, boxes, width, height)
-            if not any(bars):
-                return None
-    top, bottom, left, right = bars
-    right, bottom = width - right, height - bottom
+            for name in CROP_LEVELS:
+                if level_bars[name] is not None:
+                    guarded = _guarded_bars(level_bars[name], boxes, width, height)
+                    level_bars[name] = guarded if any(guarded) else None
+            if level_bars["aggressive"] is None:
+                return empty
     # Unguarded strict bars round inward so no black line returns. A guarded
     # crop rounds outward instead: rounding inward could cut a person's odd
     # boundary by one pixel. If that exceeds an odd-sized source, decline.
     direction = -1 if boxes else 1
-    box = CropBox(
-        left=left + direction * (left % 2),
-        top=top + direction * (top % 2),
-        right=right - direction * (right % 2),
-        bottom=bottom - direction * (bottom % 2),
-        width=width,
-        height=height,
-    )
-    if not box.is_valid():
-        return None
-    if box.crop_height < height * MIN_CONTENT_FRACTION:
-        return None
-    if box.crop_width < width * MIN_CONTENT_FRACTION:
-        return None
-    return box
+
+    def finish(bars) -> CropBox | None:
+        if bars is None:
+            return None
+        top, bottom, left, right = bars
+        right, bottom = width - right, height - bottom
+        box = CropBox(
+            left=left + direction * (left % 2),
+            top=top + direction * (top % 2),
+            right=right - direction * (right % 2),
+            bottom=bottom - direction * (bottom % 2),
+            width=width,
+            height=height,
+        )
+        if not box.is_valid():
+            return None
+        if box.crop_height < height * MIN_CONTENT_FRACTION:
+            return None
+        if box.crop_width < width * MIN_CONTENT_FRACTION:
+            return None
+        return box
+
+    return _order_level_boxes({name: finish(level_bars[name]) for name in CROP_LEVELS})
+
+
+def detect_video_borders(path: str | Path) -> CropBox | None:
+    """Suggest the crop for a video: the bars most sampled frames carry."""
+    return detect_video_crop_levels(path)["balanced"]
+
+
+def _needs_border_measure(record: FileRecord, level: str) -> bool:
+    """Whether a scan at ``level`` still has to measure ``record``.
+
+    A measurement fills every level at once. Records measured before
+    levels existed carry only a balanced verdict: a balanced or
+    conservative scan trusts it (balanced-clean settles conservative too)
+    and re-measures just the candidates, so the review toggle has their
+    other boxes; an aggressive scan cannot trust a balanced "clean" and
+    measures everything it has no aggressive verdict for. A dismissal
+    settles every level and is never re-measured.
+    """
+    if record.border_crop == BORDER_DISMISSED:
+        return False
+    if record.border_signature != BORDER_SIGNATURE:
+        return True
+    if record.border_levels_signature == BORDER_LEVELS_SIGNATURE:
+        return False
+    if level == "aggressive":
+        return True
+    return bool(record.border_crop)  # a candidate: its other levels are wanted
 
 
 def analyze_borders(
     records: list[FileRecord],
     *,
+    level: str = DEFAULT_CROP_LEVEL,
     workers: int = 1,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[str]:
-    """Fill ``border_crop`` for every croppable record lacking a current verdict.
+    """Fill the crop verdicts for every croppable record a scan needs.
 
-    Records that already carry this signature's verdict (from the hash cache,
-    including a user's dismissal) are skipped. Returns per-file error strings.
+    ``level`` is the scan's aggressiveness: it decides which cached
+    verdicts are still missing (see :func:`_needs_border_measure`), never
+    what gets measured — one measurement computes every level's box.
+    Returns per-file error strings.
     """
+    level = validate_crop_level(level)
     for record in records:
         if (
             record.border_signature in LEGACY_BORDER_SIGNATURES
@@ -2191,7 +2464,7 @@ def analyze_borders(
         record
         for record in records
         if is_croppable(record)
-        and record.border_signature != BORDER_SIGNATURE
+        and _needs_border_measure(record, level)
         and (record.media_type != MediaType.VIDEO or videos_ok)
     ]
     if not pending:
@@ -2201,15 +2474,23 @@ def analyze_borders(
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
         try:
-            box = (
-                detect_video_borders(record.path)
+            boxes = (
+                detect_video_crop_levels(record.path)
                 if record.media_type == MediaType.VIDEO
-                else detect_black_borders(record.path)
+                else detect_crop_levels(record.path)
             )
         except Exception as exc:
             return f"border check failed for {record.path}: {exc}"
-        record.border_crop = box.encode() if box else ""
+
+        def encode(name: str) -> str:
+            box = boxes[name]
+            return box.encode() if box else ""
+
+        record.border_crop = encode("balanced")
         record.border_signature = BORDER_SIGNATURE
+        record.border_crop_conservative = encode("conservative")
+        record.border_crop_aggressive = encode("aggressive")
+        record.border_levels_signature = BORDER_LEVELS_SIGNATURE
         return None
 
     results = map_parallel(

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from .borders import analyze_borders, is_croppable
+from .borders import analyze_borders, is_croppable, validate_crop_level
 from .cache import DistinctReviews, HashCache
 from .decider import DeciderJudge
 from .exact import (
@@ -167,6 +167,7 @@ def run_scan(
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_black_borders: bool = False,
+    crop_aggressiveness: str = "balanced",
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -205,6 +206,7 @@ def run_scan(
     counts when faces are also being counted (a counted face vetoes
     membership).
     """
+    crop_aggressiveness = validate_crop_level(crop_aggressiveness)
     n_workers = resolve_workers(workers)
     low_resolution_bounds = _low_resolution_bounds(
         default_max_pixels=low_resolution_max_pixels,
@@ -985,11 +987,12 @@ def run_scan(
 
             stage_errors["black_borders"] = analyze_borders(
                 border_records,
+                level=crop_aggressiveness,
                 workers=cpu_workers,
                 progress=border_progress,
                 cancelled=cancelled,
             )
-            crop_groups = build_crop_groups(border_records)
+            crop_groups = build_crop_groups(border_records, level=crop_aggressiveness)
             crop_count = sum(len(group.members) for group in crop_groups)
             _stage_progress(
                 "borders",
@@ -1374,6 +1377,7 @@ def run_scans_parallel(
     find_no_humans: bool = False,
     count_faces: bool = False,
     find_black_borders: bool = False,
+    crop_aggressiveness: str = "balanced",
     find_low_resolution: bool = True,
     low_resolution_images: bool = True,
     low_resolution_gifs: bool = True,
@@ -1514,6 +1518,7 @@ def run_scans_parallel(
             find_no_humans=find_no_humans,
             count_faces=count_faces,
             find_black_borders=find_black_borders,
+            crop_aggressiveness=crop_aggressiveness,
             find_low_resolution=find_low_resolution,
             low_resolution_images=low_resolution_images,
             low_resolution_gifs=low_resolution_gifs,

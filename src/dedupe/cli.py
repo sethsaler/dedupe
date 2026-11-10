@@ -123,6 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     scan.add_argument(
+        "--crop-aggressiveness",
+        dest="crop_aggressiveness",
+        choices=("conservative", "balanced", "aggressive"),
+        default="balanced",
+        metavar="LEVEL",
+        help=(
+            "How far --find-black-borders crop suggestions reach: conservative keeps "
+            "only flat bars with a hard edge, balanced (default) also crops bars "
+            "holding captions or noise, aggressive also takes darker-gray, noisier "
+            "and thinner bars; every level keeps detected people whole. The level "
+            "picks the candidates and is the Crop review's starting level per file"
+        ),
+    )
+    scan.add_argument(
         "--no-low-resolution",
         action="store_true",
         help="Disable low-resolution review",
@@ -586,6 +600,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,
         "find_black_borders": args.find_black_borders,
+        "crop_aggressiveness": args.crop_aggressiveness,
         "find_low_resolution": not args.no_low_resolution,
         "low_resolution_images": "images" in args.low_resolution_types,
         "low_resolution_gifs": "gifs" in args.low_resolution_types,
@@ -652,10 +667,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         ]
         print(
             f"Crops: {len(crop_members)} file(s) could be cropped "
-            "(review and apply crops in `dedupe ui`, Crop tab)"
+            f"({args.crop_aggressiveness}; review and apply crops in "
+            "`dedupe ui`, Crop tab)"
         )
         for member in crop_members[:10]:
-            box = suggested_crop(member)
+            box = suggested_crop(member, args.crop_aggressiveness)
             if box is not None:
                 print(
                     f"  {member.path}: {box.width}×{box.height} -> "
@@ -1243,7 +1259,10 @@ def _format_decisions_summary(summary: dict) -> str:
         + (f", {summary['skipped_lines']} unreadable lines skipped" if summary["skipped_lines"] else ""),
         f"Crops: {crop['decided']} decided ({crop['labels']}), accepted {rate(crop)}",
     ]
-    for name in ("by_kind", "by_media_type", "by_removed_fraction", "by_border_signature"):
+    for name in (
+        "by_kind", "by_media_type", "by_removed_fraction", "by_border_signature",
+        "by_crop_level",
+    ):
         for key, block in crop[name].items():
             lines.append(f"  {name.removeprefix('by_')}={key}: {block['decided']} decided, accepted {rate(block)}")
     if crop["applied_by_source"]:

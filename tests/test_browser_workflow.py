@@ -1118,6 +1118,107 @@ def test_crop_zone_toggles_per_card_and_for_the_whole_review(
 
 
 @pytest.mark.e2e
+def test_crop_level_switch_per_card_bulk_and_apply(
+    page, tmp_path: Path, monkeypatch
+) -> None:
+    """Each card can show its conservative, balanced, or aggressive
+    suggestion (pills or 1/2/3), the header select switches the whole
+    review, and Crop cuts the level on show."""
+    from dedupe.borders import BORDER_LEVELS_SIGNATURE, BORDER_SIGNATURE
+    from dedupe.grouping import build_crop_groups
+    from dedupe.web import app as web_app_module
+
+    trash = tmp_path / "Trash"
+
+    class _FakeBatch:
+        def send(self, src):
+            trash.mkdir(parents=True, exist_ok=True)
+            target = trash / Path(src).name
+            shutil.move(str(src), str(target))
+            return target
+
+    monkeypatch.setattr(web_app_module, "TrashBatch", _FakeBatch)
+    media = tmp_path / "media"
+    media.mkdir()
+    records = []
+    for index in range(2):
+        path = media / f"framed-{index}.png"
+        canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+        canvas.paste(Image.effect_noise((320, 180), 60).convert("RGB"), (0, 60))
+        canvas.save(path)
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=MediaType.IMAGE,
+                extension=".png",
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                width=320,
+                height=240,
+                border_crop="0,30,320,210,320,240",
+                border_signature=BORDER_SIGNATURE,
+                border_crop_conservative="0,10,320,230,320,240",
+                border_crop_aggressive="0,50,320,190,320,240",
+                border_levels_signature=BORDER_LEVELS_SIGNATURE,
+            )
+        )
+    result = ScanResult(
+        roots=[str(media)], files=records, groups=build_crop_groups(records)
+    )
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    def zone_top(card) -> float:
+        return card.locator(".crop-box").evaluate("el => parseFloat(el.style.top)")
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="crop"]').click()
+        page.locator(".group-item").first.click()
+        cards = page.locator("#members .crop-card")
+        expect(cards).to_have_count(2)
+        # Balanced is the scan default: top 30/240 = 12.5%.
+        expect(cards.nth(0).locator('.crop-level-btn[data-level="balanced"]')).to_have_attribute(
+            "aria-pressed", "true"
+        )
+        assert zone_top(cards.nth(0)) == pytest.approx(12.5, abs=0.1)
+
+        # Per-card pill: Aggressive moves only this card's zone.
+        with page.expect_response("**/api/crop/level"):
+            cards.nth(0).locator('.crop-level-btn[data-level="aggressive"]').click()
+        expect(cards.nth(0).locator('.crop-level-btn[data-level="aggressive"]')).to_have_attribute(
+            "aria-pressed", "true"
+        )
+        assert zone_top(cards.nth(0)) == pytest.approx(50 / 240 * 100, abs=0.1)
+        assert zone_top(cards.nth(1)) == pytest.approx(12.5, abs=0.1)
+
+        # Keyboard: 1 shows Conservative on the focused card.
+        cards.nth(0).locator(".name").click()
+        with page.expect_response("**/api/crop/level"):
+            page.keyboard.press("1")
+        assert zone_top(cards.nth(0)) == pytest.approx(10 / 240 * 100, abs=0.1)
+
+        # Header select: the whole review back to Balanced.
+        with page.expect_response("**/api/crop/level"):
+            page.locator("#cropLevelAll").select_option("balanced")
+        assert zone_top(cards.nth(0)) == pytest.approx(12.5, abs=0.1)
+
+        # Crop cuts the level on show: Aggressive keeps rows 50–190.
+        with page.expect_response("**/api/crop/level"):
+            cards.nth(0).locator('.crop-level-btn[data-level="aggressive"]').click()
+        target = records[0].path
+        cards.nth(0).locator(".crop-apply").click()
+        expect(cards.nth(0)).to_have_class(re.compile(r"\bcropped\b"))
+        with Image.open(target) as cropped:
+            assert cropped.size == (320, 140)
+
+
+@pytest.mark.e2e
 def test_crop_zone_can_be_dragged_resized_reset_and_applied(
     page, tmp_path: Path, monkeypatch
 ) -> None:

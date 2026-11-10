@@ -334,18 +334,26 @@ def crop_review_order(member: FileRecord, box) -> tuple:
     return (0 if box.chrome else 1, -box.removed_fraction, member.path)
 
 
-def build_crop_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
-    """Build one review collection of files with a crop suggestion,
-    ordered by :func:`crop_review_order`."""
-    from .borders import suggested_crop
+def build_crop_groups(
+    members: list[FileRecord], level: str = "balanced"
+) -> list[DuplicateGroup]:
+    """Build one review collection of files with a crop suggestion at
+    ``level`` (the scan's aggressiveness), ordered by
+    :func:`crop_review_order`. The group remembers the level as the
+    review's default; each file can be switched in the review."""
+    from .borders import suggested_crop, validate_crop_level
 
+    level = validate_crop_level(level)
     suggestions = [
         (member, box)
         for member in members
-        if (box := suggested_crop(member)) is not None
+        if (box := suggested_crop(member, level)) is not None
     ]
     suggestions.sort(key=lambda item: crop_review_order(*item))
-    return _build_independent_group(GroupKind.CROP, [member for member, _ in suggestions])
+    groups = _build_independent_group(GroupKind.CROP, [member for member, _ in suggestions])
+    for group in groups:
+        group.match_details["crop_level"] = level
+    return groups
 
 
 def build_all_files_groups(
@@ -438,7 +446,7 @@ def refresh_crop_groups(result: ScanResult, *, workers: int = 4) -> list[FileRec
     :func:`crop_review_order`. Returns the records measured again, so the
     caller can remember the new verdicts.
     """
-    from .borders import BORDER_SIGNATURE, CropBox, analyze_borders, suggested_crop
+    from .borders import CropBox, _needs_border_measure, analyze_borders, suggested_crop
 
     measured: list[FileRecord] = []
     kept_groups = []
@@ -446,21 +454,22 @@ def refresh_crop_groups(result: ScanResult, *, workers: int = 4) -> list[FileRec
         if group.kind != GroupKind.CROP:
             kept_groups.append(group)
             continue
+        level = group.match_details.get("crop_level") or "balanced"
         cropped = group.match_details.get("cropped") or {}
         stale = [
             member
             for member in group.members
-            if member.path not in cropped and member.border_signature != BORDER_SIGNATURE
+            if member.path not in cropped and _needs_border_measure(member, level)
         ]
         if stale:
-            analyze_borders(stale, workers=workers)
+            analyze_borders(stale, level=level, workers=workers)
             measured.extend(stale)
 
         boxes = {
             member.path: (
                 CropBox.decode(cropped[member.path]["box"])
                 if member.path in cropped
-                else suggested_crop(member)
+                else suggested_crop(member, level)
             )
             for member in group.members
         }

@@ -7,7 +7,7 @@ from PIL import Image
 from playwright.sync_api import expect
 from test_browser_workflow import _serve_app
 
-from dedupe.borders import BORDER_SIGNATURE
+from dedupe.borders import BORDER_LEVELS_SIGNATURE, BORDER_SIGNATURE
 from dedupe.grouping import build_crop_groups
 from dedupe.models import FileRecord, MediaType, ScanResult
 from dedupe.web.app import create_app
@@ -27,6 +27,9 @@ def crop_editor(page, tmp_path: Path):
             media_type=MediaType.IMAGE, extension=".png", device=stat.st_dev,
             inode=stat.st_ino, mtime_ns=stat.st_mtime_ns, width=320, height=240,
             border_crop="40,30,280,210,320,240", border_signature=BORDER_SIGNATURE,
+            border_crop_conservative="40,30,280,210,320,240",
+            border_crop_aggressive="40,30,280,210,320,240",
+            border_levels_signature=BORDER_LEVELS_SIGNATURE,
         ))
     app = create_app(
         ScanResult(roots=[str(tmp_path)], files=records, groups=build_crop_groups(records)),

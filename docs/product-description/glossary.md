@@ -50,6 +50,8 @@ The vocabulary used across these documents. When a document uses one of these wo
 
 **Detection threshold.** The maximum Hamming distance between perceptual hashes for two files to count as similar. Defaults: 6 for images (with tile checks up to 8), 8 for videos. `foundations/scan-pipeline.md` owns these numbers.
 
+**Crop aggressiveness.** How far a suggested crop reaches into a frame's dark edges, in three levels: *conservative* (only flat black bars with a hard edge, plus screenshot interface), *balanced* (also bars holding captions or encoder noise), and *aggressive* (also dark-gray, noisier, and thinner bars). Every file is measured at all three in one pass; the scan's level chooses the Crop review's candidates, each file can be switched in the review, and applying a crop cuts the level on show. No level cuts a detected person. `foundations/scan-pipeline.md` owns the rules.
+
 **Hash cache.** The on-disk SQLite store of per-file hashes, so rescans skip recomputing unchanged files. Owned by `cross-cutting/caches-and-files.md`.
 
 **Backend.** The person detector used by the no-person review: `opencv` (fast, default), `photon` (opt-in, downloads roughly 10 GB of model weights on first use), or `ensemble` (OpenCV first, then Photon on uncertain frames). All processing is local.

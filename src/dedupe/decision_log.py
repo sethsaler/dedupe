@@ -231,6 +231,7 @@ def make_crop_event(
     note: str | None = None,
     receipt_path: str | None = None,
     adjusted_box=None,
+    level: str | None = None,
 ) -> dict:
     """One crop decision; ``box`` is the suggestion the user decided on.
 
@@ -238,12 +239,14 @@ def make_crop_event(
     deciding — what an applied crop actually cut, or the corrected zone a
     skip still rejected. It is kept beside the suggestion, never in place
     of it, so detector tuning can measure how far users move its boxes.
+    ``level`` is the aggressiveness level whose suggestion was on screen.
     """
     adjusted = adjusted_box if adjusted_box is not None and adjusted_box != box else None
     return {
         "kind": "crop",
         "decision": decision,
         "source": source,
+        "crop_level": level,
         "group_id": group_id,
         "scan_id": scan_id,
         "file": file_snapshot(record),
@@ -486,6 +489,8 @@ def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
             ),
             "by_removed_fraction": rate_by(_removed_band),
             "by_border_signature": rate_by(lambda e: e.get("border_signature") or "unknown"),
+            # Events logged before levels existed decided on balanced boxes.
+            "by_crop_level": rate_by(lambda e: e.get("crop_level") or "balanced"),
             "applied_by_source": _counts(
                 e.get("source") for e in crops if e.get("decision") == "applied"
             ),
@@ -535,6 +540,7 @@ def crop_manifest(events: list[dict]) -> dict:
             "adjusted": event.get("adjusted"),
             "adjusted_encoded": event.get("adjusted_encoded"),
             "border_signature": event.get("border_signature"),
+            "crop_level": event.get("crop_level") or "balanced",
             "media_type": (event.get("file") or {}).get("media_type"),
             "after": event.get("after"),
             "recorded_at": event.get("recorded_at"),

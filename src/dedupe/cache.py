@@ -38,9 +38,10 @@ _UPSERT_SQL = """
         human_detection_status, human_detector, human_detection_signature,
         human_frames_analyzed, human_max_confidence, face_count, face_detector,
         face_detection_signature, ctime_ns, people_score, people_score_signature,
-        border_crop, border_signature
+        border_crop, border_signature, border_crop_conservative,
+        border_crop_aggressive, border_levels_signature
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?)
+              ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
@@ -71,7 +72,10 @@ _UPSERT_SQL = """
         people_score=excluded.people_score,
         people_score_signature=excluded.people_score_signature,
         border_crop=excluded.border_crop,
-        border_signature=excluded.border_signature
+        border_signature=excluded.border_signature,
+        border_crop_conservative=excluded.border_crop_conservative,
+        border_crop_aggressive=excluded.border_crop_aggressive,
+        border_levels_signature=excluded.border_levels_signature
 """
 
 
@@ -108,6 +112,9 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.people_score_signature,
         rec.border_crop,
         rec.border_signature,
+        rec.border_crop_conservative,
+        rec.border_crop_aggressive,
+        rec.border_levels_signature,
     )
 
 
@@ -261,7 +268,10 @@ class HashCache:
                 people_score REAL,
                 people_score_signature TEXT,
                 border_crop TEXT,
-                border_signature TEXT
+                border_signature TEXT,
+                border_crop_conservative TEXT,
+                border_crop_aggressive TEXT,
+                border_levels_signature TEXT
             )
             """
         )
@@ -320,6 +330,9 @@ class HashCache:
             "people_score_signature": "TEXT",
             "border_crop": "TEXT",
             "border_signature": "TEXT",
+            "border_crop_conservative": "TEXT",
+            "border_crop_aggressive": "TEXT",
+            "border_levels_signature": "TEXT",
         }
         for column, declaration in migrations.items():
             if column not in existing:
@@ -723,6 +736,10 @@ class HashCache:
         if row.get("border_signature") and row.get("border_crop") is not None:
             rec.border_crop = row["border_crop"]
             rec.border_signature = row["border_signature"]
+        if row.get("border_levels_signature"):
+            rec.border_crop_conservative = row.get("border_crop_conservative")
+            rec.border_crop_aggressive = row.get("border_crop_aggressive")
+            rec.border_levels_signature = row["border_levels_signature"]
         if row["media_type"]:
             try:
                 rec.media_type = MediaType(row["media_type"])

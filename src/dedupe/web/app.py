@@ -44,6 +44,7 @@ from ..actions import (
 from ..borders import (
     BORDER_DISMISSED,
     BORDER_SIGNATURE,
+    CROP_LEVELS,
     CropBox,
     adjust_crop_box,
     crop_file_in_place,
@@ -510,27 +511,62 @@ def scan_done_summary(result: ScanResult, scan_kwargs: dict) -> str:
     return ", ".join(parts) or f"{len(result.files)} files"
 
 
+def chosen_crop_level(group, member) -> str:
+    """The aggressiveness level whose suggestion ``member``'s card shows.
+
+    A per-file choice in ``match_details["chosen_crop_levels"]`` wins over
+    the review's default level (the scan's ``crop_aggressiveness``, stored
+    as ``crop_level`` when the group was built); reviews saved before
+    levels existed default to balanced.
+    """
+    chosen = (group.match_details.get("chosen_crop_levels") or {}).get(member.path)
+    if chosen in CROP_LEVELS:
+        return chosen
+    default = group.match_details.get("crop_level")
+    return default if default in CROP_LEVELS else "balanced"
+
+
+def _frame_suggestion(group, member) -> CropBox | None:
+    """Any level's suggestion, to name the frame a moved zone must fit.
+
+    Every level's box shares the suggestion frame, so when the chosen
+    level declines to suggest anything, another level's box still names
+    the dimensions a stored adjustment was dragged against.
+    """
+    for name in (chosen_crop_level(group, member), *CROP_LEVELS):
+        box = suggested_crop(member, name)
+        if box is not None:
+            return box
+    return None
+
+
 def adjusted_crop(group, member) -> CropBox | None:
     """The zone the user dragged ``member``'s suggestion to, if it still fits.
 
     Stored per crop group in ``match_details["adjusted_crops"]`` (encoded
     like a suggestion), so it rides the review session across restarts. A
     stored box that no longer matches the suggestion's frame, or equals the
-    suggestion, is not an adjustment.
+    shown level's suggestion, is not an adjustment. Switching levels never
+    discards a dragged zone; Reset returns to the shown level's box.
     """
     encoded = (group.match_details.get("adjusted_crops") or {}).get(member.path)
     box = CropBox.decode(encoded)
-    suggestion = suggested_crop(member)
+    suggestion = _frame_suggestion(group, member)
     if box is None or suggestion is None:
         return None
-    if (box.width, box.height) != (suggestion.width, suggestion.height) or box == suggestion:
+    if (box.width, box.height) != (suggestion.width, suggestion.height):
+        return None
+    if box == suggested_crop(member, chosen_crop_level(group, member)):
         return None
     return box
 
 
 def effective_crop(group, member) -> CropBox | None:
-    """The crop a Crop click would cut: the user's zone, else the suggestion."""
-    return adjusted_crop(group, member) or suggested_crop(member)
+    """The crop a Crop click would cut: the user's zone, else the shown
+    level's suggestion."""
+    return adjusted_crop(group, member) or suggested_crop(
+        member, chosen_crop_level(group, member)
+    )
 
 
 def create_app(
@@ -787,8 +823,15 @@ def create_app(
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 entry = cropped.get(member.path)
                 box = CropBox.decode(entry["box"]) if entry else effective_crop(group, member)
-                suggestion = suggested_crop(member)
+                level = chosen_crop_level(group, member)
+                suggestion = suggested_crop(member, level)
+                levels = {name: suggested_crop(member, name) for name in CROP_LEVELS}
                 member_payload["crop"] = box.to_dict() if box else None
+                member_payload["crop_level"] = level
+                member_payload["crop_levels"] = {
+                    name: (levels[name].to_dict() if levels[name] and not entry else None)
+                    for name in CROP_LEVELS
+                }
                 member_payload["crop_suggested"] = (
                     suggestion.to_dict() if suggestion and not entry else None
                 )
@@ -803,6 +846,11 @@ def create_app(
                 member_payload["crop_skip_note"] = note.get("note")
                 if entry:
                     member_payload["crop_undo_available"] = bool(entry.get("original"))
+            payload["crop_level"] = (
+                group.match_details.get("crop_level")
+                if group.match_details.get("crop_level") in CROP_LEVELS
+                else "balanced"
+            )
             payload["cropped_paths"] = [
                 member.path for member in group.members if member.path in cropped
             ]
@@ -1494,6 +1542,11 @@ def create_app(
         human_backend = str(data.get("human_backend", "opencv")).strip().lower()
         if human_backend not in HUMAN_BACKENDS:
             return jsonify({"error": f"unknown human detector: {human_backend}"}), 400
+        crop_aggressiveness = str(data.get("crop_aggressiveness", "balanced")).strip().lower()
+        if crop_aggressiveness not in CROP_LEVELS:
+            return jsonify({
+                "error": f"unknown crop aggressiveness: {crop_aggressiveness}"
+            }), 400
         photon_model = str(data.get("photon_model", DEFAULT_PHOTON_MODEL)).strip()
         if not photon_model:
             photon_model = DEFAULT_PHOTON_MODEL
@@ -1649,6 +1702,7 @@ def create_app(
                     "find_no_humans": bool(data.get("find_no_humans", False)),
                     "count_faces": bool(data.get("count_faces", False)),
                     "find_black_borders": bool(data.get("find_black_borders", False)),
+                    "crop_aggressiveness": crop_aggressiveness,
                     "find_low_resolution": bool(data.get("find_low_resolution", True)),
                     "low_resolution_images": bool(data.get("low_resolution_images", True)),
                     "low_resolution_gifs": bool(data.get("low_resolution_gifs", True)),
@@ -2328,9 +2382,9 @@ def create_app(
             return None, (jsonify({"error": "crop review not found"}), 404)
         return group, None
 
-    def parse_requested_box(member, raw):
+    def parse_requested_box(group, member, raw):
         """The CropBox a request's ``box`` edges name (TypeError/ValueError if not)."""
-        suggestion = suggested_crop(member)
+        suggestion = _frame_suggestion(group, member)
         if suggestion is None:
             raise ValueError("there is no crop suggestion for this file")
         is_video = getattr(member.media_type, "value", member.media_type) == "video"
@@ -2359,6 +2413,15 @@ def create_app(
         cropped = group.match_details.setdefault("cropped", {})
         cropped[member.path] = {
             "box": box.encode(),
+            "level": chosen_crop_level(group, member),
+            # Every level's verdict before the crop, so Undo can restore
+            # the suggestions exactly as they were (the applied box takes
+            # the applied level's place, as before levels existed).
+            "levels": {
+                "balanced": member.border_crop or "",
+                "conservative": member.border_crop_conservative or "",
+                "aggressive": member.border_crop_aggressive or "",
+            },
             "original": outcome.original_in_trash,
             "before": record_identity(member),
             "after": {"size": outcome.size, "mtime_ns": outcome.stat.st_mtime_ns},
@@ -2383,6 +2446,8 @@ def create_app(
             "video_fingerprint": None,
             "border_crop": "",
             "border_signature": BORDER_SIGNATURE,
+            "border_crop_conservative": "",
+            "border_crop_aggressive": "",
         })
         drop_from_exact_groups_locked(member.path)
 
@@ -2396,6 +2461,42 @@ def create_app(
         payload = group_payload(group)
         persist_result()
         return payload
+
+    @app.post("/api/crop/level")
+    def api_crop_level():
+        """Choose the aggressiveness level one card shows (or all of them).
+
+        With ``path``, that file's card switches to ``level``'s suggestion;
+        without, the whole review's default level changes and per-file
+        choices are cleared. Nothing on disk changes, a dragged zone is
+        kept (Crop still cuts it; Reset returns to the shown level's box),
+        and the choice rides the review session like a skip does.
+        """
+        data = request.get_json(silent=True) or {}
+        level = data.get("level")
+        if level not in CROP_LEVELS:
+            return jsonify({
+                "error": f"level must be one of: {', '.join(CROP_LEVELS)}"
+            }), 400
+        path = data.get("path")
+        with lock:
+            group, refusal = begin_crop_work(data)
+            if refusal:
+                return refusal
+            if path is None:
+                group.match_details["crop_level"] = level
+                group.match_details["chosen_crop_levels"] = {}
+            else:
+                member = next((m for m in group.members if m.path == path), None)
+                if member is None:
+                    return jsonify({"error": "crop candidate not found"}), 404
+                if path in (group.match_details.get("cropped") or {}):
+                    return jsonify({
+                        "error": "this file is already cropped; undo the crop first"
+                    }), 400
+                chosen = group.match_details.setdefault("chosen_crop_levels", {})
+                chosen[path] = level
+            return jsonify(finish_crop_locked(group))
 
     @app.post("/api/crop/adjust")
     def api_crop_adjust():
@@ -2427,10 +2528,10 @@ def create_app(
                 adjustments.pop(path, None)
             else:
                 try:
-                    box = parse_requested_box(member, data["box"])
+                    box = parse_requested_box(group, member, data["box"])
                 except (TypeError, ValueError) as exc:
                     return jsonify({"error": str(exc)}), 400
-                if box == suggested_crop(member):
+                if box == suggested_crop(member, chosen_crop_level(group, member)):
                     adjustments.pop(path, None)
                 else:
                     adjustments[path] = box.encode()
@@ -2454,12 +2555,13 @@ def create_app(
             requested = None
             if data.get("box") is not None:
                 try:
-                    requested = parse_requested_box(member, data["box"])
+                    requested = parse_requested_box(group, member, data["box"])
                 except (TypeError, ValueError) as exc:
                     return jsonify({"error": str(exc)}), 400
             if path in (group.match_details.get("cropped") or {}):
                 return jsonify(group_payload(group))
             requested = requested or effective_crop(group, member)
+            level = chosen_crop_level(group, member)
             state["acting"] = True
             roots = list(state["result"].roots)
         try:
@@ -2477,9 +2579,9 @@ def create_app(
                 )
             ])
             log_decisions([make_crop_event(
-                "applied", replace(member), suggested_crop(member) or box,
+                "applied", replace(member), suggested_crop(member, level) or box,
                 group_id=group.id, scan_id=state["scan_id"], source="single",
-                adjusted_box=box,
+                adjusted_box=box, level=level,
                 after={
                     "size": outcome.size, "width": outcome.width,
                     "height": outcome.height, "original_in_trash": outcome.original_in_trash,
@@ -2504,7 +2606,14 @@ def create_app(
             if refusal:
                 return refusal
             decided = set(group.reviewed_paths) | set(group.match_details.get("cropped") or {})
-            pending = [m for m in group.members if m.path not in decided and not m.protected]
+            # A file whose shown level suggests no crop (and with no dragged
+            # zone) has nothing to apply; it is left undecided, not failed.
+            pending = [
+                m for m in group.members
+                if m.path not in decided
+                and not m.protected
+                and effective_crop(group, m) is not None
+            ]
             state["acting"] = True
             roots = list(state["result"].roots)
         try:
@@ -2529,9 +2638,10 @@ def create_app(
             log_path = write_crop_receipt(items)
             log_decisions([
                 make_crop_event(
-                    "applied", replace(member), suggested_crop(member) or box,
+                    "applied", replace(member),
+                    suggested_crop(member, chosen_crop_level(group, member)) or box,
                     group_id=group.id, scan_id=state["scan_id"], source="bulk",
-                    adjusted_box=box,
+                    adjusted_box=box, level=chosen_crop_level(group, member),
                     after={
                         "size": outcome.size, "width": outcome.width,
                         "height": outcome.height,
@@ -2576,7 +2686,8 @@ def create_app(
                 return jsonify({"error": "crop candidate not found"}), 404
             if path in (group.match_details.get("cropped") or {}):
                 return jsonify({"error": "this file is already cropped; undo the crop instead"}), 400
-            box = suggested_crop(member)
+            level = chosen_crop_level(group, member)
+            box = suggested_crop(member, level) or _frame_suggestion(group, member)
             if skip:
                 group.reviewed_paths = list(dict.fromkeys([*group.reviewed_paths, path]))
             else:
@@ -2593,10 +2704,14 @@ def create_app(
             "skipped" if skip else "reconsidered", snapshot, box,
             group_id=group.id, scan_id=state["scan_id"], source="single",
             reason=reason if skip else None, note=note if skip else None,
-            adjusted_box=effective_crop(group, snapshot),
+            adjusted_box=effective_crop(group, snapshot), level=level,
         )])
         if box is not None:
-            store_border_verdict(snapshot, BORDER_DISMISSED if skip else box.encode())
+            # A skip dismisses every level; reconsidering restores the
+            # record's own balanced verdict whatever level was on screen.
+            store_border_verdict(
+                snapshot, BORDER_DISMISSED if skip else snapshot.border_crop or ""
+            )
         return jsonify(payload)
 
     @app.post("/api/crop/annotate-skip")
@@ -2619,7 +2734,8 @@ def create_app(
                 group.match_details.get("cropped") or {}
             ):
                 return jsonify({"error": "this file has no skipped crop to annotate"}), 400
-            box = suggested_crop(member)
+            level = chosen_crop_level(group, member)
+            box = suggested_crop(member, level) or _frame_suggestion(group, member)
             annotations = group.match_details.setdefault("skip_annotations", {})
             if reason or note:
                 annotations[path] = {"reason": reason, "note": note}
@@ -2631,7 +2747,7 @@ def create_app(
             "annotated", snapshot, box,
             group_id=group.id, scan_id=state["scan_id"], source="single",
             reason=reason, note=note,
-            adjusted_box=effective_crop(group, snapshot),
+            adjusted_box=effective_crop(group, snapshot), level=level,
         )])
         return jsonify(payload)
 
@@ -2683,8 +2799,16 @@ def create_app(
                         "undone", replace(member, **(entry.get("before") or {})),
                         CropBox.decode(entry["box"]),
                         group_id=group.id, scan_id=state["scan_id"], source="single",
+                        level=entry.get("level") or "balanced",
                     )])
                 before = dict(entry.get("before") or {})
+                # The restored file's suggestion becomes the box that was
+                # applied, at the level it was applied from; the other
+                # levels return to what they suggested before the crop.
+                levels = dict(entry.get("levels") or {})
+                applied_level = entry.get("level") or "balanced"
+                if applied_level in CROP_LEVELS:
+                    levels[applied_level] = entry["box"]
                 before.update({
                     "size": int(restored.st_size),
                     "mtime": restored.st_mtime,
@@ -2692,8 +2816,10 @@ def create_app(
                     "ctime_ns": restored.st_ctime_ns,
                     "device": restored.st_dev,
                     "inode": restored.st_ino,
-                    "border_crop": entry["box"],
+                    "border_crop": levels.get("balanced", entry["box"]),
                     "border_signature": BORDER_SIGNATURE,
+                    "border_crop_conservative": levels.get("conservative", ""),
+                    "border_crop_aggressive": levels.get("aggressive", ""),
                 })
                 update_records_locked(path, before)
                 return jsonify(finish_crop_locked(group))

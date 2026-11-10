@@ -54,6 +54,7 @@ export function collectScanSettings() {
         find_no_humans: $("optNoHumans").checked,
         count_faces: $("optCountFaces").checked,
         find_black_borders: $("optBlackBorders").checked,
+        crop_aggressiveness: $("optCropAggressiveness") ? $("optCropAggressiveness").value : "balanced",
         find_low_resolution: $("optLowResolution").checked,
         low_resolution_images: $("optLowResolutionImages").checked,
         low_resolution_gifs: $("optLowResolutionGifs").checked,

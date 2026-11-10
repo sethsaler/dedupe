@@ -105,6 +105,7 @@ const settingIds = [
   "optNoHumans",
   "optCountFaces",
   "optBlackBorders",
+  "optCropAggressiveness",
   "humanBackend",
   "optLowResolution",
   "optLowResolutionImages",
@@ -170,6 +171,13 @@ function syncHumanBackendVisibility() {
 }
 $("optNoHumans").addEventListener("change", syncHumanBackendVisibility);
 syncHumanBackendVisibility();
+
+function syncCropLevelVisibility() {
+  const field = $("cropLevelField");
+  if (field) field.hidden = !$("optBlackBorders").checked;
+}
+$("optBlackBorders").addEventListener("change", syncCropLevelVisibility);
+syncCropLevelVisibility();
 
 function syncSemanticVisibility() {
   $("semanticFields").hidden = !$("optSemantic").checked;
@@ -272,6 +280,7 @@ function applyScanPreset(preset) {
       : spec.hint;
   syncSemanticVisibility();
   syncHumanBackendVisibility();
+  syncCropLevelVisibility();
   syncCrossFolderHint();
   saveScanSettings();
 }

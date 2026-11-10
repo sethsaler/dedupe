@@ -242,6 +242,48 @@
   margin-left: auto;
 }
 
+/* Per-card aggressiveness switch: three small pills, the one on show filled. */
+#members.crop-grid .crop-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+#members.crop-grid .crop-level-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--lt-faint);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--lt-graphite);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+#members.crop-grid .crop-level-btn.chosen {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+#members.crop-grid .crop-level-btn:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 1px;
+}
+
+/* The review header's whole-pile level select. */
+.crop-level-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.crop-level-all[hidden] {
+  display: none;
+}
+
 /* Optional "why was this skipped?" annotation on a skipped card. */
 #members.crop-grid .crop-skip-why {
   margin-top: 6px;

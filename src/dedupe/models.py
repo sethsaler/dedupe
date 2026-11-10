@@ -130,8 +130,15 @@ class FileRecord:
     # Suggested black-border crop "left,top,right,bottom,width,height" in
     # display orientation; "" when checked and clean, "dismissed" when the
     # user declined the suggestion. Valid only with the current signature.
+    # This is the balanced-aggressiveness box; the conservative and
+    # aggressive boxes measured in the same pass sit beside it, valid only
+    # with the levels signature (None = not measured yet, "" = clean). A
+    # dismissal in border_crop covers every level.
     border_crop: str | None = None
     border_signature: str | None = None
+    border_crop_conservative: str | None = None
+    border_crop_aggressive: str | None = None
+    border_levels_signature: str | None = None
     error: str | None = None
     keeper_preference: int = 0
     capture_metadata: bool | None = None
@@ -207,6 +214,9 @@ class FileRecord:
             people_score_signature=data.get("people_score_signature"),
             border_crop=data.get("border_crop"),
             border_signature=data.get("border_signature"),
+            border_crop_conservative=data.get("border_crop_conservative"),
+            border_crop_aggressive=data.get("border_crop_aggressive"),
+            border_levels_signature=data.get("border_levels_signature"),
             error=data.get("error"),
         )
 

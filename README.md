@@ -391,7 +391,7 @@ Crop and Not-duplicates reviews in the UI are also logged locally (see
 decision time, including skips, undos, and an optional reason on a skipped crop:
 
 ```bash
-dedupe decisions summary                       # crop acceptance by kind/signature, skip reasons, distinct-pair distances
+dedupe decisions summary                       # crop acceptance by kind/signature/level, skip reasons, distinct-pair distances
 dedupe decisions export-benchmark pairs.json   # marked-distinct pairs as a benchmark manifest (negatives only)
 dedupe decisions export-crops crops.json       # standing applied/skipped/undone crop verdicts
 ```
