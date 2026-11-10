@@ -393,6 +393,51 @@ def suggested_crop(record: FileRecord) -> CropBox | None:
     return CropBox.decode(record.border_crop)
 
 
+def adjust_crop_box(suggestion: CropBox, edges, *, video: bool = False) -> CropBox:
+    """Validate a user-moved crop zone against ``suggestion``'s frame.
+
+    ``edges`` is the JSON shape the browser sends: integer ``left``/``top``/
+    ``right``/``bottom`` in the same display-orientation pixels the
+    suggestion was measured in. The frame size always comes from the
+    suggestion, never from the request, so a moved zone cannot smuggle in a
+    different image size. Video zones snap outward to the even offsets and
+    dimensions 4:2:0 re-encoding requires, cutting a pixel more only where
+    the frame edge leaves no room to grow. Raises ``TypeError`` for a
+    malformed box and ``ValueError`` for one that is not a real crop of the
+    frame, both with user-readable messages.
+    """
+    if not isinstance(edges, dict):
+        raise TypeError("crop box must name its left, top, right and bottom edges")
+    values: dict[str, int] = {}
+    for name in ("left", "top", "right", "bottom"):
+        value = edges.get(name)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"crop box {name} edge must be a whole number of pixels")
+        values[name] = value
+    left, top = values["left"], values["top"]
+    right, bottom = values["right"], values["bottom"]
+    if (left, top, right, bottom) == (0, 0, suggestion.width, suggestion.height):
+        raise ValueError("the crop zone covers the whole picture; skip instead")
+    if video:
+        left -= left % 2
+        top -= top % 2
+        if (right - left) % 2:
+            right = right + 1 if right < suggestion.width else right - 1
+        if (bottom - top) % 2:
+            bottom = bottom + 1 if bottom < suggestion.height else bottom - 1
+    chrome = tuple(
+        edge
+        for edge in suggestion.chrome
+        if (edge == "top" and top > 0) or (edge == "bottom" and bottom < suggestion.height)
+    )
+    box = CropBox(left, top, right, bottom, suggestion.width, suggestion.height, chrome)
+    if not box.is_valid():
+        raise ValueError("the crop zone must sit inside the picture and keep some of it")
+    return box
+
+
 def _register_heif() -> None:
     try:
         from pillow_heif import register_heif_opener

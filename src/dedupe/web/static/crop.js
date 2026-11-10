@@ -1,6 +1,10 @@
 // Crop review: images and videos framed by black bars or screenshot interface.
 // Each card shows the picture (a video's poster frame) with the suggested crop
 // drawn on it — the bars that would go are shaded — and one click applies it.
+// The zone itself can be clicked to select it, dragged to move it, and
+// resized from any edge or corner; the moved zone is saved with the review
+// and is the crop a Crop (or Crop all) click cuts. Reset zone puts the
+// detector's suggestion back.
 // A card's zone can be toggled off to see the untouched picture (and every
 // zone at once from the header), then back on to see what a crop removes.
 // The file is rewritten in place (videos are re-encoded) and the untouched
@@ -20,6 +24,20 @@ import {
 
 const busy = new Set();
 
+// Zones the user has dragged, by path, shown until the server's copy of the
+// group (which carries the same box as its effective crop) replaces them.
+// The server is the store; this only keeps a drag ahead of its save.
+const localAdjustments = new Map();
+const adjustInFlight = new Map();
+const adjustTimers = new Map();
+// A pointer press on a zone must not fall through to the thumbnail's click
+// (which opens the lightbox): the press stamps its card's path here and the
+// thumbnail handler swallows one click that follows it.
+const suppressThumbClick = new Map();
+const CROP_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+// The smallest zone a drag can make, in picture pixels per side.
+const MIN_CROP_PX = 8;
+
 // Paths whose suggested crop zone is currently hidden, so the untouched
 // picture can be compared against what a crop would remove. Visual only.
 const hiddenZones = new Set();
@@ -37,6 +55,82 @@ function thumbUrl(member) {
 
 function pendingMembers(g) {
   return (g.members || []).filter((member) => member.crop_state === "pending" && !member.protected);
+}
+
+function edgesOf(box) {
+  return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+}
+
+function sameEdges(a, b) {
+  return Boolean(a && b)
+    && a.left === b.left && a.top === b.top && a.right === b.right && a.bottom === b.bottom;
+}
+
+// A full crop box (the shape the server sends) from four edges of a frame.
+function deriveBox(edges, frame) {
+  const cropWidth = edges.right - edges.left;
+  const cropHeight = edges.bottom - edges.top;
+  const total = frame.width * frame.height;
+  return {
+    ...edges,
+    width: frame.width,
+    height: frame.height,
+    crop_width: cropWidth,
+    crop_height: cropHeight,
+    removed_fraction: total > 0 ? Math.round((1 - (cropWidth * cropHeight) / total) * 10000) / 10000 : 0,
+    chrome: (frame.chrome || []).filter(
+      (edge) => (edge === "top" && edges.top > 0) || (edge === "bottom" && edges.bottom < frame.height),
+    ),
+  };
+}
+
+// The zone on screen for a member: an unsaved drag wins over the server's
+// effective crop, which already folds in any saved adjustment.
+function effectiveBox(member) {
+  return localAdjustments.get(member?.path) || member?.crop || null;
+}
+
+function isAdjusted(member) {
+  if (!member) return false;
+  const local = localAdjustments.get(member.path);
+  if (local && member.crop_suggested) return !sameEdges(local, member.crop_suggested);
+  return Boolean(member.crop_adjusted);
+}
+
+// Videos re-encode to 4:2:0, whose crop offsets and sizes are even; snap
+// outward exactly as the server does so the zone on screen is the zone cut.
+function snapEdges(member, edges, frame) {
+  if (member?.media_type !== "video") return edges;
+  const out = { ...edges };
+  out.left -= out.left % 2;
+  out.top -= out.top % 2;
+  if ((out.right - out.left) % 2) out.right = out.right < frame.width ? out.right + 1 : out.right - 1;
+  if ((out.bottom - out.top) % 2) out.bottom = out.bottom < frame.height ? out.bottom + 1 : out.bottom - 1;
+  return out;
+}
+
+// The zone after dragging ``start`` by (dx, dy) picture pixels: "move"
+// slides it inside the frame; a handle name drags its named edge(s).
+function draggedBox(member, start, handle, dx, dy) {
+  const frame = start;
+  const minW = Math.max(1, Math.min(MIN_CROP_PX, frame.width));
+  const minH = Math.max(1, Math.min(MIN_CROP_PX, frame.height));
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, Math.round(value)));
+  let edges = edgesOf(start);
+  if (handle === "move") {
+    const shiftX = clamp(dx, -start.left, frame.width - start.right);
+    const shiftY = clamp(dy, -start.top, frame.height - start.bottom);
+    edges = {
+      left: start.left + shiftX, right: start.right + shiftX,
+      top: start.top + shiftY, bottom: start.bottom + shiftY,
+    };
+  } else {
+    if (handle.includes("w")) edges.left = clamp(start.left + dx, 0, start.right - minW);
+    if (handle.includes("e")) edges.right = clamp(start.right + dx, start.left + minW, frame.width);
+    if (handle.includes("n")) edges.top = clamp(start.top + dy, 0, start.bottom - minH);
+    if (handle.includes("s")) edges.bottom = clamp(start.bottom + dy, start.top + minH, frame.height);
+  }
+  return deriveBox(snapEdges(member, edges, frame), frame);
 }
 
 function hasBlackBars(crop) {
@@ -72,8 +166,7 @@ function cropKind(crop) {
   return hasBlackBars(crop) ? "Screenshot interface and black bars" : "Screenshot interface";
 }
 
-function evidenceFor(member) {
-  const crop = member.crop;
+function evidenceFor(member, crop = effectiveBox(member)) {
   if (!crop) return "No crop suggestion";
   const removed = Math.round((crop.removed_fraction || 0) * 100);
   const size = `${crop.width}×${crop.height} → ${crop.crop_width}×${crop.crop_height}`;
@@ -85,7 +178,10 @@ function evidenceFor(member) {
   }
   // A video crop re-encodes the whole clip; say so before the click, not after.
   const reencode = member.media_type === "video" ? " · cropping re-encodes the video" : "";
-  return `${cropKind(crop)}: ${barsLabel(crop)} · ${size} (removes ${removed}%)${reencode}`;
+  const adjusted = member.crop_suggested && !sameEdges(crop, member.crop_suggested)
+    ? "Adjusted zone · "
+    : "";
+  return `${adjusted}${cropKind(crop)}: ${barsLabel(crop)} · ${size} (removes ${removed}%)${reencode}`;
 }
 
 // Why was this suggestion skipped? Optional and collapsed: the skip lands
@@ -111,15 +207,28 @@ function skipWhyHtml(g, member) {
     </details>`;
 }
 
+const cropBoxLabel = (name) => `Crop zone for ${name}. Drag to move it, drag an edge or corner to `
+  + "resize it. With the zone focused, arrow keys move it and Shift+arrow keys resize it.";
+
+function cropBoxHtml(member, name, editable) {
+  if (!editable) return '<span class="crop-box" aria-hidden="true"></span>';
+  const handles = CROP_HANDLES
+    .map((handle) => `<span class="crop-handle ${handle}" data-handle="${handle}" aria-hidden="true"></span>`)
+    .join("");
+  return `<span class="crop-box editable" tabindex="0" role="group" aria-label="${escapeHtml(cropBoxLabel(name))}" title="Drag to move · drag an edge or corner to resize">${handles}</span>`;
+}
+
 function cardHtml(g, member, index) {
   const name = basename(member.path);
   const state_ = member.crop_state || "pending";
-  const crop = member.crop;
+  const crop = effectiveBox(member);
   // The frame always has the original's proportions, so applying or undoing
   // a crop never resizes the card: a cropped file is drawn inside the box it
   // was cut to and the bars it lost are left empty; otherwise the suggestion
   // is drawn over the original.
   const showsCrop = Boolean(crop) && state_ !== "cropped";
+  const editable = showsCrop && !member.protected;
+  const adjusted = editable && isAdjusted(member);
   const zoneHidden = showsCrop && hiddenZones.has(member.path);
   const width = crop?.width || member.width;
   const height = crop?.height || member.height;
@@ -141,7 +250,7 @@ function cardHtml(g, member, index) {
       <button class="thumb-wrap crop-thumb" type="button" data-path="${escapeHtml(member.path)}" aria-label="Open ${escapeHtml(name)} in the lightbox">
         <span class="crop-frame" data-width="${width || ""}" data-height="${height || ""}">
           <img class="crop-image" src="${thumbUrl(member)}" alt="Preview of ${escapeHtml(name)}" loading="lazy" decoding="async" />
-          ${showsCrop ? '<span class="crop-box" aria-hidden="true"></span>' : ""}
+          ${showsCrop ? cropBoxHtml(member, name, editable) : ""}
         </span>
         ${badge}
       </button>
@@ -156,6 +265,7 @@ function cardHtml(g, member, index) {
         <div class="evidence" title="${escapeHtml(evidenceFor(member))}">${escapeHtml(evidenceFor(member))}</div>
         <div class="card-actions crop-actions">
           ${primary}
+          ${adjusted ? `<button class="btn ghost crop-reset" data-path="${escapeHtml(member.path)}" type="button" title="Put the suggested crop zone back">Reset zone</button>` : ""}
           ${showsCrop ? `<button class="btn ghost crop-zone-toggle" data-path="${escapeHtml(member.path)}" type="button" aria-pressed="${!zoneHidden}" title="${zoneToggleTitle(zoneHidden)}">${zoneHidden ? "Show zone" : "Hide zone"}</button>` : ""}
           <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
         </div>
@@ -174,12 +284,12 @@ function layoutCard(card, member) {
     frame.style.setProperty("--crop-aspect", `${width} / ${height}`);
     frame.classList.toggle("portrait", height > width);
   }
-  const crop = member.crop;
+  const crop = effectiveBox(member);
   if (!crop) return;
   const box = card.querySelector(".crop-box");
   if (box) placeInFrame(box, crop);
   const image = card.querySelector(".crop-image");
-  if (image && member.crop_state === "cropped") placeInFrame(image, crop);
+  if (image && member.crop_state === "cropped") placeInFrame(image, member.crop || crop);
 }
 
 // Position an element over the crop rectangle, in the original's coordinates.
@@ -192,7 +302,8 @@ function placeInFrame(element, crop) {
 
 // What a card shows; a card is rebuilt only when this changes.
 function cardSignature(member) {
-  const crop = member.crop;
+  const crop = effectiveBox(member);
+  const suggested = member.crop_suggested;
   return [
     member.crop_state || "pending",
     member.protected ? 1 : 0,
@@ -201,7 +312,9 @@ function cardSignature(member) {
     member.crop_skip_reason || "",
     member.crop_skip_note || "",
     hiddenZones.has(member.path) ? 1 : 0,
+    isAdjusted(member) ? 1 : 0,
     crop ? [crop.left, crop.top, crop.right, crop.bottom, crop.width, crop.height].join(",") : "",
+    suggested ? [suggested.left, suggested.top, suggested.right, suggested.bottom].join(",") : "",
   ].join("|");
 }
 
@@ -242,6 +355,13 @@ function bindCard(card) {
     focusCard(Number(card.dataset.index));
   });
   card.querySelector(".crop-thumb")?.addEventListener("click", () => {
+    // A click that began on the crop zone selects or drags the zone; only a
+    // click on the picture around it opens the lightbox.
+    const stamped = suppressThumbClick.get(card.dataset.path);
+    if (stamped && Date.now() - stamped < 800) {
+      suppressThumbClick.delete(card.dataset.path);
+      return;
+    }
     state.memberFocus = Number(card.dataset.index);
     openLightbox(state.memberFocus);
   });
@@ -260,6 +380,11 @@ function bindCard(card) {
   card.querySelector(".crop-zone-toggle")?.addEventListener("click", (event) => {
     toggleCropZone(event.currentTarget.dataset.path);
   });
+  card.querySelector(".crop-reset")?.addEventListener("click", (event) => {
+    resetCropZone(event.currentTarget.dataset.path);
+  });
+  const boxEl = card.querySelector(".crop-box.editable");
+  if (boxEl) bindCropBox(card, boxEl);
   const path = card.dataset.path;
   card.querySelector(".crop-skip-why")?.addEventListener("toggle", (event) => {
     if (event.currentTarget.open) openWhy.add(path);
@@ -287,6 +412,159 @@ function bindCard(card) {
       toast(error.message, "error");
     }
   });
+}
+
+function syncEvidence(card, member, box) {
+  const evidence = card.querySelector(".evidence");
+  if (!evidence) return;
+  const text = evidenceFor(member, box);
+  evidence.textContent = text;
+  evidence.title = text;
+}
+
+// Click, drag, and resize for one card's zone. The zone lives inside the
+// thumbnail button, so a press on it claims the gesture (and stamps the
+// suppression the thumbnail's click handler checks) instead of enlarging.
+function bindCropBox(card, boxEl) {
+  boxEl.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const path = card.dataset.path;
+    const member = (currentGroup()?.members || []).find((m) => m.path === path);
+    const start = member && effectiveBox(member);
+    const frame = card.querySelector(".crop-frame");
+    if (!member || !start || !frame || busy.has(path) || hiddenZones.has(path)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    suppressThumbClick.set(path, Date.now());
+    state.memberFocus = Number(card.dataset.index);
+    markFocused();
+    try {
+      boxEl.setPointerCapture(event.pointerId);
+    } catch {
+      /* capture is a nicety; window-level moves below still track */
+    }
+    try {
+      boxEl.focus({ preventScroll: true });
+    } catch {
+      /* a span inside a button may refuse focus in some browsers */
+    }
+    const handle = event.target.closest("[data-handle]")?.dataset.handle || "move";
+    const rect = frame.getBoundingClientRect();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let current = start;
+    card.classList.add("crop-dragging");
+    boxEl.dataset.dragHandle = handle;
+
+    const onMove = (moveEvent) => {
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const dx = ((moveEvent.clientX - startX) / rect.width) * start.width;
+      const dy = ((moveEvent.clientY - startY) / rect.height) * start.height;
+      const next = draggedBox(member, start, handle, dx, dy);
+      if (sameEdges(next, current)) return;
+      current = next;
+      localAdjustments.set(path, current);
+      placeInFrame(boxEl, current);
+      syncEvidence(card, member, current);
+    };
+    const onEnd = () => {
+      boxEl.removeEventListener("pointermove", onMove);
+      boxEl.removeEventListener("pointerup", onEnd);
+      boxEl.removeEventListener("pointercancel", onEnd);
+      card.classList.remove("crop-dragging");
+      delete boxEl.dataset.dragHandle;
+      suppressThumbClick.set(path, Date.now());
+      if (sameEdges(current, start)) {
+        // A plain click: the zone is selected; its card already took focus.
+        if (sameEdges(current, member.crop)) localAdjustments.delete(path);
+        return;
+      }
+      void saveAdjustment(path, current);
+    };
+    boxEl.addEventListener("pointermove", onMove);
+    boxEl.addEventListener("pointerup", onEnd);
+    boxEl.addEventListener("pointercancel", onEnd);
+  });
+  // A zone can be Tabbed to; Enter/Space there must not also press the
+  // enclosing thumbnail button.
+  boxEl.addEventListener("click", (event) => {
+    event.stopPropagation();
+    suppressThumbClick.set(card.dataset.path, Date.now());
+  });
+}
+
+// Store a dragged zone (or, with null, the suggestion again). The reply is
+// the whole updated group, applied like any other crop decision.
+async function saveAdjustment(path, box) {
+  const g = currentGroup();
+  if (!g || !path) return;
+  const timer = adjustTimers.get(path);
+  if (timer) {
+    clearTimeout(timer);
+    adjustTimers.delete(path);
+  }
+  const hadBoxFocus = document.activeElement?.classList?.contains("crop-box");
+  const run = (async () => {
+    try {
+      const updated = await post("/api/crop/adjust", {
+        group_id: g.id,
+        path,
+        scan_id: state.scanId,
+        box: box ? edgesOf(box) : null,
+      });
+      localAdjustments.delete(path);
+      applyUpdate(updated);
+      if (hadBoxFocus) {
+        document
+          .querySelector(`.crop-card[data-path="${CSS.escape(path)}"] .crop-box.editable`)
+          ?.focus({ preventScroll: true });
+      }
+    } catch (error) {
+      localAdjustments.delete(path);
+      toast(error.message || "Could not save that crop zone", "error");
+      const current = currentGroup();
+      if (current) renderCropReview(current);
+    }
+  })();
+  adjustInFlight.set(path, run);
+  try {
+    await run;
+  } finally {
+    if (adjustInFlight.get(path) === run) adjustInFlight.delete(path);
+  }
+}
+
+function resetCropZone(path) {
+  if (!path || busy.has(path)) return;
+  localAdjustments.delete(path);
+  void saveAdjustment(path, null);
+}
+
+// Arrow-key editing for a focused zone: plain arrows move it, Shift+arrows
+// resize it from its bottom-right corner, both by 1% of the picture (at
+// least a pixel). Saves are debounced so held keys send one zone, not fifty.
+function nudgeCropZone(boxEl, event) {
+  const card = boxEl.closest(".crop-card");
+  const path = card?.dataset.path;
+  const member = (currentGroup()?.members || []).find((m) => m.path === path);
+  const start = member && effectiveBox(member);
+  if (!card || !member || !start || busy.has(path)) return false;
+  const stepX = Math.max(1, Math.round(start.width * 0.01));
+  const stepY = Math.max(1, Math.round(start.height * 0.01));
+  const dx = event.key === "ArrowRight" ? stepX : event.key === "ArrowLeft" ? -stepX : 0;
+  const dy = event.key === "ArrowDown" ? stepY : event.key === "ArrowUp" ? -stepY : 0;
+  const next = event.shiftKey
+    ? draggedBox(member, start, dx !== 0 ? "e" : "s", dx, dy)
+    : draggedBox(member, start, "move", dx, dy);
+  if (!sameEdges(next, start)) {
+    localAdjustments.set(path, next);
+    placeInFrame(boxEl, next);
+    syncEvidence(card, member, next);
+    const timer = adjustTimers.get(path);
+    if (timer) clearTimeout(timer);
+    adjustTimers.set(path, setTimeout(() => void saveAdjustment(path, next), 350));
+  }
+  return true;
 }
 
 // Members still showing a suggested zone (cropped files have none to hide).
@@ -363,7 +641,18 @@ function renderCropReview(g) {
   const box = $("members");
   // Hidden zones belong to the review on screen; a different pile starts
   // with every zone showing.
-  if (box.dataset.cropGroup && box.dataset.cropGroup !== g.id) hiddenZones.clear();
+  if (box.dataset.cropGroup && box.dataset.cropGroup !== g.id) {
+    hiddenZones.clear();
+    localAdjustments.clear();
+  }
+  // A local drag the server has since echoed back (or a crop has spent) is
+  // no longer ahead of anything; drop it so the server's box shows.
+  for (const member of g.members || []) {
+    const local = localAdjustments.get(member.path);
+    if (local && (member.crop_state === "cropped" || sameEdges(local, member.crop))) {
+      localAdjustments.delete(member.path);
+    }
+  }
   box.classList.remove("triage-grid", "focus-review");
   box.classList.add("crop-grid");
   $("memberPagination").hidden = true;
@@ -395,6 +684,8 @@ function renderCropReview(g) {
   if (samePile) {
     cards.forEach((card, index) => {
       const member = members[index];
+      // Never rebuild a card mid-drag: its zone holds the pointer capture.
+      if (card.classList.contains("crop-dragging")) return;
       if (card.dataset.signature !== cardSignature(member)) {
         replaceCard(card, buildCard(g, member, index));
       }
@@ -493,10 +784,26 @@ function markCropping(path, cropping) {
 
 async function applyCrop(g, path, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
+  // A drag's save may still be in flight (or debounced behind held arrow
+  // keys); flush it so the zone on screen is the zone that gets cut, and
+  // send that zone with the apply as well in case of a race.
+  const timer = adjustTimers.get(path);
+  if (timer) {
+    clearTimeout(timer);
+    adjustTimers.delete(path);
+    const local = localAdjustments.get(path);
+    if (local) await saveAdjustment(path, local);
+  }
+  if (adjustInFlight.has(path)) await adjustInFlight.get(path);
+  if (busy.has(path)) return;
   busy.add(path);
   markCropping(path, true);
   try {
-    const updated = await post("/api/crop/apply", { group_id: g.id, path, scan_id: state.scanId });
+    const member = (currentGroup()?.members || []).find((m) => m.path === path);
+    const zone = localAdjustments.get(path) || (isAdjusted(member) ? member.crop : null);
+    const updated = await post("/api/crop/apply", {
+      group_id: g.id, path, scan_id: state.scanId, ...(zone ? { box: edgesOf(zone) } : {}),
+    });
     applyUpdate(updated);
     advanceFocus(updated, path, { reveal: fromKeyboard });
     dismissCropUndoToast();
@@ -566,11 +873,19 @@ async function cropAllRemaining() {
   const videos = pending.filter((member) => member.media_type === "video").length;
   const ok = await confirmModal({
     title: `Crop ${pending.length} file${pending.length === 1 ? "" : "s"}?`,
-    body: `<p>Each file is cropped to its suggested frame and rewritten in place. The originals go to the Trash, and each crop can be undone from its card.</p>${videos ? `<p>${videos} video${videos === 1 ? "" : "s"} will be re-encoded, which can take a while.</p>` : ""}<p class="muted">Skipped and already cropped files are left alone.</p>`,
+    body: `<p>Each file is cropped to the zone shown on its card (dragged zones included) and rewritten in place. The originals go to the Trash, and each crop can be undone from its card.</p>${videos ? `<p>${videos} video${videos === 1 ? "" : "s"} will be re-encoded, which can take a while.</p>` : ""}<p class="muted">Skipped and already cropped files are left alone.</p>`,
     confirmLabel: `Crop ${pending.length}`,
     danger: false,
   });
   if (ok !== true) return;
+  // Flush any zone saves still landing so Crop all cuts the zones on screen.
+  for (const [path, timer] of [...adjustTimers]) {
+    clearTimeout(timer);
+    adjustTimers.delete(path);
+    const local = localAdjustments.get(path);
+    if (local) await saveAdjustment(path, local);
+  }
+  if (adjustInFlight.size) await Promise.all([...adjustInFlight.values()]);
   try {
     $("btnCropAll").disabled = true;
     const updated = await post("/api/crop/apply-all", { group_id: g.id, scan_id: state.scanId });
@@ -592,12 +907,17 @@ async function cropAllRemaining() {
 $("btnCropAll")?.addEventListener("click", cropAllRemaining);
 
 // Keyboard: c crops the focused file, x skips it, v toggles its crop
-// zone, ←/→ move between cards.
+// zone, ←/→ move between cards. On a focused zone itself, arrows move the
+// zone and Shift+arrows resize it instead.
 function handleCropKey(event) {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return false;
   const members = g.members || [];
   const member = members[state.memberFocus];
+  const boxEl = event.target?.closest?.(".crop-box.editable");
+  if (boxEl && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+    return nudgeCropZone(boxEl, event);
+  }
   if (event.key === "c" && member?.crop_state === "pending") {
     applyCrop(g, member.path, { fromKeyboard: true });
     return true;

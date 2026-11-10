@@ -45,6 +45,7 @@ from ..borders import (
     BORDER_DISMISSED,
     BORDER_SIGNATURE,
     CropBox,
+    adjust_crop_box,
     crop_file_in_place,
     restore_original_in_place,
     suggested_crop,
@@ -509,6 +510,29 @@ def scan_done_summary(result: ScanResult, scan_kwargs: dict) -> str:
     return ", ".join(parts) or f"{len(result.files)} files"
 
 
+def adjusted_crop(group, member) -> CropBox | None:
+    """The zone the user dragged ``member``'s suggestion to, if it still fits.
+
+    Stored per crop group in ``match_details["adjusted_crops"]`` (encoded
+    like a suggestion), so it rides the review session across restarts. A
+    stored box that no longer matches the suggestion's frame, or equals the
+    suggestion, is not an adjustment.
+    """
+    encoded = (group.match_details.get("adjusted_crops") or {}).get(member.path)
+    box = CropBox.decode(encoded)
+    suggestion = suggested_crop(member)
+    if box is None or suggestion is None:
+        return None
+    if (box.width, box.height) != (suggestion.width, suggestion.height) or box == suggestion:
+        return None
+    return box
+
+
+def effective_crop(group, member) -> CropBox | None:
+    """The crop a Crop click would cut: the user's zone, else the suggestion."""
+    return adjusted_crop(group, member) or suggested_crop(member)
+
+
 def create_app(
     initial_result: ScanResult | None = None,
     review_session_path: str | Path | None = None,
@@ -762,8 +786,15 @@ def create_app(
             reviewed = set(group.reviewed_paths)
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 entry = cropped.get(member.path)
-                box = CropBox.decode(entry["box"]) if entry else suggested_crop(member)
+                box = CropBox.decode(entry["box"]) if entry else effective_crop(group, member)
+                suggestion = suggested_crop(member)
                 member_payload["crop"] = box.to_dict() if box else None
+                member_payload["crop_suggested"] = (
+                    suggestion.to_dict() if suggestion and not entry else None
+                )
+                member_payload["crop_adjusted"] = bool(
+                    not entry and adjusted_crop(group, member)
+                )
                 member_payload["crop_state"] = (
                     "cropped" if entry else "skipped" if member.path in reviewed else "pending"
                 )
@@ -2297,9 +2328,18 @@ def create_app(
             return None, (jsonify({"error": "crop review not found"}), 404)
         return group, None
 
-    def crop_member(member, roots: list[str], batch: TrashBatch):
+    def parse_requested_box(member, raw):
+        """The CropBox a request's ``box`` edges name (TypeError/ValueError if not)."""
+        suggestion = suggested_crop(member)
+        if suggestion is None:
+            raise ValueError("there is no crop suggestion for this file")
+        is_video = getattr(member.media_type, "value", member.media_type) == "video"
+        return adjust_crop_box(suggestion, raw, video=is_video)
+
+    def crop_member(member, roots: list[str], batch: TrashBatch, box=None):
         """Crop one file on disk; returns (outcome, box, error). Lock not held."""
-        box = suggested_crop(member)
+        if box is None:
+            box = suggested_crop(member)
         if box is None:
             return None, None, "there is no crop suggestion for this file"
         if member.protected:
@@ -2314,6 +2354,8 @@ def create_app(
         return outcome, box, None
 
     def record_crop_locked(group, member, box, outcome) -> None:
+        # The applied box is recorded below; a stored adjustment for it is spent.
+        (group.match_details.get("adjusted_crops") or {}).pop(member.path, None)
         cropped = group.match_details.setdefault("cropped", {})
         cropped[member.path] = {
             "box": box.encode(),
@@ -2355,6 +2397,45 @@ def create_app(
         persist_result()
         return payload
 
+    @app.post("/api/crop/adjust")
+    def api_crop_adjust():
+        """Move one suggested crop zone, or reset it with ``box: null``.
+
+        The moved zone is only a review decision — nothing on disk changes
+        until Crop is clicked — and it is stored with the group, so it
+        survives reloads and a resumed review like a skip does.
+        """
+        data = request.get_json(silent=True) or {}
+        path = data.get("path")
+        if "box" not in data:
+            return jsonify({"error": "box is required (null resets the zone)"}), 400
+        with lock:
+            group, refusal = begin_crop_work(data)
+            if refusal:
+                return refusal
+            member = next((m for m in group.members if m.path == path), None)
+            if member is None:
+                return jsonify({"error": "crop candidate not found"}), 404
+            if path in (group.match_details.get("cropped") or {}):
+                return jsonify({
+                    "error": "this file is already cropped; undo the crop first"
+                }), 400
+            if member.protected:
+                return jsonify({"error": "This file is in a protected library"}), 400
+            adjustments = group.match_details.setdefault("adjusted_crops", {})
+            if data["box"] is None:
+                adjustments.pop(path, None)
+            else:
+                try:
+                    box = parse_requested_box(member, data["box"])
+                except (TypeError, ValueError) as exc:
+                    return jsonify({"error": str(exc)}), 400
+                if box == suggested_crop(member):
+                    adjustments.pop(path, None)
+                else:
+                    adjustments[path] = box.encode()
+            return jsonify(finish_crop_locked(group))
+
     @app.post("/api/crop/apply")
     def api_crop_apply():
         """Crop one file in place: the original goes to the system Trash."""
@@ -2367,12 +2448,22 @@ def create_app(
             member = next((m for m in group.members if m.path == path), None)
             if member is None:
                 return jsonify({"error": "crop candidate not found"}), 404
+            # A box sent with the apply is the zone on screen; it wins over a
+            # stored adjustment, and a malformed one is refused even when the
+            # file was already cropped by an earlier click.
+            requested = None
+            if data.get("box") is not None:
+                try:
+                    requested = parse_requested_box(member, data["box"])
+                except (TypeError, ValueError) as exc:
+                    return jsonify({"error": str(exc)}), 400
             if path in (group.match_details.get("cropped") or {}):
                 return jsonify(group_payload(group))
+            requested = requested or effective_crop(group, member)
             state["acting"] = True
             roots = list(state["result"].roots)
         try:
-            outcome, box, error = crop_member(member, roots, TrashBatch())
+            outcome, box, error = crop_member(member, roots, TrashBatch(), box=requested)
             if error:
                 return jsonify({"error": error}), 400
             log_path = write_crop_receipt([
@@ -2386,8 +2477,9 @@ def create_app(
                 )
             ])
             log_decisions([make_crop_event(
-                "applied", replace(member), box,
+                "applied", replace(member), suggested_crop(member) or box,
                 group_id=group.id, scan_id=state["scan_id"], source="single",
+                adjusted_box=box,
                 after={
                     "size": outcome.size, "width": outcome.width,
                     "height": outcome.height, "original_in_trash": outcome.original_in_trash,
@@ -2419,7 +2511,9 @@ def create_app(
             batch = TrashBatch()
             items, failures, done = [], [], []
             for member in pending:
-                outcome, box, error = crop_member(member, roots, batch)
+                outcome, box, error = crop_member(
+                    member, roots, batch, box=effective_crop(group, member)
+                )
                 if error:
                     failures.append({"path": member.path, "error": error})
                     continue
@@ -2435,8 +2529,9 @@ def create_app(
             log_path = write_crop_receipt(items)
             log_decisions([
                 make_crop_event(
-                    "applied", replace(member), box,
+                    "applied", replace(member), suggested_crop(member) or box,
                     group_id=group.id, scan_id=state["scan_id"], source="bulk",
+                    adjusted_box=box,
                     after={
                         "size": outcome.size, "width": outcome.width,
                         "height": outcome.height,
@@ -2498,6 +2593,7 @@ def create_app(
             "skipped" if skip else "reconsidered", snapshot, box,
             group_id=group.id, scan_id=state["scan_id"], source="single",
             reason=reason if skip else None, note=note if skip else None,
+            adjusted_box=effective_crop(group, snapshot),
         )])
         if box is not None:
             store_border_verdict(snapshot, BORDER_DISMISSED if skip else box.encode())
@@ -2535,6 +2631,7 @@ def create_app(
             "annotated", snapshot, box,
             group_id=group.id, scan_id=state["scan_id"], source="single",
             reason=reason, note=note,
+            adjusted_box=effective_crop(group, snapshot),
         )])
         return jsonify(payload)
 
@@ -2576,6 +2673,9 @@ def create_app(
             )
             with lock:
                 (group.match_details.get("cropped") or {}).pop(path, None)
+                # The restored file's suggestion becomes the box that was
+                # applied, so any older adjustment of it is spent.
+                (group.match_details.get("adjusted_crops") or {}).pop(path, None)
                 group.reviewed_paths = [p for p in group.reviewed_paths if p != path]
                 member = next((m for m in group.members if m.path == path), None)
                 if member is not None:

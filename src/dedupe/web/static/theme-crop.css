@@ -68,6 +68,70 @@
   pointer-events: none;
 }
 
+/* A pending zone can be grabbed: its inside moves it, its handles resize
+   it. Handles stay out of the way until the card is hovered, focused, or
+   being dragged, so a grid of untouched suggestions reads as before. */
+#members.crop-grid .crop-box.editable {
+  pointer-events: auto;
+  cursor: move;
+  touch-action: none;
+}
+
+#members.crop-grid .crop-card.focused .crop-box.editable,
+#members.crop-grid .crop-box.editable:focus,
+#members.crop-grid .crop-card.crop-dragging .crop-box.editable {
+  border-style: solid;
+}
+
+#members.crop-grid .crop-box.editable:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+#members.crop-grid .crop-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  background: var(--lt-table, #fff);
+  border: 2px solid var(--lt-pencil);
+  border-radius: 2px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+#members.crop-grid .crop-card:hover .crop-handle,
+#members.crop-grid .crop-card.focused .crop-handle,
+#members.crop-grid .crop-box.editable:focus .crop-handle,
+#members.crop-grid .crop-card.crop-dragging .crop-handle {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #members.crop-grid .crop-handle {
+    transition: none;
+  }
+}
+
+#members.crop-grid .crop-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+#members.crop-grid .crop-handle.n { left: 50%; top: 0; transform: translate(-50%, -50%); cursor: ns-resize; }
+#members.crop-grid .crop-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+#members.crop-grid .crop-handle.e { right: 0; top: 50%; transform: translate(50%, -50%); cursor: ew-resize; }
+#members.crop-grid .crop-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+#members.crop-grid .crop-handle.s { left: 50%; bottom: 0; transform: translate(-50%, 50%); cursor: ns-resize; }
+#members.crop-grid .crop-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+#members.crop-grid .crop-handle.w { left: 0; top: 50%; transform: translate(-50%, -50%); cursor: ew-resize; }
+
+/* While a zone is dragged, its handles match the gesture and the picture
+   under the pointer cannot be selected or scrolled away. */
+#members.crop-grid .crop-card.crop-dragging {
+  user-select: none;
+}
+
+#members.crop-grid .crop-card.crop-dragging .crop-image {
+  pointer-events: none;
+}
+
 /* A cropped picture sits inside the box it was cut to, at the same scale as
    before, so applying a crop never resizes the print; the bars it lost read
    as an empty, faintly hatched margin. */
@@ -84,6 +148,10 @@
 #members.crop-grid .crop-card.skipped .crop-box {
   border-color: var(--lt-faint);
   box-shadow: 0 0 0 100vmax rgba(120, 120, 120, 0.25);
+}
+
+#members.crop-grid .crop-card.skipped .crop-handle {
+  border-color: var(--lt-faint);
 }
 
 /* Zone toggled off: the untouched picture, with nothing shaded away. */

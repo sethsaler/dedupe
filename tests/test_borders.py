@@ -20,6 +20,7 @@ from dedupe.borders import (
     LEGACY_BORDER_SIGNATURES,
     USER_LOCK_FLAGS,
     CropBox,
+    adjust_crop_box,
     copy_xattrs,
     crop_file_in_place,
     detect_black_borders,
@@ -629,6 +630,190 @@ def test_web_crop_all_skips_decided_files(tmp_path: Path, monkeypatch) -> None:
     assert body["failures"] == []
     assert Path(skipped).read_bytes() == before
     assert set(body["cropped_paths"]) == {m.path for m in group.members} - {skipped}
+
+
+def _member_of(body: dict, path: str) -> dict:
+    return next(m for m in body["members"] if m["path"] == path)
+
+
+def test_adjust_crop_box_snaps_video_to_even_geometry() -> None:
+    suggestion = CropBox(left=0, top=30, right=320, bottom=210, width=320, height=240)
+    moved = adjust_crop_box(
+        suggestion, {"left": 11, "top": 41, "right": 309, "bottom": 201}
+    )
+    assert (moved.left, moved.top, moved.right, moved.bottom) == (11, 41, 309, 201)
+    snapped = adjust_crop_box(
+        suggestion, {"left": 11, "top": 41, "right": 309, "bottom": 201}, video=True
+    )
+    assert snapped.left % 2 == 0 and snapped.top % 2 == 0
+    assert snapped.crop_width % 2 == 0 and snapped.crop_height % 2 == 0
+    # Snapping never cuts more than the user asked for.
+    assert snapped.left <= 11 and snapped.top <= 41
+    assert snapped.right >= 309 and snapped.bottom >= 201
+    with pytest.raises(ValueError):
+        adjust_crop_box(suggestion, {"left": 10, "top": 40, "right": 10, "bottom": 200})
+    with pytest.raises(ValueError):
+        adjust_crop_box(suggestion, {"left": 0, "top": 0, "right": 320, "bottom": 240})
+    with pytest.raises(TypeError):
+        adjust_crop_box(suggestion, {"left": True, "top": 40, "right": 300, "bottom": 200})
+
+
+def test_web_crop_adjust_moves_the_zone_and_apply_uses_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _app, client, headers, scan_id, group, _result = _crop_app(tmp_path, monkeypatch)
+    target = group.members[0].path
+    base = {"group_id": group.id, "path": target, "scan_id": scan_id}
+    suggested = _member_of(client.get(f"/api/groups/{group.id}").get_json(), target)["crop"]
+    edges = {
+        "left": suggested["left"] + 12,
+        "top": suggested["top"] + 8,
+        "right": suggested["right"] - 20,
+        "bottom": suggested["bottom"] - 6,
+    }
+
+    adjusted = client.post("/api/crop/adjust", json={**base, "box": edges}, headers=headers)
+    assert adjusted.status_code == 200, adjusted.get_json()
+    member = _member_of(adjusted.get_json(), target)
+    assert member["crop_adjusted"] is True
+    assert {k: member["crop"][k] for k in edges} == edges
+    assert member["crop"]["crop_width"] == edges["right"] - edges["left"]
+    assert {k: member["crop_suggested"][k] for k in edges} == {
+        k: suggested[k] for k in edges
+    }
+
+    # The adjustment survives a fresh fetch of the group.
+    fetched = _member_of(client.get(f"/api/groups/{group.id}").get_json(), target)
+    assert fetched["crop_adjusted"] is True
+    assert {k: fetched["crop"][k] for k in edges} == edges
+
+    applied = client.post("/api/crop/apply", json=base, headers=headers)
+    assert applied.status_code == 200, applied.get_json()
+    with Image.open(target) as cropped:
+        assert cropped.size == (
+            edges["right"] - edges["left"],
+            edges["bottom"] - edges["top"],
+        )
+    member = _member_of(applied.get_json(), target)
+    assert member["crop_state"] == "cropped"
+    assert member["crop_adjusted"] is False
+
+    # The decision log keeps the detector's box and the box actually used apart.
+    from dedupe.decision_log import read_decisions
+
+    events, _skipped = read_decisions(tmp_path / "state" / "dedupe" / "decision-log.jsonl")
+    event = next(
+        e for e in events if e.get("decision") == "applied" and e["file"]["path"] == target
+    )
+    assert event["suggestion"]["left"] == suggested["left"]
+    assert {k: event["adjusted"][k] for k in edges} == edges
+
+    # Undo brings the file back with the applied (adjusted) zone as its suggestion.
+    undone = client.post("/api/crop/undo", json=base, headers=headers)
+    assert undone.status_code == 200, undone.get_json()
+    member = _member_of(undone.get_json(), target)
+    assert member["crop_state"] == "pending"
+    assert member["crop_adjusted"] is False
+    assert {k: member["crop"][k] for k in edges} == edges
+
+
+def test_web_crop_adjust_reset_and_validation(tmp_path: Path, monkeypatch) -> None:
+    _app, client, headers, scan_id, group, _result = _crop_app(tmp_path, monkeypatch)
+    target = group.members[0].path
+    base = {"group_id": group.id, "path": target, "scan_id": scan_id}
+    suggested = _member_of(client.get(f"/api/groups/{group.id}").get_json(), target)["crop"]
+    edges = {
+        "left": suggested["left"] + 10,
+        "top": suggested["top"] + 10,
+        "right": suggested["right"] - 10,
+        "bottom": suggested["bottom"] - 10,
+    }
+    assert client.post(
+        "/api/crop/adjust", json={**base, "box": edges}, headers=headers
+    ).status_code == 200
+
+    reset = client.post("/api/crop/adjust", json={**base, "box": None}, headers=headers)
+    assert reset.status_code == 200, reset.get_json()
+    member = _member_of(reset.get_json(), target)
+    assert member["crop_adjusted"] is False
+    assert {k: member["crop"][k] for k in edges} == {k: suggested[k] for k in edges}
+
+    bad_boxes = [
+        {**edges, "left": -1},
+        {**edges, "right": edges["left"]},
+        {**edges, "bottom": suggested["height"] + 5},
+        {"left": 0, "top": 0, "right": suggested["width"], "bottom": suggested["height"]},
+        {**edges, "top": "eight"},
+        {k: v for k, v in edges.items() if k != "bottom"},
+        "not-a-box",
+    ]
+    for bad in bad_boxes:
+        refused = client.post("/api/crop/adjust", json={**base, "box": bad}, headers=headers)
+        assert refused.status_code == 400, (bad, refused.get_json())
+
+    # A protected file's zone cannot be edited, and neither can a cropped one's.
+    group.members[0].protected = True
+    refused = client.post("/api/crop/adjust", json={**base, "box": edges}, headers=headers)
+    assert refused.status_code == 400
+    group.members[0].protected = False
+    assert client.post("/api/crop/apply", json=base, headers=headers).status_code == 200
+    refused = client.post("/api/crop/adjust", json={**base, "box": edges}, headers=headers)
+    assert refused.status_code == 400
+
+
+def test_web_crop_apply_inline_box_and_apply_all_use_adjustments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _app, client, headers, scan_id, group, _result = _crop_app(tmp_path, monkeypatch)
+    fetched = client.get(f"/api/groups/{group.id}").get_json()
+    boxes = {}
+    for member in group.members:
+        crop = _member_of(fetched, member.path)["crop"]
+        boxes[member.path] = {
+            "left": crop["left"] + 15,
+            "top": crop["top"] + 5,
+            "right": crop["right"] - 15,
+            "bottom": crop["bottom"] - 5,
+        }
+    first, second = (m.path for m in group.members)
+    base = {"group_id": group.id, "scan_id": scan_id}
+
+    # A box sent with the apply itself wins, even with no stored adjustment.
+    applied = client.post(
+        "/api/crop/apply", json={**base, "path": first, "box": boxes[first]}, headers=headers
+    )
+    assert applied.status_code == 200, applied.get_json()
+    with Image.open(first) as cropped:
+        assert cropped.size == (
+            boxes[first]["right"] - boxes[first]["left"],
+            boxes[first]["bottom"] - boxes[first]["top"],
+        )
+
+    # A stored adjustment is honoured by Crop all.
+    assert client.post(
+        "/api/crop/adjust",
+        json={**base, "path": second, "box": boxes[second]},
+        headers=headers,
+    ).status_code == 200
+    bulk = client.post("/api/crop/apply-all", json=base, headers=headers)
+    assert bulk.status_code == 200, bulk.get_json()
+    assert bulk.get_json()["cropped_count"] == 1
+    with Image.open(second) as cropped:
+        assert cropped.size == (
+            boxes[second]["right"] - boxes[second]["left"],
+            boxes[second]["bottom"] - boxes[second]["top"],
+        )
+
+    # An invalid inline box is refused before anything on disk changes.
+    third_path = Path(first)
+    before = third_path.read_bytes()
+    refused = client.post(
+        "/api/crop/apply",
+        json={**base, "path": second, "box": {"left": 9, "top": 9, "right": 9, "bottom": 9}},
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert third_path.read_bytes() == before
 
 
 def test_web_crop_refuses_changed_file_and_selection(tmp_path: Path, monkeypatch) -> None:
