@@ -71,8 +71,8 @@ for (const root of [$("members"), $("similarBoard")]) {
     if (wrap === pendingWrap) hidePreview();
   });
 
-  // A click opens the lightbox (or toggles a board tile); the quick-look must
-  // not linger above it.
+  // A click acts on the card (opens the lightbox, trashes a triage picture,
+  // or toggles a board tile); the quick-look must not linger above it.
   root.addEventListener("pointerdown", hidePreview);
 }
 

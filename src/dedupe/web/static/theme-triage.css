@@ -3,8 +3,8 @@
    Card rules are keyed on #members.triage-grid so the decision review
    (.decision-card) and the Similar views keep their own steps. Focus-mode cards
    (.focus-card) keep the app layout; only the outline and placeholder change there.
-   Red (--lt-pencil) marks only things that will leave: Trash chips and the trashed
-   placeholder. Keepers and selection stay ink. */
+   Red (--lt-pencil) marks only things that will leave: the trashed
+   placeholder (clicking the print is the Trash). Keepers stay ink. */
 
 /* ---------- Contact sheet grid ----------
    --tile-size comes from the Preview size slider (240-520px). Triage cells use half
@@ -152,10 +152,12 @@
 }
 
 /* ---------- Action chips on the print ----------
-   Reveal and Trash float bottom-right of the print. They show on hover, focus
-   and the focused card. Touch has no hover, so they stay visible there. The
-   top-right overlay Trash is replaced by these chips. */
-#members.triage-grid .triage-card .thumb-delete {
+   Enlarge and Reveal float bottom-right of the print; the print itself is
+   the Trash (red marks only the trashed placeholder). They show on hover,
+   focus and the focused card. Touch has no hover, so they stay visible
+   there. The top-right overlay control is replaced by these chips. */
+#members.triage-grid .triage-card .thumb-delete,
+#members.triage-grid .triage-card .thumb-enlarge {
   display: none;
 }
 
@@ -188,6 +190,7 @@
 }
 
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate,
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal {
   width: auto;
   min-width: 0;
@@ -208,7 +211,9 @@
   cursor: pointer;
 }
 
-#members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal:hover {
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal:hover,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate:hover,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate:focus-visible {
   background: var(--lt-ink);
   color: var(--lt-table);
   text-decoration: none;

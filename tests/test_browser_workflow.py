@@ -277,14 +277,16 @@ def test_lingering_hover_shows_a_full_image_preview(
     page.keyboard.press("Escape")
     expect(page.locator("#hoverPreview")).to_be_hidden()
 
-    # Clicking through the quick-look still opens the real lightbox.
+    # Clicking through the quick-look still acts on the card — on a Files
+    # card that is now the one-click Trash, not the lightbox.
     page.locator("#detailTitle").hover()
     thumb.hover()
     expect(page.locator("#hoverPreview")).to_be_visible(timeout=3_500)
     thumb.click()
-    page.locator("#lightbox").wait_for(state="visible")
     expect(page.locator("#hoverPreview")).to_be_hidden()
-    page.locator("#lbClose").click()
+    page.locator("#toast").filter(has_text="Moved").wait_for(state="visible")
+    page.locator("#toastAction").click()
+    page.locator("#toast").filter(has_text="restored").wait_for(state="visible")
 
     assert page_errors == []
 
@@ -861,7 +863,8 @@ def test_non_human_delete_is_one_click_and_undoable(page, tmp_path: Path) -> Non
             }"""
         )
 
-        page.locator("#members .card-actions .delete-candidate").first.click()
+        # Clicking the picture itself is the one-click Trash.
+        page.locator("#members .thumb-wrap").first.click()
         expect(page.locator("#modalBackdrop")).to_be_hidden()
         page.locator("#toast").filter(has_text="Moved").wait_for()
         expect(page.locator("#toastAction")).to_be_visible()
@@ -928,11 +931,12 @@ def test_all_files_review_trashes_uncategorized_files_from_the_lightbox(
         expect(page.locator("#detailTitle")).to_contain_text("All files")
         expect(page.locator("#detailTitle")).to_contain_text("media")
 
-        # Cards are triage-style: one-click Trash, no selection checkboxes.
-        expect(page.locator("#members .card-actions .delete-candidate")).to_have_count(3)
+        # Cards are triage-style: clicking a picture trashes it, the former
+        # Trash button now enlarges it, and there are no selection checkboxes.
+        expect(page.locator("#members .card-actions .enlarge-candidate")).to_have_count(3)
         expect(page.locator("#members .sel-cb")).to_have_count(0)
 
-        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#members .card-actions .enlarge-candidate").first.click()
         page.locator("#lightbox").wait_for(state="visible")
         expect(page.locator("#lbCounter")).to_have_text("1 / 3")
         expect(page.locator("#lbDelete")).to_be_visible()
@@ -1147,7 +1151,7 @@ def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
         )
 
         # …but the lightbox sifts the whole group without stopping at the edge.
-        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#members .card-actions .enlarge-candidate").first.click()
         page.locator("#lightbox").wait_for(state="visible")
         expect(page.locator("#lbCounter")).to_have_text("1 / 55")
         for _ in range(50):
@@ -1185,7 +1189,7 @@ def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
             )
 
         page.route("**/api/reveal*", fake_reveal)
-        page.locator("#members .thumb-wrap").first.click()
+        page.locator("#members .card-actions .enlarge-candidate").first.click()
         page.locator("#lightbox").wait_for(state="visible")
         expect(page.locator("#lbMeta")).to_contain_text("file-07.png")
         page.keyboard.press("r")
@@ -1262,8 +1266,13 @@ def test_results_scroll_batches_and_single_group_next(page, tmp_path: Path, kind
             "cards => cards.map(card => card.dataset.path)"
         ))) == 105
 
-        # Newly appended previews use the full list's indices.
-        page.locator("#members .thumb-wrap").nth(100).click()
+        # Newly appended previews use the full list's indices. Triage
+        # pictures trash on click, so they enlarge from their Enlarge
+        # button; a Similar picture still opens the lightbox directly.
+        if kind == "similar":
+            page.locator("#members .thumb-wrap").nth(100).click()
+        else:
+            page.locator("#members .card-actions .enlarge-candidate").nth(100).click()
         expect(page.locator("#lbCounter")).to_have_text("101 / 105")
         page.keyboard.press("Escape")
         if kind == "similar":
@@ -2549,7 +2558,8 @@ def test_focus_gallery_navigation_and_recovery(page, tmp_path, review_media, kin
         assert group.reviewed_paths == [] and group.selected_for_removal == []
         page.keyboard.press("ArrowLeft")
         expect(page.locator("#members .card")).to_have_attribute("data-path", paths[1])
-        page.locator("#members .delete-candidate").click()
+        # In focus view the picture is still the one-click Trash.
+        page.locator("#members .thumb-wrap").click()
         expect(page.locator("#toast")).to_contain_text("Moved")
         assert not Path(paths[1]).exists()
         expect(page.locator("#members .card")).to_have_attribute("data-path", paths[2])

@@ -1802,12 +1802,14 @@ kbd {
 }
 
 .card-actions > .delete-candidate,
+.card-actions > .enlarge-candidate,
 .card-actions > .undo-delete {
   width: 100%;
   min-height: 48px;
 }
 
-.thumb-delete {
+.thumb-delete,
+.thumb-enlarge {
   position: absolute;
   top: 8px;
   right: 8px;
@@ -1830,17 +1832,22 @@ kbd {
 }
 
 .card:hover .thumb-delete,
+.card:hover .thumb-enlarge,
 .card.focused .thumb-delete,
+.card.focused .thumb-enlarge,
 .thumb-stack:focus-within .thumb-delete,
-.thumb-delete:focus-visible {
+.thumb-stack:focus-within .thumb-enlarge,
+.thumb-delete:focus-visible,
+.thumb-enlarge:focus-visible {
   opacity: 1;
   transform: translateY(0);
 }
 
-/* Touch devices have no hover: keep the delete control visible and drop the
+/* Touch devices have no hover: keep the overlay control visible and drop the
    "Hover to play" badge (a tap opens the lightbox instead). */
 @media (hover: none) {
-  .thumb-delete {
+  .thumb-delete,
+  .thumb-enlarge {
     opacity: 1;
     transform: none;
   }
@@ -1850,6 +1857,18 @@ kbd {
 
 .thumb-delete:hover {
   background: rgba(239, 90, 90, 0.92);
+  color: #fff;
+}
+
+/* The overlay control enlarges now; the picture itself is the Trash. */
+.thumb-enlarge {
+  border-color: rgba(255, 255, 255, 0.45);
+  background: rgba(10, 14, 22, 0.78);
+  color: #fff;
+}
+
+.thumb-enlarge:hover {
+  background: rgba(10, 14, 22, 0.95);
   color: #fff;
 }
 
