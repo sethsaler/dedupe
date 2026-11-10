@@ -387,6 +387,8 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     ? document.activeElement?.closest?.("#members .card")
     : null;
   const focusedMemberPath = focusedMemberCard?.dataset.path;
+  const focusedCropZone = focusedMemberCard
+    && document.activeElement?.classList?.contains("crop-box");
   if (focusedMemberCard) {
     const focusedIndex = Number(focusedMemberCard.dataset.index);
     if (Number.isFinite(focusedIndex)) state.memberFocus = focusedIndex;
@@ -469,7 +471,8 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
     if (focusedCard) {
       $("members").querySelectorAll(".card").forEach((card) => card.classList.remove("focused"));
       focusedCard.classList.add("focused");
-      focusedCard.querySelector(".thumb-wrap")?.focus({ preventScroll: true });
+      focusedCard.querySelector(focusedCropZone ? ".crop-box.editable" : ".thumb-wrap")
+        ?.focus({ preventScroll: true });
     }
   }
   applyPendingGroupFocus(id);

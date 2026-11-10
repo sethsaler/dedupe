@@ -46,10 +46,10 @@ from .parallel import map_parallel
 
 # Bump when the detection rules change so cached verdicts are recomputed.
 # A user's dismissal under an earlier signature still stands.
-BORDER_SIGNATURE = "black-borders-v6"
+BORDER_SIGNATURE = "black-borders-v7"
 LEGACY_BORDER_SIGNATURES = frozenset(
     {"black-borders-v1", "black-borders-v2", "black-borders-v3", "black-borders-v4",
-     "black-borders-v5"}
+     "black-borders-v5", "black-borders-v6"}
 )
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
@@ -2094,9 +2094,10 @@ def detect_video_borders(path: str | Path) -> CropBox | None:
 
     The box is in display orientation (rotation applied, as players show the
     clip), pulled back by the human guard wherever a sampled frame puts a
-    person in the removed strips, and pulled in to even offsets and
-    dimensions, which the 4:2:0 encoders used to apply the crop require.
-    Without the guard only strict, majority bars are suggested.
+    person in the removed strips, with even offsets and dimensions as the
+    4:2:0 encoders require. Guarded edges round outward to keep people whole.
+    Without a successful guard on every sampled frame, only strict, majority
+    bars are suggested; any people found still take precedence over them.
     """
     if not _ffmpeg_available():
         return None
@@ -2119,28 +2120,40 @@ def detect_video_borders(path: str | Path) -> CropBox | None:
     bars = _majority_bars(_frame_bars(frames, aggressive=aggressive))
     if bars is None:
         return None
+    boxes: list[tuple[float, float, float, float]] = []
     if aggressive:
-        boxes: list[tuple[float, float, float, float]] = []
+        guard_failed = False
         for stamp, frame in zip(timestamps, frames):
             if frame is None:
+                guard_failed = True
                 continue
             rgb = _video_frame_rgb(path, stamp)
             found = _human_guard_boxes(rgb) if rgb is not None else None
-            if found:
+            if found is None:
+                guard_failed = True
+            else:
                 boxes.extend(found)
+        if guard_failed:
+            bars = _majority_bars(_frame_bars(frames, aggressive=False))
+            if bars is None:
+                return None
         if boxes:
-            proven = _majority_bars(_frame_bars(frames, aggressive=False)) or (0, 0, 0, 0)
-            bars = _guard_floor(bars, proven, boxes, width, height)
+            # Strict bars in a majority of frames say nothing about people
+            # in other segments. Unlike an image, they cannot be a floor.
+            bars = _guarded_bars(bars, boxes, width, height)
             if not any(bars):
                 return None
     top, bottom, left, right = bars
-    # Even offsets and sizes, always inward: at most one picture line is
-    # given up per edge, and no black line is ever brought back.
+    right, bottom = width - right, height - bottom
+    # Unguarded strict bars round inward so no black line returns. A guarded
+    # crop rounds outward instead: rounding inward could cut a person's odd
+    # boundary by one pixel. If that exceeds an odd-sized source, decline.
+    direction = -1 if boxes else 1
     box = CropBox(
-        left=left + left % 2,
-        top=top + top % 2,
-        right=width - right - (width - right) % 2,
-        bottom=height - bottom - (height - bottom) % 2,
+        left=left + direction * (left % 2),
+        top=top + direction * (top % 2),
+        right=right - direction * (right % 2),
+        bottom=bottom - direction * (bottom % 2),
         width=width,
         height=height,
     )

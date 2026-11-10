@@ -30,6 +30,17 @@ const busy = new Set();
 const localAdjustments = new Map();
 const adjustInFlight = new Map();
 const adjustTimers = new Map();
+let adjustmentScan = null;
+
+function syncAdjustmentScan() {
+  if (adjustmentScan === state.scanId) return;
+  adjustmentScan = state.scanId;
+  for (const timer of adjustTimers.values()) clearTimeout(timer);
+  adjustTimers.clear();
+  localAdjustments.clear();
+  adjustInFlight.clear();
+  document.querySelectorAll(".crop-card").forEach((card) => { delete card.dataset.signature; });
+}
 // A pointer press on a zone must not fall through to the thumbnail's click
 // (which opens the lightbox): the press stamps its card's path here and the
 // thumbnail handler swallows one click that follows it.
@@ -331,6 +342,8 @@ function buildCard(g, member, index) {
 // Swap a changed card in place. The previous picture stays on screen until
 // the new one has loaded, so the card never flashes empty.
 function replaceCard(previous, card) {
+  const keepZoneFocus = previous.contains(document.activeElement)
+    && document.activeElement?.classList?.contains("crop-box");
   const fresh = card.querySelector(".crop-image");
   const shown = previous.querySelector(".crop-image");
   const url = fresh?.getAttribute("src");
@@ -347,6 +360,7 @@ function replaceCard(previous, card) {
     loader.src = url;
   }
   previous.replaceWith(card);
+  if (keepZoneFocus) card.querySelector(".crop-box.editable")?.focus({ preventScroll: true });
 }
 
 function bindCard(card) {
@@ -426,6 +440,10 @@ function syncEvidence(card, member, box) {
 // thumbnail button, so a press on it claims the gesture (and stamps the
 // suppression the thumbnail's click handler checks) instead of enlarging.
 function bindCropBox(card, boxEl) {
+  boxEl.addEventListener("focus", () => {
+    state.memberFocus = Number(card.dataset.index);
+    markFocused();
+  });
   boxEl.addEventListener("pointerdown", (event) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
     const path = card.dataset.path;
@@ -495,40 +513,55 @@ function bindCropBox(card, boxEl) {
 
 // Store a dragged zone (or, with null, the suggestion again). The reply is
 // the whole updated group, applied like any other crop decision.
-async function saveAdjustment(path, box) {
-  const g = currentGroup();
-  if (!g || !path) return;
+async function saveAdjustment(path, box, g = currentGroup(), scanId = state.scanId) {
+  syncAdjustmentScan();
+  if (!g || !path || state.scanId !== scanId) return false;
   const timer = adjustTimers.get(path);
-  if (timer) {
-    clearTimeout(timer);
-    adjustTimers.delete(path);
-  }
-  const hadBoxFocus = document.activeElement?.classList?.contains("crop-box");
+  if (timer) clearTimeout(timer);
+  adjustTimers.delete(path);
+  // Serialize writes for this file: ignoring an older reply alone would still
+  // let an older request overwrite the newer box on the server.
+  const previous = adjustInFlight.get(path);
   const run = (async () => {
+    if (previous) await previous;
+    if (state.scanId !== scanId) return false;
     try {
       const updated = await post("/api/crop/adjust", {
-        group_id: g.id,
-        path,
-        scan_id: state.scanId,
+        group_id: g.id, path, scan_id: scanId,
         box: box ? edgesOf(box) : null,
       });
-      localAdjustments.delete(path);
-      applyUpdate(updated);
-      if (hadBoxFocus) {
-        document
-          .querySelector(`.crop-card[data-path="${CSS.escape(path)}"] .crop-box.editable`)
-          ?.focus({ preventScroll: true });
+      if (state.scanId !== scanId) return false;
+      if (localAdjustments.get(path) === box) localAdjustments.delete(path);
+      // Replies contain an entire group snapshot. Another card may have saved
+      // since that snapshot was taken; only acknowledge this request's member.
+      const group = state.allGroups.find((item) => item.id === g.id)
+        || state.groups.find((item) => item.id === g.id);
+      if (group) {
+        const focused = document.activeElement?.closest(".crop-card")?.dataset.path;
+        const hadBoxFocus = document.activeElement?.classList?.contains("crop-box");
+        applyUpdate({ ...group, members: group.members.map((member) => {
+          const saved = updated.members.find((item) => item.path === path);
+          if (member.path !== path || !saved || member.crop_state === "cropped") return member;
+          return { ...member, crop: saved.crop, crop_adjusted: saved.crop_adjusted,
+            crop_suggested: saved.crop_suggested };
+        }) });
+        if (hadBoxFocus && focused) {
+          document.querySelector(`.crop-card[data-path="${CSS.escape(focused)}"] .crop-box.editable`)
+            ?.focus({ preventScroll: true });
+        }
       }
+      return true;
     } catch (error) {
-      localAdjustments.delete(path);
-      toast(error.message || "Could not save that crop zone", "error");
-      const current = currentGroup();
-      if (current) renderCropReview(current);
+      if (state.scanId === scanId) {
+        toast(error.message || "Could not save that crop zone", "error");
+      }
+      // Keep the unsaved box visible and available for retry.
+      return false;
     }
   })();
   adjustInFlight.set(path, run);
   try {
-    await run;
+    return await run;
   } finally {
     if (adjustInFlight.get(path) === run) adjustInFlight.delete(path);
   }
@@ -536,8 +569,18 @@ async function saveAdjustment(path, box) {
 
 function resetCropZone(path) {
   if (!path || busy.has(path)) return;
-  localAdjustments.delete(path);
-  void saveAdjustment(path, null);
+  const member = currentGroup()?.members.find((item) => item.path === path);
+  if (!member) return;
+  // Keep reset visible even if an earlier save arrives while reset is queued.
+  const suggestion = member.crop_suggested || member.crop;
+  localAdjustments.set(path, suggestion);
+  void saveAdjustment(path, null).then((saved) => {
+    if (saved && localAdjustments.get(path) === suggestion) {
+      localAdjustments.delete(path);
+      if (currentGroup()) renderCropReview(currentGroup());
+    }
+  });
+  renderCropReview(currentGroup());
 }
 
 // Arrow-key editing for a focused zone: plain arrows move it, Shift+arrows
@@ -549,6 +592,8 @@ function nudgeCropZone(boxEl, event) {
   const member = (currentGroup()?.members || []).find((m) => m.path === path);
   const start = member && effectiveBox(member);
   if (!card || !member || !start || busy.has(path)) return false;
+  state.memberFocus = Number(card.dataset.index);
+  markFocused();
   const stepX = Math.max(1, Math.round(start.width * 0.01));
   const stepY = Math.max(1, Math.round(start.height * 0.01));
   const dx = event.key === "ArrowRight" ? stepX : event.key === "ArrowLeft" ? -stepX : 0;
@@ -562,7 +607,9 @@ function nudgeCropZone(boxEl, event) {
     syncEvidence(card, member, next);
     const timer = adjustTimers.get(path);
     if (timer) clearTimeout(timer);
-    adjustTimers.set(path, setTimeout(() => void saveAdjustment(path, next), 350));
+    const group = currentGroup();
+    const scanId = state.scanId;
+    adjustTimers.set(path, setTimeout(() => void saveAdjustment(path, next, group, scanId), 350));
   }
   return true;
 }
@@ -638,18 +685,18 @@ function updateCropMeta(g) {
 }
 
 function renderCropReview(g) {
+  syncAdjustmentScan();
   const box = $("members");
   // Hidden zones belong to the review on screen; a different pile starts
   // with every zone showing.
   if (box.dataset.cropGroup && box.dataset.cropGroup !== g.id) {
     hiddenZones.clear();
-    localAdjustments.clear();
   }
-  // A local drag the server has since echoed back (or a crop has spent) is
-  // no longer ahead of anything; drop it so the server's box shows.
+  // A completed crop has spent its local zone. Only the save that owns an
+  // edit may otherwise clear it, even when a poll happens to echo its edges.
   for (const member of g.members || []) {
     const local = localAdjustments.get(member.path);
-    if (local && (member.crop_state === "cropped" || sameEdges(local, member.crop))) {
+    if (local && member.crop_state === "cropped" && !adjustInFlight.has(member.path)) {
       localAdjustments.delete(member.path);
     }
   }
@@ -784,21 +831,18 @@ function markCropping(path, cropping) {
 
 async function applyCrop(g, path, { fromKeyboard = false } = {}) {
   if (!g || !path || busy.has(path)) return;
-  // A drag's save may still be in flight (or debounced behind held arrow
-  // keys); flush it so the zone on screen is the zone that gets cut, and
-  // send that zone with the apply as well in case of a race.
-  const timer = adjustTimers.get(path);
-  if (timer) {
-    clearTimeout(timer);
-    adjustTimers.delete(path);
-    const local = localAdjustments.get(path);
-    if (local) await saveAdjustment(path, local);
-  }
-  if (adjustInFlight.has(path)) await adjustInFlight.get(path);
-  if (busy.has(path)) return;
+  const scanId = state.scanId;
   busy.add(path);
   markCropping(path, true);
   try {
+    const timer = adjustTimers.get(path);
+    if (timer) clearTimeout(timer);
+    adjustTimers.delete(path);
+    if (adjustInFlight.has(path)) await adjustInFlight.get(path);
+    if (state.scanId !== scanId || currentGroup()?.id !== g.id) return;
+    const local = localAdjustments.get(path);
+    if (local && !await saveAdjustment(path, local)) return;
+    if (state.scanId !== scanId || currentGroup()?.id !== g.id) return;
     const member = (currentGroup()?.members || []).find((m) => m.path === path);
     const zone = localAdjustments.get(path) || (isAdjusted(member) ? member.crop : null);
     const updated = await post("/api/crop/apply", {
@@ -878,16 +922,24 @@ async function cropAllRemaining() {
     danger: false,
   });
   if (ok !== true) return;
-  // Flush any zone saves still landing so Crop all cuts the zones on screen.
-  for (const [path, timer] of [...adjustTimers]) {
-    clearTimeout(timer);
-    adjustTimers.delete(path);
-    const local = localAdjustments.get(path);
-    if (local) await saveAdjustment(path, local);
-  }
-  if (adjustInFlight.size) await Promise.all([...adjustInFlight.values()]);
+  const scanId = state.scanId;
+  if (pending.some((member) => busy.has(member.path))) return;
+  for (const member of pending) busy.add(member.path);
   try {
     $("btnCropAll").disabled = true;
+    // Freeze edits first, then drain each file's queue and save any newer
+    // debounced (or previously failed) edit before applying the whole pile.
+    for (const member of pending) {
+      const path = member.path;
+      const timer = adjustTimers.get(path);
+      if (timer) clearTimeout(timer);
+      adjustTimers.delete(path);
+      if (adjustInFlight.has(path)) await adjustInFlight.get(path);
+      if (state.scanId !== scanId || currentGroup()?.id !== g.id) return;
+      const local = localAdjustments.get(path);
+      if (local && !await saveAdjustment(path, local)) return;
+    }
+    if (state.scanId !== scanId || currentGroup()?.id !== g.id) return;
     const updated = await post("/api/crop/apply-all", { group_id: g.id, scan_id: state.scanId });
     applyUpdate(updated);
     dismissCropUndoToast();
@@ -900,6 +952,7 @@ async function cropAllRemaining() {
   } catch (error) {
     toast(error.message, "error");
   } finally {
+    for (const member of pending) busy.delete(member.path);
     $("btnCropAll").disabled = false;
   }
 }

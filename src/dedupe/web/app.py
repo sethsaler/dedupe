@@ -2680,7 +2680,8 @@ def create_app(
                 member = next((m for m in group.members if m.path == path), None)
                 if member is not None:
                     log_decisions([make_crop_event(
-                        "undone", replace(member), CropBox.decode(entry["box"]),
+                        "undone", replace(member, **(entry.get("before") or {})),
+                        CropBox.decode(entry["box"]),
                         group_id=group.id, scan_id=state["scan_id"], source="single",
                     )])
                 before = dict(entry.get("before") or {})
@@ -2902,8 +2903,11 @@ def create_app(
                             if path in by_path
                         ]
             if len(backfill) > 2:
+                # Earlier swipes (including those restored from a session)
+                # already decided some pairs. Log only newly inferred pairs,
+                # never downgrade an explicit verdict to dissolution backfill.
+                decided = cache.distinct_pairs(backfill)
                 pair_count = cache.mark_distinct(backfill, source="inferred")
-                decided = {(e["path_a"], e["path_b"]) for e in decision_events}
                 log_decisions([
                     event
                     for event in distinct_events_for_records(
