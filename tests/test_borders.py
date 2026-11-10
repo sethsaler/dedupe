@@ -3461,6 +3461,122 @@ def test_video_boxed_in_most_segments_is_cropped(tmp_path: Path) -> None:
     assert box.left >= 214 and box.right <= 426
 
 
+def _mock_guarded_video(monkeypatch, frames, guard_results, *, rgb_failures=()):
+    """Exercise the video decision with real pixels and deterministic guard output."""
+    height, width = frames[0].shape
+    stamps = list(borders.VIDEO_SAMPLE_FRACTIONS)
+    monkeypatch.setattr(borders, "_ffmpeg_available", lambda: True)
+    monkeypatch.setattr(
+        borders, "_probe_video_stream",
+        lambda path: {"duration": 1.0, "width": width, "height": height},
+    )
+    monkeypatch.setattr(borders, "_human_guard_available", lambda: True)
+    monkeypatch.setattr(borders, "_video_frame_luma", lambda path, stamp: frames[stamps.index(stamp)])
+    monkeypatch.setattr(
+        borders, "_video_frame_rgb",
+        lambda path, stamp: None if stamps.index(stamp) in rgb_failures else stamps.index(stamp),
+    )
+    monkeypatch.setattr(borders, "_human_guard_boxes", lambda index: guard_results[index])
+
+
+@pytest.mark.parametrize("horizontal", [False, True], ids=["letterbox", "pillarbox"])
+@pytest.mark.parametrize("edge", [0.05, 0.051, 0.0], ids=["even-edge", "odd-edge", "full-frame"])
+def test_video_guard_overrides_majority_strict_bars(monkeypatch, horizontal, edge) -> None:
+    boxed = borders._luma(Image.fromarray(_framed(1000, 1000, top=200, bottom=200)))
+    full = borders._luma(Image.fromarray(_picture(1000, 1000)))
+    person = (0.3, edge, 0.7, 1 - edge)
+    if horizontal:
+        boxed = boxed.T
+        person = (edge, 0.3, 1 - edge, 0.7)
+    _mock_guarded_video(monkeypatch, [boxed] * 3 + [full] * 2, [[], [], [], [person], []])
+
+    box = borders.detect_video_borders("mixed.mp4")
+
+    if edge == 0:
+        assert box is None  # Keeping the person leaves no crop at all.
+    else:
+        assert box is not None
+        assert box.left <= person[0] * box.width
+        assert box.top <= person[1] * box.height
+        assert box.right >= person[2] * box.width
+        assert box.bottom >= person[3] * box.height
+        assert all(value % 2 == 0 for value in (box.left, box.top, box.right, box.bottom))
+
+
+@pytest.mark.parametrize("failure", ["inference", "rgb"])
+@pytest.mark.parametrize("failed_frames", [(0,), (0, 1, 2, 3, 4)], ids=["one-frame", "all-frames"])
+@pytest.mark.parametrize("strict", [False, True], ids=["aggressive-only", "strict-fallback"])
+def test_video_guard_failure_disables_aggressive_bars(
+    monkeypatch, failure, failed_frames, strict,
+) -> None:
+    frame = borders._luma(Image.fromarray(_framed(800, 600, top=100, bottom=100, bar_value=40)))
+    if strict:
+        frame = frame.copy()
+        frame[:, :40] = 3  # A strict pillarbox remains eligible on fallback.
+    results = [None if failure == "inference" and i in failed_frames else [] for i in range(5)]
+    _mock_guarded_video(
+        monkeypatch, [frame] * 5, results,
+        rgb_failures=failed_frames if failure == "rgb" else (),
+    )
+
+    box = borders.detect_video_borders("guard-failure.mp4")
+
+    if strict:
+        assert box is not None
+        assert box.left == 40 and box.right == 800
+        assert box.top == 0 and box.bottom == 600
+    else:
+        assert box is None
+
+
+def test_video_successful_empty_guard_keeps_aggressive_bars(monkeypatch) -> None:
+    frame = borders._luma(Image.fromarray(_framed(800, 600, top=100, bottom=100, bar_value=40)))
+    _mock_guarded_video(monkeypatch, [frame] * 5, [[]] * 5)
+
+    box = borders.detect_video_borders("no-people.mp4")
+
+    assert box is not None
+    assert box.top >= 96 and box.bottom <= 504
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_video_missing_luma_frame_disables_aggressive_bars(monkeypatch, strict) -> None:
+    frame = borders._luma(Image.fromarray(_framed(800, 600, top=100, bottom=100, bar_value=40)))
+    if strict:
+        frame = frame.copy()
+        frame[:, :40] = 3
+    _mock_guarded_video(monkeypatch, [frame] * 4 + [None], [[]] * 5)
+
+    box = borders.detect_video_borders("missing-frame.mp4")
+
+    if strict:
+        assert box is not None
+        assert (box.left, box.top, box.right, box.bottom) == (40, 0, 800, 600)
+    else:
+        assert box is None
+
+
+def test_video_odd_source_edge_is_not_rounded_through_a_person(monkeypatch) -> None:
+    boxed = borders._luma(Image.fromarray(_framed(1001, 1000, top=200, bottom=200)))
+    person = (0.0, 0.25, 1.0, 0.75)
+    _mock_guarded_video(monkeypatch, [boxed] * 5, [[person]] * 5)
+
+    # No even crop width can keep a person spanning all 1001 source columns.
+    assert borders.detect_video_borders("odd-width.mp4") is None
+
+
+def test_video_strict_fallback_still_honors_people_from_successful_frames(monkeypatch) -> None:
+    boxed = borders._luma(Image.fromarray(_framed(1000, 1000, top=200, bottom=200)))
+    full = borders._luma(Image.fromarray(_picture(1000, 1000)))
+    person = (0.3, 0.05, 0.7, 0.95)
+    _mock_guarded_video(monkeypatch, [boxed] * 3 + [full] * 2, [None, [], [], [person], []])
+
+    box = borders.detect_video_borders("partial-guard.mp4")
+
+    assert box is not None
+    assert box.top <= 50 and box.bottom >= 950
+
+
 # --- aggressive bars ----------------------------------------------------------
 #
 # The strict detector stays as the first word; the aggressive pass adds the

@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import shutil
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from dedupe.borders import BORDER_SIGNATURE, CropBox
+from dedupe.cache import HashCache
 from dedupe.cli import main as cli_main
 from dedupe.decision_log import (
     append_decisions,
@@ -18,6 +20,7 @@ from dedupe.decision_log import (
     crop_manifest,
     current_crop_labels,
     current_distinct_labels,
+    file_snapshot,
     make_crop_event,
     make_distinct_event,
     make_distinct_path_event,
@@ -230,7 +233,12 @@ def test_web_crop_decisions_are_logged(tmp_path: Path, monkeypatch) -> None:
     _FakeBatch.trash_dir = tmp_path / "Trash"
     monkeypatch.setattr(web_app, "TrashBatch", _FakeBatch)
     one = _record(_framed_image(tmp_path / "one.png"))
-    two = _record(_framed_image(tmp_path / "two.png"))
+    two = _record(
+        _framed_image(tmp_path / "two.png"),
+        sha256="original-sha256", tile_phashes="original-tiles",
+        orientation_phashes="original-orientations", video_fingerprint="original-frames",
+    )
+    original_features = file_snapshot(two)
     group = build_crop_groups([one, two])[0]
     result = ScanResult(roots=[str(tmp_path)], files=[one, two], groups=[group])
     log = tmp_path / "decisions.jsonl"
@@ -269,6 +277,16 @@ def test_web_crop_decisions_are_logged(tmp_path: Path, monkeypatch) -> None:
 
     applied = client.post("/api/crop/apply", json={**base, "path": two.path}, headers=headers)
     assert applied.status_code == 200, applied.get_json()
+    def fail_restore(*args, **kwargs):
+        raise OSError("restore failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(web_app, "restore_original_in_place", fail_restore)
+        failed = client.post("/api/crop/undo", json={**base, "path": two.path}, headers=headers)
+        assert failed.status_code == 400
+        assert [event["decision"] for event in read_decisions(log)[0]] == [
+            "skipped", "annotated", "applied",
+        ]
     undone = client.post("/api/crop/undo", json={**base, "path": two.path}, headers=headers)
     assert undone.status_code == 200, undone.get_json()
 
@@ -284,6 +302,8 @@ def test_web_crop_decisions_are_logged(tmp_path: Path, monkeypatch) -> None:
     ]
     assert events[0]["suggestion"]["top"] == 30
     assert events[2]["source"] == "single" and events[2]["after"]["height"] == 180
+    assert events[3]["file"] == original_features
+    assert current_crop_labels(events)[0]["file"] == original_features
     labels = current_crop_labels(events)
     assert {e["file"]["path"]: e["decision"] for e in labels} == {two.path: "undone"}
 
@@ -330,3 +350,99 @@ def test_web_distinct_decisions_are_logged(tmp_path: Path) -> None:
     ]
     assert events[0]["pair"]["phash_distance"] == 0
     assert current_distinct_labels(events) == []
+
+
+@pytest.mark.parametrize("scope", ["pair", "group"])
+def test_backfill_preserves_explicit_labels_in_persisted_logs(tmp_path: Path, scope: str) -> None:
+    a = _record(tmp_path / "a.png")
+    b = _record(tmp_path / "b.png")
+    explicit = make_distinct_event("marked", a, b, label_scope=scope, source="swipe")
+    inferred = make_distinct_event("marked", a, b, label_scope="backfill")
+    log = tmp_path / "legacy.jsonl"
+    append_decisions([explicit, inferred], log)
+    events, _ = read_decisions(log)
+    assert current_distinct_labels(events) == [events[0]]
+    assert len(benchmark_manifest(events, scopes=(scope,))["pairs"]) == 1
+
+    # Undo still withdraws the explicit label, and a later inference must
+    # not resurrect its former explicit provenance.
+    reversal = make_distinct_path_event("unmarked", b.path, a.path)
+    assert current_distinct_labels([*events, reversal]) == []
+    assert current_distinct_labels([*events, reversal, inferred]) == [inferred]
+    assert current_distinct_labels([inferred, explicit]) == [explicit]
+
+
+@pytest.mark.parametrize("stale_cached_pair", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+def test_web_dissolution_logs_only_new_backfill_pairs(
+    tmp_path: Path, stale_cached_pair: bool, resume: bool,
+) -> None:
+    records = [_record(tmp_path / name) for name in ("a.jpg", "b.jpg", "c.jpg")]
+    result = ScanResult(roots=[str(tmp_path)], files=records, groups=build_groups([], [records]))
+    group = result.groups[0]
+    anchor = group.suggested_keep
+    others = [m.path for m in group.members if m.path != anchor]
+    log = tmp_path / "decisions.jsonl"
+    app = create_app(
+        result, review_session_path=tmp_path / "session.json",
+        cache_path=tmp_path / "cache.sqlite3", decision_log_path=log,
+    )
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    if stale_cached_pair:
+        # A former review of replacement files at the same two paths must
+        # not prevent logging their newly inferred pair at dissolution.
+        cache = HashCache(tmp_path / "cache.sqlite3")
+        try:
+            cache.mark_distinct([
+                replace(record, inode=record.inode + 1, phash="ffffffffffffffff")
+                for record in records if record.path in others
+            ])
+        finally:
+            cache.close()
+    for other in others:
+        response = client.post(
+            "/api/similar/mark-distinct",
+            json={"group_id": group.id, "path": other, "anchor": anchor,
+                  "scan_id": scan_id, "source": "swipe"},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.get_json()
+        if resume and other == others[0]:
+            app = create_app(
+                review_session_path=tmp_path / "session.json",
+                cache_path=tmp_path / "cache.sqlite3", decision_log_path=log,
+            )
+            client = app.test_client()
+            headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+            resumed = client.post("/api/review-session/resume", json={}, headers=headers)
+            assert resumed.status_code == 200, resumed.get_json()
+            scan_id = resumed.get_json()["scan_id"]
+    assert response.get_json()["dissolved"]
+    events, _ = read_decisions(log)
+    assert [e["label_scope"] for e in events] == ["pair", "pair", "backfill"]
+    assert (events[-1]["path_a"], events[-1]["path_b"]) == tuple(sorted(others))
+    assert len(benchmark_manifest(events)["pairs"]) == 2
+    assert len(benchmark_manifest(events, scopes=("pair", "backfill"))["pairs"]) == 3
+
+
+@pytest.mark.parametrize("changed", [
+    {"inode": -1}, {"mtime_ns": -1}, {"size": 999},
+    {"phash": "ffffffffffffffff"}, {"video_fingerprint": "replacement"},
+])
+def test_backfill_does_not_preserve_verdict_for_changed_files(
+    tmp_path: Path, changed: dict,
+) -> None:
+    a = _record(tmp_path / "a.png")
+    b = _record(tmp_path / "b.png")
+    explicit = make_distinct_event("marked", a, b, label_scope="pair")
+    inferred = make_distinct_event("marked", replace(a, **changed), b, label_scope="backfill")
+    assert current_distinct_labels([explicit, inferred]) == [inferred]
+    assert benchmark_manifest([explicit, inferred])["pairs"] == []
+
+
+def test_backfill_does_not_preserve_path_only_provenance() -> None:
+    explicit = make_distinct_path_event("marked", "/a.png", "/b.png", label_scope="pair")
+    inferred = make_distinct_path_event("marked", "/a.png", "/b.png", label_scope="backfill")
+    assert current_distinct_labels([explicit, inferred]) == [inferred]

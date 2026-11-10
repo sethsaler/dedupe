@@ -378,8 +378,26 @@ def current_crop_labels(events: list[dict]) -> list[dict]:
     return list(labels.values())
 
 
+def _same_file_snapshot(left: dict | None, right: dict | None) -> bool:
+    """Only preserve provenance when snapshots positively identify the same file.
+
+    Paths alone are insufficient: new media may replace a previously reviewed
+    file. Require complete stat identity and matching saved features rather
+    than carrying an old explicit label onto uncertain or changed content.
+    """
+    if not left or not right:
+        return False
+    identity = ("size", "mtime_ns", "device", "inode")
+    return all(left.get(key) is not None for key in identity) and left == right
+
+
 def current_distinct_labels(events: list[dict]) -> list[dict]:
-    """Pairs whose latest distinct decision still stands."""
+    """Pairs whose latest distinct decision still stands.
+
+    Dissolution backfill is inferred, so it cannot replace a standing
+    explicit verdict. Apply this when reading as well as writing so logs
+    recorded before that safeguard retain their inspected-pair labels.
+    """
     labels: dict[tuple[str, str], dict] = {}
     for event in events:
         if event.get("kind") != "distinct":
@@ -389,6 +407,15 @@ def current_distinct_labels(events: list[dict]) -> list[dict]:
             continue
         key = tuple(sorted((path_a, path_b)))
         if event.get("decision") == "marked":
+            if (
+                event.get("label_scope") == "backfill"
+                and labels.get(key, {}).get("label_scope") in ("pair", "group")
+                and all(
+                    _same_file_snapshot(labels[key].get(field), event.get(field))
+                    for field in ("file_a", "file_b")
+                )
+            ):
+                continue
             labels[key] = event
         elif event.get("decision") == "unmarked":
             labels.pop(key, None)
