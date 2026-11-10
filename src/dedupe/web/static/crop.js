@@ -569,18 +569,21 @@ async function saveAdjustment(path, box, g = currentGroup(), scanId = state.scan
 
 function resetCropZone(path) {
   if (!path || busy.has(path)) return;
-  const member = currentGroup()?.members.find((item) => item.path === path);
-  if (!member) return;
+  const group = currentGroup();
+  const scanId = state.scanId;
+  const member = group?.members.find((item) => item.path === path);
+  if (group?.kind !== "crop" || !member) return;
   // Keep reset visible even if an earlier save arrives while reset is queued.
   const suggestion = member.crop_suggested || member.crop;
   localAdjustments.set(path, suggestion);
-  void saveAdjustment(path, null).then((saved) => {
-    if (saved && localAdjustments.get(path) === suggestion) {
+  void saveAdjustment(path, null, group, scanId).then((saved) => {
+    if (saved && state.scanId === scanId && localAdjustments.get(path) === suggestion) {
       localAdjustments.delete(path);
-      if (currentGroup()) renderCropReview(currentGroup());
+      const selected = currentGroup();
+      if (selected?.id === group.id && selected.kind === "crop") renderCropReview(selected);
     }
   });
-  renderCropReview(currentGroup());
+  renderCropReview(group);
 }
 
 // Arrow-key editing for a focused zone: plain arrows move it, Shift+arrows

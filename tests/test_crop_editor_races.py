@@ -221,3 +221,53 @@ def test_bulk_crop_retries_unsaved_geometry_and_aborts_on_save_failure(page, cro
         page.locator("#modalConfirm").click()
     assert len(applied) == 1
     assert page.evaluate("window.adjustRequests.at(-1).box.left") == 43
+
+
+def test_delayed_reset_does_not_render_crop_ui_over_another_group(page, crop_editor):
+    card = crop_editor.first
+    _release(page)
+    card.locator(".crop-box").focus()
+    with page.expect_response("**/api/crop/adjust"):
+        page.keyboard.press("ArrowRight")
+    expect(card.locator(".crop-reset")).to_be_visible()
+    crop_group_id = page.evaluate("""async () => {
+      const {state} = await import('/static/state.js');
+      return state.currentId;
+    }""")
+    page.evaluate("window.holdAdjustments = true")
+    card.locator(".crop-reset").click()
+    page.wait_for_function("() => window.heldAdjustments.length === 1")
+
+    # Use the real tab and group navigation while the reset reply is held.
+    page.locator('.tab[data-kind="all_files"]').click()
+    page.locator(".group-item").first.click()
+    expect(page.locator("#detailTitle")).to_contain_text("All files")
+    expect(page.locator("#members .crop-card")).to_have_count(0)
+    expect(page.locator("#members .card")).to_have_count(2)
+    page.evaluate("""() => {
+      window.unexpectedCropCards = [];
+      new MutationObserver(records => {
+        for (const record of records) for (const node of record.addedNodes) {
+          if (node.nodeType === 1 && node.matches('.crop-card')) {
+            window.unexpectedCropCards.push(node.dataset.path);
+          }
+        }
+      }).observe(document.querySelector('#members'), {childList: true});
+    }""")
+    _release(page)
+    page.wait_for_function("""async (id) => {
+      const {state} = await import('/static/state.js');
+      return state.allGroups.find(g => g.id === id).members.every(m => !m.crop_adjusted);
+    }""", arg=crop_group_id)
+    page.wait_for_timeout(200)
+    assert page.evaluate("window.unexpectedCropCards") == []
+    expect(page.locator("#members .crop-card")).to_have_count(0)
+    expect(page.locator("#members")).not_to_have_class(re.compile(r"\bcrop-grid\b"))
+    expect(page.locator("#detailTitle")).to_contain_text("All files")
+
+    # The originating review still receives the reset when revisited.
+    page.locator('.tab[data-kind="crop"]').click()
+    page.locator(".group-item").first.click()
+    expect(page.locator("#members .crop-card")).to_have_count(2)
+    expect(page.locator("#members .crop-reset")).to_have_count(0)
+    assert _left(page.locator("#members .crop-card").first) == 12.5
