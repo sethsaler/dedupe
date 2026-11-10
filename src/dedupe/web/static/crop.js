@@ -17,6 +17,9 @@ import {
 } from "./util.js";
 
 const busy = new Set();
+// Skip-reason panels left open, by path: annotating rebuilds the card, and
+// the panel (with its note field) must not collapse out from under the user.
+const openWhy = new Set();
 
 function thumbUrl(member) {
   return withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(member.path)}`, member.path);
@@ -75,6 +78,29 @@ function evidenceFor(member) {
   return `${cropKind(crop)}: ${barsLabel(crop)} · ${size} (removes ${removed}%)${reencode}`;
 }
 
+// Why was this suggestion skipped? Optional and collapsed: the skip lands
+// with one click either way, and a reason picked afterwards is logged with
+// the rejected box for future detector tuning.
+function skipWhyHtml(g, member) {
+  if ((member.crop_state || "pending") !== "skipped") return "";
+  const reasons = g.crop_skip_reasons || [];
+  const chosen = reasons.find((r) => r.id === member.crop_skip_reason);
+  const summary = chosen ? `Skipped: ${chosen.label}` : "Why was this skipped?";
+  const chips = reasons.map((r) => `
+      <button class="chip crop-skip-reason ${r.id === member.crop_skip_reason ? "chosen" : ""}"
+        type="button" data-reason="${escapeHtml(r.id)}"
+        aria-pressed="${r.id === member.crop_skip_reason}">${escapeHtml(r.label)}</button>`).join("");
+  return `
+    <details class="crop-skip-why" ${openWhy.has(member.path) ? "open" : ""}>
+      <summary>${escapeHtml(summary)}</summary>
+      <div class="crop-skip-chips">${chips}</div>
+      <input class="crop-skip-note" type="text" maxlength="500"
+        placeholder="Optional note (Enter to save)"
+        value="${escapeHtml(member.crop_skip_note || "")}" />
+      ${chosen || member.crop_skip_note ? '<button class="linkish crop-skip-clear" type="button">Clear reason</button>' : ""}
+    </details>`;
+}
+
 function cardHtml(g, member, index) {
   const name = basename(member.path);
   const state_ = member.crop_state || "pending";
@@ -121,6 +147,7 @@ function cardHtml(g, member, index) {
           ${primary}
           <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
         </div>
+        ${skipWhyHtml(g, member)}
       </div>
     </article>`;
 }
@@ -159,6 +186,8 @@ function cardSignature(member) {
     member.protected ? 1 : 0,
     member.crop_undo_available ? 1 : 0,
     member.size,
+    member.crop_skip_reason || "",
+    member.crop_skip_note || "",
     crop ? [crop.left, crop.top, crop.right, crop.bottom, crop.width, crop.height].join(",") : "",
   ].join("|");
 }
@@ -214,6 +243,25 @@ function bindCard(card) {
   });
   card.querySelector(".crop-undo")?.addEventListener("click", (event) => {
     undoCrop(currentGroup(), event.currentTarget.dataset.path);
+  });
+  const path = card.dataset.path;
+  card.querySelector(".crop-skip-why")?.addEventListener("toggle", (event) => {
+    if (event.currentTarget.open) openWhy.add(path);
+    else openWhy.delete(path);
+  });
+  card.querySelectorAll(".crop-skip-reason").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const member = (currentGroup()?.members || []).find((m) => m.path === path);
+      const reason = member?.crop_skip_reason === chip.dataset.reason ? null : chip.dataset.reason;
+      annotateSkip(currentGroup(), path, reason, card.querySelector(".crop-skip-note")?.value || null);
+    });
+  });
+  card.querySelector(".crop-skip-note")?.addEventListener("change", (event) => {
+    const member = (currentGroup()?.members || []).find((m) => m.path === path);
+    annotateSkip(currentGroup(), path, member?.crop_skip_reason || null, event.target.value || null);
+  });
+  card.querySelector(".crop-skip-clear")?.addEventListener("click", () => {
+    annotateSkip(currentGroup(), path, null, null);
   });
   card.querySelector(".reveal")?.addEventListener("click", async (event) => {
     event.stopPropagation();
@@ -397,6 +445,21 @@ async function skipCrop(g, path, skip, { fromKeyboard = false } = {}) {
     if (skip) advanceFocus(updated, path, { reveal: fromKeyboard });
   } catch (error) {
     toast(error.message, "error");
+  } finally {
+    busy.delete(path);
+  }
+}
+
+async function annotateSkip(g, path, reason, note) {
+  if (!g || !path || busy.has(path)) return;
+  busy.add(path);
+  try {
+    const updated = await post("/api/crop/annotate-skip", {
+      group_id: g.id, path, scan_id: state.scanId, reason, note,
+    });
+    applyUpdate(updated);
+  } catch (error) {
+    toast(error.message || "Could not save that reason", "error");
   } finally {
     busy.delete(path);
   }

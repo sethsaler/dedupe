@@ -226,6 +226,14 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   }
   state.keepDecisionsError = s.keep_decisions_error || null;
 
+  if (s.decision_log_error && s.decision_log_error !== state.decisionLogError) {
+    toast(
+      `Review decisions are not being logged (${s.decision_log_error}) — decisions still apply`,
+      "error",
+    );
+  }
+  state.decisionLogError = s.decision_log_error || null;
+
   // Configure workers slider from server CPU info (once)
   if (s.system) {
     const cpu = Number(s.system.cpu_count) || 0;

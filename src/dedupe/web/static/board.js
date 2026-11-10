@@ -376,7 +376,7 @@ async function markNotDuplicates(g) {
   try {
     await api("/api/similar/mark-distinct", {
       method: "POST",
-      body: JSON.stringify({ group_id: g.id, scan_id: state.scanId }),
+      body: JSON.stringify({ group_id: g.id, scan_id: state.scanId, source: "board" }),
     });
   } catch (error) {
     toast(error.message || "Could not mark the group", "error");

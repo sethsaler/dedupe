@@ -52,6 +52,15 @@ from ..borders import (
 from ..cache import HashCache
 from ..cleanup import cleanup_opportunity
 from ..decider import decider_available
+from ..decision_log import (
+    SKIP_REASONS,
+    append_decisions,
+    distinct_events_for_records,
+    make_crop_event,
+    make_distinct_event,
+    make_distinct_path_event,
+    validate_skip_annotation,
+)
 from ..engine import run_scan, run_scans_parallel
 from ..grouping import (
     apply_smart_select,
@@ -96,7 +105,7 @@ from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 32
+WEB_API_VERSION = 33
 PREVIEW_TOKEN_TTL_SECONDS = 600
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
@@ -504,6 +513,7 @@ def create_app(
     initial_result: ScanResult | None = None,
     review_session_path: str | Path | None = None,
     cache_path: str | Path | None = None,
+    decision_log_path: str | Path | None = None,
 ) -> Flask:
     app = Flask(
         __name__,
@@ -514,6 +524,7 @@ def create_app(
     app.config["SECRET_KEY"] = secrets.token_hex(32)
     app.config["DEDUPE_CSRF_TOKEN"] = csrf_token
     app.config["DEDUPE_CACHE_PATH"] = cache_path
+    app.config["DEDUPE_DECISION_LOG_PATH"] = decision_log_path
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     capabilities = detect_capabilities()
     lock = threading.RLock()
@@ -561,6 +572,9 @@ def create_app(
         # Last durable keep-decisions write failure (None when healthy). The
         # write must never fail a selection request, but it must be visible.
         "keep_decisions_error": None,
+        # Last decision-log write failure (None when healthy). Logging a
+        # review decision must never fail the decision, but must be visible.
+        "decision_log_error": None,
         # Per-candidate Trash undo entries dropped by the latest scan start;
         # surfaced once so the user knows in-app undo has ended for them.
         "trash_undo_cleared": 0,
@@ -580,6 +594,16 @@ def create_app(
         "events": threading.Condition(lock),
     }
     app.extensions["dedupe_state"] = state
+
+    def log_decisions(events: list[dict]) -> None:
+        """Append review decisions to the decision log; never fail the review."""
+        if not events:
+            return
+        try:
+            append_decisions(events, app.config["DEDUPE_DECISION_LOG_PATH"])
+            state["decision_log_error"] = None
+        except OSError as exc:
+            state["decision_log_error"] = f"could not write the decision log: {exc}"
 
     def remember_border_verdicts(records) -> None:
         """Cache crop verdicts measured again for a resumed review."""
@@ -734,6 +758,7 @@ def create_app(
                     )
         if group.kind == GroupKind.CROP:
             cropped = group.match_details.get("cropped") or {}
+            annotations = group.match_details.get("skip_annotations") or {}
             reviewed = set(group.reviewed_paths)
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 entry = cropped.get(member.path)
@@ -742,10 +767,16 @@ def create_app(
                 member_payload["crop_state"] = (
                     "cropped" if entry else "skipped" if member.path in reviewed else "pending"
                 )
+                note = annotations.get(member.path) or {}
+                member_payload["crop_skip_reason"] = note.get("reason")
+                member_payload["crop_skip_note"] = note.get("note")
                 if entry:
                     member_payload["crop_undo_available"] = bool(entry.get("original"))
             payload["cropped_paths"] = [
                 member.path for member in group.members if member.path in cropped
+            ]
+            payload["crop_skip_reasons"] = [
+                {"id": reason_id, "label": label} for reason_id, label in SKIP_REASONS.items()
             ]
         agreements = [m["similarity_percent"] for m in payload["members"]
                       if m.get("similarity_percent") is not None
@@ -983,6 +1014,11 @@ def create_app(
                 )
             except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
                 return jsonify({"error": str(exc)}), 400
+            if outcome.get("removed_pairs"):
+                log_decisions([make_distinct_path_event(
+                    "unmarked", data.get("path_a"), data.get("path_b"),
+                    scan_id=state["scan_id"], source="history",
+                )])
         return jsonify(outcome)
 
     @app.get("/favicon.ico")
@@ -1022,6 +1058,7 @@ def create_app(
             "review_session": state["review_session"].metadata(),
             "capabilities": capabilities,
             "keep_decisions_error": state["keep_decisions_error"],
+            "decision_log_error": state["decision_log_error"],
             "trash_undo_cleared": state["trash_undo_cleared"],
             "recovered_actions": len(recovered_actions),
             "scan_settings": state.get("last_scan_settings") or (result.scan_settings if result else {}),
@@ -2348,6 +2385,15 @@ def create_app(
                     size=member.size,
                 )
             ])
+            log_decisions([make_crop_event(
+                "applied", replace(member), box,
+                group_id=group.id, scan_id=state["scan_id"], source="single",
+                after={
+                    "size": outcome.size, "width": outcome.width,
+                    "height": outcome.height, "original_in_trash": outcome.original_in_trash,
+                },
+                receipt_path=log_path,
+            )])
             with lock:
                 record_crop_locked(group, member, box, outcome)
                 payload = finish_crop_locked(group)
@@ -2387,6 +2433,19 @@ def create_app(
                     size=member.size,
                 ))
             log_path = write_crop_receipt(items)
+            log_decisions([
+                make_crop_event(
+                    "applied", replace(member), box,
+                    group_id=group.id, scan_id=state["scan_id"], source="bulk",
+                    after={
+                        "size": outcome.size, "width": outcome.width,
+                        "height": outcome.height,
+                        "original_in_trash": outcome.original_in_trash,
+                    },
+                    receipt_path=log_path,
+                )
+                for member, box, outcome in done
+            ])
             with lock:
                 for member, box, outcome in done:
                     record_crop_locked(group, member, box, outcome)
@@ -2407,6 +2466,12 @@ def create_app(
         skip = data.get("skip", True)
         if not isinstance(skip, bool):
             return jsonify({"error": "skip must be a boolean"}), 400
+        try:
+            reason, note = validate_skip_annotation(data.get("reason"), data.get("note"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not skip and (reason or note):
+            return jsonify({"error": "a skip reason only applies when skipping"}), 400
         with lock:
             group, refusal = begin_crop_work(data)
             if refusal:
@@ -2421,10 +2486,56 @@ def create_app(
                 group.reviewed_paths = list(dict.fromkeys([*group.reviewed_paths, path]))
             else:
                 group.reviewed_paths = [p for p in group.reviewed_paths if p != path]
+            annotations = group.match_details.setdefault("skip_annotations", {})
+            if skip and (reason or note):
+                annotations[path] = {"reason": reason, "note": note}
+            else:
+                annotations.pop(path, None)
             snapshot = replace(member)
             payload = finish_crop_locked(group)
+        # Log before the cache verdict overwrites the rejected suggestion.
+        log_decisions([make_crop_event(
+            "skipped" if skip else "reconsidered", snapshot, box,
+            group_id=group.id, scan_id=state["scan_id"], source="single",
+            reason=reason if skip else None, note=note if skip else None,
+        )])
         if box is not None:
             store_border_verdict(snapshot, BORDER_DISMISSED if skip else box.encode())
+        return jsonify(payload)
+
+    @app.post("/api/crop/annotate-skip")
+    def api_crop_annotate_skip():
+        """Attach (or clear) why a crop was skipped; the skip already landed."""
+        data = request.get_json(silent=True) or {}
+        path = data.get("path")
+        try:
+            reason, note = validate_skip_annotation(data.get("reason"), data.get("note"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        with lock:
+            group, refusal = begin_crop_work(data)
+            if refusal:
+                return refusal
+            member = next((m for m in group.members if m.path == path), None)
+            if member is None:
+                return jsonify({"error": "crop candidate not found"}), 404
+            if path not in group.reviewed_paths or path in (
+                group.match_details.get("cropped") or {}
+            ):
+                return jsonify({"error": "this file has no skipped crop to annotate"}), 400
+            box = suggested_crop(member)
+            annotations = group.match_details.setdefault("skip_annotations", {})
+            if reason or note:
+                annotations[path] = {"reason": reason, "note": note}
+            else:
+                annotations.pop(path, None)
+            snapshot = replace(member)
+            payload = finish_crop_locked(group)
+        log_decisions([make_crop_event(
+            "annotated", snapshot, box,
+            group_id=group.id, scan_id=state["scan_id"], source="single",
+            reason=reason, note=note,
+        )])
         return jsonify(payload)
 
     @app.post("/api/crop/undo")
@@ -2466,6 +2577,12 @@ def create_app(
             with lock:
                 (group.match_details.get("cropped") or {}).pop(path, None)
                 group.reviewed_paths = [p for p in group.reviewed_paths if p != path]
+                member = next((m for m in group.members if m.path == path), None)
+                if member is not None:
+                    log_decisions([make_crop_event(
+                        "undone", replace(member), CropBox.decode(entry["box"]),
+                        group_id=group.id, scan_id=state["scan_id"], source="single",
+                    )])
                 before = dict(entry.get("before") or {})
                 before.update({
                     "size": int(restored.st_size),
@@ -2610,6 +2727,20 @@ def create_app(
             if member is not None and anchor.path == member.path:
                 return jsonify({"error": "a file cannot be distinct from itself"}), 400
             records = [anchor, member] if member is not None else list(group.members)
+            ui_source = data.get("source") if data.get("source") in (
+                "swipe", "board", "list"
+            ) else "unknown"
+            decision_events = distinct_events_for_records(
+                "marked", [replace(record) for record in records],
+                group_id=group_id, scan_id=state["scan_id"], source=ui_source,
+                label_scope="pair" if member is not None else "group",
+                match_basis=group.match_basis,
+                match_score=(
+                    group.match_scores.get(member.path)
+                    if member is not None and anchor.path == group.suggested_keep
+                    else None
+                ),
+            )
             # Whole-group reviews can be undone (the Similar board's "Not
             # duplicates" → Undo); remember the group and where it sat.
             group_index = result.groups.index(group)
@@ -2623,6 +2754,7 @@ def create_app(
                 cache.recorded_pairs_among(review_paths) if member is None else set()
             )
             pair_count = cache.mark_distinct(records)
+            log_decisions(decision_events)
             backfill: list = []
             with lock:
                 if member is not None:
@@ -2670,7 +2802,17 @@ def create_app(
                             if path in by_path
                         ]
             if len(backfill) > 2:
-                pair_count = cache.mark_distinct(backfill)
+                pair_count = cache.mark_distinct(backfill, source="inferred")
+                decided = {(e["path_a"], e["path_b"]) for e in decision_events}
+                log_decisions([
+                    event
+                    for event in distinct_events_for_records(
+                        "marked", [replace(record) for record in backfill],
+                        group_id=group_id, scan_id=state["scan_id"], source=ui_source,
+                        label_scope="backfill", match_basis=group.match_basis,
+                    )
+                    if (event["path_a"], event["path_b"]) not in decided
+                ])
             if member is None and dissolved:
                 new_pairs = cache.recorded_pairs_among(review_paths) - pairs_before
                 with lock:
@@ -2745,6 +2887,14 @@ def create_app(
                 member.path for member in group.members
             }:
                 return jsonify(group_payload(group))
+            anchor_record = next(
+                (
+                    file
+                    for file in (result.files if result else [])
+                    if file.path == anchor_path
+                ),
+                None,
+            )
             state["acting"] = True
 
         cache = None
@@ -2755,6 +2905,20 @@ def create_app(
                 member_path,
                 result.files if result else None,
             )
+            if removed:
+                if anchor_record is not None and record is not None:
+                    event = make_distinct_event(
+                        "unmarked", replace(anchor_record), replace(record),
+                        group_id=group_id, scan_id=state["scan_id"], source="undo",
+                        label_scope="pair",
+                        match_basis=group.match_basis if group else None,
+                    )
+                else:
+                    event = make_distinct_path_event(
+                        "unmarked", anchor_path, member_path,
+                        group_id=group_id, scan_id=state["scan_id"], source="undo",
+                    )
+                log_decisions([event])
             with lock:
                 if group is not None:
                     group.members = [*group.members, record]
@@ -2825,8 +2989,27 @@ def create_app(
         try:
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
             removed = 0
+            removed_pairs = []
             for path_a, path_b in entry["new_pairs"]:
-                removed += cache.unmark_distinct_pair(path_a, path_b, result.files)
+                dropped = cache.unmark_distinct_pair(path_a, path_b, result.files)
+                removed += dropped
+                if dropped:
+                    removed_pairs.append((path_a, path_b))
+            by_path = {file.path: file for file in result.files}
+            log_decisions([
+                make_distinct_event(
+                    "unmarked", replace(by_path[path_a]), replace(by_path[path_b]),
+                    group_id=group_id, scan_id=state["scan_id"], source="undo",
+                    label_scope="group", match_basis=group.match_basis,
+                )
+                if path_a in by_path and path_b in by_path
+                else make_distinct_path_event(
+                    "unmarked", path_a, path_b,
+                    group_id=group_id, scan_id=state["scan_id"], source="undo",
+                    label_scope="group",
+                )
+                for path_a, path_b in removed_pairs
+            ])
             with lock:
                 member_paths = {member.path for member in members}
                 group.members = members

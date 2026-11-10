@@ -386,6 +386,20 @@ recall, runtime, errors, and per-pair decisions. Use representative private medi
 repository does not ship personal benchmark photos. For cleanup safety, optimize Similar
 matching for low false-positive rates before increasing recall.
 
+Crop and Not-duplicates reviews in the UI are also logged locally (see
+[Files and caches](#files-and-caches)) with the suggestion or pair distances shown at
+decision time, including skips, undos, and an optional reason on a skipped crop:
+
+```bash
+dedupe decisions summary                       # crop acceptance by kind/signature, skip reasons, distinct-pair distances
+dedupe decisions export-benchmark pairs.json   # marked-distinct pairs as a benchmark manifest (negatives only)
+dedupe decisions export-crops crops.json       # standing applied/skipped/undone crop verdicts
+```
+
+Only pairs actually decided together export by default; `--include-group` and
+`--include-backfill` add the weaker whole-group and never-shown-together labels. These
+are your own review decisions, not independent ground truth.
+
 **Near-identical only** — Similar is intended for copies of one photograph at different
 quality, export, or resolution. After coarse hashing, overlapping fine-detail patches
 check for small expression, pose, and hair changes. Global exposure changes are accounted
@@ -443,6 +457,7 @@ For a laptop-friendly scan of a huge folder: `dedupe scan ~/Pictures --workers 2
 | `~/.cache/dedupe/logs/` | Action receipts, plus `.journal` move events until completion or reconciliation; preview receipts use `preview-*.json` |
 | `~/.local/state/dedupe/review-session.json` | The resumable review (result + selections); honours `XDG_STATE_HOME` |
 | `~/.local/state/dedupe/cleanup-jobs/` | Named job settings, scan baselines, and each job's saved review; honours `XDG_STATE_HOME` |
+| `~/.local/state/dedupe/decision-log.jsonl` | Append-only crop and Not-duplicates decisions with the detector output shown at decision time, for detector tuning; honours `XDG_STATE_HOME`, overridable with `DEDUPE_DECISION_LOG_PATH` |
 
 `DEDUPE_THUMBNAIL_CACHE_DIR` relocates the thumbnail cache and
 `DEDUPE_THUMBNAIL_CACHE_BUDGET` sets its budget in bytes. Receipts are pruned with

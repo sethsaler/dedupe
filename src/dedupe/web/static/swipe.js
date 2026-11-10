@@ -499,6 +499,7 @@ async function decideSwipe(direction, path = null) {
           path: target,
           anchor,
           scan_id: state.scanId,
+          source: "swipe",
         }),
       });
       recordReview(anchor, target, false);

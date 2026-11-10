@@ -476,6 +476,51 @@ def build_parser() -> argparse.ArgumentParser:
     similarity.add_argument("--decider", action="store_true",
                             help="Judge edited-copy candidates with Decider (implies --semantic)")
 
+    decisions = sub.add_parser(
+        "decisions",
+        help="Summarize or export logged crop and distinct review decisions",
+    )
+    decisions_sub = decisions.add_subparsers(dest="decisions_command", required=True)
+
+    def _add_decision_log(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--log",
+            default=None,
+            metavar="FILE",
+            help="Decision log (default: ~/.local/state/dedupe/decision-log.jsonl)",
+        )
+
+    decisions_summary = decisions_sub.add_parser(
+        "summary", help="Acceptance rates and label counts from the decision log"
+    )
+    _add_decision_log(decisions_summary)
+    decisions_summary.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    decisions_benchmark = decisions_sub.add_parser(
+        "export-benchmark",
+        help="Write marked-distinct pairs as a benchmark-similarity manifest (negatives only)",
+    )
+    decisions_benchmark.add_argument("output", metavar="OUTPUT", help="Manifest JSON to write")
+    decisions_benchmark.add_argument(
+        "--include-group", action="store_true",
+        help="Also export pairs expanded from whole-group decisions",
+    )
+    decisions_benchmark.add_argument(
+        "--include-backfill", action="store_true",
+        help="Also export pairs never shown together (dissolution backfill)",
+    )
+    decisions_benchmark.add_argument(
+        "--include-missing", action="store_true",
+        help="Keep pairs whose files are no longer on disk (benchmark will refuse them)",
+    )
+    _add_decision_log(decisions_benchmark)
+
+    decisions_crops = decisions_sub.add_parser(
+        "export-crops", help="Write standing crop verdicts (applied/skipped/undone) as JSON"
+    )
+    decisions_crops.add_argument("output", metavar="OUTPUT", help="JSON file to write")
+    _add_decision_log(decisions_crops)
+
     return p
 
 
@@ -1186,6 +1231,80 @@ def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
     return 1 if report["errors"] else 0
 
 
+def _format_decisions_summary(summary: dict) -> str:
+    crop, distinct = summary["crop"], summary["distinct"]
+
+    def rate(block: dict) -> str:
+        value = block.get("acceptance_rate")
+        return f"{value:.0%}" if isinstance(value, (int, float)) else "—"
+
+    lines = [
+        f"Decision log: {summary['events']} events"
+        + (f", {summary['skipped_lines']} unreadable lines skipped" if summary["skipped_lines"] else ""),
+        f"Crops: {crop['decided']} decided ({crop['labels']}), accepted {rate(crop)}",
+    ]
+    for name in ("by_kind", "by_media_type", "by_removed_fraction", "by_border_signature"):
+        for key, block in crop[name].items():
+            lines.append(f"  {name.removeprefix('by_')}={key}: {block['decided']} decided, accepted {rate(block)}")
+    if crop["applied_by_source"]:
+        lines.append(f"  applied by source: {crop['applied_by_source']}")
+    lines.append(
+        f"  skip reasons: {crop['skip_reasons'] or '—'} ({crop['annotated_skips']} annotated)"
+    )
+    dist = distinct["phash_distance"]
+    lines.append(
+        f"Distinct: {distinct['current_pairs']} standing pairs "
+        f"({distinct['by_label_scope']}), by basis {distinct['by_match_basis']}"
+    )
+    lines.append(
+        f"  pHash distance over {dist['count']} pairs: "
+        f"min {dist['min']}, mean {dist['mean']}, max {dist['max']}"
+    )
+    return "\n".join(lines)
+
+
+def cmd_decisions(args: argparse.Namespace) -> int:
+    from .decision_log import (
+        benchmark_manifest,
+        crop_manifest,
+        read_decisions,
+        summarize_decisions,
+    )
+
+    events, skipped = read_decisions(args.log)
+    if args.decisions_command == "summary":
+        summary = summarize_decisions(events, skipped_lines=skipped)
+        print(json.dumps(summary, indent=2) if args.json else _format_decisions_summary(summary))
+        return 0
+    if args.decisions_command == "export-benchmark":
+        scopes = ["pair"]
+        if args.include_group:
+            scopes.append("group")
+        if args.include_backfill:
+            scopes.append("backfill")
+        manifest = benchmark_manifest(
+            events, scopes=tuple(scopes), only_existing=not args.include_missing
+        )
+        out = Path(args.output).expanduser()
+        out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(
+            f"Wrote {len(manifest['pairs'])} distinct pairs to {out} "
+            f"({manifest['missing_skipped']} skipped: file no longer on disk)"
+        )
+        return 0
+    if args.decisions_command == "export-crops":
+        manifest = crop_manifest(events)
+        out = Path(args.output).expanduser()
+        out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        verdicts: dict[str, int] = {}
+        for item in manifest["items"]:
+            verdicts[item["decision"]] = verdicts.get(item["decision"], 0) + 1
+        print(f"Wrote {len(manifest['items'])} crop verdicts to {out} ({verdicts})")
+        return 0
+    print(f"error: unknown decisions command {args.decisions_command}", file=sys.stderr)
+    return 2
+
+
 _COMMANDS = frozenset(
     {
         "scan",
@@ -1198,6 +1317,7 @@ _COMMANDS = frozenset(
         "benchmark-similarity",
         "rank-people",
         "benchmark-people",
+        "decisions",
     }
 )
 
@@ -1237,6 +1357,8 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return cmd_rank_people(args)
     if args.command == "benchmark-people":
         return cmd_benchmark_people(args)
+    if args.command == "decisions":
+        return cmd_decisions(args)
     parser.print_help()
     return 1
 
