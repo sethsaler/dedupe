@@ -1118,6 +1118,191 @@ def test_crop_zone_toggles_per_card_and_for_the_whole_review(
 
 
 @pytest.mark.e2e
+def test_crop_zone_can_be_dragged_resized_reset_and_applied(
+    page, tmp_path: Path, monkeypatch
+) -> None:
+    """A suggested crop zone takes pointer input: clicking it selects the
+    card (no lightbox), dragging inside it moves it, a corner handle resizes
+    it, the moved zone survives a reload, Crop cuts the zone as shown, and
+    Reset zone puts the suggestion back."""
+    from dedupe.borders import BORDER_SIGNATURE
+    from dedupe.grouping import build_crop_groups
+    from dedupe.web import app as web_app_module
+
+    trash = tmp_path / "Trash"
+
+    class _FakeBatch:
+        def send(self, src):
+            trash.mkdir(parents=True, exist_ok=True)
+            target = trash / Path(src).name
+            count = 1
+            while target.exists():
+                target = trash / f"{Path(src).stem}_{count}{Path(src).suffix}"
+                count += 1
+            shutil.move(str(src), str(target))
+            return target
+
+    monkeypatch.setattr(web_app_module, "TrashBatch", _FakeBatch)
+    media = tmp_path / "media"
+    media.mkdir()
+    path = media / "framed.png"
+    canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+    canvas.paste(Image.effect_noise((240, 180), 60).convert("RGB"), (40, 30))
+    canvas.save(path)
+    stat = path.stat()
+    record = FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        width=320,
+        height=240,
+        border_crop="40,30,280,210,320,240",
+        border_signature=BORDER_SIGNATURE,
+    )
+    result = ScanResult(
+        roots=[str(media)], files=[record], groups=build_crop_groups([record])
+    )
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    def open_review() -> None:
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator('.tab[data-kind="crop"]').click()
+        page.locator(".group-item").first.click()
+        expect(page.locator("#members .crop-card")).to_have_count(1)
+
+    def zone_edges(card) -> tuple[float, float, float, float]:
+        """(left, top, width, height) of the zone in picture pixels.
+
+        Both rects are read in one JS call so a page still settling from a
+        click cannot shift the frame between the two measurements.
+        """
+        return tuple(card.evaluate("""(el) => {
+          const frame = el.querySelector(".crop-frame").getBoundingClientRect();
+          const zone = el.querySelector(".crop-box").getBoundingClientRect();
+          return [
+            (zone.x - frame.x) / frame.width * 320,
+            (zone.y - frame.y) / frame.height * 240,
+            zone.width / frame.width * 320,
+            zone.height / frame.height * 240,
+          ];
+        }"""))
+
+    def assert_zone(card, expected: tuple[float, float, float, float]) -> None:
+        page.wait_for_function(
+            """(wanted) => {
+              const el = document.querySelector("#members .crop-card");
+              if (!el) return false;
+              const frame = el.querySelector(".crop-frame")?.getBoundingClientRect();
+              const zone = el.querySelector(".crop-box")?.getBoundingClientRect();
+              if (!frame || !zone || !frame.width) return false;
+              const actual = [
+                (zone.x - frame.x) / frame.width * 320,
+                (zone.y - frame.y) / frame.height * 240,
+                zone.width / frame.width * 320,
+                zone.height / frame.height * 240,
+              ];
+              return actual.every((got, i) => Math.abs(got - wanted[i]) <= 3);
+            }""",
+            arg=list(expected),
+            timeout=5_000,
+        )
+        actual = zone_edges(card)
+        for got, want in zip(actual, expected):
+            assert abs(got - want) <= 3, (actual, expected)
+
+    def drag(card, start, dx: float, dy: float) -> None:
+        """Drag by a share of the picture and wait for the zone to be saved."""
+        frame = card.locator(".crop-frame").bounding_box()
+        assert frame
+        page.mouse.move(start[0], start[1])
+        page.mouse.down()
+        page.mouse.move(
+            start[0] + dx * frame["width"], start[1] + dy * frame["height"], steps=8
+        )
+        with page.expect_response("**/api/crop/adjust") as saved:
+            page.mouse.up()
+        assert saved.value.ok, saved.value.status
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        open_review()
+        card = page.locator("#members .crop-card").first
+        assert_zone(card, (40, 30, 240, 180))
+
+        # Clicking the zone selects its card instead of opening the lightbox.
+        zone = card.locator(".crop-box").bounding_box()
+        assert zone
+        page.mouse.click(zone["x"] + zone["width"] / 2, zone["y"] + zone["height"] / 2)
+        expect(page.locator("#lightbox")).to_be_hidden()
+        expect(card).to_have_class(re.compile(r"\bfocused\b"))
+        assert_zone(card, (40, 30, 240, 180))
+        expect(card.locator(".crop-reset")).to_have_count(0)
+
+        # Dragging inside the zone moves it 10% of the picture down-right.
+        zone = card.locator(".crop-box").bounding_box()
+        assert zone
+        drag(card, (zone["x"] + zone["width"] / 2, zone["y"] + zone["height"] / 2), 0.1, 0.1)
+        expect(page.locator("#lightbox")).to_be_hidden()
+        expect(card.locator(".crop-reset")).to_be_visible()
+        assert_zone(card, (72, 54, 240, 180))
+        expect(card.locator(".evidence")).to_contain_text("Adjusted zone")
+
+        # The south-east handle resizes: 10% smaller, top-left unmoved.
+        card.hover()
+        handle = card.locator(".crop-handle.se").bounding_box()
+        assert handle
+        drag(card, (handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2), -0.1, -0.1)
+        expect(card.locator(".crop-reset")).to_be_visible()
+        assert_zone(card, (72, 54, 208, 156))
+
+        # The moved zone is the server's, not just this page's.
+        page.reload(wait_until="domcontentloaded")
+        open_review()
+        card = page.locator("#members .crop-card").first
+        assert_zone(card, (72, 54, 208, 156))
+
+        # Reset brings the suggestion back.
+        card.locator(".crop-reset").click()
+        expect(card.locator(".crop-reset")).to_have_count(0)
+        assert_zone(card, (40, 30, 240, 180))
+
+        # Crop cuts the zone as last adjusted, and Undo restores the file.
+        card.hover()
+        handle = card.locator(".crop-handle.se").bounding_box()
+        assert handle
+        drag(card, (handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2), -0.1, -0.1)
+        expect(card.locator(".crop-reset")).to_be_visible()
+        card.locator(".crop-apply").click()
+        expect(card).to_have_class(re.compile(r"\bcropped\b"))
+        with Image.open(path) as cropped:
+            assert abs(cropped.size[0] - 208) <= 3
+            assert abs(cropped.size[1] - 156) <= 3
+        card.locator(".crop-undo").click()
+        expect(card).to_have_class(re.compile(r"\bpending\b"))
+        with Image.open(path) as restored:
+            assert restored.size == (320, 240)
+
+        # Keyboard: a focused zone moves with arrows and resizes with
+        # Shift+arrows (the restored zone is the applied 208x156 one).
+        zone = card.locator(".crop-box").bounding_box()
+        assert zone
+        page.mouse.click(zone["x"] + zone["width"] / 2, zone["y"] + zone["height"] / 2)
+        with page.expect_response("**/api/crop/adjust") as saved:
+            for _ in range(3):
+                page.keyboard.press("ArrowRight")
+            for _ in range(2):
+                page.keyboard.press("Shift+ArrowRight")
+        assert saved.value.ok, saved.value.status
+        assert_zone(card, (49, 30, 214, 156))
+
+
+@pytest.mark.e2e
 def test_all_files_lightbox_sifts_across_pages_sorts_and_reveals(
     page, tmp_path: Path
 ) -> None:

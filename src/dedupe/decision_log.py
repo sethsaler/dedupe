@@ -230,8 +230,16 @@ def make_crop_event(
     reason: str | None = None,
     note: str | None = None,
     receipt_path: str | None = None,
+    adjusted_box=None,
 ) -> dict:
-    """One crop decision; ``box`` is the suggestion the user decided on."""
+    """One crop decision; ``box`` is the suggestion the user decided on.
+
+    ``adjusted_box`` is the zone the user dragged the suggestion to before
+    deciding — what an applied crop actually cut, or the corrected zone a
+    skip still rejected. It is kept beside the suggestion, never in place
+    of it, so detector tuning can measure how far users move its boxes.
+    """
+    adjusted = adjusted_box if adjusted_box is not None and adjusted_box != box else None
     return {
         "kind": "crop",
         "decision": decision,
@@ -241,6 +249,8 @@ def make_crop_event(
         "file": file_snapshot(record),
         "suggestion": box.to_dict() if box is not None else None,
         "suggestion_encoded": box.encode() if box is not None else record.border_crop,
+        "adjusted": adjusted.to_dict() if adjusted is not None else None,
+        "adjusted_encoded": adjusted.encode() if adjusted is not None else None,
         "border_signature": record.border_signature,
         "after": after,
         "reason": reason,
@@ -460,6 +470,7 @@ def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
             "annotated_skips": sum(
                 1 for e in crops if e.get("decision") == "skipped" and e.get("reason")
             ),
+            "adjusted_zones": sum(1 for e in crops if e.get("adjusted")),
         },
         "distinct": {
             "events_by_decision": _counts(e.get("decision") for e in distinct_events),
@@ -494,6 +505,8 @@ def crop_manifest(events: list[dict]) -> dict:
             "note": event.get("note"),
             "suggestion": event.get("suggestion"),
             "suggestion_encoded": event.get("suggestion_encoded"),
+            "adjusted": event.get("adjusted"),
+            "adjusted_encoded": event.get("adjusted_encoded"),
             "border_signature": event.get("border_signature"),
             "media_type": (event.get("file") or {}).get("media_type"),
             "after": event.get("after"),
