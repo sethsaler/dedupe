@@ -1014,7 +1014,28 @@ def test_desktop_menu_bar_is_suggested(tmp_path: Path) -> None:
 
     box = detect_black_borders(path)
     assert box is not None and box.chrome == ("top",)
-    assert box.top == 28 and box.bottom == height
+    # The menu bar goes as interface, and with it the flat desktop that
+    # frames the window on every side: the crop is the window.
+    assert (box.left, box.top, box.right, box.bottom) == (160, 100, 1760, 1000)
+
+
+def test_desktop_menu_bar_alone_is_cut_over_a_wallpaper(tmp_path: Path) -> None:
+    from PIL import ImageDraw
+
+    width, height = 1920, 1080
+    image = Image.new("RGB", (width, height), (236, 236, 236))
+    draw = ImageDraw.Draw(image)
+    for x in (20, 70, 140, 210, 290):  # menus
+        draw.rectangle([x, 8, x + 40, 20], fill=(20, 20, 20))
+    for x in (1700, 1760, 1820):  # status items
+        draw.rectangle([x, 7, x + 30, 21], fill=(20, 20, 20))
+    image.paste(Image.fromarray(_picture(width, height - 28)), (0, 28))
+    path = tmp_path / "Screen Shot 2024-05-02 at 10.00.00.png"
+    image.save(path)
+
+    box = detect_black_borders(path)
+    assert box is not None and box.chrome == ("top",)
+    assert (box.left, box.top, box.right, box.bottom) == (0, 28, width, height)
 
 
 def test_meme_caption_is_not_a_status_bar(tmp_path: Path) -> None:
@@ -1306,7 +1327,7 @@ def test_action_row_clipped_by_the_edge_is_still_interface(tmp_path: Path) -> No
 
     box = detect_black_borders(path)
     assert box is not None and box.chrome == ("bottom",)
-    assert box.top == 0
+    assert box.top == 60  # the blank band above the picture is a bar of its own
     assert abs(box.bottom - 1420) <= 4
 
 

@@ -216,7 +216,7 @@ const SCAN_PRESETS = {
   crop: {
     on: ["optBlackBorders"],
     tab: "crop",
-    hint: "Find images and MP4/MOV videos framed by black bars, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop for each. Videos are re-encoded when cropped. Duplicates are not checked.",
+    hint: "Find images and MP4/MOV videos framed by black bars, images framed in white or another flat colour, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop for each. Videos are re-encoded when cropped. Duplicates are not checked.",
   },
   faces: {
     on: ["optCountFaces"],

@@ -226,6 +226,7 @@
 
 #members.crop-grid .crop-actions {
   display: flex;
+  justify-content: flex-start;
   align-items: center;
   gap: 8px;
   margin-top: 8px;
@@ -238,7 +239,25 @@
   padding: 0 14px;
 }
 
-#members.crop-grid .crop-actions .reveal {
+/* The zone's tools sit on a line of their own under the decision buttons.
+   The line is there in every state, at one height, so a crop, a skip or a
+   moved zone never changes how tall the card is. */
+#members.crop-grid .crop-tools {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 24px;
+  margin-top: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+#members.crop-grid .crop-tools .linkish {
+  font-size: 12px;
+}
+
+#members.crop-grid .crop-tools .reveal {
   margin-left: auto;
 }
 
@@ -324,4 +343,245 @@
   box-sizing: border-box;
   font: inherit;
   font-size: 12px;
+}
+
+/* ---------- The large crop editor ----------
+   One picture as big as the window allows, the same dashed zone and shaded
+   cut as a card, and a panel with a field for each side. It sits under the
+   toast so "Cropped … · Undo" stays in reach while the next file loads. */
+.crop-editor {
+  position: fixed;
+  inset: 0;
+  z-index: 38;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+}
+
+.crop-editor[hidden] {
+  display: none;
+}
+
+.crop-editor .ce-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  margin: 28px;
+  display: grid;
+  place-items: center;
+}
+
+.crop-editor .ce-frame {
+  position: relative;
+  overflow: hidden;
+  background: var(--lt-loupe);
+  outline: 1px solid var(--lt-sleeve);
+}
+
+.crop-editor .ce-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  user-select: none;
+  pointer-events: none;
+}
+
+.crop-editor .ce-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid var(--lt-pencil);
+  box-shadow: 0 0 0 100vmax rgba(232, 54, 31, 0.38);
+  cursor: move;
+  touch-action: none;
+}
+
+.crop-editor .ce-box:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
+.crop-editor .crop-handle {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  background: var(--lt-table);
+  border: 2px solid var(--lt-pencil);
+  border-radius: 3px;
+}
+
+/* Edge grips run long, so an edge can be caught anywhere near its middle. */
+.crop-editor .crop-handle.n,
+.crop-editor .crop-handle.s { width: 44px; height: 12px; }
+.crop-editor .crop-handle.e,
+.crop-editor .crop-handle.w { width: 12px; height: 44px; }
+
+.crop-editor .crop-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+.crop-editor .crop-handle.n { left: 50%; top: 0; transform: translate(-50%, -50%); cursor: ns-resize; }
+.crop-editor .crop-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+.crop-editor .crop-handle.e { right: 0; top: 50%; transform: translate(50%, -50%); cursor: ew-resize; }
+.crop-editor .crop-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+.crop-editor .crop-handle.s { left: 50%; bottom: 0; transform: translate(-50%, 50%); cursor: ns-resize; }
+.crop-editor .crop-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+.crop-editor .crop-handle.w { left: 0; top: 50%; transform: translate(-50%, -50%); cursor: ew-resize; }
+
+.crop-editor.crop-dragging {
+  user-select: none;
+}
+
+.crop-editor .ce-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 28px 24px;
+  overflow-y: auto;
+  border-left: 1px solid var(--lt-sleeve);
+  font-size: 13px;
+}
+
+.crop-editor .ce-name {
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.crop-editor .ce-count {
+  margin-top: 4px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+.crop-editor .ce-summary {
+  margin: 0;
+  line-height: 1.45;
+  min-height: calc(1.45em * 3);
+}
+
+.crop-editor .ce-sides {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.crop-editor .ce-sides legend {
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.crop-editor .ce-side {
+  display: grid;
+  grid-template-columns: 56px 96px auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.crop-editor .ce-side input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 4px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+  font-family: var(--lt-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.crop-editor .ce-side input:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 1px;
+}
+
+.crop-editor .ce-keep {
+  justify-self: start;
+  font-size: 12px;
+}
+
+.crop-editor .ce-keep:disabled {
+  visibility: hidden;
+}
+
+.crop-editor .ce-levels .crop-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.crop-editor .crop-level-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--lt-faint);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--lt-graphite);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.crop-editor .crop-level-btn.chosen {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+.crop-editor .crop-level-btn:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 1px;
+}
+
+.crop-editor .ce-actions,
+.crop-editor .ce-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.crop-editor .ce-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--lt-graphite);
+}
+
+.crop-editor .ce-hint kbd {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 4px;
+}
+
+.crop-editor .ce-close {
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+@media (max-width: 820px) {
+  .crop-editor {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .crop-editor .ce-stage {
+    margin: 16px;
+  }
+
+  .crop-editor .ce-panel {
+    max-height: 46vh;
+    padding: 16px;
+    border-left: 0;
+    border-top: 1px solid var(--lt-sleeve);
+  }
 }

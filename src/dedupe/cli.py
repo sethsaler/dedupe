@@ -117,7 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="find_black_borders",
         action="store_true",
         help=(
-            "Find images and MP4/MOV videos framed by black bars, and screenshots with "
+            "Find images and MP4/MOV videos framed by black bars, images framed in "
+            "white or another flat colour, and screenshots with "
             "interface at the edges (status bar, app header, navigation bar, reply "
             "field), and suggest a crop (apply crops in `dedupe ui`, Crop tab)"
         ),
@@ -131,8 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "How far --find-black-borders crop suggestions reach: conservative keeps "
             "only flat bars with a hard edge, balanced (default) also crops bars "
-            "holding captions or noise, aggressive also takes darker-gray, noisier "
-            "and thinner bars; every level keeps detected people whole. The level "
+            "holding captions or noise, aggressive also takes dark-gray and hairline "
+            "bars and colour bars holding a mark; every level keeps detected people whole. The level "
             "picks the candidates and is the Crop review's starting level per file"
         ),
     )

@@ -2,6 +2,7 @@
 
 import { boardActive, handleBoardKey } from "./board.js";
 import { handleCropKey } from "./crop.js";
+import { handleCropEditorKey } from "./cropeditor.js";
 import { openHelp, closeHelp } from "./help.js";
 import { closeLightbox, openLightbox } from "./lightbox.js";
 import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
@@ -37,6 +38,9 @@ document.addEventListener("keydown", async (e) => {
     }
 
     if (!$("modalBackdrop").hidden || !$("helpBackdrop").hidden) return;
+
+  // The crop editor is a dialog of its own: every key is its to take.
+  if ($("lightbox").hidden && handleCropEditorKey(e)) return;
 
   if (!typing && (e.key === "?" || (e.shiftKey && e.key === "/"))) {
     openHelp();
