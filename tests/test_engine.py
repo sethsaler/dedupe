@@ -978,3 +978,54 @@ def test_parallel_streams_floor_per_stream_workers(tmp_path: Path, monkeypatch) 
     seen_workers.clear()
     run_scans_parallel(roots, workers=1, use_cache=False)
     assert seen_workers == [2, 2, 2]  # floor of 2 keeps CPU stages concurrent
+
+
+@pytest.mark.parametrize("chosen", [True, False])
+def test_image_stage_cap_applies_to_the_automatic_budget_only(
+    tmp_path: Path, monkeypatch, chosen: bool
+) -> None:
+    """A chosen worker count reaches image matching whole; auto stays capped."""
+    import dedupe.engine as engine_module
+
+    _save(tmp_path / "a.jpg", (30, 120, 60))
+    _save(tmp_path / "b.jpg", (200, 40, 80))
+    seen: list[int] = []
+
+    def fake_images(records, *, workers=None, **_kwargs):
+        seen.append(workers)
+        return []
+
+    monkeypatch.setattr(engine_module, "find_similar_image_groups", fake_images)
+    monkeypatch.setattr(engine_module, "resolve_workers", lambda workers=None, **_k: 12)
+
+    run_scan(
+        [tmp_path], exact=False, similar=True, use_cache=False,
+        workers=12 if chosen else None,
+    )
+
+    assert seen == [12 if chosen else engine_module.DEFAULT_IMAGE_WORKERS_CAP]
+
+
+def test_parallel_streams_say_whether_the_worker_count_was_chosen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A stream gets its share as a number, so the origin travels beside it."""
+    import dedupe.engine as engine_module
+
+    seen: list[bool] = []
+
+    def fake_run_scan(paths, **kwargs):
+        seen.append(kwargs["_workers_chosen"])
+        return ScanResult(roots=[str(path) for path in paths], files=[], groups=[])
+
+    monkeypatch.setattr(engine_module, "run_scan", fake_run_scan)
+    roots = []
+    for name in ("a", "b"):
+        root = tmp_path / name
+        root.mkdir()
+        roots.append(root)
+
+    run_scans_parallel(roots, workers=8, use_cache=False)
+    run_scans_parallel(roots, workers=None, use_cache=False)
+
+    assert seen == [True, True, False, False]

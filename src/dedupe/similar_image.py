@@ -21,7 +21,7 @@ from .cache import DistinctReviews
 from .grouping import cluster_around_best
 from .image_frames import is_animated_image
 from .models import FileRecord, MediaType
-from .parallel import DEFAULT_IMAGE_WORKERS_CAP, map_parallel, resolve_workers
+from .parallel import DEFAULT_IMAGE_WORKERS_CAP, map_parallel, stage_workers
 
 ProgressCb = Callable[[str, int, int], None]
 
@@ -72,8 +72,14 @@ TILE_NORMALIZE = 256
 # enough that a big scan never re-decodes the same file twice.
 TILE_CACHE_SIZE = 65536
 # Animation tiles retain ordered, time-aligned samples. Older first-frame-only
-# tiles cannot verify animations and must be recomputed.
-TILE_HASH_VERSION = "t3"
+# tiles cannot verify animations and must be recomputed. t4: JPEGs are decoded
+# at reduced size, which moves every hash of a file by a bit or two, so hashes
+# from the full-size decode are computed again rather than compared with new ones.
+TILE_HASH_VERSION = "t4"
+# Formats whose decoder can produce a smaller image directly (JPEG's scaled
+# inverse transform). The reduced image keeps both sides at or above
+# HASH_MAX_SIDE, so the downscale that follows still only shrinks.
+REDUCED_DECODE_FORMATS = frozenset({"JPEG", "MPO"})
 ANIMATION_HASH_FRAMES = 8
 MIN_ASPECT_RATIO_SIMILARITY = 0.95
 # Rotated and mirrored copies (pixels turned by an app that ignored or dropped
@@ -167,6 +173,34 @@ def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
         return int(width), int(height)
 
 
+def _upright_hash_source(img):
+    """``(upright image, display width, display height, animated)`` for hashing.
+
+    The size is the file's own, read before any reduced decode. JPEGs are
+    asked for a reduced decode first: turning the image loads it, and a
+    request made after that has no effect.
+    """
+    from PIL import ImageOps
+
+    animated = is_animated_image(img)
+    width, height = img.size
+    if animated:
+        return img, width, height, True
+    if img.format in REDUCED_DECODE_FORMATS:
+        quarter_turn = img.getexif().get(EXIF_ORIENTATION, 1) in QUARTER_TURN_EXIF_ORIENTATIONS
+        try:
+            img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
+        except Exception:
+            pass
+        img = ImageOps.exif_transpose(img)
+        if quarter_turn:
+            width, height = height, width
+    else:
+        img = ImageOps.exif_transpose(img)
+        width, height = img.size
+    return img, width, height, False
+
+
 def compute_image_hashes(path: str | Path) -> tuple[str | None, str | None, int | None, int | None]:
     """Return (phash_hex, dhash_hex, width, height).
 
@@ -207,21 +241,11 @@ def compute_image_fingerprint(
     _register_heif()
 
     import imagehash
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     path = Path(path)
     with Image.open(path) as img:
-        animated = is_animated_image(img)
-        if not animated:
-            img = ImageOps.exif_transpose(img)
-        # Capture original dimensions before draft (draft can shrink reported size).
-        width, height = img.size
-
-        # JPEG (and some formats): request a smaller decode where supported.
-        try:
-            img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
-        except Exception:
-            pass
+        img, width, height, animated = _upright_hash_source(img)
 
         frames = _hash_frames(img)
         # Candidate lookup uses the first frame. Verification below preserves
@@ -351,16 +375,11 @@ def _hash_samples_for_path(path: str):
     """
     _ensure_image_deps()
     _register_heif()
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     try:
         with Image.open(path) as img:
-            if not is_animated_image(img):
-                img = ImageOps.exif_transpose(img)
-            try:
-                img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
-            except Exception:
-                pass
+            img, _width, _height, _animated = _upright_hash_source(img)
             try:
                 rgb = tuple(_hash_frames(img))
             except Exception:
@@ -693,6 +712,9 @@ class HammingIndex:
         self.values = np.array(self.keys, dtype=np.uint64)
         pieces = radius + 1
         self.buckets: list[tuple[int, int, dict[int, object]]] = []
+        # Per bucket: distinct chunk values, and where each one's stored
+        # hashes start, how many there are, and their indexes in chunk order.
+        self._sorted: list[tuple] = []
         if pieces * self.MIN_CHUNK_BITS > 64 or not self.keys:
             return
         edges = [round(i * 64 / pieces) for i in range(pieces + 1)]
@@ -705,6 +727,9 @@ class HammingIndex:
             groups = np.split(order, starts[1:])
             table = {int(ordered[start]): group for start, group in zip(starts, groups, strict=True)}
             self.buckets.append((lo, mask, table))
+            self._sorted.append(
+                (ordered[starts], starts, np.diff(np.r_[starts, len(order)]), order)
+            )
 
     def _popcount(self, values):
         np = self._np
@@ -734,6 +759,71 @@ class HammingIndex:
         near = np.flatnonzero(distances <= radius)
         return [(int(distances[i]), self.keys[int(indexes[i])]) for i in near]
 
+    # Candidate pairs examined per batch of find_many: bounds its working
+    # arrays to tens of megabytes however large the library is.
+    BATCH_PAIRS = 1 << 21
+
+    def find_many(self, queries, radius: int | None = None) -> list[tuple[int, int, object]]:
+        """(query position, distance, hash) for every match of every query.
+
+        The same matches as calling find on each query, found a batch of
+        queries at a time: per-query overhead dominates find once a scan
+        makes eight lookups per image.
+        """
+        np = self._np
+        radius = self.radius if radius is None else radius
+        queries = np.asarray(queries, dtype=np.uint64)
+        if not self.keys or not len(queries):
+            return []
+        indexed = bool(self._sorted) and radius <= self.radius
+        # Expected candidates per query: a stored hash meets its own chunk
+        # group in every bucket, so weight each group's size by itself.
+        per_query = (
+            sum(
+                float((counts * counts).sum()) / len(self.keys)
+                for _values, _starts, counts, _order in self._sorted
+            )
+            if indexed
+            else len(self.keys)
+        )
+        step = max(1, int(self.BATCH_PAIRS // max(1.0, per_query)))
+        found: list[tuple[int, int, object]] = []
+        for begin in range(0, len(queries), step):
+            batch = queries[begin : begin + step]
+            if indexed:
+                rows, columns = [], []
+                for (lo, mask, _table), (values, starts, counts, order) in zip(
+                    self.buckets, self._sorted, strict=True
+                ):
+                    chunks = (batch >> np.uint64(lo)) & np.uint64(mask)
+                    slots = np.minimum(np.searchsorted(values, chunks), len(values) - 1)
+                    hit = np.flatnonzero(values[slots] == chunks)
+                    sizes = counts[slots[hit]]
+                    ends = np.cumsum(sizes)
+                    within = np.arange(int(ends[-1]) if len(ends) else 0) - np.repeat(
+                        ends - sizes, sizes
+                    )
+                    rows.append(np.repeat(hit, sizes))
+                    columns.append(order[np.repeat(starts[slots[hit]], sizes) + within])
+                # A pair agreeing on several chunks is found once per chunk.
+                pairs = np.unique(
+                    np.concatenate(rows) * np.int64(len(self.keys)) + np.concatenate(columns)
+                )
+                row, column = np.divmod(pairs, len(self.keys))
+            else:
+                row = np.repeat(np.arange(len(batch)), len(self.keys))
+                column = np.tile(np.arange(len(self.keys)), len(batch))
+            distances = self._popcount(self.values[column] ^ batch[row])
+            near = np.flatnonzero(distances <= radius)
+            keys = self.keys
+            found.extend(
+                (begin + r, d, keys[c])
+                for r, d, c in zip(
+                    row[near].tolist(), distances[near].tolist(), column[near].tolist(), strict=True
+                )
+            )
+        return found
+
 
 def find_similar_image_groups(
     records: list[FileRecord],
@@ -761,7 +851,7 @@ def find_similar_image_groups(
     """
     skip_paths = skip_paths or set()
     distinct = distinct or DistinctReviews.empty()
-    n_workers = resolve_workers(workers, cap=DEFAULT_IMAGE_WORKERS_CAP)
+    n_workers = stage_workers(workers, cap=DEFAULT_IMAGE_WORKERS_CAP)
     media = [
         r
         for r in records
@@ -775,8 +865,9 @@ def find_similar_image_groups(
     need = [
         r for r in media
         if not (r.phash and r.dhash)
-        # Old GIF global hashes XORed frames. Never compare them to first-frame hashes.
-        or (r.media_type == MediaType.GIF and not decode_tile_phashes(r.tile_phashes))
+        # Tiles carry the version of the decode that produced every hash of
+        # the file. Never compare hashes from an older decode with current ones.
+        or not decode_tile_phashes(r.tile_phashes)
     ]
     # Stills cached before orientation lookup existed are hashed once more to
     # add it. Their stored hashes stay valid, so they are kept if that fails:
@@ -900,65 +991,97 @@ def find_similar_image_groups(
             orientation_a=orientation,
         )
 
+    # Candidate lookup is index arithmetic; verification decodes both files.
+    # Collect every pair first, then verify the pairs on the worker pool: a
+    # pair's verdict depends only on its two files, so the order is free.
+    # Upright candidates first, then turns in pHash-distance order.
+    # Symmetric grayscale structure can hide different color layouts,
+    # so a failed best turn must not suppress another valid orientation.
+    # Every pair only needs verification once, from its earlier record.
+    upright: dict[tuple[int, int], None] = {}
+    queries = [int(record.phash or "0", 16) for record in hashed]
+    for i, _distance, matched_hash in tree.find_many(queries, threshold):
+        for other in by_phash[matched_hash]:
+            j = positions[other.path]
+            if j > i:
+                upright[(i, j)] = None
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
+    turns: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    turned_queries: list[int] = []
+    turned_source: list[tuple[int, int]] = []
+    for i, record in enumerate(hashed):
+        turned = decode_orientation_phashes(record.orientation_phashes)
+        if turned and record.media_type == MediaType.IMAGE:
+            for turn, value in enumerate(turned):
+                turned_queries.append(int(value, 16))
+                turned_source.append((i, turn))
+    for query, distance, matched_hash in tree.find_many(turned_queries, threshold):
+        i, turn = turned_source[query]
+        for other in by_phash[matched_hash]:
+            j = positions[other.path]
+            if j > i and other.media_type == MediaType.IMAGE:
+                turns.setdefault((i, j), []).append((distance, turn))
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
+    jobs: list[tuple[int, FileRecord, FileRecord, list[str | None]]] = []
+    for i, j in sorted(upright.keys() | turns.keys()):
+        rec, other = hashed[i], hashed[j]
+        if distinct and distinct.is_distinct(rec, other):
+            continue
+        names: list[str | None] = [None] if (i, j) in upright else []
+        names.extend(ORIENTATIONS[turn] for _distance, turn in sorted(turns.get((i, j), ())))
+        jobs.append((i, rec, other, names))
+
+    def verify_pair(job) -> tuple[bool, bool]:
+        """(matched, near miss): the first orientation that verifies wins."""
+        _i, rec, other, names = job
+        near_miss = False
+        for orientation in names:
+            if verified(rec, other, orientation):
+                return True, False
+            if (
+                orientation is None
+                and rec.media_type == MediaType.IMAGE
+                and other.media_type == MediaType.IMAGE
+            ):
+                near_miss = True
+        return False, near_miss
+
+    def cluster_progress(done: int, _total: int) -> None:
+        # Jobs are ordered by image, so the last finished job's image is a
+        # fair position in the library for the shared progress count.
+        if progress and done % 20 == 0:
+            progress("image-cluster", jobs[done - 1][0] + 1, len(hashed))
+
     try:
-        for i, rec in enumerate(hashed):
-            if cancelled and cancelled():
-                raise InterruptedError("scan cancelled")
-            # Upright candidates first, then turns in pHash-distance order.
-            # Symmetric grayscale structure can hide different color layouts,
-            # so a failed best turn must not suppress another valid orientation.
-            candidates: list[tuple[FileRecord, str | None]] = [
-                (other, None)
-                for _distance, matched_hash in tree.find(int(rec.phash or "0", 16), threshold)
-                for other in by_phash[matched_hash]
-            ]
-            turned = decode_orientation_phashes(rec.orientation_phashes)
-            if turned and rec.media_type == MediaType.IMAGE:
-                turns: dict[str, list[tuple[int, str, FileRecord]]] = {}
-                for name, value in zip(ORIENTATIONS, turned, strict=True):
-                    for distance, matched_hash in tree.find(int(value, 16), threshold):
-                        for other in by_phash[matched_hash]:
-                            if other.media_type != MediaType.IMAGE:
-                                continue
-                            turns.setdefault(other.path, []).append((distance, name, other))
-                candidates.extend(
-                    (other, name)
-                    for matches in turns.values()
-                    for _distance, name, other in sorted(matches, key=lambda match: match[0])
-                )
-            for other, orientation in candidates:
-                # Every pair only needs verification once.
-                if positions[other.path] <= i or other.path in adjacency[rec.path]:
-                    continue
-                if distinct and distinct.is_distinct(rec, other):
-                    continue
-                if not verified(rec, other, orientation):
-                    if (
-                        orientation is None
-                        and rec.media_type == MediaType.IMAGE
-                        and other.media_type == MediaType.IMAGE
-                    ):
-                        near_misses.append((rec, other))
-                    continue
+        outcomes = map_parallel(
+            verify_pair,
+            jobs,
+            workers=n_workers,
+            backend="thread",
+            progress=cluster_progress,
+            cancelled=cancelled,
+        )
+        for (_i, rec, other, _names), (matched, near_miss) in zip(jobs, outcomes, strict=True):
+            if matched:
                 adjacency[rec.path].add(other.path)
                 adjacency[other.path].add(rec.path)
-            if progress and (i + 1) % 20 == 0:
-                progress("image-cluster", i + 1, len(hashed))
+            elif near_miss:
+                near_misses.append((rec, other))
 
         # A crop, border, or color edit misaligns the regional checks above
         # even when the global hash agrees. Feature alignment verifies those
         # copies with the same fine-detail bar, so poses stay separate.
-        unique = {(rec.path, other.path): (rec, other) for rec, other in near_misses}
-        pending = [
-            (rec, other) for rec, other in unique.values()
-            if other.path not in adjacency[rec.path]
-        ]
+        pending = near_misses
         if pending:
             from .edited_copy import verify_edited_copy
 
+            # Alignment runs first: it rejects most near misses, and the
+            # color check would decode each of those files a second time.
             verdicts = map_parallel(
-                lambda pair: _color_balance_agrees(pair[0].path, pair[1].path)
-                and verify_edited_copy(pair[0].path, pair[1].path),
+                lambda pair: verify_edited_copy(pair[0].path, pair[1].path)
+                and _color_balance_agrees(pair[0].path, pair[1].path),
                 pending,
                 workers=n_workers,
                 backend="thread",

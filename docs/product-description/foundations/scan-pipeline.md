@@ -49,7 +49,7 @@ After the last stage, everything the scan learned is written back to the hash ca
 
 **Similar images and GIFs.** Candidate pairs first pass global and regional comparisons, followed by color, transparency, and local-detail checks. Similar is intended for copies of one photograph. Small changes in expression, pose, or hair can keep two otherwise similar pictures out of the category. A pair must pass every check:
 
-> Technical note: candidate hashing downsizes images to at most 512 px per side and computes pHash and dHash. Regional tile hashes then compare quadrants and the center. These coarse checks are followed by the checks below; a matching hash is not sufficient evidence by itself.
+> Technical note: candidate hashing downsizes images to at most 512 px per side and computes pHash and dHash. A JPEG is decoded at a reduced size for this — the decoder itself produces the smaller picture, never below what hashing needs — so a large photo is not decoded in full only to be shrunk. Its reported width and height are still the file's own. Regional tile hashes then compare quadrants and the center. These coarse checks are followed by the checks below; a matching hash is not sufficient evidence by itself.
 
 | Check | Default |
 | --- | --- |
@@ -136,7 +136,7 @@ A single corrupt or unreadable file never aborts the scan; this is deliberate, b
 
 **Optional dependencies.** ffmpeg/ffprobe are required for video similarity and video dimension probes; OpenCV for the no-person and faces reviews; Photon only when chosen as a backend. Degraded behavior per dependency is collected in [Optional dependencies](../cross-cutting/optional-dependencies.md).
 
-**Concurrency and resource limits.** Worker counts default to "auto": one fewer than the CPU count (all cores on 2-core machines), capped at 8 overall, with per-stage caps — 4 for exact hashing, 6 for image hashing, 4 for video fingerprinting, 4 for OpenCV detection, 2 for preparing images for DigUp's helper, 3 for verifying look-alike candidates. Photon runs serially. Explicit worker settings are honored, then clamped to the stage cap.
+**Concurrency and resource limits.** Worker counts default to "auto": one fewer than the CPU count (all cores on 2-core machines), capped at 8 overall, with per-stage caps — 4 for exact hashing, 6 for image hashing, 4 for video fingerprinting, 4 for OpenCV detection, 2 for preparing images for DigUp's helper, 3 for verifying look-alike candidates. Photon runs serially. An explicit worker setting is honored and then clamped to the stage cap, except for image hashing and the verification of similar-image candidates: there the cap of 6 bounds the automatic setting only, and a chosen count is used as given, so a machine with spare cores can be put to work. Video fingerprinting keeps its cap because the hardware video decoder, not the CPU, is the limit; where that decoder is in use and the machine has cores to spare, up to 2 further fingerprint jobs (one per 8 cores) decode on the CPU beside the 4 hardware ones. Both decoders produce the same fingerprints.
 
 **macOS specifics.** Photos.app libraries are detected and refused at root validation. HEIC/HEIF are first-class image types.
 
@@ -144,6 +144,7 @@ A single corrupt or unreadable file never aborts the scan; this is deliberate, b
 
 ## Edge cases
 
+- Image hashes are stored with the version of the decode that produced them. After an update that changes that decode, the first scan hashes every image again; hashes from different versions are never compared. Pairs already marked not-duplicates keep their mark across that re-hash as long as the files themselves are unchanged.
 - Scanning the same folder twice reuses cached fingerprints, but candidate pairs still undergo the current local-detail checks. Cache reuse does not mean those comparisons are skipped.
 - A same-size file with a different prefix exits the exact funnel after the 64 KiB partial hash. Matching prefixes on larger files still require a full SHA-256; a matching prefix alone never proves an exact duplicate.
 - Zero-byte files are excluded from exact candidacy (`size > 0` is required).

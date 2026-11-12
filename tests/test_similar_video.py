@@ -627,3 +627,89 @@ def test_near_miss_pair_that_fails_offset_check_stays_separate(tmp_path: Path) -
     distances = video_fingerprint_distances(*(record.video_fingerprint for record in records))
     assert 8 < sum(distances) / len(distances) <= 16
     assert groups == []
+
+
+@pytest.mark.parametrize(
+    ("cores", "workers", "hardware", "expected"),
+    [
+        (16, 4, True, 2),
+        (8, 4, True, 1),
+        (64, 4, True, 2),  # capped
+        (4, 4, True, 0),  # no cores to spare
+        (16, 2, True, 0),  # a lower worker setting asks for a lighter scan
+        (16, 4, False, 0),  # software is already the only decoder
+    ],
+)
+def test_software_decode_jobs_are_added_only_beside_a_full_hardware_lane(
+    monkeypatch, cores: int, workers: int, hardware: bool, expected: int
+) -> None:
+    import dedupe.similar_video as module
+
+    monkeypatch.setattr(module.os, "cpu_count", lambda: cores)
+    monkeypatch.setattr(
+        module, "_hwaccel_args", lambda: ("-hwaccel", "videotoolbox") if hardware else ()
+    )
+
+    assert module._software_decode_workers(workers) == expected
+
+
+def test_software_decode_job_does_not_try_the_hardware_decoder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        targets = [cmd[index + 1] for index, arg in enumerate(cmd) if arg == "-y"]
+        for target in targets:
+            Path(target).write_bytes(bytes(HASH_FRAME_SIZE * HASH_FRAME_SIZE))
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(
+        "dedupe.similar_video._hwaccel_args", lambda: ("-hwaccel", "videotoolbox")
+    )
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", fake_run)
+
+    frames = _extract_hash_frames(tmp_path / "video.mp4", [0.0, 1.0], software=True)
+
+    assert len(frames) == 2
+    assert len(calls) == 1 and "-hwaccel" not in calls[0]
+
+
+def test_hardware_lane_stays_at_its_cap_while_software_jobs_run_beside_it(monkeypatch) -> None:
+    import threading
+    import time
+
+    import dedupe.similar_video as module
+
+    lock = threading.Lock()
+    running = {"hardware": 0, "software": 0}
+    peak = {"hardware": 0, "software": 0}
+
+    def fake_fingerprint(path, *, on_frame=None, software=False):
+        lane = "software" if software else "hardware"
+        with lock:
+            running[lane] += 1
+            peak[lane] = max(peak[lane], running[lane])
+        time.sleep(0.02)
+        with lock:
+            running[lane] -= 1
+        return "v3:" + ",".join([f"{int(Path(path).stem):016x}"] * 8), 640, 480, 10.0
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(module, "_hwaccel_args", lambda: ("-hwaccel", "videotoolbox"))
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(module, "compute_video_fingerprint", fake_fingerprint)
+    records = [
+        FileRecord(
+            path=f"/{index}.mp4", size=1, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", duration=10.0,
+        )
+        for index in range(1, 41)
+    ]
+
+    find_similar_video_groups(records, workers=8)
+
+    assert all(record.video_fingerprint for record in records)
+    assert peak["hardware"] == module.DEFAULT_VIDEO_WORKERS_CAP
+    assert 1 <= peak["software"] <= module.MAX_SOFTWARE_DECODE_WORKERS

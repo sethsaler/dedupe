@@ -501,3 +501,40 @@ def test_cache_drops_animation_hashes_stored_for_a_jpeg(tmp_path: Path) -> None:
     assert fresh[1].tile_phashes == still.tile_phashes and fresh[1].phash == "0" * 16
     assert fresh[2].tile_phashes == gif.tile_phashes
     cache.close()
+
+
+def test_distinct_content_identity_follows_recomputed_hashes(tmp_path: Path) -> None:
+    """A decision recorded under older hashes is carried to the current ones."""
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    left = _record(tmp_path / "left.jpg", inode=10)
+    right = _record(tmp_path / "right.jpg", inode=11)
+    cache.mark_distinct([left, right])
+
+    # Same files, hashed by a newer pipeline.
+    rehashed = _record(tmp_path / "right.jpg", inode=11)
+    rehashed.phash = "a" * 16
+    assert cache.backfill_distinct_content([left, rehashed]) == 1
+    assert cache.backfill_distinct_content([left, rehashed]) == 0
+
+    # The refreshed identity now survives metadata drift of the rehashed file.
+    drifted = _record(tmp_path / "right.jpg", inode=99)
+    drifted.phash = "a" * 16
+    drifted.mtime_ns = 2_000_000_000
+    assert cache.distinct_reviews([left, drifted]).is_distinct(left, drifted)
+    cache.close()
+
+
+def test_distinct_content_identity_is_not_refreshed_for_a_changed_file(tmp_path: Path) -> None:
+    """New hashes on a file whose stat identity moved are a change, not an upgrade."""
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    left = _record(tmp_path / "left.jpg", inode=10)
+    right = _record(tmp_path / "right.jpg", inode=11)
+    cache.mark_distinct([left, right])
+
+    changed = _record(tmp_path / "right.jpg", inode=99)
+    changed.phash = "a" * 16
+    changed.mtime_ns = 2_000_000_000
+
+    assert cache.backfill_distinct_content([left, changed]) == 0
+    assert not cache.distinct_reviews([left, changed]).is_distinct(left, changed)
+    cache.close()

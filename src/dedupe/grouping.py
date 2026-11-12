@@ -85,8 +85,13 @@ def cluster_around_best(
     only attaching its verified neighbors, every automatically removable member has
     been compared directly with the file the UI will recommend keeping.
     """
+    # Ranking reads capture metadata from the file, so only rank records that
+    # can take part in a group: those with a match, or named as one. In a
+    # library that is mostly unique files this skips nearly every file open.
+    linked = {path for path, matches in adjacency.items() if matches}
+    linked.update(path for matches in adjacency.values() for path in matches)
     ordered = sorted(
-        records,
+        (record for record in records if record.path in linked),
         key=lambda record: (rank_keep_candidate(record), record.path),
         reverse=True,
     )

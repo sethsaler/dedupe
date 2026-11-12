@@ -213,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=(
             "Parallel workers for hashing and OpenCV person detection "
-            "(0 = auto, conservative; 1 = serial; each stage has a safety cap)"
+            "(0 = auto, conservative; 1 = serial; stages have safety caps, and image "
+            "hashing uses a higher N as given)"
         ),
     )
     scan.add_argument(

@@ -86,6 +86,21 @@ def _register(left, right, valid):
     return moved, interior & support
 
 
+def _window_support(mask, window: int, whole_frame: bool):
+    """Pixels whose whole ``window`` neighborhood is valid and inside the frame."""
+    import numpy as np
+    from scipy.ndimage import minimum_filter
+
+    if whole_frame and window % 2:
+        # Every pixel is valid, so a window has full support exactly when it
+        # lies inside the frame; no filter pass is needed.
+        edge = window // 2
+        support = np.zeros(mask.shape, dtype=bool)
+        support[edge : mask.shape[0] - edge, edge : mask.shape[1] - edge] = True
+        return support
+    return minimum_filter(mask, size=window, mode="constant", cval=0)
+
+
 def aligned_detail_matches(left, right, *, valid=None) -> bool:
     """Compare same-sized grayscale arrays (0–255), optionally within an overlap.
 
@@ -95,7 +110,7 @@ def aligned_detail_matches(left, right, *, valid=None) -> bool:
     noise in flat areas is not mistaken for a new expression.
     """
     import numpy as np
-    from scipy.ndimage import gaussian_filter, minimum_filter, uniform_filter
+    from scipy.ndimage import gaussian_filter, uniform_filter
 
     a, b = np.asarray(left, dtype=np.float32), np.asarray(right, dtype=np.float32)
     if a.ndim != 2 or a.shape != b.shape or not a.size:
@@ -118,10 +133,11 @@ def aligned_detail_matches(left, right, *, valid=None) -> bool:
     if float(difference[mask].max()) <= LOCAL_RESIDUAL_MAX:
         return True
     checked = False
+    whole_frame = bool(mask.all())
     for window in DETAIL_WINDOWS:
         if min(a.shape) < window:
             continue
-        support = minimum_filter(mask, size=window, mode="constant", cval=0)
+        support = _window_support(mask, window, whole_frame)
         if not support.any():
             continue
         checked = True

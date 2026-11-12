@@ -578,15 +578,18 @@ class HashCache:
         )
 
     def backfill_distinct_content(self, records: list[FileRecord]) -> int:
-        """Fill perceptual content identities onto rows recorded before hashing.
+        """Bring stored perceptual content identities up to the current hashes.
 
         Rows written while a file carried no perceptual hash (legacy caches,
         decisions recorded from unhashed loaded sessions) are stat-only: any
         metadata touch revives the pair for review. Once a scan has hashed
         the file again, the row can carry the content identity and survive
-        drift. Only sides whose stored stat identity still matches the
-        current record are backfilled — a changed file must not have its
-        decision hardened. Returns the number of rows updated.
+        drift. A row whose identity came from an older hashing pipeline is
+        refreshed the same way, so a change to the hashes does not strand
+        the decision on values no scan will compute again. Only sides whose
+        stored stat identity still matches the current record are written —
+        a changed file must not have its decision hardened. Returns the
+        number of rows updated.
         """
         by_path: dict[str, FileRecord] = {}
         by_identity: dict[str, FileRecord] = {}
@@ -596,9 +599,7 @@ class HashCache:
         updated = 0
         rows = self._conn.execute(
             "SELECT path_a, identity_a, content_a, path_b, identity_b, content_b "
-            "FROM distinct_similar_pairs "
-            "WHERE content_a IS NULL OR content_a = '' "
-            "   OR content_b IS NULL OR content_b = ''"
+            "FROM distinct_similar_pairs"
         ).fetchall()
         for row in rows:
             fills: dict[str, str] = {}
@@ -606,15 +607,13 @@ class HashCache:
                 ("path_a", "identity_a", "content_a"),
                 ("path_b", "identity_b", "content_b"),
             ):
-                if row[content_key]:
-                    continue
                 rec = by_path.get(row[path_key]) or by_identity.get(row[identity_key])
                 # Renames keep the stored identity; drift does not. Only an
                 # identity match proves the hashes describe the decided file.
                 if rec is None or self._identity(rec) != row[identity_key]:
                     continue
                 content = _content_identity(rec)
-                if content:
+                if content and content != row[content_key]:
                     fills[content_key] = content
             if fills:
                 self._conn.execute(
