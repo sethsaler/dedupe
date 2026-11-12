@@ -384,13 +384,16 @@ def test_similarity_chain_does_not_create_transitive_group(monkeypatch) -> None:
 
 
 def _spy_map_parallel(monkeypatch, captured: dict):
-    """Record the backend passed to map_parallel while running the real thing."""
+    """Record the hashing pass's map_parallel backend while running the real thing.
+
+    Hashing is the first call; pair verification reuses map_parallel on threads.
+    """
     import dedupe.similar_image as module
 
     real_map = module.map_parallel
 
     def spy(fn, items, **kwargs):
-        captured["backend"] = kwargs.get("backend")
+        captured.setdefault("backend", kwargs.get("backend"))
         return real_map(fn, items, **kwargs)
 
     monkeypatch.setattr(module, "map_parallel", spy)
@@ -773,6 +776,34 @@ def test_hamming_index_matches_brute_force(radius: int) -> None:
         assert sorted(index.find(query, radius)) == expected
 
 
+@pytest.mark.parametrize("radius", [0, 6, 20])
+@pytest.mark.parametrize("batch_pairs", [1, 1 << 21])
+def test_hamming_index_batched_lookup_matches_single_lookups(
+    radius: int, batch_pairs: int, monkeypatch
+) -> None:
+    import random
+
+    from dedupe.similar_image import HammingIndex
+
+    # A budget of one pair forces a batch per query; the default takes them together.
+    monkeypatch.setattr(HammingIndex, "BATCH_PAIRS", batch_pairs)
+    rng = random.Random(radius)
+    hashes = [rng.getrandbits(64) for _ in range(600)]
+    hashes += [h ^ (1 << rng.randrange(64)) ^ (1 << rng.randrange(64)) for h in hashes[:200]]
+    hashes = list(dict.fromkeys(hashes))
+    index = HammingIndex(hashes, radius)
+    queries = hashes[:120] + [rng.getrandbits(64) for _ in range(40)] + [0, (1 << 64) - 1]
+
+    expected = sorted(
+        (position, distance, matched)
+        for position, query in enumerate(queries)
+        for distance, matched in index.find(query, radius)
+    )
+    assert sorted(index.find_many(queries, radius)) == expected
+    assert index.find_many([], radius) == []
+    assert HammingIndex([], radius).find_many(queries, radius) == []
+
+
 @pytest.mark.parametrize("extension", ["gif", "webp", "png"])
 def test_animation_checks_colors_after_the_first_frame(tmp_path, extension):
     """Equal first frames and grayscale structure cannot hide later color changes."""
@@ -963,3 +994,70 @@ def test_cropped_copy_within_hash_range_is_verified_by_alignment(tmp_path: Path)
     assert [sorted(Path(r.path).name for r in group) for group in groups] == [
         ["cropped.jpg", "source.jpg"]
     ]
+
+
+@pytest.mark.parametrize("orientation", [1, 6])
+def test_jpeg_hashing_decodes_reduced_and_keeps_the_file_dimensions(
+    tmp_path: Path, orientation: int
+) -> None:
+    """A large JPEG is decoded small for hashing; its reported size is the file's."""
+    from PIL import ImageOps
+
+    import dedupe.similar_image as module
+
+    path = tmp_path / "large.jpg"
+    exif = Image.Exif()
+    exif[module.EXIF_ORIENTATION] = orientation
+    Image.effect_noise((2048, 1280), 40).convert("RGB").save(path, exif=exif.tobytes())
+    with Image.open(path) as img:
+        expected = ImageOps.exif_transpose(img).size
+
+    with Image.open(path) as img:
+        source, width, height, animated = module._upright_hash_source(img)
+        decoded = source.size
+
+    assert (width, height) == expected
+    assert not animated
+    assert max(decoded) < 2048
+    # The decoded copy is still upright and at least as large as hashing needs.
+    assert (decoded[0] > decoded[1]) == (width > height)
+    assert max(decoded) >= module.HASH_MAX_SIDE
+    assert module.compute_image_hashes(path)[2:] == expected
+
+
+def test_reduced_decode_hashes_stay_close_to_full_decode_hashes(tmp_path: Path) -> None:
+    """The reduced decode moves a hash by far less than the matching threshold."""
+    import imagehash
+
+    import dedupe.similar_image as module
+
+    path = tmp_path / "large.jpg"
+    _soft_photo(path, size=(2400, 1800))
+    with Image.open(path) as img:
+        full = imagehash.phash(module._downscale_for_hash(img, module.HASH_MAX_SIDE))
+
+    reduced = imagehash.hex_to_hash(module.compute_image_hashes(path)[0])
+
+    assert full - reduced <= 2
+
+
+def test_hashes_from_an_older_decode_are_computed_again(tmp_path: Path) -> None:
+    """A cached record whose tiles carry an older version is hashed afresh."""
+    import dedupe.similar_image as module
+
+    a, b = tmp_path / "a.jpg", tmp_path / "b.jpg"
+    _soft_photo(a)
+    _soft_photo(b, shift=1)
+    records = [_rec_for(a), _rec_for(b)]
+    current = [module.compute_image_hashes(path)[0] for path in (a, b)]
+    for record in records:
+        record.phash = "f" * 16
+        record.dhash = "0" * 16
+        record.tile_phashes = "t3:" + ",".join(["0" * 16] * 5)
+
+    find_similar_image_groups(records, workers=1)
+
+    assert [record.phash for record in records] == current
+    assert all(
+        record.tile_phashes.startswith(f"{module.TILE_HASH_VERSION}:") for record in records
+    )

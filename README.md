@@ -433,16 +433,16 @@ Hashing stages run in a **bounded** thread pool so large libraries don’t pin e
 
 | Setting | Default | Cap |
 | --- | --- | --- |
-| `--workers N` | auto (`min(cpu−1, 8)`) | overall budget; `1` = serial |
+| `--workers N` | auto (`min(cpu−1, 8)`) | overall budget; `1` = serial; a higher explicit `N` is allowed |
 | Exact SHA-256 | ≤ budget | max **4** concurrent full-file reads |
-| Image pHash | ≤ budget | max **6**; images downscaled ≤512px before hash |
-| Video fingerprints | ≤ budget | max **4** concurrent direct-seek ffmpeg jobs (each `-threads 1`) |
+| Image pHash | ≤ budget | max **6** on auto, an explicit `--workers N` is used as given; images downscaled ≤512px before hash |
+| Video fingerprints | ≤ budget | max **4** concurrent direct-seek ffmpeg jobs (each `-threads 1`), plus up to **2** software-decode jobs beside hardware decoding on machines with 8+ cores |
 | OpenCV person detection | ≤ budget | max **4** thread-local detectors; Photon/ensemble remain serial |
 
 Also:
 
 - Futures stay windowed (~2× workers in flight) so 50k files don’t allocate 50k tasks at once
-- Image decode uses Pillow `draft()` + thumbnail so 12MP HEIC/JPEG never hold full-res RGB
+- JPEGs are decoded at reduced size for hashing (Pillow `draft()`), so a 12MP photo is never held as full-res RGB; other formats are decoded and then downscaled
 - Video fingerprints fast-seek directly to 32px grayscale samples; person detection uses separate 640px direct seeks and stops decoding after positive evidence
 - The scan cache means re-scans skip hashes and person checks for unchanged media, including files renamed on the same filesystem; new, replaced, or modified files are analyzed normally
 

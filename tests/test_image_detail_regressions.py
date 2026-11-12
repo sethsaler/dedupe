@@ -93,3 +93,19 @@ def test_detail_verification_preserves_actual_reexports(tmp_path, size, quality,
     assert [{record.path for record in group} for group in groups] == [
         {str(original), str(exported)}
     ]
+
+
+@pytest.mark.parametrize("shape", [(7, 7), (15, 16), (33, 90), (120, 160)])
+def test_whole_frame_support_matches_the_mask_filter(shape):
+    """The whole-frame shortcut marks the pixels the mask filter would."""
+    import numpy as np
+
+    from dedupe.image_detail import DETAIL_WINDOWS, _window_support
+
+    mask = np.ones(shape, dtype=bool)
+    for window in DETAIL_WINDOWS:
+        if min(shape) < window:
+            continue
+        filtered = _window_support(mask, window, False)
+        assert np.array_equal(_window_support(mask, window, True), filtered)
+        assert filtered.any() == (min(shape) >= window)

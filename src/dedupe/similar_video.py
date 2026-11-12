@@ -39,6 +39,10 @@ ERROR_VIDEO_FINGERPRINT_FAILED = "video fingerprint failed"
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
 FRAME_WIDTH = 320
 HASH_FRAME_SIZE = 32
+# Software-decode fingerprint jobs run beside the hardware-decode ones: one
+# per this many cores, up to the maximum.
+CORES_PER_SOFTWARE_DECODE = 8
+MAX_SOFTWARE_DECODE_WORKERS = 2
 HASH_FRAME_FILTER = f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,format=gray"
 
 
@@ -244,19 +248,21 @@ def _extract_hash_frame_once(
     return result.stdout
 
 
-def _extract_hash_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+def _extract_hash_frames(
+    path: str | Path, timestamps: list[float], *, software: bool = False
+) -> list[bytes]:
     """Fast-seek every sampled timestamp in a single ffmpeg process.
 
     The same file is opened once per timestamp so each output keeps the exact
     input-side seek of the per-frame extractor, which makes the buffers
     byte-identical to :func:`_extract_hash_frame` while spawning one process
     instead of one per frame. Tries hardware decode when available, falling
-    back to software decode. Returns ``[]`` when the pass is incomplete so the
-    caller can fall back.
+    back to software decode; ``software`` skips the hardware attempt. Returns
+    ``[]`` when the pass is incomplete so the caller can fall back.
     """
     if not timestamps:
         return []
-    hwaccel = _hwaccel_args()
+    hwaccel = () if software else _hwaccel_args()
     frames = _extract_hash_frames_once(path, timestamps, hwaccel)
     if not frames and hwaccel:
         frames = _extract_hash_frames_once(path, timestamps, ())
@@ -429,11 +435,14 @@ def compute_video_fingerprint(
     path: str | Path,
     *,
     on_frame: Callable[[int, int], None] | None = None,
+    software: bool = False,
 ) -> tuple[str | None, int | None, int | None, float | None]:
     """
     Return (fingerprint_hex, width, height, duration).
     Fingerprint preserves the ordered pHash sequence of sampled frames.
     ``on_frame(frame_number, total_frames)`` is called after each sampled frame.
+    ``software`` decodes the sampled frames on the CPU without trying the
+    hardware decoder first.
     """
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg/ffprobe not available")
@@ -446,7 +455,7 @@ def compute_video_fingerprint(
 
     if duration is not None and duration > 0:
         timestamps = _sample_timestamps(duration)
-        raw_frames = _extract_hash_frames(path, timestamps)
+        raw_frames = _extract_hash_frames(path, timestamps, software=software)
         if len(raw_frames) != len(timestamps):
             # Per-frame fallback for inputs the batched pass cannot satisfy.
             raw_frames = []
@@ -536,15 +545,34 @@ def _video_fingerprint_job(
     path: str,
     *,
     on_frame: Callable[[int, int], None] | None = None,
+    software: bool = False,
 ) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
     """Worker: (path, fingerprint, width, height, duration, error)."""
     try:
-        fp, w, h, dur = compute_video_fingerprint(path, on_frame=on_frame)
+        fp, w, h, dur = compute_video_fingerprint(
+            path, on_frame=on_frame, software=software
+        )
         if not fp:
             return path, None, w, h, dur, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: incomplete frames"
         return path, fp, w, h, dur, None
     except Exception as exc:
         return path, None, None, None, None, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: {exc}"
+
+
+def _software_decode_workers(video_workers: int) -> int:
+    """Extra fingerprint jobs that decode on the CPU beside the hardware ones.
+
+    The hardware decoder is one shared device: past a few jobs it is the
+    limit and more of them wait on it. Software decoding draws on CPU cores
+    instead, so a few such jobs add throughput the hardware lane cannot, and
+    they produce the same fingerprints. Each costs several cores, so they
+    are added only on machines with cores to spare, and only when the
+    hardware lane is already at its cap — a lower worker setting is a
+    request for a lighter scan.
+    """
+    if video_workers < DEFAULT_VIDEO_WORKERS_CAP or not _hwaccel_args():
+        return 0
+    return min(MAX_SOFTWARE_DECODE_WORKERS, (os.cpu_count() or 1) // CORES_PER_SOFTWARE_DECODE)
 
 
 def find_similar_video_groups(
@@ -600,13 +628,24 @@ def find_similar_video_groups(
                         f"Video hashing: {videos_done}/{total} · frame {frame}/{n_frames}",
                     )
 
+        software_workers = _software_decode_workers(video_workers)
+        hardware_slots = threading.BoundedSemaphore(video_workers)
+
         def job(path: str) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
-            return _video_fingerprint_job(path, on_frame=on_frame)
+            if not software_workers:
+                return _video_fingerprint_job(path, on_frame=on_frame)
+            # Jobs beyond the hardware lane's width decode on the CPU.
+            if not hardware_slots.acquire(blocking=False):
+                return _video_fingerprint_job(path, on_frame=on_frame, software=True)
+            try:
+                return _video_fingerprint_job(path, on_frame=on_frame)
+            finally:
+                hardware_slots.release()
 
         results = map_parallel(
             job,
             [r.path for r in need],
-            workers=video_workers,
+            workers=video_workers + software_workers,
             # ffmpeg spawns real OS processes → threads buy true parallelism.
             backend="thread",
             progress=None,

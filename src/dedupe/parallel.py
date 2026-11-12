@@ -21,6 +21,7 @@ DEFAULT_WORKERS_CAP = 8
 # Concurrent full-file reads (SHA-256 of large videos is disk-bound).
 DEFAULT_EXACT_WORKERS_CAP = 4
 # Concurrent image decodes (Pillow + pHash are CPU + RAM heavy on big JPEGs/HEIC).
+# Bounds the automatic budget only; an explicit worker count is used as given.
 DEFAULT_IMAGE_WORKERS_CAP = 6
 # Direct-seek fingerprint jobs are short-lived; four keeps modern SSDs/CPUs busy
 # without returning to the contention caused by parallel full-timeline decodes.
@@ -52,6 +53,18 @@ def resolve_workers(
     if cap is not None:
         n = min(n, max(1, int(cap)))
     return n
+
+
+def stage_workers(workers: int | None, *, cap: int) -> int:
+    """Worker count for a stage whose cap bounds only the automatic budget.
+
+    An automatic budget is clamped to ``cap``, which keeps a default scan
+    light on memory. A count the user chose is their budget: it is used as
+    given, so a machine with spare cores is not held to the default.
+    """
+    if workers is None or workers <= 0:
+        return resolve_workers(None, cap=cap)
+    return max(1, int(workers))
 
 
 def split_cpu_budget(total: int, stages: int) -> int:

@@ -46,7 +46,12 @@ from .models import (
     ScanResult,
     StageDiagnostics,
 )
-from .parallel import map_parallel, resolve_workers, split_cpu_budget
+from .parallel import (
+    DEFAULT_IMAGE_WORKERS_CAP,
+    map_parallel,
+    resolve_workers,
+    split_cpu_budget,
+)
 from .scanner import inventory, is_in_photos_library
 from .semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 from .semantic import DEFAULT_THRESHOLD as SEMANTIC_THRESHOLD
@@ -193,6 +198,7 @@ def run_scan(
     progress: ProgressCb | None = None,
     on_group: GroupCb | None = None,
     _build_review_groups: bool = True,
+    _workers_chosen: bool | None = None,
 ) -> ScanResult:
     """Run a full scan.
 
@@ -208,6 +214,11 @@ def run_scan(
     """
     crop_aggressiveness = validate_crop_level(crop_aggressiveness)
     n_workers = resolve_workers(workers)
+    # Whether the user chose the count. A per-folder stream receives a share
+    # of the budget as a number, so its caller says where the number came from.
+    workers_chosen = (
+        bool(workers and workers > 0) if _workers_chosen is None else _workers_chosen
+    )
     low_resolution_bounds = _low_resolution_bounds(
         default_max_pixels=low_resolution_max_pixels,
         images=low_resolution_images,
@@ -457,6 +468,11 @@ def run_scan(
             )
         )
         cpu_workers = split_cpu_budget(n_workers, cpu_stage_count)
+        # The image cap keeps an automatic scan light on memory; a count the
+        # user chose is their budget and is passed on as given.
+        image_workers = (
+            cpu_workers if workers_chosen else min(cpu_workers, DEFAULT_IMAGE_WORKERS_CAP)
+        )
         human_workers = (
             cpu_workers if normalized_human_backend == "opencv" else n_workers
         )
@@ -600,7 +616,7 @@ def run_scan(
                     threshold=image_threshold,
                     distinct=distinct,
                     progress=img_progress,
-                    workers=cpu_workers,
+                    workers=image_workers,
                     cancelled=cancelled,
                 )
                 exact_done.wait()
@@ -1539,6 +1555,7 @@ def run_scans_parallel(
             use_cache=use_cache,
             cache_path=cache_path,
             workers=per_stream_workers,
+            _workers_chosen=bool(workers and workers > 0),
             exclusions=exclusions,
             cancelled=cancelled,
             progress=stream_progress_cb,
