@@ -1,8 +1,10 @@
-"""Black-border detection and in-place cropping for images and videos.
+"""Border detection and in-place cropping for images and videos.
 
 A scan with border detection enabled looks along each edge of every
 croppable image for solid black bars — letterboxing, pillarboxing, scanner
 margins, screenshots of videos — and suggests the crop that removes them.
+Images get the same for a flat frame of any other colour: a story set on
+white, a collage's outer border, a gray or coloured mat.
 MP4-family videos get the same treatment on sampled frames: a bar counts
 when most sampled frames carry it, and a human guard pulls every suggested
 crop back wherever it would cut a detected person.
@@ -46,27 +48,28 @@ from .parallel import map_parallel
 
 # Bump when the detection rules change so cached verdicts are recomputed.
 # A user's dismissal under an earlier signature still stands.
-BORDER_SIGNATURE = "black-borders-v7"
+BORDER_SIGNATURE = "black-borders-v8"
 LEGACY_BORDER_SIGNATURES = frozenset(
     {"black-borders-v1", "black-borders-v2", "black-borders-v3", "black-borders-v4",
-     "black-borders-v5", "black-borders-v6"}
+     "black-borders-v5", "black-borders-v6", "black-borders-v7"}
 )
 # Cached verdict for a file the user dismissed ("No crop needed").
 BORDER_DISMISSED = "dismissed"
 
 # --- crop aggressiveness levels ----------------------------------------------
 # Every measurement computes one suggested box per level in a single pass:
-# conservative keeps only what the strict detector (plus screenshot
-# interface) proves, balanced is the detector exactly as it behaved before
-# levels existed (strict + guarded aggressive pass), and aggressive loosens
-# the aggressive pass further — darker-gray bars, more ink and noise
-# tolerated, thinner bars surfaced — still behind the human guard. The
+# conservative keeps only what the strict detectors (black bars, flat colour
+# bars, screenshot interface) prove, balanced adds the guarded aggressive
+# pass over black bars (captions, encoder noise), and aggressive loosens
+# that pass further — darker-gray and thinner bars, colour bars holding a
+# mark — but only where the bar holds nothing and stops at a ruled line,
+# still behind the human guard. The
 # balanced box keeps living in ``border_crop`` under BORDER_SIGNATURE, so
 # verdicts cached before levels existed stay valid; the other two boxes are
 # stamped with their own signature, bumped when their rules change.
 CROP_LEVELS = ("conservative", "balanced", "aggressive")
 DEFAULT_CROP_LEVEL = "balanced"
-BORDER_LEVELS_SIGNATURE = "crop-levels-v1"
+BORDER_LEVELS_SIGNATURE = "crop-levels-v2"
 
 
 def validate_crop_level(level: str | None) -> str:
@@ -190,6 +193,49 @@ AGGRESSIVE_LEVEL_LINE_FRACTION = 0.70
 AGGRESSIVE_LEVEL_PICTURE_FRACTION = 0.35
 AGGRESSIVE_LEVEL_GAP_FRACTION = 0.04
 AGGRESSIVE_LEVEL_MIN_FRACTION = 0.002
+# Rules that loose also take a dark beam, a shadowed wall or a night sky for
+# a bar: most of each line sits near one dark level there too. What a bar has
+# and a picture does not is nothing in it and a ruled line where it stops. The
+# aggressive level's bar is therefore read again in blocks, which average
+# noise and ringing away: at least AGGRESSIVE_LEVEL_FLAT_BLOCKS of them sit
+# within BAR_BLOCK_TOLERANCE of the bar's level, and where the bar ends the
+# picture steps off it by BAR_STEP_CONTRAST along at least
+# AGGRESSIVE_LEVEL_STRAIGHT_EDGE of the line.
+BAR_BLOCK_TOLERANCE = 6
+BAR_BLOCKS_ACROSS = 128
+BAR_STEP_CONTRAST = 16
+AGGRESSIVE_LEVEL_FLAT_BLOCKS = 0.9
+AGGRESSIVE_LEVEL_STRAIGHT_EDGE = 0.6
+
+# --- solid-colour bars --------------------------------------------------------
+# A picture set on white, gray or any other flat colour — a letterboxed story,
+# a collage's outer frame, a scan's margin — is framed just as one on black.
+# A colour bar is measured like a strict black bar, on all three channels, but
+# must end harder: white walls, blown skies and paper are common in pictures,
+# so at least this share of a line within BAR_EDGE_LINES past the bar is off
+# its colour. A seamless backdrop behind a head, or a page's margin above a
+# line of text, changes less of the line than that and is left alone.
+COLOUR_BAR_EDGE_FRACTION = 0.5
+# Lines of a colour bar that an edge's ringing may leave short of flat: an
+# edge inside a JPEG block rings through the rest of that block.
+COLOUR_BAR_RINGING_LINES = 7
+# A frame's colour stays outside the picture. Where more than this share of
+# the rows or columns kept are that colour from end to end, with content on
+# both sides of them — the blank lines between a page's paragraphs — it is
+# the ground the content sits on, a page's own margin, and trimming it is
+# not a crop. A collage's dividers are a line or two and stay well under it;
+# a band still standing at the kept part's own edge (the other side of the
+# frame, where a mark or a pale picture kept it from being cut) is not
+# between anything and does not count.
+COLOUR_GROUND_FRACTION = 0.05
+# Times the edges are measured again on what the bars found so far leave.
+COLOUR_BAR_PASSES = 3
+# The aggressive level also takes a colour bar that holds a little ink — a
+# watermark, a mute icon, a counter — read loosely like a captioned black bar
+# and held to the same two checks: nothing in its blocks, a ruled line at its
+# end. It stays out of the balanced level because a caption on white is more
+# often the point of the picture (a meme, a quoted post) than one on black.
+COLOUR_LOOSE_TOLERANCE = 20
 
 
 @dataclass(frozen=True)
@@ -202,6 +248,10 @@ class _LooseRules:
     picture_fraction: float
     gap_fraction: float
     min_fraction: float
+    # Share of the bar's blocks at its level, and of the line past its end
+    # that steps off it; ``None`` skips the check.
+    flat_blocks: float | None = None
+    straight_edge: float | None = None
 
 
 _BALANCED_LOOSE = _LooseRules(
@@ -219,6 +269,18 @@ _AGGRESSIVE_LOOSE = _LooseRules(
     picture_fraction=AGGRESSIVE_LEVEL_PICTURE_FRACTION,
     gap_fraction=AGGRESSIVE_LEVEL_GAP_FRACTION,
     min_fraction=AGGRESSIVE_LEVEL_MIN_FRACTION,
+    flat_blocks=AGGRESSIVE_LEVEL_FLAT_BLOCKS,
+    straight_edge=AGGRESSIVE_LEVEL_STRAIGHT_EDGE,
+)
+_COLOUR_LOOSE = _LooseRules(
+    dark_luma=DARK_LUMA,
+    tolerance=COLOUR_LOOSE_TOLERANCE,
+    line_fraction=AGGRESSIVE_LINE_FRACTION,
+    picture_fraction=AGGRESSIVE_PICTURE_FRACTION,
+    gap_fraction=AGGRESSIVE_GAP_FRACTION,
+    min_fraction=MIN_BORDER_FRACTION,
+    flat_blocks=AGGRESSIVE_LEVEL_FLAT_BLOCKS,
+    straight_edge=AGGRESSIVE_LEVEL_STRAIGHT_EDGE,
 )
 # A video edge is suggested when more than this share of pictured frames
 # carry it (mixed boxed/full-frame clips: the majority wins).
@@ -670,7 +732,21 @@ def _aggressive_edge_bar(lines, rules: _LooseRules = _BALANCED_LOOSE) -> int:
     if level > rules.dark_luma:
         return 0
     near = (np.abs(lines.astype(np.int16) - level) <= rules.tolerance).mean(axis=1)
-    gap_allowed = max(4, int(len(lines) * rules.gap_fraction))
+    run = _loose_run(near, rules)
+    if run == 0 or run >= len(lines):
+        return run
+    if rules.flat_blocks is not None and not _empty_and_ruled(lines, run, level, rules):
+        return 0
+    return run
+
+
+def _loose_run(near, rules: _LooseRules) -> int:
+    """Lines of bar at the start of ``near``, each line's share at the bar's level.
+
+    The whole length when nothing ends the bar, and 0 when what follows it
+    within reach is not clearly picture.
+    """
+    gap_allowed = max(4, int(len(near) * rules.gap_fraction))
     last = -1
     gap = 0
     for index, fraction in enumerate(near):
@@ -683,10 +759,50 @@ def _aggressive_edge_bar(lines, rules: _LooseRules = _BALANCED_LOOSE) -> int:
             if gap > gap_allowed:
                 break
     run = last + 1
-    if run == 0 or run >= len(lines):
+    if run == 0 or run >= len(near):
         return run
     lookahead = near[run : run + max(BAR_EDGE_LINES * 3, gap_allowed)]
     return run if lookahead.size and float(lookahead.min()) <= rules.picture_fraction else 0
+
+
+def _empty_and_ruled(lines, run: int, level, rules: _LooseRules) -> bool:
+    """Whether the first ``run`` lines hold nothing and stop at a ruled line.
+
+    ``lines`` is luma with a scalar ``level``, or RGB with a colour. Read in
+    blocks, a bar is one level throughout (sparse ink aside) and the picture
+    steps off it along most of the line where it ends; a dark part of a
+    picture drifts from block to block and ends raggedly.
+    """
+    import numpy as np
+
+    if lines.ndim == 2:
+        lines = lines[:, :, None]
+    across, channels = lines.shape[1], lines.shape[2]
+    size = max(4, across // BAR_BLOCKS_ACROSS)
+    tall = min(size, run)
+    rows, columns = run // tall, across // size
+    if columns == 0:
+        return False
+    blocks = (
+        lines[: rows * tall, : columns * size]
+        .reshape(rows, tall, columns, size, channels)
+        .mean(axis=(1, 3), dtype=np.float32)
+    )
+    level_blocks = (np.abs(blocks - level) <= BAR_BLOCK_TOLERANCE).all(axis=2)
+    if float(level_blocks.mean()) < rules.flat_blocks:
+        return False
+    if rules.straight_edge is None:
+        return True
+    # The step is where the bar stops, not somewhere in the lines after it: a
+    # dark sky that fades for a hundred rows before a roofline has no edge.
+    depth = min(3, run)
+    outer = lines[run - depth : run].mean(axis=0, dtype=np.float32)
+    for start in range(run, min(run + BAR_EDGE_LINES, len(lines) - depth) + 1):
+        inner = lines[start : start + depth].mean(axis=0, dtype=np.float32)
+        stepped = (np.abs(inner - outer) >= BAR_STEP_CONTRAST).any(axis=1)
+        if float(stepped.mean()) >= rules.straight_edge:
+            return True
+    return False
 
 
 def detect_borders_aggressive(
@@ -726,6 +842,238 @@ def detect_borders_aggressive(
     return top, bottom, left, right
 
 
+def _colour_edge_bar(lines) -> int:
+    """Thickness of the flat bar of one colour at the start of ``lines``.
+
+    ``lines`` is an RGB array, one row per line running parallel to the edge,
+    ordered from it. Black bars are :func:`_edge_bar`'s; this answers for
+    every other colour, and returns 0 unless the bar is flat on all three
+    channels and ends in a hard edge against the picture.
+    """
+    import numpy as np
+
+    colour = np.median(lines[0], axis=0)
+    if float(colour @ (0.299, 0.587, 0.114)) <= DARK_LUMA:
+        return 0
+    near = (np.abs(lines.astype(np.int16) - colour.astype(np.int16)) <= BAR_TOLERANCE).all(axis=2)
+    flat = near.mean(axis=1) >= BAR_LINE_FRACTION
+    if flat.all():
+        return 0  # one colour as far as a bar may reach: a backdrop, not a frame
+    run = int(np.argmin(flat))
+    if run == 0:
+        return 0
+    last_flat = lines[run - 1].astype(np.int16)
+    # The bar's last lines take the ringing of the edge beside them and are
+    # no longer flat, yet are still bar while most of each sits at its colour:
+    # left behind, a white hairline shows on the cropped picture as a black
+    # one never would.
+    share = near.mean(axis=1)
+    for _ in range(COLOUR_BAR_RINGING_LINES):
+        if run >= len(lines) - 1 or share[run] < AGGRESSIVE_LINE_FRACTION:
+            break
+        run += 1
+    # A JPEG stores colour at half height, so a bar's last line can share its
+    # colour with the picture's first and sit between the two: still bar
+    # where most of it is nearer the bar's colour than the line after it.
+    if run < len(lines) - 1:
+        line = lines[run].astype(np.int16)
+        to_bar = np.abs(line - colour.astype(np.int16)).sum(axis=1)
+        to_picture = np.abs(line - lines[run + 1].astype(np.int16)).sum(axis=1)
+        if float((to_bar < to_picture).mean()) >= AGGRESSIVE_LINE_FRACTION:
+            run += 1
+    # The edge is a step from the bar's last flat line, not a drift from its
+    # first: a sky that shades smoothly out of tolerance has left the colour
+    # without ever leaving the lines just before.
+    after = lines[run : run + BAR_EDGE_LINES].astype(np.int16)
+    stepped = (np.abs(after - last_flat) > BAR_TOLERANCE).any(axis=2).mean(axis=1)
+    off = np.minimum(1.0 - share[run : run + BAR_EDGE_LINES], stepped)
+    return run if off.size and off.max() >= COLOUR_BAR_EDGE_FRACTION else 0
+
+
+def _loose_colour_edge_bar(lines, rules: _LooseRules = _COLOUR_LOOSE) -> int:
+    """Thickness of a colour bar at the start of ``lines`` that may hold ink.
+
+    The any-colour counterpart of :func:`_aggressive_edge_bar`: most of each
+    line sits at the bar's colour, the bar's blocks hold nothing, and the
+    picture steps off it along a ruled line.
+    """
+    import numpy as np
+
+    colour = np.median(lines[0], axis=0)
+    if float(colour @ (0.299, 0.587, 0.114)) <= rules.dark_luma:
+        return 0
+    off = np.abs(lines.astype(np.int16) - colour.astype(np.int16))
+    near = (off <= rules.tolerance).all(axis=2).mean(axis=1)
+    run = _loose_run(near, rules)
+    if run == 0 or run >= len(lines):
+        return 0
+    return run if _empty_and_ruled(lines, run, colour.astype(np.float32), rules) else 0
+
+
+def detect_colour_bars(
+    rgb, *, loose: bool = False, interface: tuple[bool, bool] = (False, False)
+) -> tuple[int, int, int, int] | None:
+    """Flat non-black bar thickness ``(top, bottom, left, right)`` for an RGB array.
+
+    The any-colour counterpart of :func:`detect_borders_in_array`, with the
+    same size and content limits: white, gray and coloured frames. ``loose``
+    measures them as the aggressive level does, ink and all. ``interface``
+    says the top or bottom of ``rgb`` is where a screenshot's interface was
+    cut away: the walk that cut it already found where the picture begins,
+    so a colour bar there counts only as one side of a frame, its colour cut
+    from another edge too.
+    """
+    import numpy as np
+
+    height, width = rgb.shape[:2]
+    if height < 8 or width < 8:
+        return None
+    keep_rows = int(np.ceil(height * MIN_CONTENT_FRACTION))
+    keep_cols = int(np.ceil(width * MIN_CONTENT_FRACTION))
+    min_rows = max(MIN_BORDER_PIXELS, int(np.ceil(height * MIN_BORDER_FRACTION)))
+    min_cols = max(MIN_BORDER_PIXELS, int(np.ceil(width * MIN_BORDER_FRACTION)))
+    measure = _loose_colour_edge_bar if loose else _colour_edge_bar
+    top = bottom = left = right = 0
+    # A side is a bar once the picture runs along most of it, which it may
+    # only do after another side has gone: a picture set to one side of a
+    # white canvas loses the wide margins first and then the one above it.
+    for _ in range(COLOUR_BAR_PASSES):
+        inner = rgb[top : height - bottom, left : width - right]
+        reach_rows = inner.shape[0] - keep_rows + BAR_EDGE_LINES
+        reach_cols = inner.shape[1] - keep_cols + BAR_EDGE_LINES
+        if reach_rows <= BAR_EDGE_LINES or reach_cols <= BAR_EDGE_LINES:
+            break
+        sideways = inner.transpose(1, 0, 2)
+        found = (
+            _past_hairline(measure, inner[:reach_rows], min_rows),
+            _past_hairline(measure, inner[::-1][:reach_rows], min_rows),
+            _past_hairline(measure, sideways[:reach_cols], min_cols),
+            _past_hairline(measure, sideways[::-1][:reach_cols], min_cols),
+        )
+        found = tuple(
+            thickness if thickness >= least else 0
+            for thickness, least in zip(found, (min_rows, min_rows, min_cols, min_cols))
+        )
+        if not any(found):
+            break
+        if height - top - bottom - found[0] - found[1] < height * MIN_CONTENT_FRACTION:
+            break
+        if width - left - right - found[2] - found[3] < width * MIN_CONTENT_FRACTION:
+            break
+        top, bottom = top + found[0], bottom + found[1]
+        left, right = left + found[2], right + found[3]
+    if not (top or bottom or left or right):
+        return None
+    bars = _without_page_ground(rgb, (top, bottom, left, right))
+    if any(interface) and any(bars):
+        bars = _framed_past_interface(rgb, bars, interface)
+    return bars if any(bars) else None
+
+
+def _past_hairline(measure, lines, least: int) -> int:
+    """``measure(lines)``, or the bar standing behind a hairline at the edge.
+
+    A file cut or exported a pixel wide of its frame carries a line or two
+    of another colour outside the bar. Too thin to be a bar itself, it would
+    hide the one behind it; when a full bar follows it, both go.
+    """
+    import numpy as np
+
+    found = measure(lines)
+    if found >= least or least < 2:
+        return found
+    hairline = found
+    if not hairline:  # a black line is not this measure's to find
+        outer = lines[:least].astype(np.int16)
+        colour = np.median(outer[0], axis=0).astype(np.int16)
+        flat = (np.abs(outer - colour) <= BAR_TOLERANCE).all(axis=2).mean(axis=1)
+        flat = flat >= BAR_LINE_FRACTION
+        if not flat[0] or flat.all():
+            return 0
+        hairline = int(np.argmin(flat))
+    behind = measure(lines[hairline:])
+    return hairline + behind if behind >= least else found
+
+
+def _edge_colours(rgb):
+    """The colour of each outermost line: top, bottom, left, right."""
+    import numpy as np
+
+    return [
+        np.median(line, axis=0).astype(np.int16)
+        for line in (rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1])
+    ]
+
+
+def _framed_past_interface(rgb, bars, interface: tuple[bool, bool]):
+    """``bars`` less a top or bottom bar that follows interface and frames nothing."""
+    import numpy as np
+
+    colours = _edge_colours(rgb)
+    result = list(bars)
+    for edge in (0, 1):
+        if not (interface[edge] and bars[edge]):
+            continue
+        framed = any(
+            bars[other]
+            and int(np.abs(colours[other] - colours[edge]).max()) <= BAR_TOLERANCE
+            for other in range(4)
+            if other != edge
+        )
+        if not framed:
+            result[edge] = 0
+    return tuple(result)
+
+
+def _without_page_ground(rgb, bars: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """``bars`` less every edge whose colour is the ground of what is kept."""
+    import numpy as np
+
+    height, width = rgb.shape[:2]
+    top, bottom, left, right = bars
+    kept = rgb[top : height - bottom, left : width - right].astype(np.int16)
+    colours = _edge_colours(rgb)
+    grounds: dict[tuple[int, ...], bool] = {}
+    result = list(bars)
+    for edge, thickness in enumerate(bars):
+        if not thickness:
+            continue
+        colour = colours[edge]
+        key = tuple(int(value) for value in colour)
+        if key not in grounds:
+            near = (np.abs(kept - colour) <= BAR_TOLERANCE).all(axis=2)
+            rows = _share_between(near.mean(axis=1) >= BAR_LINE_FRACTION)
+            columns = _share_between(near.mean(axis=0) >= BAR_LINE_FRACTION)
+            grounds[key] = max(rows, columns) > COLOUR_GROUND_FRACTION
+        if grounds[key]:
+            result[edge] = 0
+    return tuple(result)
+
+
+def _share_between(blank) -> float:
+    """Share of ``blank`` (one flag per line) set with unset lines on both sides."""
+    import numpy as np
+
+    filled = np.flatnonzero(~blank)
+    if filled.size == 0:
+        return 1.0
+    return float(blank[filled[0] : filled[-1] + 1].sum()) / blank.size
+
+
+def _with_colour_bars(bars, colour, width: int, height: int):
+    """``bars`` widened edge by edge to ``colour``'s, where a picture is left."""
+    if colour is None:
+        return bars
+    if bars is None:
+        return colour
+    merged = tuple(max(a, b) for a, b in zip(bars, colour))
+    if height - merged[0] - merged[1] < height * MIN_CONTENT_FRACTION:
+        return bars
+    if width - merged[2] - merged[3] < width * MIN_CONTENT_FRACTION:
+        return bars
+    return merged
+
+
 def _combined_bars(luma, *, speck=False, aggressive: bool = True, rules=_BALANCED_LOOSE):
     """Per-edge maximum of the strict and (when allowed) loose bars."""
     height, width = luma.shape[:2]
@@ -745,8 +1093,15 @@ def _combined_bars(luma, *, speck=False, aggressive: bool = True, rules=_BALANCE
     return combined
 
 
-def _level_bars(luma, *, speck=False, loose_allowed: bool = True):
+def _level_bars(
+    luma, *, speck=False, loose_allowed: bool = True, rgb=None, interface=(False, False)
+):
     """Bar tuples per aggressiveness level, ``None`` where a level declines.
+
+    With ``rgb`` (the same frame in colour), flat bars of any other colour
+    join every level: they are proven the way strict black bars are. Colour
+    bars holding ink join the aggressive level alone, and like every loose
+    bar only when the human guard can run.
 
     Conservative is the strict pass alone; balanced combines strict with the
     balanced loose pass exactly as before levels existed; aggressive takes
@@ -756,6 +1111,21 @@ def _level_bars(luma, *, speck=False, loose_allowed: bool = True):
     can run); the caller still guards the result before suggesting it.
     """
     height, width = luma.shape[:2]
+    if rgb is not None:
+        levels = _level_bars(luma, speck=speck, loose_allowed=loose_allowed)
+        colour = detect_colour_bars(rgb, interface=interface)
+        levels = {
+            name: _with_colour_bars(bars, colour, width, height)
+            for name, bars in levels.items()
+        }
+        if loose_allowed:
+            levels["aggressive"] = _with_colour_bars(
+                levels["aggressive"],
+                detect_colour_bars(rgb, loose=True, interface=interface),
+                width,
+                height,
+            )
+        return levels
     strict = detect_borders_in_array(luma, speck=speck)
     if not loose_allowed:
         return {"conservative": strict, "balanced": strict, "aggressive": strict}
@@ -886,6 +1256,19 @@ def _guard_floor(combined, strict, boxes, width: int, height: int):
     """
     guarded = _guarded_bars(combined, boxes, width, height)
     return tuple(max(kept, proven) for kept, proven in zip(guarded, strict))
+
+
+def _see_through(image) -> bool:
+    """Whether any of ``image`` is transparent.
+
+    A cut-out's empty canvas is flattened onto white to be read, which would
+    make a white frame of it; it is neither a bar nor a crop to suggest.
+    """
+    if image.mode == "P" and "transparency" in image.info:
+        image = image.convert("RGBA")
+    if image.mode not in ("RGBA", "LA", "PA"):
+        return False
+    return image.getchannel("A").getextrema()[0] < 255
 
 
 def _flattened(image):
@@ -1953,8 +2336,15 @@ def _boxes_for(
     chrome_top, chrome_bottom = chrome
     luma = _luma(upright)[chrome_top : height - chrome_bottom]
     specks = (speck and not chrome_top, speck and not chrome_bottom)
-    boxes = _human_guard_boxes(np.asarray(_flattened(upright)))
-    levels = _level_bars(luma, speck=specks, loose_allowed=boxes is not None)
+    rgb = np.asarray(_flattened(upright))
+    boxes = _human_guard_boxes(rgb)
+    levels = _level_bars(
+        luma,
+        speck=specks,
+        loose_allowed=boxes is not None,
+        rgb=None if _see_through(upright) else rgb[chrome_top : height - chrome_bottom],
+        interface=(bool(chrome_top), bool(chrome_bottom)),
+    )
     strict = levels["conservative"] or (0, 0, 0, 0)
     proven = (chrome_top + strict[0], chrome_bottom + strict[1], strict[2], strict[3])
 
@@ -2027,8 +2417,13 @@ def detect_crop_levels(path: str | Path) -> dict[str, CropBox | None]:
         chrome = detect_screenshot_chrome(screened, certain=evidence != "shape")
         if any(chrome):
             return _boxes_for(screened, chrome=chrome, speck=True)
+    import numpy as np
+
     screen = _level_bars(
-        _luma(screened), speck=speck, loose_allowed=_human_guard_available()
+        _luma(screened),
+        speck=speck,
+        loose_allowed=_human_guard_available(),
+        rgb=None if _see_through(screened) else np.asarray(_flattened(screened)),
     )
     if screen["aggressive"] is None:
         return {name: None for name in CROP_LEVELS}

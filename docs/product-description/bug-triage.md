@@ -20,6 +20,7 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
 | B-10 | Fast Tabbing could escape an overlay's focus trap mid-repaint | low | ui (a11y) | fix (done) | — |
 | B-11 | The Crop review stopped short of a screenshot's interface | medium | ui (Crop review) | fix (done) | — |
 | B-12 | The Crop review kept a gallery's filmstrip, a media viewer's marks, and a cut-through reply field | medium | ui (Crop review) | fix (done) | — |
+| B-13 | The Crop review missed frames that are not black, its aggressive level cut into pictures, and a zone was hard to place by hand | medium | ui (Crop review) | fix (done) | — |
 
 ## Medium
 
@@ -94,6 +95,41 @@ Fifty-odd open questions across twenty-one documents collapsed to five entries a
   - **Tests.** Each rule has a fixture in `tests/test_borders.py` shown to fail without it.
 
   Checklist item SCANP-14 should pass against builds at or after this change.
+- **Issue:** none filed (fixed in the same pass).
+
+### B-13: The Crop review missed frames that are not black, its aggressive level cut into pictures, and a zone was hard to place by hand
+
+- **Where the user meets it:** The Crop tab: which files it lists, the zone each card suggests, and moving that zone before a crop.
+- **What happens / what was expected:** Under `black-borders-v7` and `crop-levels-v1`:
+  - **Candidates.** A picture framed in white, gray or any colour but black was never listed: a story letterboxed on white, a collage's outer border, a thin pale strip down one side. Once the black bars of a library had been cropped, the balanced level had nothing left to suggest.
+  - **Targets.** The aggressive level, added to find more, suggested mostly cuts into pictures: any dark part of a scene along an edge (a beam, a shadowed wall, a boat's canopy, a night sky) passed as a bar.
+  - **Editing.** A zone could only be moved on its card, where a pixel of pointer travel is five to fifteen of the picture; Shift+arrows moved the bottom and right edges and nothing moved the top or left; a file whose level suggested nothing had no zone to pull in.
+
+  Expected ([scan-pipeline.md](foundations/scan-pipeline.md#how-each-detection-works)): frames of any flat colour are suggested, no level suggests a cut inside a picture, and a zone can be set to the pixel.
+- **Reproduce:** 1. Scan, with Crops enabled, a folder holding a photo letterboxed on white and a photo with a dark beam along its top. 2. Open the Crop tab at the balanced level: the letterboxed photo is not listed. 3. Rescan at the aggressive level: the beam is offered as a bar.
+- **Why (from the code):** In `src/dedupe/borders.py`:
+  - Every bar test began from a dark level (`_edge_bar`, `_aggressive_edge_bar`), so no other colour was ever measured.
+  - The aggressive level's rules asked only that most of each line sit within 28 levels of a dark level of up to 64, with picture following somewhere within reach; a dark, textured part of a picture meets that.
+
+  In `src/dedupe/web/static/crop.js`, the zone was drawn and dragged only inside the card's thumbnail.
+- **Severity:** `medium`. Nothing is damaged, since a crop is a suggestion the user confirms and can undo, but the review listed too little at one level and mostly wrong zones at the next.
+- **Decision needed:** `fix` (done).
+  - **Flat colour bars (images, every level).** A bar of any colour, flat on all three channels, ending at a hard edge that is a real step; not where the colour comes back between the content (a page's own ground), not on a picture with transparency, and on a screenshot edge the interface walk cut only as one side of a frame. The edges are measured again on what is left, so nested frames and a picture set to one side both lose every margin; a line or two of another colour outside a bar goes with it; and the bar's last ringing lines are cut too. The rules are in [scan-pipeline.md](foundations/scan-pipeline.md#how-each-detection-works).
+  - **Aggressive level.** Its looser bars are read again in blocks: nine tenths of the blocks at the bar's level, and a ruled line where it stops. It also takes a colour bar holding a little ink (a watermark, a mute button, page dots), under the same two checks.
+  - **Editing.** A dragged edge lands on the edges found at each level and on the picture's own edge (Alt places it freely). **Adjust** on a card, `e`, or a double-click on the zone opens it on a view as large as the window, with a field for the pixels removed from each side, a button that keeps a side whole, the level switch, Reset, and Crop or Skip moving straight to the next file. Alt+arrows move a zone's top and left edges, as Shift+arrows move its bottom and right; in the large view one key is one screen pixel. Where the level on show suggests nothing, the large view starts from the whole picture so an edge can be pulled in.
+- **Raised by:** user request, 2026-11-12 ("improve the performance of the cropping tool at both recognizing ideal candidates for cropping, applying the correct crop targets, and making it easy for the user to manipulate zones before applying the crop").
+- **Status:** Fixed in the working tree on 2026-11-12 under signatures `black-borders-v8` and `crop-levels-v2` (earlier dismissals carry over; every file is measured again on the next scan).
+  - **Library check.** All 11,690 images of the same library, new against the shipped detector's cached verdicts. The 244 crops accepted since 2026-11-10 were already applied and their originals were no longer in the Trash, so the balanced level had no suggestion left to lose: the 19 boxes still cached belonged to files already cropped.
+    - *Balanced:* 0 suggestions before, 79 after. The 28 that remove 2% of the frame or more were each looked at whole, as they are: all are frames (white letterboxes and pillarboxes, collage borders, gray and coloured bands, film-scan margins; two are cut only part of the way in). The 51 thinner ones were each looked at in close-up along every cut: about 45 are flat strips cut at their edge, 3 are not bars (a strip of ceiling above the line where it meets a wall, a trim stripe, a story's band above its progress bar; 14 to 21 rows each), and 3 could not be told.
+    - *Aggressive:* 560 suggestions before, 134 after. Of the 560, a random 36 looked at whole held no clear bar, and 504 are no longer suggested (306 of them removed 5% of the frame or more); the 56 that remain are hairline black bars, 16 of them checked in close-up. Beyond the balanced level the aggressive level now adds 55 files (50 thinner than 2% of the frame, nearly all hairlines; 5 larger, each a white band, most holding a header, page dots or a mark, all looked at whole) and widens 9 balanced zones.
+  - **Found and fixed during the work:**
+    - A smooth sky gradient passed as a bar with a "hard" edge, since every row past the tolerance is wholly off the first row's colour; the edge must now step off the bar's last flat line. The contact sheets first used to judge the suggestions brightened the removed area, which made such a sky look like a white bar; the review was redone on unbrightened pictures.
+    - On a white page, the page's own margins read as a frame; the colour may no longer come back between the content.
+    - Under a cut-away status bar, a picture's flat top was cut as a bar; the interface walk now owns that edge unless the colour frames the picture.
+    - A JPEG's ringing and half-height colour left a one- or two-row pale line on the crop; those rows now go with the bar.
+    - A white margin behind a one-pixel dark edge line was not seen, and kept its opposite margin from being cut.
+  - **Tests.** `tests/test_colour_bars.py` holds a fixture for each rule, each shown to fail with its rule removed in a scratch copy; `tests/test_crop_editor.py` drives the large view, snapping, and the new keys in a browser. Two screenshot fixtures in `tests/test_borders.py` changed on purpose: a flat desktop around a window and a blank band above a picture are now cut.
+  - **Not done.** Videos are still checked for black bars only. The Crop review has no document of its own in this set; its behaviour is described here and in the in-app help.
 - **Issue:** none filed (fixed in the same pass).
 
 ## Low

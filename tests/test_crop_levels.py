@@ -65,8 +65,12 @@ def _record(path: Path) -> FileRecord:
     )
 
 
-def _framed(width, height, *, top=0, bar_value=3, caption_rows=None) -> np.ndarray:
+def _framed(width, height, *, top=0, bar_value=3, caption_rows=None, grain=0) -> np.ndarray:
     canvas = np.full((height, width, 3), bar_value, dtype=np.uint8)
+    if grain:
+        # Encoder grain: every pixel of the bar off its level by up to ``grain``.
+        noise = np.random.default_rng(11).integers(-grain, grain + 1, size=(top, width, 1))
+        canvas[:top] = np.clip(canvas[:top].astype(int) + noise, 0, 255).astype(np.uint8)
     canvas[top:] = _picture(width, height - top)
     if caption_rows is not None:
         start, stop = caption_rows
@@ -74,6 +78,11 @@ def _framed(width, height, *, top=0, bar_value=3, caption_rows=None) -> np.ndarr
         for x in range(60, width - 60, 80):
             canvas[start:stop, x : x + 12] = 230
     return canvas
+
+
+def _GRAY() -> np.ndarray:
+    """A bar only the aggressive level takes: dark gray, and grainy."""
+    return _framed(640, 480, top=70, bar_value=56, grain=18)
 
 
 def _contains(outer: CropBox, inner: CropBox) -> bool:
@@ -113,14 +122,23 @@ def test_caption_in_the_bar_needs_balanced(tmp_path: Path) -> None:
     assert _contains(levels["aggressive"], balanced)
 
 
-def test_dark_gray_bar_needs_aggressive(tmp_path: Path) -> None:
-    # A flat bar at luma 56 is past the balanced pass's "black" (48) but
-    # inside the aggressive level's.
-    path = _save(_framed(640, 480, top=70, bar_value=56), tmp_path / "gray.png")
+def test_grainy_dark_gray_bar_needs_aggressive(tmp_path: Path) -> None:
+    # A grainy bar at luma 56 is not flat enough for the strict passes and is
+    # past the balanced pass's "black" (48), but inside the aggressive level's.
+    path = _save(_GRAY(), tmp_path / "gray.png")
     levels = detect_crop_levels(path)
     assert levels["balanced"] is None
     assert levels["conservative"] is None
     assert levels["aggressive"] is not None and levels["aggressive"].top >= 65
+
+
+def test_flat_gray_bar_is_proven_at_every_level(tmp_path: Path) -> None:
+    # Flat with a hard edge, a gray bar is as certain as a black one.
+    path = _save(_framed(640, 480, top=70, bar_value=56), tmp_path / "flat-gray.png")
+    levels = detect_crop_levels(path)
+    assert levels["conservative"] == CropBox(0, 70, 640, 480, 640, 480)
+    assert levels["balanced"] == levels["conservative"]
+    assert levels["aggressive"] == levels["conservative"]
 
 
 def test_levels_are_monotonic_on_a_noisy_bar(tmp_path: Path) -> None:
@@ -158,7 +176,7 @@ def test_suggested_crop_reads_each_level_and_dismissal_covers_all() -> None:
 
 
 def test_analyze_stores_all_levels(tmp_path: Path) -> None:
-    path = _save(_framed(640, 480, top=70, bar_value=56), tmp_path / "gray.png")
+    path = _save(_GRAY(), tmp_path / "gray.png")
     record = _record(path)
     assert analyze_borders([record]) == []
     assert record.border_signature == BORDER_SIGNATURE
@@ -196,7 +214,7 @@ def test_balanced_cache_stays_valid_without_remeasuring_clean_files(
 
 
 def test_cache_round_trips_level_verdicts(tmp_path: Path) -> None:
-    path = _save(_framed(640, 480, top=70, bar_value=56), tmp_path / "gray.png")
+    path = _save(_GRAY(), tmp_path / "gray.png")
     record = _record(path)
     analyze_borders([record])
     cache = HashCache(tmp_path / "cache.sqlite3")
@@ -210,7 +228,7 @@ def test_cache_round_trips_level_verdicts(tmp_path: Path) -> None:
 
 
 def test_groups_follow_the_scan_level(tmp_path: Path) -> None:
-    gray = _record(_save(_framed(640, 480, top=70, bar_value=56), tmp_path / "gray.png"))
+    gray = _record(_save(_GRAY(), tmp_path / "gray.png"))
     plain = _record(_save(_framed(640, 480, top=60), tmp_path / "plain.png"))
     analyze_borders([gray, plain])
     balanced = build_crop_groups([gray, plain])
@@ -223,7 +241,7 @@ def test_groups_follow_the_scan_level(tmp_path: Path) -> None:
 def test_scan_level_picks_the_candidates(tmp_path: Path) -> None:
     media = tmp_path / "media"
     media.mkdir()
-    _save(_framed(640, 480, top=70, bar_value=56), media / "gray.png")
+    _save(_GRAY(), media / "gray.png")
     _save(_framed(640, 480, top=60), media / "plain.png")
     balanced = run_scan([media], find_black_borders=True, use_cache=False)
     names = {
