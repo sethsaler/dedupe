@@ -715,7 +715,6 @@
 
 /* Reusable cleanup workflows */
 .saved-jobs, .protected-setup { padding: 12px 0; border-bottom: 1px solid var(--border, #d6d9df); }
-.saved-jobs summary, .protected-setup summary { cursor: pointer; font-weight: 600; }
 .job-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding-top: 12px; }
 .job-controls label { display: grid; gap: 5px; flex: 1 1 200px; }
 .job-controls input, .job-controls select { min-width: 0; width: 100%; }
@@ -731,4 +730,64 @@
   .job-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .job-controls label { grid-column: 1 / -1; }
   .history-panel { padding: 14px; }
+}
+
+/* ---------- Flat scan setup: every setting visible, less scrolling ----------
+   No Options disclosure and no nested Advanced details. The settings grid
+   widens with the window (2 columns, then 3) so the whole form is a short
+   scan, and the Scan bar sticks to the bottom of the form. */
+.scan-panel .scan-main {
+  max-width: 1240px;
+}
+
+.scan-panel .setup-heading,
+.scan-panel .options-heading h3 {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lt-graphite);
+}
+
+.scan-panel .options-heading {
+  padding-top: 20px;
+  border-top: 1px solid var(--lt-sleeve);
+}
+
+.scan-panel .job-controls {
+  padding-top: 10px;
+}
+
+.scan-panel .scan-action-bar {
+  background: var(--lt-table);
+  border-top: 1px solid var(--lt-sleeve);
+  padding: 14px 0 6px;
+}
+
+.scan-panel .options > .advanced-options {
+  grid-column: auto;
+}
+
+@media (min-width: 1200px) {
+  .scan-panel .options {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scan-panel .options > .workers-field {
+    grid-column: auto;
+  }
+
+  .scan-panel .options > .exclude-field {
+    grid-column: span 2;
+  }
+
+  .scan-panel .options > .field-row,
+  .scan-panel .options > .semantic-fields {
+    grid-column: span 2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-panel .options { animation: none; }
 }

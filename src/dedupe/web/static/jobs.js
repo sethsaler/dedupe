@@ -114,9 +114,6 @@ $("btnDeleteJob").addEventListener("click", async () => {
   } catch (error) { toast(error.message, "error"); }
 });
 
-$("savedJobs").addEventListener("toggle", () => {
-  if ($("savedJobs").open) refreshJobs().catch((error) => toast(error.message, "error"));
-});
 refreshJobs().catch((error) => toast(error.message, "error"));
 
 window.addEventListener("dedupe:work-state", (event) => {

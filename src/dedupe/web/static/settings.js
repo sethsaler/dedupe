@@ -69,13 +69,7 @@ try {
 }
 updateWorkersUI();
 
-// —— Options toggle ——
-$("optsToggle").addEventListener("click", () => {
-  const panel = $("optionsPanel");
-  const open = panel.hidden;
-  panel.hidden = !open;
-  $("optsToggle").setAttribute("aria-expanded", open ? "true" : "false");
-});
+// Scan settings are always visible; there is no Options disclosure.
 
 // —— Scan panel collapse ——
 // The setup form folds into a slim bar once a scan starts (or when results
@@ -231,7 +225,7 @@ const SCAN_PRESETS = {
   low_resolution: {
     on: ["optLowResolution"],
     tab: "low_resolution",
-    hint: "Find media below the low-resolution bounds in Options (1 MP by default).",
+    hint: "Find media below the low-resolution bounds in Scan settings below (1 MP by default).",
   },
   random_review: {
     on: ["optRandomReview"],

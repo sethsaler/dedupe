@@ -34,9 +34,7 @@ def test_protected_job_and_history_survive_reload(page, tmp_path):
     try:
         page.goto(f"http://127.0.0.1:{server.server_port}")
         page.locator("#paths").fill(str(inbox))
-        page.locator(".protected-setup summary").click()
         page.locator("#protectedFolders").fill(str(archive))
-        page.locator("#savedJobs summary").click()
         page.locator("#cleanupJobName").fill("Inbox against archive")
         page.locator("#btnSaveJob").click()
         expect(page.locator("#cleanupJob option")).to_have_count(2)
@@ -71,7 +69,6 @@ def test_protected_job_and_history_survive_reload(page, tmp_path):
         page.locator("#btnCloseHistory").click()
         if "collapsed" in page.locator("#scanPanel").get_attribute("class"):
             page.locator("#scanCollapse").click()
-        page.locator("#savedJobs summary").click()
         page.locator("#cleanupJob").select_option(label="Inbox against archive")
         expect(page.locator("#protectedFolders")).to_have_value(str(archive))
         expect(page.locator("#btnResumeJob")).to_be_enabled()
