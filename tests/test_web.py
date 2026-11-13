@@ -913,6 +913,36 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert "content-visibility: visible;" in triage_card_rule
 
 
+def test_settings_are_not_buried_behind_disclosures(tmp_path: Path) -> None:
+    """Scan and filter settings are visible without opening any chevron."""
+    app = create_app(_result(tmp_path))
+    html = app.test_client().get("/").get_data(as_text=True)
+
+    # Scan settings: no Options toggle, no hidden panel, no nested details.
+    assert 'id="optsToggle"' not in html
+    assert 'id="optionsPanel" hidden' not in html
+    assert '<details class="saved-jobs"' not in html
+    assert '<details class="protected-setup"' not in html
+    assert '<details class="advanced-options"' not in html
+    # Results filters: no Filter / Advanced / Bulk disclosures.
+    assert '<details class="review-filters"' not in html
+    assert '<details class="sidebar-panel" id="advancedFilters"' not in html
+    assert '<details class="sidebar-panel" id="bulkPanel"' not in html
+    # Every setting survives the flattening.
+    for control in (
+        "optExact", "optSemantic", "threshold", "workers", "exclusions",
+        "preferredFolders", "protectedFolders", "resultSort",
+        "filterFaces", "bulkCriteria", "btnBulkCriteria",
+    ):
+        assert f'id="{control}"' in html
+    # The flat filter sections sit above the group list in the sidebar, so
+    # the detail pane beside them keeps its full height.
+    assert html.index('class="sidebar"') < html.index('class="result-controls"')
+    assert html.index('class="result-controls"') < html.index('id="groupList"')
+    # Scan stays reachable after the settings, in a sticky action bar.
+    assert html.index('id="optionsPanel"') < html.index('id="btnScan"')
+
+
 def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
     result = _result(tmp_path)
     duplicate = result.groups[0]

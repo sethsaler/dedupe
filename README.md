@@ -103,7 +103,7 @@ That starts the local server, opens your browser, and keeps a Terminal window fo
 3. Choose a category across the top. **Similar** opens on the **Similar board**: every similar group as one row, with the suggested keeper first. Standard similar copies start marked Remove; semantic look-alikes and video-version suggestions require manual selection. Click a photo (or press `Space`) to keep it, press `n` on a row that isn't really a duplicate (undo from the row), then move every marked copy to Trash with one confirmed batch that a single Undo restores. **Compare ↗** opens any group in the side-by-side swipe review — **Same · Trash copy**, **Different · Keep both**, Skip, and Undo, with videos playing and scrubbing in either pane — and **▦ Board** comes back.
 4. In **Non-Human**, **Faces**, and **All files**, switch between a resizable **Gallery** and single-file **Focus**. `←` / `→` navigate Focus without making a decision; Trash is immediate and undoable. Layout and preview size are remembered. **File details** reveals full paths, dates, and detection evidence.
 5. Review **Low-res** and **Random** one item at a time with `←` Delete and `→` Keep, including in the expanded lightbox. These decisions only stage removals; confirm with the Low-res + Random action to move selected files to `_Dedupe Quarantine`.
-6. Open **Filter & organize** for advanced filters (size, dimensions, path, faces) and bulk selection. A group matches when any of its files match. Bulk selection applies only to the groups currently shown.
+6. Use **Filter & organize** above the group list for advanced filters (size, dimensions, path, faces) and bulk selection — every filter is visible, nothing to expand. A group matches when any of its files match. Bulk selection applies only to the groups currently shown.
 
 Click an image or **Expand ↗** for the full-screen lightbox. Images support full-resolution
 zoom and panning, videos have native playback controls, and GIFs retain their animation.
@@ -125,7 +125,7 @@ action. The resumed-session banner reports how many files were pruned and why (n
 disk, changed since the scan, outside the scanned folders, became a symbolic link, could not
 be read), with a "What was dropped?" list of up to 20 example files.
 
-For recurring work, open **Saved cleanup jobs**, enter a name, and **Save job**.
+For recurring work, use **Saved cleanup jobs** in Scan setup: enter a name, and **Save job**.
 Selecting a job restores its folders and settings; **Resume review** restores its
 own saved progress. **Check new arrivals** compares against all current files but
 shows duplicate groups involving new or changed files and new independent review

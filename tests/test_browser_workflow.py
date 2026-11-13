@@ -71,7 +71,6 @@ def duplicate_images(tmp_path: Path) -> Path:
 
 def _disable_exact_detection(page) -> None:
     """Scan only for similar matches, so byte-identical fixtures form no exact group."""
-    page.locator("#optsToggle").click()
     page.locator("#optExact").uncheck(force=True)
 
 
@@ -200,7 +199,6 @@ def test_empty_results_offer_recovery_without_changing_selections(
     page.locator(".group-item").first.click()
     expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
     expect(page.locator("#filteredCount")).to_have_text("1 of 1 groups shown")
-    page.locator("#reviewFilters > summary").click()
     page.locator("#resultSort").select_option("date")
 
     page.locator("#resultSearch").fill("not-a-file")
@@ -216,7 +214,6 @@ def test_empty_results_offer_recovery_without_changing_selections(
     expect(page.locator("#resultSort")).to_have_value("date")
     expect(page.locator("#members .sel-cb:checked")).to_have_count(1)
 
-    page.locator("#advancedFilters summary").click()
     page.locator("#filterMinWidth").fill("99999")
     expect(empty).to_contain_text("No matching groups")
     empty.get_by_role("button", name="Clear filters").click()
@@ -296,7 +293,6 @@ def test_low_resolution_review_uses_left_delete_and_right_keep(
     page, live_dedupe_server: str, duplicate_images: Path
 ) -> None:
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    page.locator("#optsToggle").click()
     page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
@@ -416,8 +412,6 @@ def test_bulk_selection_and_advanced_filters(
 
     # A path glob narrows the sidebar and Clear filters resets every result-display filter.
     # (Text filters are debounced; to_have_count auto-retries until they apply.)
-    page.locator("#reviewFilters > summary").click()
-    page.locator("#advancedFilters summary").click()
     page.locator("#filterPathPattern").fill("*/no-such-folder/*")
     expect(page.locator(".group-item")).to_have_count(0)
     page.locator("#filterPathPattern").fill("*keeper*")
@@ -434,7 +428,6 @@ def test_bulk_selection_and_advanced_filters(
     expect(page.locator(".group-item")).to_have_count(1)
 
     # Bulk operations always leave one member of a duplicate group behind.
-    page.locator("#bulkPanel summary").click()
     page.locator("#btnBulkNone").click()
     page.locator("#toast").filter(has_text="Select none").wait_for()
     page.locator("#members .sel-cb").first.wait_for(state="visible")
@@ -1975,7 +1968,6 @@ def test_review_action_shortcut_and_card_reveal_from_the_keyboard(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    page.locator("#optsToggle").click()
     page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
@@ -2042,7 +2034,6 @@ def test_scan_setup_hints_and_exclusion_check(
     expect(page.locator("#crossFolderHint")).to_be_hidden()
     page.locator("#paths").fill(f"{folder_a}, {folder_b}")
     expect(page.locator("#crossFolderHint")).to_be_hidden()
-    page.locator("#optsToggle").click()
     # Chip checkboxes are visually hidden behind their label; force the toggle.
     page.locator("#optParallel").check(force=True)
     expect(page.locator("#crossFolderHint")).to_be_visible()
@@ -2099,7 +2090,6 @@ def test_attention_navigation_and_space_u_shortcuts(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    page.locator("#optsToggle").click()
     page.locator("#optLowResolution").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
@@ -2384,7 +2374,6 @@ def test_parallel_streams_toggle_controls_cross_folder_groups(
 
     # Explicitly separate scans still keep each folder independent.
     page.locator("#scanCollapse").click()
-    page.locator("#optsToggle").click()
     # Chip checkboxes are visually hidden behind their label; force the toggle.
     page.locator("#optParallel").check(force=True)
     page.locator("#btnScan").click()
@@ -2403,7 +2392,6 @@ def test_launch_resets_folder_mode_but_preserves_other_preferences(
         optParallel: true, threshold: '3', exclusions: '*.tmp', optVideos: false
     }))""")
     page.reload(wait_until="domcontentloaded")
-    page.locator("#optsToggle").click()
     expect(page.locator("#optParallel")).not_to_be_checked()
     expect(page.locator("#threshold")).to_have_value("3")
     expect(page.locator("#exclusions")).to_have_value("*.tmp")
@@ -2602,7 +2590,6 @@ def test_random_review_decision_mechanics(
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     page.goto(live_dedupe_server, wait_until="domcontentloaded")
-    page.locator("#optsToggle").click()
     page.locator("#optRandomReview").check(force=True)
     page.locator("#paths").fill(str(duplicate_images))
     page.locator("#btnScan").click()
@@ -3033,7 +3020,6 @@ def test_launch_quickly_finds_exact_and_resized_copies(
         }))""")
         page.reload()
     expect(page.locator("#scanPreset")).to_have_value("cleanup")
-    page.locator("#optsToggle").click()
     for selector in ("#optSemantic", "#optDecider", "#optCountFaces", "#optNoHumans",
                      "#optLowResolution", "#optRandomReview", "#optParallel"):
         expect(page.locator(selector)).not_to_be_checked()
@@ -3099,8 +3085,6 @@ def test_difference_zoom_and_local_review_export(page, tmp_path):
         page.set_viewport_size({"width": 1440, "height": 900})
         page.locator("#swipeDiff").click()
         page.wait_for_function("() => JSON.parse(localStorage.getItem('dedupe.reviewLabels.v1') || '[]').length === 1")
-        # Export button lives inside the organize disclosure; open its parent directly.
-        page.locator("#exportReviewLabels").evaluate("el => { el.closest('details').open = true; }")
         with page.expect_download() as download:
             page.locator("#exportReviewLabels").click()
         import json
@@ -3169,7 +3153,6 @@ def test_review_goal_scans_only_its_detector_and_opens_its_tab(
     # The goal crops videos as well as images; its label and hint say so.
     expect(page.locator('#scanPreset option[value="crop"]')).to_contain_text("videos")
     expect(page.locator("#presetHint")).to_contain_text("videos")
-    page.locator("#optsToggle").click()
     expect(page.locator("#optBlackBorders")).to_be_checked()
     for selector in ("#optExact", "#optSimilar", "#optCountFaces", "#optNoHumans",
                      "#optLowResolution", "#optRandomReview"):
@@ -3313,7 +3296,6 @@ def test_full_speed_embedding_is_a_remembered_look_alike_option(
         folderScopeVersion: 2, optSemanticFast: true
     }))""")
     page.reload()
-    page.locator("#optsToggle").click()
     fast = page.locator("#optSemanticFast")
     expect(fast).to_be_checked()  # a speed preference, not reset by the launch preset
     assert page.locator("#semanticFields #optSemanticFast").count() == 1

@@ -7,7 +7,7 @@
 /* ---------- Results shell: flat index rail + one sleeve rule ---------- */
 .results {
   gap: 12px 0;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr);
 }
 
 .results .sidebar,
@@ -29,8 +29,8 @@
 
 /* Filter controls: quiet, sleeve-bordered, mono labels. */
 .results .result-controls {
-  padding: 16px;
-  gap: 10px;
+  padding: 14px 16px;
+  gap: 8px;
   border-bottom: 1px solid var(--lt-sleeve);
   background: var(--lt-table);
 }
@@ -57,8 +57,8 @@
 
 .results .search-field input,
 .results .search-field input[type="search"] {
-  min-height: 36px;
-  padding: 8px 10px;
+  min-height: 32px;
+  padding: 5px 10px;
   font-size: 13px;
   border: 1px solid var(--lt-sleeve);
   border-radius: 8px;
@@ -72,18 +72,15 @@
   outline-offset: 2px;
 }
 
-.results .review-filters summary,
-.results .sidebar-panel summary {
+.results .filter-heading {
   font-family: var(--lt-mono);
   font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--lt-graphite);
   padding: 2px 0;
 }
-
-.results .review-filters summary:hover,
-.results .sidebar-panel summary:hover { color: var(--lt-ink); }
 
 .results .sidebar-panel {
   border: 0;
@@ -93,7 +90,7 @@
   background: transparent;
 }
 
-.results .sidebar-panel[open] { background: transparent; }
+.results .filter-section { background: transparent; }
 .results .sidebar-panel > p { font-size: 12px; color: var(--lt-graphite); }
 
 .results .sidebar-panel .btn,
@@ -1097,4 +1094,13 @@
     padding: 8px 10px;
   }
   .results .decision-card .candidate-decision strong { font-size: 14px; }
+}
+
+/* ---------- Flat filter sections: nothing behind a chevron ----------
+   Search, sort, display toggles, advanced filters, and bulk selection are
+   all on show above the group list as headed sections. The detail pane
+   beside them keeps its full height. */
+.results .review-filters > .filter-section {
+  border-top: 1px solid var(--lt-sleeve);
+  padding-top: 8px;
 }

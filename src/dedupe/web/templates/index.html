@@ -50,18 +50,6 @@
         <span class="scan-collapse-paths" id="scanCollapsePaths"></span>
       </button>
       <div class="scan-main" id="scanMain">
-        <details class="saved-jobs" id="savedJobs">
-          <summary>Saved cleanup jobs</summary>
-          <div class="job-controls">
-            <label for="cleanupJob">Job<select id="cleanupJob"><option value="">New cleanup</option></select></label>
-            <label for="cleanupJobName">Name<input id="cleanupJobName" type="text" maxlength="100" placeholder="Downloads against archive" /></label>
-            <button class="btn ghost" type="button" id="btnSaveJob">Save job</button>
-            <button class="btn ghost" type="button" id="btnResumeJob" disabled>Resume review</button>
-            <button class="btn ghost" type="button" id="btnNewArrivals" disabled>Check new arrivals</button>
-            <button class="btn ghost" type="button" id="btnDeleteJob" disabled>Delete job</button>
-          </div>
-          <p class="thresh-hint" id="jobHint">Save folders and settings together. Each job keeps its own review progress.</p>
-        </details>
         <div class="field-row path-row">
           <label for="paths">Folders or files to scan</label>
           <div class="path-input-wrap">
@@ -82,17 +70,16 @@
           <div class="recent-paths" id="recentPaths" hidden></div>
           <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
             Scan folders separately is on: duplicates <em>across</em> folders are not found.
-            Turn it off in Options to compare all selected folders together.
+            Turn off “Scan folders separately” in Scan settings below to compare all selected folders together.
           </p>
         </div>
 
-        <details class="protected-setup">
-          <summary>Compare against a protected library</summary>
-          <label class="field-row" for="protectedFolders">Protected library folders (one per line)
+        <section class="protected-setup" aria-label="Protected library">
+          <label class="field-row" for="protectedFolders">Compare against a protected library (optional, one folder per line)
             <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive"></textarea>
           </label>
           <p class="thresh-hint">These folders are included in the comparison. Their files cannot be removed or moved; only the cleanup folders above can change.</p>
-        </details>
+        </section>
 
         <div class="field-row">
           <label for="scanPreset">Scan goal</label>
@@ -115,21 +102,24 @@
           </select>
           <p class="thresh-hint" id="presetHint">Find exact copies and similar versions, including resized or lightly edited media, across all folders.</p>
         </div>
-        <div class="scan-meta-row">
-          <button type="button" class="opts-toggle" id="optsToggle" aria-expanded="false">
-            <span class="chev" aria-hidden="true">▸</span>
-            Options
-          </button>
-          <div class="actions-row">
-            <span id="scanStatus" class="status muted" aria-live="polite">Ready</span>
-            <button id="btnCancelScan" class="btn ghost" type="button" hidden>Cancel</button>
-            <button id="btnScan" class="btn primary" type="button">
-              <span class="btn-label">Scan</span>
-            </button>
+        <section class="saved-jobs" id="savedJobs" aria-label="Saved cleanup jobs">
+          <h3 class="setup-heading">Saved cleanup jobs</h3>
+          <div class="job-controls">
+            <label for="cleanupJob">Job<select id="cleanupJob"><option value="">New cleanup</option></select></label>
+            <label for="cleanupJobName">Name<input id="cleanupJobName" type="text" maxlength="100" placeholder="Downloads against archive" /></label>
+            <button class="btn ghost" type="button" id="btnSaveJob">Save job</button>
+            <button class="btn ghost" type="button" id="btnResumeJob" disabled>Resume review</button>
+            <button class="btn ghost" type="button" id="btnNewArrivals" disabled>Check new arrivals</button>
+            <button class="btn ghost" type="button" id="btnDeleteJob" disabled>Delete job</button>
           </div>
+          <p class="thresh-hint" id="jobHint">Save folders and settings together. Each job keeps its own review progress.</p>
+        </section>
+        <div class="options-heading">
+          <h3>Scan settings</h3>
+          <p class="thresh-hint">Every setting is shown here. Pick a goal above, or adjust anything directly — then Scan, pinned below.</p>
         </div>
 
-        <div class="options" id="optionsPanel" hidden>
+        <div class="options" id="optionsPanel" aria-label="Scan settings">
           <div class="opt-group">
             <span class="opt-label">Detect</span>
             <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
@@ -219,15 +209,14 @@
             </select>
             <span class="thresh-hint">Start strict; broader results need closer review.</span>
           </label>
-          <details class="advanced-options">
-            <summary>Advanced similarity threshold</summary>
+          <div class="advanced-options">
             <label class="thresh" for="threshold">
-              <span class="opt-label">Raw distance</span>
+              <span class="opt-label">Similarity distance (raw)</span>
               <input type="range" id="threshold" min="0" max="16" value="6" />
               <span id="threshVal" class="thresh-val">6</span>
               <span class="thresh-hint">lower = stricter</span>
             </label>
-          </details>
+          </div>
           <label class="thresh workers-field">
             <span class="opt-label">Workers</span>
             <input type="range" id="workers" min="0" max="16" value="0" />
@@ -244,6 +233,16 @@
             <span class="thresh-hint exclusions-check-result" id="exclusionsCheckResult" hidden></span>
           </label>
           <p class="thresh-hint settings-note">Each launch starts with Find duplicates quickly. Other scan preferences and recent folders are remembered in this browser only.</p>
+        </div>
+
+        <div class="scan-meta-row scan-action-bar">
+          <span id="scanStatus" class="status muted" aria-live="polite">Ready</span>
+          <div class="actions-row">
+            <button id="btnCancelScan" class="btn ghost" type="button" hidden>Cancel</button>
+            <button id="btnScan" class="btn primary" type="button">
+              <span class="btn-label">Scan</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -322,9 +321,11 @@
             <span class="sr-only">Search files</span>
             <input id="resultSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
           </label>
-          <details class="review-filters" id="reviewFilters">
-            <summary>Filter &amp; organize</summary>
-            <button class="btn ghost" id="exportReviewLabels" type="button" title="Export local Same/Different decisions and review timing; restore trashed samples before benchmarking">Export review labels</button>
+          <div class="review-filters" id="reviewFilters">
+            <div class="filter-head-row">
+              <h3 class="filter-heading">Filter &amp; organize</h3>
+              <button class="btn ghost" id="exportReviewLabels" type="button" title="Export local Same/Different decisions and review timing; restore trashed samples before benchmarking">Export review labels</button>
+            </div>
           <div class="result-control-grid">
             <label class="control-field" for="resultSort">
               <span>Sort</span>
@@ -347,46 +348,45 @@
             <label class="toggle-option"><input id="issuesOnly" type="checkbox" /> Needs attention</label>
             <label class="toggle-option"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
           </div>
-          <details class="sidebar-panel" id="advancedFilters">
-            <summary>Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></summary>
-            <div class="result-control-row">
-              <label for="filterMinMb">Size MB</label>
-              <div class="range-pair">
-                <input id="filterMinMb" type="number" min="0" step="0.1" placeholder="min" aria-label="Minimum file size in megabytes" />
-                <input id="filterMaxMb" type="number" min="0" step="0.1" placeholder="max" aria-label="Maximum file size in megabytes" />
-              </div>
+          <section class="sidebar-panel filter-section" id="advancedFilters" aria-label="Advanced filters">
+            <h4 class="filter-heading" title="A group matches when any file matches. Path: substring or glob. Faces need a Count faces scan.">Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></h4>
+            <div class="adv-grid">
+              <label class="adv-field" for="filterMinMb">Size MB
+                <span class="range-pair">
+                  <input id="filterMinMb" type="number" min="0" step="0.1" placeholder="min" aria-label="Minimum file size in megabytes" />
+                  <input id="filterMaxMb" type="number" min="0" step="0.1" placeholder="max" aria-label="Maximum file size in megabytes" />
+                </span>
+              </label>
+              <label class="adv-field" for="filterMinWidth">Min px
+                <span class="range-pair">
+                  <input id="filterMinWidth" type="number" min="0" step="1" placeholder="width" aria-label="Minimum pixel width" />
+                  <input id="filterMinHeight" type="number" min="0" step="1" placeholder="height" aria-label="Minimum pixel height" />
+                </span>
+              </label>
+              <label class="adv-field" for="filterPathPattern">Path
+                <input id="filterPathPattern" type="text" spellcheck="false" placeholder="*/Screenshots/* or .heic" />
+              </label>
+              <label class="adv-field" for="filterFaces">Faces
+                <select id="filterFaces" aria-label="Filter by detected face count">
+                  <option value="any">Any</option>
+                  <option value="has">1+ faces</option>
+                  <option value="has_male">1+ male faces</option>
+                  <option value="none">No faces (0)</option>
+                </select>
+              </label>
             </div>
-            <div class="result-control-row">
-              <label for="filterMinWidth">Min px</label>
-              <div class="range-pair">
-                <input id="filterMinWidth" type="number" min="0" step="1" placeholder="width" aria-label="Minimum pixel width" />
-                <input id="filterMinHeight" type="number" min="0" step="1" placeholder="height" aria-label="Minimum pixel height" />
-              </div>
+          </section>
+          <section class="sidebar-panel filter-section" id="bulkPanel" aria-label="Bulk selection">
+            <div class="filter-head-row">
+              <h4 class="filter-heading">Bulk selection</h4>
+              <span class="muted small" id="bulkScope">Groups shown only</span>
             </div>
-            <div class="result-control-row">
-              <label for="filterPathPattern">Path</label>
-              <input id="filterPathPattern" type="text" spellcheck="false" placeholder="*/Screenshots/* or .heic" />
-            </div>
-            <div class="result-control-row">
-              <label for="filterFaces">Faces</label>
-              <select id="filterFaces" aria-label="Filter by detected face count">
-                <option value="any">Any</option>
-                <option value="has">1+ faces</option>
-                <option value="has_male">1+ male faces</option>
-                <option value="none">No faces (0)</option>
-              </select>
-            </div>
-            <span class="thresh-hint">A group matches when any of its files match. Path accepts a substring or a glob. Face filters only apply to files scanned with Count faces.</span>
-          </details>
-          <details class="sidebar-panel" id="bulkPanel">
-            <summary>Bulk selection</summary>
-            <p class="muted small" id="bulkScope">Applies to the groups currently shown.</p>
             <div class="bulk-row">
               <button class="btn ghost" id="btnBulkAll" type="button">Select all</button>
               <button class="btn ghost" id="btnBulkNone" type="button">Select none</button>
               <button class="btn ghost" id="btnBulkInvert" type="button">Invert</button>
             </div>
-            <div class="result-control-row">
+            <div class="result-control-row bulk-apply-row">
               <label for="bulkCriteria">Rule</label>
               <select id="bulkCriteria">
                 <option value="smaller_than_keeper">Smaller than keeper</option>
@@ -395,15 +395,14 @@
                 <option value="path_contains">Path contains …</option>
                 <option value="min_faces">At least … faces</option>
               </select>
+              <button class="btn primary-soft" id="btnBulkCriteria" type="button" title="Apply this rule to the groups currently shown. Suggested keepers are always protected (server-checked).">Apply rule</button>
             </div>
             <div class="result-control-row" id="bulkValueRow" hidden>
               <label for="bulkValue">Value</label>
               <input id="bulkValue" type="text" spellcheck="false" placeholder="MB" />
             </div>
-            <button class="btn primary-soft" id="btnBulkCriteria" type="button">Apply rule to shown groups</button>
-            <span class="thresh-hint">Duplicate groups always keep their suggested keeper; the server re-checks that.</span>
-          </details>
-          </details>
+          </section>
+          </div>
           <button class="btn primary-soft" id="btnNextReview" type="button" title="Next unreviewed group or group that needs attention (])">Next to review <kbd>]</kbd></button>
         </div>
         <div class="group-more-slot" id="groupEarlier"></div>

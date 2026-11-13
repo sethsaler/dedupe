@@ -98,7 +98,25 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .advanced-options summary { cursor: pointer; }
 .advanced-options .thresh { margin-top: 8px; }
 
-.result-controls { padding: 10px 12px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; font-size: .78rem; }
+/* All filter controls sit flat above the group list — headed sections,
+   no disclosures. Compact rows keep them on one screen at ordinary
+   window heights; the review panes keep their full height beside them. */
+.result-controls { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; font-size: .78rem; }
+.review-filters { display: flex; flex-direction: column; gap: 8px; }
+.filter-section { display: grid; gap: 6px; }
+.filter-heading { margin: 0; font-size: .78rem; font-weight: 650; color: var(--text); }
+.filter-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.filter-head-row .btn { min-height: 28px; padding: 3px 8px; font-size: .72rem; }
+.result-controls select, .result-controls input[type="number"], .result-controls input[type="text"] { min-height: 30px; padding: 3px 8px; font-size: .78rem; line-height: 1.25; }
+.result-controls .btn { min-height: 30px; padding-top: 4px; padding-bottom: 4px; }
+.adv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+.adv-field { display: grid; gap: 3px; color: var(--muted); font-size: .72rem; min-width: 0; }
+.adv-field input, .adv-field select { width: 100%; min-width: 0; }
+.result-controls .bulk-apply-row { grid-template-columns: 34px minmax(0, 1fr) auto; }
+.result-controls .bulk-apply-row select { min-width: 0; }
+.result-controls .control-field { display: flex; align-items: center; gap: 6px; }
+.result-controls .control-field select { flex: 1; min-width: 0; }
+#bulkScope { font-size: .7rem; white-space: nowrap; }
 .result-controls > input, .result-controls select { width: 100%; min-width: 0; }
 .result-control-row { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; }
 .inline-check { display: flex; align-items: center; gap: 7px; }
@@ -575,6 +593,32 @@ input[type="text"]:focus, select:focus {
   gap: 12px;
   flex-wrap: wrap;
 }
+
+/* Scan stays reachable while the (now always visible) settings scroll. */
+.scan-action-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  padding: 12px 4px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.setup-heading,
+.options-heading h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.options-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.options-heading .thresh-hint { margin: 0; }
 
 .opts-toggle {
   appearance: none;
@@ -1088,7 +1132,7 @@ kbd {
 .results {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 10px 12px;
   min-height: 480px;
   flex: 1;
@@ -3021,9 +3065,13 @@ kbd {
     overflow: hidden;
   }
   .app:has(> .results:not([hidden])) > :is(.topbar, .scan-panel) { flex-shrink: 0; }
-  /* An expanded scan form must not squeeze the results to nothing. */
+  /* An expanded scan form must not squeeze the results to nothing. The
+     settings are all visible now, so the form is long; it scrolls within
+     a third of the window (Scan sticks to its bottom) and the results
+     keep the rest. Collapse it for the full review height. */
   .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) {
-    max-height: 55vh;
+    max-height: 32vh;
+    max-height: 32dvh;
     overflow-y: auto;
   }
   .app:has(> .results:not([hidden])) > .results {
@@ -3032,12 +3080,15 @@ kbd {
     grid-template-rows: auto minmax(0, 1fr);
   }
   .app:has(> .results:not([hidden])) .sidebar { min-height: 0; }
+  /* The flat filter sections take their natural height when the sidebar
+     can spare it; in a short window they shrink (and scroll within
+     themselves) so the group list always keeps at least 140px. */
   .app:has(> .results:not([hidden])) .result-controls {
-    flex-shrink: 0;
-    max-height: 55%;
+    flex: 0 1 auto;
+    min-height: 0;
     overflow-y: auto;
   }
-  .app:has(> .results:not([hidden])) .group-list { max-height: none; min-height: 0; }
+  .app:has(> .results:not([hidden])) .group-list { max-height: none; min-height: 140px; }
   .app:has(> .results:not([hidden])) .detail { min-height: 0; overflow-y: auto; }
   .app:has(> .results:not([hidden])) .detail-empty { min-height: 0; }
   .app:has(> .results:not([hidden])) .similar-board { min-height: 0; overflow-y: auto; }
