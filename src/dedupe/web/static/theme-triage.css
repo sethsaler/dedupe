@@ -87,7 +87,8 @@
 }
 
 #members.triage-grid .triage-card .thumb-wrap:focus-visible {
-  outline: none;
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 3px;
 }
 
 /* The caption: file name left in mono ink, size right in mono graphite. */
@@ -142,7 +143,8 @@
 /* ---------- Focus ring on the print ----------
    The focused card outlines its print, not the caption: 2px ink, 3px offset. */
 #members.triage-grid .triage-card.focused {
-  outline: none;
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 3px;
 }
 
 #members.triage-grid .triage-card.focused > .thumb-stack,
@@ -193,11 +195,11 @@
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate,
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal {
   width: auto;
-  min-width: 0;
-  min-height: 26px;
-  height: 26px;
+  min-width: 36px;
+  min-height: 36px;
+  height: 36px;
   margin: 0;
-  padding: 0 9px;
+  padding: 0 12px;
   border: 0;
   border-radius: 4px;
   background: var(--lt-table);
@@ -226,6 +228,13 @@
   box-shadow: none;
 }
 
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate:focus-visible,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate:focus-visible,
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .reveal:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+}
+
 /* ---------- Trashed placeholder ----------
    Pencil-soft fill, 1.5px dashed pencil border, centered "Moved to Trash" text and
    an ink underlined Undo link. The name stays, struck through in graphite. */
@@ -245,9 +254,9 @@
 #members.triage-grid .triage-card .deleted-preview .thumb-fallback {
   font-family: var(--lt-ui);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.4;
-  color: var(--lt-pencil);
+  color: var(--lt-ink);
   text-align: center;
   background: none;
 }
@@ -261,11 +270,11 @@
 
 #members.triage-grid .triage-card.deleted .card-actions > .undo-delete {
   width: auto;
-  min-width: 0;
-  min-height: 0;
+  min-width: 36px;
+  min-height: 36px;
   height: auto;
   margin: 0;
-  padding: 0;
+  padding: 8px 12px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -303,7 +312,7 @@
 }
 
 .results .detail-body:has(> #members.triage-grid) #reviewViewSwitch > .btn {
-  min-height: 0;
+  min-height: 36px;
   padding: 5px 12px;
   border: 0;
   border-radius: 6px;
@@ -339,7 +348,7 @@
 .results .detail-body:has(> #members.triage-grid) #memberSort,
 .results .detail-body:has(> #members.triage-grid) #memberModified,
 .results .detail-body:has(> #members.triage-grid) #memberPeople {
-  min-height: 32px;
+  min-height: 36px;
   padding: 5px 30px 5px 10px;
   border: 1px solid var(--lt-sleeve);
   border-radius: 8px;
@@ -367,9 +376,10 @@
 }
 
 .results .detail-body:has(> #members.triage-grid) .member-pagination .btn {
-  min-height: 0;
-  height: 28px;
-  width: 28px;
+  min-height: 36px;
+  min-width: 36px;
+  height: 36px;
+  width: 36px;
   padding: 0;
   border: 0;
   border-radius: 6px;
@@ -407,6 +417,12 @@
   opacity: 1;
 }
 
+.results .detail-body:has(> #members.triage-grid) .member-pagination .btn:focus-visible {
+  outline: 2px solid var(--lt-ink);
+  outline-offset: 2px;
+  color: var(--lt-ink);
+}
+
 .results .detail-body:has(> #members.triage-grid) .member-pagination .member-page-summary {
   min-width: 0;
   padding: 0 6px;
@@ -420,8 +436,8 @@
 
 /* ---------- Guide banner: quiet, graphite, no tinted chips ---------- */
 .results .detail-body:has(> #members.triage-grid) #nonHumanBanner > summary {
-  min-height: 0;
-  padding: 6px 0;
+  min-height: 36px;
+  padding: 10px 0;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -521,8 +537,8 @@
 }
 
 .toast .toast-action {
-  min-height: 0;
-  padding: 4px 10px;
+  min-height: 36px;
+  padding: 4px 12px;
   border: 1px solid #444444;
   border-radius: 6px;
   background: transparent;
@@ -543,7 +559,9 @@
   opacity: 1;
   color: var(--lt-graphite);
   font-size: 13px;
-  padding: 4px 6px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 8px 10px;
   margin: 0 -4px 0 0;
 }
 
