@@ -157,7 +157,7 @@ Keyboard:
 | `d` | Trash the focused Non-Human/Faces file; in an exact/similar lightbox, toggle removal |
 | `z` | Full-resolution zoom in the lightbox (drag pans) |
 | `Esc` | Close the lightbox, help, or overlay |
-| `?` | Shortcut help |
+| `?` | Shortcut help (or the **Shortcuts** button in the top bar) |
 
 On the Similar board, `j` / `k` move between rows, `←` / `→` between files, `Space` keeps or removes, `Shift+K` keeps only the focused file, `u` restores the suggestion, `n` marks the row not duplicates, `Enter` opens the lightbox, `c` opens the swipe compare, and `A` moves every marked copy to Trash.
 
