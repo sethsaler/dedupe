@@ -253,6 +253,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     statusEl.classList.remove("error");
     $("btnScan").disabled = true;
     $("btnCancelScan").hidden = false;
+    $("btnCancelScanProgress").hidden = false;
     $("btnScan").querySelector(".btn-label").textContent = "Scanning…";
     const p = s.progress || {};
     const total = p.files_found || 0;
@@ -277,6 +278,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   } else {
     $("btnScan").disabled = false;
     $("btnCancelScan").hidden = true;
+    $("btnCancelScanProgress").hidden = true;
     $("btnScan").querySelector(".btn-label").textContent = "Scan";
     if (s.progress?.done) {
       fill.style.width = "100%";

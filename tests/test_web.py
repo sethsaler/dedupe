@@ -943,6 +943,30 @@ def test_settings_are_not_buried_behind_disclosures(tmp_path: Path) -> None:
     assert html.index('id="optionsPanel"') < html.index('id="btnScan"')
 
 
+def test_cancel_and_help_stay_reachable_outside_collapsed_setup(tmp_path: Path) -> None:
+    """Cancel lives with progress and Shortcuts in the top bar.
+
+    Starting a scan collapses the setup form, which hides the in-form
+    Cancel button; the progress copy stays visible so a wrong scan can
+    still be stopped. The Shortcuts button opens the same help overlay
+    as the ? key for users who never find the key.
+    """
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    html = client.get("/").get_data(as_text=True)
+
+    assert 'id="btnHelp"' in html
+    assert 'id="btnCancelScanProgress"' in html
+    # The progress Cancel sits inside the progress region, after the form.
+    assert html.index('id="progressWrap"') < html.index('id="btnCancelScanProgress"')
+    assert html.index('id="btnCancelScanProgress"') < html.index('id="sessionStatus"')
+
+    static_dir = Path(web_app.__file__).parent / "static"
+    script = "\n".join(path.read_text() for path in sorted(static_dir.glob("*.js")))
+    assert '$("btnCancelScanProgress")' in script
+    assert '$("btnHelp")' in script
+
+
 def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
     result = _result(tmp_path)
     duplicate = result.groups[0]
