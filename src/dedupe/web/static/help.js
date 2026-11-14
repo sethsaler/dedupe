@@ -15,6 +15,7 @@ function closeHelp() {
   if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
   previousFocus = null;
 }
+$("btnHelp").addEventListener("click", openHelp);
 $("helpClose").addEventListener("click", closeHelp);
 $("helpBackdrop").addEventListener("click", (e) => {
   if (e.target === $("helpBackdrop")) closeHelp();

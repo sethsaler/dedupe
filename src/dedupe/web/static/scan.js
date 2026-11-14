@@ -16,18 +16,21 @@ $("btnScan").addEventListener("click", startScan);
 $("btnRetryAnalysis").addEventListener("click", () => {
   if (state.lastScanSettings) startScan({ ...state.lastScanSettings, new_only: false });
 });
-$("btnCancelScan").addEventListener("click", async () => {
+async function cancelScan() {
   try {
     await api("/api/scan/cancel", {
       method: "POST",
       body: JSON.stringify({ scan_id: state.scanId }),
     });
     $("btnCancelScan").disabled = true;
+    $("btnCancelScanProgress").disabled = true;
     toast("Cancelling scan after the current work item…");
   } catch (error) {
     toast(error.message, "error");
   }
-});
+}
+$("btnCancelScan").addEventListener("click", cancelScan);
+$("btnCancelScanProgress").addEventListener("click", cancelScan);
 $("paths").addEventListener("keydown", (e) => {
   if (e.key === "Enter") startScan();
 });
@@ -153,6 +156,7 @@ export async function startScan(overrides = {}) {
     toast(e.message, "error");
   } finally {
     $("btnCancelScan").disabled = false;
+    $("btnCancelScanProgress").disabled = false;
   }
 }
 

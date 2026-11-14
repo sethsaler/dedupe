@@ -47,8 +47,8 @@
   font-size: 11px;
   letter-spacing: 0.08em;
   color: var(--lt-graphite);
-  padding: 2px 0;
-  min-height: 0;
+  padding: 6px 4px;
+  min-height: 36px;
   border: 0;
   background: transparent;
 }
@@ -57,7 +57,7 @@
 
 .results .search-field input,
 .results .search-field input[type="search"] {
-  min-height: 32px;
+  min-height: 36px;
   padding: 5px 10px;
   font-size: 13px;
   border: 1px solid var(--lt-sleeve);
@@ -181,8 +181,8 @@
 
 .results .group-item.attention .g-state { color: var(--lt-ink); }
 .results .group-item.attention .g-state-glyph { color: var(--lt-pencil); }
-.results .group-item.done .g-state { color: var(--lt-faint); }
-.results .group-item.done .g-state-glyph { color: var(--lt-faint); }
+.results .group-item.done .g-state { color: var(--lt-graphite); }
+.results .group-item.done .g-state-glyph { color: var(--lt-graphite); }
 
 .results .group-item .g-sub {
   font-family: var(--lt-mono);
@@ -194,8 +194,12 @@
 .results .group-item .g-sub .sel-mark {
   font-family: var(--lt-mono);
   font-size: 12px;
-  font-weight: 500;
-  color: var(--lt-pencil);
+  font-weight: 600;
+  color: var(--lt-ink);
+  text-decoration: underline;
+  text-decoration-color: var(--lt-pencil);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
 }
 
 /* Badges: mono uppercase text, no fill. */
@@ -270,8 +274,8 @@
 .results .detail-header > .btn,
 .results .detail-header > .btn.ghost,
 .results .detail-header > .btn.primary-soft {
-  min-height: 0;
-  padding: 6px 2px;
+  min-height: 36px;
+  padding: 6px 8px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -306,7 +310,7 @@
 .results .detail-header .guide-popover > summary {
   display: inline-flex;
   align-items: center;
-  min-height: 34px;
+  min-height: 36px;
   padding: 6px 12px;
   border: 1px solid var(--lt-sleeve);
   border-radius: 6px;
@@ -597,6 +601,7 @@
 
 .results .board-search input,
 .results .board-filter select {
+  min-height: 36px;
   border: 1px solid var(--lt-sleeve);
   border-radius: 8px;
   background: var(--lt-table);
@@ -616,6 +621,8 @@
 .results .board-row.focused {
   background: var(--lt-loupe);
   box-shadow: inset 3px 0 0 var(--lt-ink);
+  outline: 2px solid var(--lt-ink);
+  outline-offset: -2px;
   padding-left: 14px;
 }
 
@@ -630,8 +637,8 @@
 }
 
 .results .board-row-actions .btn {
-  min-height: 0;
-  padding: 4px 0;
+  min-height: 36px;
+  padding: 8px 6px;
   border: 0;
   background: transparent;
   color: var(--lt-graphite);
@@ -664,6 +671,12 @@
 
 .results .board-tile.remove .board-thumb img { opacity: 0.72; }
 
+.results .board-tile.remove .board-tile-name {
+  text-decoration: line-through;
+  text-decoration-color: var(--lt-pencil);
+  text-decoration-thickness: 2px;
+}
+
 .results .board-tile.focused .board-thumb {
   outline: 2px solid var(--lt-ink);
   outline-offset: 8px;
@@ -680,17 +693,19 @@
   border: 0;
   border-radius: 3px;
   font-family: var(--lt-mono);
-  font-size: 10px;
+  font-size: 11px;
+  font-weight: 600;
   letter-spacing: 0.06em;
 }
 
 .results .board-tile .thumb-badge.remove {
   background: var(--lt-pencil);
   color: #FFFFFF;
-  border: 0;
+  border: 1px solid var(--lt-ink);
   border-radius: 3px;
   font-family: var(--lt-mono);
-  font-size: 10px;
+  font-size: 11px;
+  font-weight: 600;
   letter-spacing: 0.06em;
 }
 
@@ -717,7 +732,7 @@
   font-weight: 500;
 }
 
-.results .board-chip.keeper { color: var(--lt-ink); }
+.results .board-chip.keeper { color: var(--lt-ink); font-weight: 600; }
 .results .board-chip.uncertain { color: var(--lt-graphite); }
 
 .results .board-keep-only {
@@ -762,7 +777,7 @@
 }
 
 #actionBar .btn {
-  min-height: 36px;
+  min-height: 40px;
   min-width: 0;
   background: transparent;
   border: 1px solid var(--lt-sleeve);
@@ -851,13 +866,23 @@
 /* Stage: the card has no border or shadow; the media sits on the mat. */
 .results .decision-card,
 .results .decision-card.keep,
-.results .decision-card.selected,
-.results .decision-card.focused {
+.results .decision-card.selected {
   background: transparent;
   border: 0;
   border-radius: 0;
   box-shadow: none;
   outline: 0;
+  overflow: visible;
+  transform: none;
+}
+
+.results .decision-card.focused {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  outline: 2px solid var(--lt-ink);
+  outline-offset: -2px;
   overflow: visible;
   transform: none;
 }
@@ -898,7 +923,7 @@
   border-radius: 4px;
   font-family: var(--lt-mono);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: none;
   backdrop-filter: none;
@@ -912,6 +937,7 @@
 .results .decision-card .thumb-badge.remove {
   background: var(--lt-pencil);
   color: #FFFFFF;
+  border: 1px solid var(--lt-ink);
 }
 
 /* File info under the mat: name 15px/600, meta and path mono 12px. */
@@ -935,6 +961,7 @@
   padding: 2px 8px;
   border-radius: 4px;
   background: var(--lt-pencil-soft);
+  box-shadow: inset 0 0 0 1px var(--lt-pencil);
 }
 
 .results .decision-card .card-meta,
@@ -1056,8 +1083,9 @@
 }
 
 .results .detail-body:has(> #members > .decision-card) > #memberPagination .btn {
-  min-height: 36px;
-  padding: 6px 10px;
+  min-height: 40px;
+  min-width: 40px;
+  padding: 6px 12px;
   font-family: var(--lt-mono);
   font-size: 12px;
   letter-spacing: 0.04em;

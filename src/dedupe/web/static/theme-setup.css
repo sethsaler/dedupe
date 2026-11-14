@@ -19,12 +19,15 @@
   gap: 12px;
 }
 
-/* Section labels: mono 12px uppercase, graphite. */
+/* Section labels: mono 12px uppercase, graphite. Matches the section
+   headings (.setup-heading / .options-heading h3) in size, weight and
+   spacing; headings step up to ink, field labels stay graphite. */
 .scan-panel .field-row > label,
 .scan-panel .opt-label {
   font-family: var(--lt-mono);
   font-size: 12px;
-  font-weight: 400;
+  font-weight: 600;
+  line-height: 1.4;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--lt-graphite);
@@ -44,11 +47,12 @@
   color: var(--lt-ink);
   font-family: var(--lt-mono);
   font-size: 13px;
+  font-weight: 500;
   box-shadow: none;
 }
 
 .scan-panel .path-input-wrap input[type="text"]::placeholder {
-  color: var(--lt-faint);
+  color: var(--lt-graphite);
   opacity: 1;
 }
 
@@ -163,10 +167,10 @@
 }
 
 .scan-panel #btnScan.btn.primary {
-  min-height: 42px;
-  padding: 0 22px;
+  min-height: 48px;
+  padding: 0 28px;
   border-radius: 6px;
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
 }
 
@@ -210,7 +214,17 @@
 }
 
 /* Checkbox rows: a drawn ink box, label beside it. The native input stays
-   in the DOM (visually hidden) so keyboard and state behave as before. */
+   in the DOM (visually hidden) so keyboard and state behave as before.
+   The label itself is the touch target: at least 36px tall with padding,
+   so the row is easy to hit without moving the drawn box or checkmark. */
+.scan-panel .options .chip-check {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  min-height: 36px;
+  padding: 4px 8px 4px 0;
+}
+
 .scan-panel .options .chip-check span {
   position: relative;
   display: inline-flex;
@@ -498,6 +512,7 @@
   margin-top: 0;
   padding-top: 0;
   border-top: 0;
+  color: var(--lt-ink);
 }
 
 .scan-panel .progress-bar {
@@ -515,8 +530,9 @@
 .scan-panel .progress-msg {
   font-family: var(--lt-mono);
   font-size: 13px;
+  font-weight: 500;
   line-height: 1.5;
-  color: var(--lt-graphite);
+  color: var(--lt-ink);
   font-variant-numeric: tabular-nums;
 }
 
@@ -543,7 +559,8 @@
 }
 
 .scan-panel .stream-row:not(.active):not(.done) {
-  opacity: 0.6;
+  /* Keep pending rows legible: lower opacity washes graphite below AA. */
+  opacity: 0.85;
 }
 
 .scan-panel .stream-head {
@@ -742,12 +759,14 @@
 
 .scan-panel .setup-heading,
 .scan-panel .options-heading h3 {
+  margin: 0;
   font-family: var(--lt-mono);
   font-size: 12px;
-  font-weight: 400;
+  font-weight: 600;
+  line-height: 1.4;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--lt-graphite);
+  color: var(--lt-ink);
 }
 
 .scan-panel .options-heading {
@@ -760,9 +779,14 @@
 }
 
 .scan-panel .scan-action-bar {
+  /* Sticky lives here too (app.css already pins it) so the scoped theme
+     keeps Scan reachable on its own while the settings scroll. */
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   background: var(--lt-table);
   border-top: 1px solid var(--lt-sleeve);
-  padding: 14px 0 6px;
+  padding: 14px 0 12px;
 }
 
 .scan-panel .options > .advanced-options {
@@ -790,4 +814,5 @@
 
 @media (prefers-reduced-motion: reduce) {
   .scan-panel .options { animation: none; }
+  .scan-panel .chip-check:active span { transform: none; }
 }

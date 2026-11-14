@@ -34,6 +34,7 @@
       <div class="top-stats" id="topStats">
         <span class="stat-chip muted-chip">No scan yet</span>
       </div>
+      <button type="button" class="btn ghost" id="btnHelp">Shortcuts</button>
       <button type="button" class="btn ghost" id="btnHistory" aria-expanded="false" aria-controls="historyPanel">History</button>
     </header>
 
@@ -250,6 +251,7 @@
         <div class="progress-bar" id="progressBar" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="progressFill"></div></div>
         <div class="progress-msg" id="progressMsg"></div>
         <div class="stream-progress" id="streamProgress" hidden></div>
+        <button id="btnCancelScanProgress" class="btn ghost" type="button" hidden>Cancel scan</button>
       </div>
       <div class="session-status" id="sessionStatus" hidden aria-live="polite">
         <div class="session-status-main">
