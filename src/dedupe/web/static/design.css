@@ -1,5 +1,6 @@
 /* Workspace design system. Structural and media behavior stays in app.css. */
-:root {
+@layer workspace {
+:root:not([data-theme="light"]) {
   color-scheme: dark;
   --bg: #111216;
   --bg-elev: #1b1d24;
@@ -22,7 +23,7 @@
 }
 
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     color-scheme: light;
     --bg: #f7f8fa;
     --bg-elev: #ffffff;
@@ -177,4 +178,5 @@ body { background: var(--bg); }
   .swipe-btn kbd { display: none; }
   .actionbar { flex-direction: column; align-items: stretch; }
   .result-control-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+}
 }

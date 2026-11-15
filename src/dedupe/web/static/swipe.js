@@ -10,7 +10,7 @@ import { noteReviewPair, recordReview, undoReview } from "./review-metrics.js";
 import { wireComparison } from "./comparison.js";
 import { boardActive } from "./board.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
-import { openLightbox, updateLightbox } from "./lightbox.js";
+import { lightboxOpen, openLightbox, updateLightbox } from "./lightbox.js";
 import { selectGroup } from "./members.js";
 import { currentGroup, patchGroup } from "./model.js";
 import { scheduleRender } from "./render.js";
@@ -441,7 +441,7 @@ function refreshAfterDecision(g) {
   const openPath = state.lightboxItems[state.lightboxIndex]?.path;
   const live = currentGroup();
   if (live && live.id === g.id) renderSwipeReview(live);
-  if (!$("lightbox").hidden && state.lightboxItems.length) {
+  if (lightboxOpen() && state.lightboxItems.length) {
     const idx = state.lightboxItems.findIndex((item) => item.path === openPath);
     state.lightboxIndex = idx >= 0
       ? idx

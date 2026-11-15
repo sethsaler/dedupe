@@ -1,11 +1,9 @@
 /* Scoped theme (triage): Non-Human, Faces and Files contact sheets.
-   Loads after app.css, design.css, theme.css and theme-review.css.
+   Loads inside @layer theme.
    Card rules are keyed on #members.triage-grid so the decision review
-   (.decision-card) and the Similar views keep their own steps. Focus-mode cards
-   (.focus-card) keep the app layout; only the outline and placeholder change there.
-   Red (--lt-pencil) marks only things that will leave: the trashed
-   placeholder (clicking the print is the Trash). Keepers stay ink. */
+   (.decision-card) and the Similar views keep their own steps. */
 
+@layer theme {
 /* ---------- Contact sheet grid ----------
    --tile-size comes from the Preview size slider (240-520px). Triage cells use half
    of it so the default 360px lands at five to six columns on a 1440px window. */
@@ -377,32 +375,15 @@
 
 .results .detail-body:has(> #members.triage-grid) .member-pagination .btn {
   min-height: 36px;
-  min-width: 36px;
-  height: 36px;
-  width: 36px;
-  padding: 0;
-  border: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--lt-sleeve);
   border-radius: 6px;
   background: transparent;
   box-shadow: none;
   color: var(--lt-graphite);
-  font-size: 0;
-  line-height: 0;
+  font-size: 13px;
+  line-height: 1.2;
   text-decoration: none;
-}
-
-.results .detail-body:has(> #members.triage-grid) .member-pagination .btn::before {
-  font-family: var(--lt-mono);
-  font-size: 16px;
-  line-height: 1;
-}
-
-.results .detail-body:has(> #members.triage-grid) .member-pagination .member-prev::before {
-  content: "\2039";
-}
-
-.results .detail-body:has(> #members.triage-grid) .member-pagination .member-next::before {
-  content: "\203A";
 }
 
 .results .detail-body:has(> #members.triage-grid) .member-pagination .btn:hover:not(:disabled) {
@@ -493,11 +474,11 @@
   border: 0;
 }
 
-/* ---------- Toast: ink ground, white text (loupe on dark) ---------- */
+/* ---------- Toast: ink ground in light, loupe ground in dark ---------- */
 .toast {
-  --toast-bg: var(--lt-ink);
-  --toast-fg: var(--lt-table);
-  --toast-line: transparent;
+  --toast-bg: light-dark(var(--lt-ink), var(--lt-loupe));
+  --toast-fg: light-dark(var(--lt-table), var(--lt-ink));
+  --toast-line: light-dark(transparent, var(--lt-sleeve));
   background: var(--toast-bg);
   color: var(--toast-fg);
   border: 1px solid var(--toast-line);
@@ -508,20 +489,6 @@
   font-size: 13px;
   line-height: 1.4;
   gap: 12px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .toast {
-    --toast-bg: var(--lt-loupe);
-    --toast-fg: var(--lt-ink);
-    --toast-line: var(--lt-sleeve);
-  }
-}
-
-:root[data-theme="dark"] .toast {
-  --toast-bg: var(--lt-loupe);
-  --toast-fg: var(--lt-ink);
-  --toast-line: var(--lt-sleeve);
 }
 
 .toast.error {
@@ -582,4 +549,5 @@
     grid-template-columns: repeat(auto-fill, minmax(min(100%, 150px), 1fr));
     gap: 20px 10px;
   }
+}
 }

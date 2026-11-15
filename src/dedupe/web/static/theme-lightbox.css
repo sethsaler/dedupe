@@ -1,10 +1,25 @@
 /* Scoped theme (lightbox): the one dark surface, in both schemes, like a loupe.
-   Loads after app.css, design.css and theme.css. Colors are fixed (not tokens)
-   because the lightbox ground never changes with the OS appearance. */
+   Loads inside @layer theme. Re-declares inherited custom properties under
+   color-scheme: dark so light-dark() tokens resolve for this surface. */
 
+@layer theme {
 /* ---------- Ground and text ---------- */
 .lightbox {
   color-scheme: dark;
+  --lt-table: #0E0E0E;
+  --lt-loupe: #1A1A1A;
+  --lt-sleeve: #333333;
+  --lt-graphite: #A0A0A0;
+  --lt-faint: #8A8A8A;
+  --lt-ink: #F2F2F0;
+  --lt-pencil: #FF5A43;
+  --lt-pencil-soft: #3A1712;
+  --lt-keep: #3ECF8E;
+  --text: #F2F2F0;
+  --muted: #A0A0A0;
+  --bg: #0E0E0E;
+  --panel: #141414;
+  --border: #333333;
   background: #0E0E0E;
   backdrop-filter: none;
   color: #F2F2F0;
@@ -249,4 +264,5 @@
 
 .lightbox select {
   color-scheme: dark;
+}
 }

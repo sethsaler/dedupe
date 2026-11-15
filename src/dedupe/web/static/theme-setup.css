@@ -1,6 +1,7 @@
 /* Scoped theme (setup): scan panel, empty state, scanning progress.
-   Loads after app.css, design.css and theme.css. Presentation only. */
+   Loads inside @layer theme. Presentation only. */
 
+@layer theme {
 /* ---------- Scan panel, expanded: unboxed, generous whitespace ---------- */
 .scan-panel {
   background: transparent;
@@ -239,53 +240,15 @@
   font-weight: 400;
 }
 
-.scan-panel .options .chip-check span::before {
-  content: "";
-  flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
-  box-sizing: border-box;
-  border: 1.5px solid var(--lt-graphite);
-  border-radius: 4px;
-  background: var(--lt-table);
-}
-
-.scan-panel .options .chip-check input:checked + span {
-  border: 0;
-  background: transparent;
-  color: var(--lt-ink);
-}
-
-.scan-panel .options .chip-check input:checked + span::before {
-  border-color: var(--lt-ink);
-  background: var(--lt-ink);
-}
-
-.scan-panel .options .chip-check input:checked + span::after {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 3px;
-  width: 4px;
-  height: 8px;
-  border: solid var(--lt-table);
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-}
-
-.scan-panel .options .chip-check input:focus-visible + span {
-  outline: 2px solid var(--lt-ink);
-  outline-offset: 3px;
-  border-radius: 4px;
-}
-
-.scan-panel .options .chip-check input:disabled + span {
-  opacity: 0.45;
-}
-
-.scan-panel .options input[type="checkbox"],
-.scan-panel .options input[type="radio"] {
+.scan-panel .options .chip-check input[type="checkbox"],
+.scan-panel .options .chip-check input[type="radio"] {
   accent-color: var(--lt-ink);
+}
+
+/* Native checkbox styling handled cleanly in modern.css; hide legacy decorative span pseudo boxes. */
+.scan-panel .options .chip-check span::before,
+.scan-panel .options .chip-check span::after {
+  content: none;
 }
 
 /* Track-style field for the similarity preset select (native select kept). */
@@ -318,7 +281,7 @@
   margin: 0;
 }
 
-/* ---------- Empty state: left-aligned editorial layout ---------- */
+/* ---------- Empty state: natural DOM order editorial layout ---------- */
 .empty-state {
   display: grid;
   place-items: start stretch;
@@ -329,55 +292,8 @@
   padding: 0;
 }
 
-/* Landing screen: the empty state's children flow directly into .app so the
-   headline and body sit above the scan form, and the steps and keyboard line
-   sit below it. Only while the empty state is shown; [hidden] wins otherwise. */
-.app > .topbar { order: -3; }
-.app > .results,
-.app > .actionbar { order: 3; }
-
-.empty-state:not([hidden]),
-.empty-state:not([hidden]) > .empty-card {
-  display: contents;
-}
-
 .empty-state:not([hidden]) .empty-icon {
   display: none;
-}
-
-.empty-state:not([hidden]) .empty-card > h2,
-.empty-state:not([hidden]) .empty-card > p:not(.empty-hint) {
-  order: -1;
-  max-width: 560px;
-}
-
-.empty-state:not([hidden]) .empty-card > h2 {
-  margin: 16px 0 0;
-}
-
-.empty-state:not([hidden]) .empty-card > p:not(.empty-hint) {
-  margin: 4px 0 20px;
-}
-
-.app > .scan-panel {
-  order: 0;
-}
-
-/* Landing: the form ends where the steps begin, so no trailing panel padding. */
-.app:has(> .empty-state:not([hidden])) > .scan-panel {
-  padding-bottom: 0;
-}
-
-.empty-state:not([hidden]) .empty-card > .empty-steps {
-  order: 1;
-  max-width: 560px;
-  margin: 16px 0 0;
-}
-
-.empty-state:not([hidden]) .empty-card > .empty-hint {
-  order: 1;
-  max-width: 560px;
-  margin: 16px 0 0 !important;
 }
 
 .empty-state .empty-card {
@@ -815,4 +731,5 @@
 @media (prefers-reduced-motion: reduce) {
   .scan-panel .options { animation: none; }
   .scan-panel .chip-check:active span { transform: none; }
+}
 }

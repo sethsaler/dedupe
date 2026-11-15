@@ -24,7 +24,7 @@ import { state } from "./state.js";
 import { confirmModal } from "./modal.js";
 import { openCropEditor, syncCropEditor } from "./cropeditor.js";
 import {
-  $, basename, escapeHtml, formatBytes, hideToast, noteMediaVersion, sleep, toast, withMediaVersion,
+  $, basename, escapeHtml, formatBytes, hideToast, isOverlayOpen, noteMediaVersion, sleep, toast, withMediaVersion,
 } from "./util.js";
 
 const busy = new Set();
@@ -1007,7 +1007,7 @@ function dismissCropUndoToast(path = null) {
   if (shown === null || (path !== null && path !== shown)) return;
   cropUndoToastPath = null;
   // Only hide it while it is still the toast on screen.
-  if (!$("toast").hidden && $("toastMessage")?.textContent === cropUndoMessage(shown)) hideToast();
+  if (isOverlayOpen($("toast")) && $("toastMessage")?.textContent === cropUndoMessage(shown)) hideToast();
 }
 
 // A video crop re-encodes the whole clip and can take minutes; the button

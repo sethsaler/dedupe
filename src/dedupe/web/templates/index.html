@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="text-scale" content="scale" />
   <meta name="dedupe-token" content="{{ csrf_token }}" />
   <title>Dedupe — Media Duplicate Finder</title>
   <link rel="stylesheet" href="/static/app.css" />
@@ -14,6 +16,7 @@
   <link rel="stylesheet" href="/static/theme-crop.css" />
   <link rel="stylesheet" href="/static/theme-sheet.css" />
   <link rel="stylesheet" href="/static/theme-lightbox.css" />
+  <link rel="stylesheet" href="/static/modern.css" />
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -34,21 +37,23 @@
       <div class="top-stats" id="topStats">
         <span class="stat-chip muted-chip">No scan yet</span>
       </div>
-      <button type="button" class="btn ghost" id="btnHelp">Shortcuts</button>
-      <button type="button" class="btn ghost" id="btnHistory" aria-expanded="false" aria-controls="historyPanel">History</button>
+      <div class="topbar-actions">
+        <button type="button" class="btn ghost theme-toggle" id="btnTheme" title="Switch color theme (System)" aria-label="Color theme: System">
+          <span class="theme-icon" aria-hidden="true">◐</span>
+          <span class="theme-label" id="themeLabel">Auto</span>
+        </button>
+        <button type="button" class="btn ghost" id="btnHelp">Shortcuts</button>
+        <button type="button" class="btn ghost" id="btnHistory" aria-controls="historyPanel">History</button>
+      </div>
     </header>
-
-    <section id="historyPanel" class="scan-panel history-panel" hidden aria-label="Cleanup history">
-      <div class="section-heading"><h2>Cleanup history</h2><button type="button" class="btn ghost" id="btnCloseHistory">Close</button></div>
-      <p class="muted">Restore previous cleanups or reconsider files marked as different.</p>
-      <div id="historyList" aria-live="polite"></div>
-    </section>
 
     <section class="scan-panel" id="scanPanel" tabindex="-1">
       <button type="button" class="scan-collapse" id="scanCollapse" aria-expanded="true" aria-controls="scanMain">
         <span class="chev" aria-hidden="true">▸</span>
         <span class="scan-collapse-label">Scan setup</span>
+        <span class="scan-collapse-goal" id="scanCollapseGoal" hidden></span>
         <span class="scan-collapse-paths" id="scanCollapsePaths"></span>
+        <span class="scan-collapse-close-hint" aria-hidden="true">Back to results · Esc</span>
       </button>
       <div class="scan-main" id="scanMain">
         <div class="field-row path-row">
@@ -60,6 +65,8 @@
               placeholder="~/Pictures or /path/photo.jpg — comma-separate multiple"
               spellcheck="false"
               autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
             />
             <button type="button" class="btn ghost path-pick" id="btnPickFolder" title="Choose folders">
               Folders…
@@ -77,7 +84,7 @@
 
         <section class="protected-setup" aria-label="Protected library">
           <label class="field-row" for="protectedFolders">Compare against a protected library (optional, one folder per line)
-            <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive"></textarea>
+            <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
           </label>
           <p class="thresh-hint">These folders are included in the comparison. Their files cannot be removed or moved; only the cleanup folders above can change.</p>
         </section>
@@ -121,8 +128,8 @@
         </div>
 
         <div class="options" id="optionsPanel" aria-label="Scan settings">
-          <div class="opt-group">
-            <span class="opt-label">Detect</span>
+          <fieldset class="opt-group">
+            <legend class="opt-label">Detect</legend>
             <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check" id="optSimilarWrap"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
             <label class="chip-check" id="optVideoVersionsWrap"><input type="checkbox" id="optVideoVersions" /><span>Video clips &amp; versions</span></label>
@@ -131,9 +138,9 @@
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
             <label class="chip-check" id="optBlackBordersWrap" title="Find images and MP4/MOV videos framed by black bars, images framed in white or another flat colour, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop"><input type="checkbox" id="optBlackBorders" /><span>Crops — images &amp; videos (black bars, flat borders, screenshot interface)</span></label>
             <span class="thresh-hint" id="depHint" hidden></span>
-          </div>
+          </fieldset>
           <label class="field-row" for="preferredFolders">Preferred keeper folders (one per line, highest priority first)
-            <textarea id="preferredFolders" rows="2" placeholder="~/Pictures/Originals"></textarea>
+            <textarea id="preferredFolders" rows="2" placeholder="~/Pictures/Originals" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
             <span class="thresh-hint">A preference chooses which duplicate survives. It does not protect every file in the folder.</span>
           </label>
           <div class="semantic-fields" id="semanticFields" hidden>
@@ -171,34 +178,34 @@
             </select>
             <span class="thresh-hint">Ensemble keeps more photos of people, including women whose faces are turned away or cropped. First Photon use downloads ~10 GB.</span>
           </label>
-          <div class="opt-group">
-            <span class="opt-label">Review</span>
+          <fieldset class="opt-group">
+            <legend class="opt-label">Review</legend>
             <label class="chip-check"><input type="checkbox" id="optLowResolution" /><span>Low resolution</span></label>
             <label class="chip-check"><input type="checkbox" id="optRandomReview" /><span>Random set of 50</span></label>
-          </div>
-          <div class="opt-group">
-            <span class="opt-label">Low-res types</span>
+          </fieldset>
+          <fieldset class="opt-group">
+            <legend class="opt-label">Low-res types</legend>
             <label class="chip-check"><input type="checkbox" id="optLowResolutionImages" checked /><span>Images</span></label>
             <label class="chip-check"><input type="checkbox" id="optLowResolutionGifs" checked /><span>GIFs</span></label>
             <label class="chip-check"><input type="checkbox" id="optLowResolutionVideos" checked /><span>Videos</span></label>
-          </div>
-          <div class="low-resolution-bounds" aria-label="Low-resolution megapixel bounds">
-            <span class="opt-label">Low-res bounds</span>
+          </fieldset>
+          <fieldset class="low-resolution-bounds">
+            <legend class="opt-label">Low-res bounds</legend>
             <label>Images below <input id="lowResolutionImageMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
             <label>GIFs below <input id="lowResolutionGifMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
             <label>Videos below <input id="lowResolutionVideoMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
-          </div>
-          <div class="opt-group">
-            <span class="opt-label">Types</span>
+          </fieldset>
+          <fieldset class="opt-group">
+            <legend class="opt-label">Types</legend>
             <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
             <label class="chip-check"><input type="checkbox" id="optGifs" checked /><span>GIFs</span></label>
             <label class="chip-check"><input type="checkbox" id="optVideos" checked /><span>Videos</span></label>
-          </div>
-          <div class="opt-group">
-            <span class="opt-label">Folders</span>
+          </fieldset>
+          <fieldset class="opt-group">
+            <legend class="opt-label">Folders</legend>
             <label class="chip-check"><input type="checkbox" id="optParallel" /><span>Scan folders separately</span></label>
             <span class="thresh-hint">By default, find matches within and across all selected folders. Separate scans only find matches within each folder.</span>
-          </div>
+          </fieldset>
           <label class="preset-field">
             <span class="opt-label">Similarity preset</span>
             <select id="similarityPreset">
@@ -227,7 +234,7 @@
           <label class="exclude-field">
             <span class="opt-label">Exclude</span>
             <span class="exclude-input-row">
-              <input id="exclusions" type="text" placeholder="*.tmp, exports/**, cache" spellcheck="false" />
+              <input id="exclusions" type="text" placeholder="*.tmp, exports/**, cache" spellcheck="false" autocorrect="off" autocapitalize="none" />
               <button class="btn ghost" id="btnCheckExclusions" type="button" title="Check what each glob matches under the scan folders">Check</button>
             </span>
             <span class="thresh-hint">comma-separated globs</span>
@@ -239,6 +246,7 @@
         <div class="scan-meta-row scan-action-bar">
           <span id="scanStatus" class="status muted" aria-live="polite">Ready</span>
           <div class="actions-row">
+            <button id="btnCollapseScan" class="btn ghost" type="button" hidden>Back to results</button>
             <button id="btnCancelScan" class="btn ghost" type="button" hidden>Cancel</button>
             <button id="btnScan" class="btn primary" type="button">
               <span class="btn-label">Scan</span>
@@ -248,7 +256,7 @@
       </div>
 
       <div class="progress-wrap" id="progressWrap" hidden>
-        <div class="progress-bar" id="progressBar" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="progressFill"></div></div>
+        <progress class="progress-bar" id="progressBar" max="100" aria-label="Scan progress"></progress>
         <div class="progress-msg" id="progressMsg"></div>
         <div class="stream-progress" id="streamProgress" hidden></div>
         <button id="btnCancelScanProgress" class="btn ghost" type="button" hidden>Cancel scan</button>
@@ -314,14 +322,14 @@
           <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">All files <span class="tab-count" id="countAllFiles">0</span></button>
         </div>
       <aside class="sidebar">
-        <div class="result-controls" aria-label="Find and organize results">
+        <search class="result-controls" aria-label="Find and organize results">
           <div class="result-controls-heading">
             <span class="muted small" id="filteredCount" aria-live="polite"></span>
             <button class="btn text-button" id="btnClearFilters" type="button" hidden>Clear filters</button>
           </div>
           <label class="search-field" for="resultSearch">
             <span class="sr-only">Search files</span>
-            <input id="resultSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
+            <input id="resultSearch" type="search" placeholder="Search path or file name" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" />
           </label>
           <div class="review-filters" id="reviewFilters">
             <div class="filter-head-row">
@@ -366,7 +374,7 @@
                 </span>
               </label>
               <label class="adv-field" for="filterPathPattern">Path
-                <input id="filterPathPattern" type="text" spellcheck="false" placeholder="*/Screenshots/* or .heic" />
+                <input id="filterPathPattern" type="text" spellcheck="false" autocorrect="off" autocapitalize="none" placeholder="*/Screenshots/* or .heic" />
               </label>
               <label class="adv-field" for="filterFaces">Faces
                 <select id="filterFaces" aria-label="Filter by detected face count">
@@ -401,12 +409,12 @@
             </div>
             <div class="result-control-row" id="bulkValueRow" hidden>
               <label for="bulkValue">Value</label>
-              <input id="bulkValue" type="text" spellcheck="false" placeholder="MB" />
+              <input id="bulkValue" type="text" spellcheck="false" autocorrect="off" autocapitalize="none" placeholder="MB" />
             </div>
           </section>
           </div>
           <button class="btn primary-soft" id="btnNextReview" type="button" title="Next unreviewed group or group that needs attention (])">Next to review <kbd>]</kbd></button>
-        </div>
+        </search>
         <div class="group-more-slot" id="groupEarlier"></div>
         <div class="group-list" id="groupList" aria-label="Duplicate groups"></div>
         <div class="group-more-slot" id="groupMore"></div>
@@ -447,38 +455,42 @@
             <button class="btn ghost" id="btnToggleCropZones" type="button" hidden aria-pressed="true" title="Hide every suggested crop zone to see the untouched pictures; show them again to see what a crop removes">
               Hide crop zones
             </button>
-            <details class="non-human-banner popover guide-popover" id="nonHumanBanner" hidden>
-              <summary title="About Non-Human review">? Guide</summary>
-              <div class="popover-body">
-                <div>
-                  <strong>Independent Non-Human candidates</strong>
-                  <span>Click a picture — or <kbd>d</kbd> / <kbd>⌫</kbd> — to move that file to Trash. Its Enlarge button opens the lightbox. Undo from the toast or the card. Detection can miss people.</span>
-                </div>
-                <div class="triage-guide" aria-label="Triage shortcuts">
-                  <span class="delete-key">Click picture · Trash</span>
-                  <span class="keep-key">Enlarge · lightbox</span>
-                </div>
-              </div>
-            </details>
-            <details class="candidate-review-banner popover guide-popover" id="candidateReviewBanner" hidden>
-              <summary title="Review guide &amp; shortcuts">? Guide</summary>
-              <div class="popover-body">
-                <div>
-                  <strong id="candidateReviewTitle">Quick review</strong>
-                  <span id="candidateReviewDescription"></span>
-                </div>
-                <div class="candidate-key-guide" id="candidateKeys" aria-label="Review shortcuts">
-                  <span class="delete-key"><kbd>←</kbd> Delete</span>
-                  <span><kbd>↑</kbd> Back</span>
-                  <span class="keep-key">Keep <kbd>→</kbd></span>
-                </div>
-                <div class="candidate-key-guide" id="swipeKeys" hidden aria-label="Swipe shortcuts">
-                  <span class="delete-key"><kbd>←</kbd> Same — Trash</span>
-                  <span><kbd>⌫</kbd> Undo</span>
-                  <span class="keep-key">Different <kbd>→</kbd></span>
+            <div class="non-human-banner popover guide-popover" id="nonHumanBanner" hidden>
+              <button type="button" class="guide-trigger" id="btnNonHumanGuide" popovertarget="nonHumanGuidePopover" title="About Non-Human review">? Guide</button>
+              <div class="guide-popover-panel" id="nonHumanGuidePopover" popover="auto">
+                <div class="popover-body">
+                  <div>
+                    <strong>Independent Non-Human candidates</strong>
+                    <span>Click a picture — or <kbd>d</kbd> / <kbd>⌫</kbd> — to move that file to Trash. Its Enlarge button opens the lightbox. Undo from the toast or the card. Detection can miss people.</span>
+                  </div>
+                  <div class="triage-guide" aria-label="Triage shortcuts">
+                    <span class="delete-key">Click picture · Trash</span>
+                    <span class="keep-key">Enlarge · lightbox</span>
+                  </div>
                 </div>
               </div>
-            </details>
+            </div>
+            <div class="candidate-review-banner popover guide-popover" id="candidateReviewBanner" hidden>
+              <button type="button" class="guide-trigger" id="btnCandidateGuide" popovertarget="candidateGuidePopover" title="Review guide &amp; shortcuts">? Guide</button>
+              <div class="guide-popover-panel" id="candidateGuidePopover" popover="auto">
+                <div class="popover-body">
+                  <div>
+                    <strong id="candidateReviewTitle">Quick review</strong>
+                    <span id="candidateReviewDescription"></span>
+                  </div>
+                  <div class="candidate-key-guide" id="candidateKeys" aria-label="Review shortcuts">
+                    <span class="delete-key"><kbd>←</kbd> Delete</span>
+                    <span><kbd>↑</kbd> Back</span>
+                    <span class="keep-key">Keep <kbd>→</kbd></span>
+                  </div>
+                  <div class="candidate-key-guide" id="swipeKeys" hidden aria-label="Swipe shortcuts">
+                    <span class="delete-key"><kbd>←</kbd> Same — Trash</span>
+                    <span><kbd>⌫</kbd> Undo</span>
+                    <span class="keep-key">Different <kbd>→</kbd></span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="selection-toolbar" aria-label="Group selection controls">
             <div class="group-selection-summary">
@@ -552,17 +564,19 @@
             <h2 id="boardTitle">Similar board</h2>
             <p class="muted" id="boardSummary" aria-live="polite"></p>
           </div>
-          <label class="search-field board-search" for="boardSearch">
-            <span class="sr-only">Search files</span>
-            <input id="boardSearch" type="search" placeholder="Search path or file name" autocomplete="off" />
-          </label>
-          <label class="control-field board-filter" for="boardFilter">
-            <span>Show</span>
-            <select id="boardFilter">
-              <option value="all">All groups</option>
-              <option value="uncertain">Needs a look (&lt; 95% match)</option>
-            </select>
-          </label>
+          <search class="board-controls" aria-label="Search and filter similar groups">
+            <label class="search-field board-search" for="boardSearch">
+              <span class="sr-only">Search files</span>
+              <input id="boardSearch" type="search" placeholder="Search path or file name" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" />
+            </label>
+            <label class="control-field board-filter" for="boardFilter">
+              <span>Show</span>
+              <select id="boardFilter">
+                <option value="all">All groups</option>
+                <option value="uncertain">Needs a look (&lt; 95% match)</option>
+              </select>
+            </label>
+          </search>
           <label class="preview-size" for="boardTileSize">Thumbnails
             <input id="boardTileSize" type="range" min="120" max="280" step="20" value="180" />
           </label>
@@ -571,25 +585,27 @@
             <button class="btn ghost" type="button" data-similar-view="swipe" aria-pressed="false">Swipe</button>
             <button class="btn ghost" type="button" data-similar-view="grid" aria-pressed="false">List</button>
           </div>
-          <details class="candidate-review-banner popover guide-popover board-guide">
-            <summary title="How the board works">? How it works</summary>
-            <div class="popover-body">
-              <div>
-                <strong>Every Similar group, one row each</strong>
-                <span>Each copy starts marked for removal and the suggested keeper stays. Click a photo to switch it between Keep and Remove; nothing moves until you press the Trash button at the bottom, and that one batch can be undone. “Not duplicates” keeps every file in a group and stops it from matching again.</span>
-              </div>
-              <div class="candidate-key-guide" aria-label="Board shortcuts">
-                <span><kbd>j</kbd>/<kbd>k</kbd> rows</span>
-                <span><kbd>←</kbd>/<kbd>→</kbd> files</span>
-                <span><kbd>Space</kbd> keep/remove</span>
-                <span><kbd>⇧K</kbd> keep only this</span>
-                <span><kbd>u</kbd> suggested</span>
-                <span><kbd>n</kbd> not duplicates</span>
-                <span><kbd>Enter</kbd> compare</span>
-                <span><kbd>A</kbd> Trash marked</span>
+          <div class="candidate-review-banner popover guide-popover board-guide">
+            <button type="button" class="guide-trigger" id="btnBoardGuide" popovertarget="boardGuidePopover" title="How the board works">? How it works</button>
+            <div class="guide-popover-panel" id="boardGuidePopover" popover="auto">
+              <div class="popover-body">
+                <div>
+                  <strong>Every Similar group, one row each</strong>
+                  <span>Each copy starts marked for removal and the suggested keeper stays. Click a photo to switch it between Keep and Remove; nothing moves until you press the Trash button at the bottom, and that one batch can be undone. “Not duplicates” keeps every file in a group and stops it from matching again.</span>
+                </div>
+                <div class="candidate-key-guide" aria-label="Board shortcuts">
+                  <span><kbd>j</kbd>/<kbd>k</kbd> rows</span>
+                  <span><kbd>←</kbd>/<kbd>→</kbd> files</span>
+                  <span><kbd>Space</kbd> keep/remove</span>
+                  <span><kbd>⇧K</kbd> keep only this</span>
+                  <span><kbd>u</kbd> suggested</span>
+                  <span><kbd>n</kbd> not duplicates</span>
+                  <span><kbd>Enter</kbd> compare</span>
+                  <span><kbd>A</kbd> Trash marked</span>
+                </div>
               </div>
             </div>
-          </details>
+          </div>
         </div>
         <p class="board-filtered muted small" id="boardFiltered" hidden>
           <span id="boardFilteredText"></span>
@@ -617,6 +633,18 @@
     </footer>
   </div>
 
+  <!-- Cleanup history drawer -->
+  <dialog id="historyPanel" class="history-panel" closedby="any" aria-labelledby="historyTitle">
+    <div class="history-drawer-inner">
+      <div class="section-heading">
+        <h2 id="historyTitle">Cleanup history</h2>
+        <button type="button" class="btn ghost" id="btnCloseHistory">Close</button>
+      </div>
+      <p class="muted">Restore previous cleanups or reconsider files marked as different.</p>
+      <div id="historyList" aria-live="polite"></div>
+    </div>
+  </dialog>
+
   <!-- Linger-to-preview: a non-interactive full-image quick-look, shown after
        a second of hovering a thumbnail. It never takes focus or pointer input;
        the lightbox stays the interactive full view. -->
@@ -625,7 +653,7 @@
   </div>
 
   <!-- Lightbox -->
-  <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Media comparison" hidden>
+  <dialog class="lightbox" id="lightbox" popover="manual" aria-label="Media comparison">
     <button class="lb-close" id="lbClose" type="button" aria-label="Close">✕</button>
     <button class="lb-nav prev" id="lbPrev" type="button" aria-label="Previous">‹</button>
     <div class="lb-stage">
@@ -681,24 +709,24 @@
       </div>
     </div>
     <button class="lb-nav next" id="lbNext" type="button" aria-label="Next">›</button>
-  </div>
+  </dialog>
 
   <!-- Confirm modal -->
-  <div class="modal-backdrop" id="modalBackdrop" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+  <dialog class="modal-backdrop" id="modalBackdrop" closedby="any" aria-labelledby="modalTitle">
+    <div class="modal">
       <h3 id="modalTitle">Confirm</h3>
       <div id="modalBody"></div>
-      <p class="modal-validity" id="modalValidity" hidden aria-live="polite"></p>
       <div class="modal-actions">
-        <button class="btn ghost" id="modalCancel" type="button">Cancel</button>
+        <button class="btn ghost" id="modalCancel" type="button" autofocus>Cancel</button>
         <button class="btn danger" id="modalConfirm" type="button">Confirm</button>
       </div>
+      <p class="modal-validity" id="modalValidity" hidden aria-live="polite"></p>
     </div>
-  </div>
+  </dialog>
 
   <!-- Shortcuts help -->
-  <div class="modal-backdrop" id="helpBackdrop" hidden>
-    <div class="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+  <dialog class="modal-backdrop" id="helpBackdrop" closedby="any" aria-labelledby="helpTitle">
+    <div class="modal help-modal">
       <h3 id="helpTitle">Keyboard shortcuts</h3>
       <dl class="shortcuts">
         <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group · in Low-res and Random review, ↓ steps to the next candidate without deciding</dd></div>
@@ -722,14 +750,14 @@
         <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>
       <div class="modal-actions">
-        <button class="btn primary" id="helpClose" type="button">Got it</button>
+        <button class="btn primary" id="helpClose" type="button" autofocus>Got it</button>
       </div>
     </div>
-  </div>
+  </dialog>
 
   <!-- Crop editor: one file's crop zone on a large view. Built once here and
        filled by cropeditor.js; the zone's handles are added on first use. -->
-  <div class="crop-editor" id="cropEditor" role="dialog" aria-modal="true" aria-labelledby="ceName" hidden>
+  <dialog class="crop-editor" id="cropEditor" popover="manual" aria-labelledby="ceName">
     <div class="ce-stage" id="ceStage">
       <div class="ce-frame" id="ceFrame">
         <img class="ce-image" id="ceImage" alt="" draggable="false" />
@@ -782,12 +810,15 @@
       </p>
       <button class="btn ghost ce-close" id="ceClose" type="button">Done</button>
     </aside>
-  </div>
+  </dialog>
 
-  <div class="toast" id="toast" role="status" aria-live="polite" hidden>
-    <span id="toastMessage"></span>
-    <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>
-    <button class="toast-dismiss" id="toastDismiss" type="button" aria-label="Dismiss notification">✕</button>
+  <div class="toast-region" role="region" aria-label="Notifications">
+    <div id="toastLiveRegion" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div class="toast" id="toast" popover="manual" aria-labelledby="toastMessage">
+      <span id="toastMessage"></span>
+      <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>
+      <button class="toast-dismiss" id="toastDismiss" type="button" aria-label="Dismiss notification">✕</button>
+    </div>
   </div>
   <script type="module" src="/static/main.js"></script>
 </body>

@@ -60,15 +60,18 @@ function initHistory() {
   const button = $("btnHistory");
   if (!panel || !button || !$("historyList")) return;
   button.addEventListener("click", () => {
-    panel.hidden = !panel.hidden;
-    button.setAttribute("aria-expanded", String(!panel.hidden));
-    if (!panel.hidden) refreshHistory();
+    if (!panel.open) {
+      panel.showModal();
+      refreshHistory();
+    } else {
+      panel.close();
+    }
   });
-  $("btnRefreshHistory")?.addEventListener("click", refreshHistory);
   $("btnCloseHistory")?.addEventListener("click", () => {
-    panel.hidden = true;
-    button.setAttribute("aria-expanded", "false");
-    button.focus();
+    if (panel.open) panel.close();
+  });
+  panel.addEventListener("close", (e) => {
+    if (e.target === panel) button.focus();
   });
   $("historyList").addEventListener("click", async event => {
     const target = event.target.closest("button");

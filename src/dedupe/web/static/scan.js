@@ -2,11 +2,20 @@
 
 import { api } from "./api.js";
 import { updateSelectionSummary } from "./actions.js";
+import { renderBoard } from "./board.js";
 import { loadGroups, renderGroupList, rememberFocusedGroup, resetGroupListWindow } from "./groups.js";
 import { selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
 import { groupNeedsAttention } from "./model.js";
-import { collapseScanPanel, lowResolutionMaxPixels, presetResultsTab, saveRecent } from "./settings.js";
+import {
+  collapseScanPanel,
+  expandScanPanel,
+  lowResolutionMaxPixels,
+  presetResultsTab,
+  saveRecent,
+  scanGoalShortLabel,
+  syncCollapseButtonVisibility,
+} from "./settings.js";
 import { state } from "./state.js";
 import { refreshStatus, renderSession, startStatusPolling } from "./status.js";
 import { $, toast } from "./util.js";
@@ -32,7 +41,9 @@ async function cancelScan() {
 $("btnCancelScan").addEventListener("click", cancelScan);
 $("btnCancelScanProgress").addEventListener("click", cancelScan);
 $("paths").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") startScan();
+  if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  startScan();
 });
 
 export function collectScanSettings() {
@@ -78,8 +89,55 @@ export function collectScanSettings() {
   };
 }
 
+function kindSupportedBySettings(kind, settings) {
+  switch (kind) {
+    case "all":
+    case "all_files":
+      return true;
+    case "exact":
+      return Boolean(settings.exact);
+    case "similar":
+      return Boolean(settings.similar || settings.video_versions || settings.semantic);
+    case "sets":
+      return Boolean(settings.semantic);
+    case "crop":
+      return Boolean(settings.find_black_borders);
+    case "faces":
+      return Boolean(settings.count_faces);
+    case "no_humans":
+      return Boolean(settings.find_no_humans);
+    case "low_resolution":
+      return Boolean(settings.find_low_resolution);
+    case "random_review":
+      return Number(settings.random_review_count || 0) > 0;
+    default:
+      return true;
+  }
+}
+
+function targetTabForScan(settings, explicitOverrides = false) {
+  const presetTab = !explicitOverrides ? presetResultsTab() : null;
+  if (presetTab) return presetTab;
+  if (kindSupportedBySettings(state.kind, settings)) return state.kind;
+  const duplicatesEnabled = Boolean(
+    settings.exact || settings.similar || settings.semantic || settings.video_versions,
+  );
+  if (!duplicatesEnabled) {
+    const enabledReviews = [
+      ["crop", Boolean(settings.find_black_borders)],
+      ["faces", Boolean(settings.count_faces)],
+      ["no_humans", Boolean(settings.find_no_humans)],
+      ["low_resolution", Boolean(settings.find_low_resolution)],
+      ["random_review", Number(settings.random_review_count || 0) > 0],
+    ].filter(([, active]) => active);
+    if (enabledReviews.length === 1) return enabledReviews[0][0];
+  }
+  return "all";
+}
+
 export async function startScan(overrides = {}) {
   if (overrides instanceof Event) overrides = {};
+  const hasOverrides = Object.keys(overrides).length > 0;
   const settings = { ...collectScanSettings(), job_id: state.selectedJobId || null, ...overrides };
   const raw = (settings.paths || []).join(", ");
   if (!raw) {
@@ -105,17 +163,24 @@ export async function startScan(overrides = {}) {
   paths.forEach(saveRecent);
   try {
     $("progressWrap").hidden = false;
-    $("progressFill").style.width = "5%";
-    $("progressBar").setAttribute("aria-valuenow", "5");
+    $("progressBar").removeAttribute("value");
     $("progressMsg").textContent = "Starting…";
+    $("scanStatus").textContent = "Scanning…";
+    $("scanStatus").classList.remove("error");
+    $("scanQuality").hidden = true;
+    $("scanQuality").open = false;
+    $("exclusionsCheckResult").hidden = true;
+    $("streamProgress").hidden = true;
+    $("streamProgress").innerHTML = "";
+    $("btnCollapseScan").hidden = true;
     $("emptyState").hidden = true;
     $("results").hidden = false;
     $("actionBar").hidden = true;
     $("detailBody").hidden = true;
     $("detailEmpty").hidden = false;
-      $("groupList").innerHTML =
-        `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
-      $("groupMore").innerHTML = "";
+    $("groupList").innerHTML =
+      `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
+    $("groupMore").innerHTML = "";
     $("countAll").textContent = "0";
     $("countExact").textContent = "0";
     $("countSimilar").textContent = "0";
@@ -143,16 +208,25 @@ export async function startScan(overrides = {}) {
     state.scanId = started.scan_id || state.scanId;
     state.scanning = true;
     // Fold the setup form into its slim bar so the streaming results get
-    // the screen; the bar shows the scanned paths and re-opens on click.
-    collapseScanPanel(raw);
-    // A review goal (crops, faces, …) streams its results straight into its
-    // own tab rather than leaving the user on an empty duplicates list.
-    const goalTab = tabButtons.find((tab) => tab.dataset.kind === presetResultsTab());
-    if (goalTab && !goalTab.classList.contains("active")) activateTab(goalTab);
+    // the screen; the bar shows the active goal + scanned paths and re-opens on click.
+    collapseScanPanel(raw, scanGoalShortLabel(hasOverrides ? settings : null));
+    syncCollapseButtonVisibility();
+    // Route to the goal's results tab (or recover from an inactive category)
+    // rather than leaving the user stranded on the previous scan's tab.
+    const nextKind = targetTabForScan(settings, hasOverrides);
+    const goalTab = tabButtons.find((tab) => tab.dataset.kind === nextKind);
+    if (goalTab && !goalTab.classList.contains("active")) {
+      activateTab(goalTab);
+    } else {
+      renderBoard();
+    }
     // SSE status/group events drive the UI from here; polling is the
     // fallback and stands down as soon as the stream delivers.
     startStatusPolling();
   } catch (e) {
+    $("scanStatus").textContent = "Error";
+    $("scanStatus").classList.add("error");
+    syncCollapseButtonVisibility();
     toast(e.message, "error");
   } finally {
     $("btnCancelScan").disabled = false;
@@ -176,6 +250,11 @@ async function activateTab(tab) {
   // Switch layouts now (the Similar board or the sidebar) rather than after
   // the refetch below.
   renderGroupList();
+  try {
+    tab.scrollIntoView({ block: "nearest", inline: "nearest", container: "nearest" });
+  } catch {
+    tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
   try {
     await loadGroups();
   } catch (e) {
@@ -250,6 +329,8 @@ $("groupList").addEventListener("click", (event) => {
     const tab = tabButtons.find((tab) => tab.dataset.kind === "all");
     tab.focus();
     activateTab(tab);
+  } else if (action === "setup") {
+    expandScanPanel({ focusId: "scanPreset" });
   }
 });
 $("btnNextReview").addEventListener("click", () => {
@@ -292,6 +373,12 @@ $("btnResumeSession").addEventListener("click", async () => {
     const resumed = await api("/api/review-session/resume", { method: "POST", body: "{}" });
     state.scanId = resumed.scan_id || state.scanId;
     await refreshStatus();
+    const roots = (
+      state.lastScanSettings?.paths
+      || state.reviewSession?.roots
+      || []
+    ).join(", ");
+    collapseScanPanel(roots, scanGoalShortLabel(state.lastScanSettings));
     toast("Saved review resumed", "ok");
   } catch (error) {
     toast(error.message || String(error), "error");
@@ -313,7 +400,12 @@ $("btnDiscardSession").addEventListener("click", async () => {
     state.groups = []; state.allGroups = []; state.currentId = null;
     state.touchedGroups.clear();
     rememberFocusedGroup(null);
+    $("progressWrap").hidden = true;
+    $("scanQuality").hidden = true;
+    $("scanCollapsePaths").textContent = "";
+    $("scanCollapseGoal").hidden = true;
     renderSession(null); renderGroupList(); await refreshStatus();
+    expandScanPanel();
     toast("Saved review discarded", "ok");
   } catch (error) { toast(error.message, "error"); }
 });

@@ -14,6 +14,7 @@ import { openLightbox } from "./lightbox.js";
 import { selectGroup } from "./members.js";
 import { markGroupTouched, patchGroup } from "./model.js";
 import { scheduleRender } from "./render.js";
+import { expandScanPanel } from "./settings.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
@@ -109,7 +110,7 @@ function tileHtml(g, member, index, selected, rowFocused) {
   const percent = member.similarity_percent == null ? NaN : Number(member.similarity_percent);
   const turned = member.orientation_label ? ` · ${escapeHtml(member.orientation_label)}` : "";
   const chip = member.path === g.suggested_keep
-    ? '<span class="board-chip keeper" title="${escapeHtml(g.cleanup?.keeper_reason || "Ranked by resolution, size, date, and path")}">Suggested keeper</span>'
+    ? `<span class="board-chip keeper" title="${escapeHtml(g.cleanup?.keeper_reason || "Ranked by resolution, size, date, and path")}">Suggested keeper</span>`
     : g.match_basis === "video_version"
       ? `<span class="board-chip uncertain">${escapeHtml(member.match_label || "Matching video section")}</span>`
     : member.match_label
@@ -221,6 +222,7 @@ function renderBoard() {
     rows.innerHTML = `<div class="board-empty">
       <strong>${categoryHasGroups ? "No matching groups" : state.scanning ? "Waiting for results" : "No similar groups"}</strong>
       <p class="muted">${categoryHasGroups ? "Try a different search or filter." : state.scanning ? "Similar groups appear here as the scan finds them." : "This scan found no near-duplicate photos or videos."}</p>
+      ${!categoryHasGroups && !state.scanning ? '<button class="btn ghost" type="button" data-board-empty="setup">Change scan setup</button>' : ""}
     </div>`;
     boardObserver.disconnect();
     return;
@@ -526,6 +528,10 @@ function handleBoardKey(e) {
 // —— Wiring ——
 
 $("boardRows").addEventListener("click", (event) => {
+  if (event.target.closest('[data-board-empty="setup"]')) {
+    expandScanPanel({ focusId: "scanPreset" });
+    return;
+  }
   const row = event.target.closest(".board-row[data-id]");
   if (!row) {
     if (event.target.closest("#boardMore button")) showMoreRows();

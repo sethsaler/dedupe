@@ -3304,3 +3304,157 @@ def test_full_speed_embedding_is_a_remembered_look_alike_option(
         page.locator("#btnScan").click()
     sent = request.value.post_data_json
     assert sent["semantic"] is False and sent["semantic_full_speed"] is False
+
+
+@pytest.mark.e2e
+@pytest.mark.similar_board
+def test_modern_ux_theme_dialogs_popovers_and_sidebar_geometry(
+    page, live_dedupe_server: str, tmp_path: Path
+) -> None:
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    page.on("pageerror", lambda err: page_errors.append(str(err)))
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
+
+    media = tmp_path / "media"
+    media.mkdir()
+    base = Image.new("RGB", (64, 64), (25, 100, 180))
+    base.save(media / "keeper.png")
+    shutil.copyfile(media / "keeper.png", media / "exact_copy.png")
+    similar = base.copy()
+    similar.putpixel((0, 0), (26, 101, 181))
+    similar.save(media / "similar_copy.png")
+
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    # Theme switcher cycles Auto -> Light -> Dark -> Auto and persists choice.
+    theme_btn = page.locator("#btnTheme")
+    theme_label = page.locator("#themeLabel")
+    expect(theme_label).to_have_text("Auto")
+    theme_btn.click()
+    expect(theme_label).to_have_text("Light")
+    assert page.evaluate("document.documentElement.dataset.theme") == "light"
+    assert page.evaluate("localStorage.getItem('dedupe.theme')") == "light"
+    theme_btn.click()
+    expect(theme_label).to_have_text("Dark")
+    assert page.evaluate("document.documentElement.dataset.theme") == "dark"
+    assert page.evaluate("localStorage.getItem('dedupe.theme')") == "dark"
+    theme_btn.click()
+    expect(theme_label).to_have_text("Auto")
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert page.evaluate("localStorage.getItem('dedupe.theme')") is None
+
+    # Scan fixtures and verify sidebar #groupList is never crushed at 1280x720.
+    page.locator("#paths").fill(str(media))
+    page.locator("#btnScan").click()
+    expect(page.locator("#results")).to_be_visible(timeout=20_000)
+    expect(page.locator("#groupList .group-item").first).to_be_visible(timeout=20_000)
+    group_list_box = page.locator("#groupList").bounding_box()
+    assert group_list_box is not None
+    assert group_list_box["height"] >= 180
+
+    # History drawer opens as top-layer <dialog> and closes on Escape restoring focus.
+    page.locator("#btnHistory").click()
+    assert page.evaluate("document.getElementById('historyPanel').open") is True
+    page.keyboard.press("Escape")
+    assert page.evaluate("document.getElementById('historyPanel').open") is False
+    assert page.evaluate("document.activeElement?.id") == "btnHistory"
+
+    # Similar board renders interpolated keeper tooltip and light-dismiss guide popover.
+    page.locator(".tab[data-kind='similar']").click()
+    keeper_chip = page.locator(".board-chip.keeper").first
+    expect(keeper_chip).to_be_visible(timeout=10_000)
+    keeper_title = keeper_chip.get_attribute("title") or ""
+    assert "${escapeHtml" not in keeper_title
+
+    page.locator("#btnBoardGuide").click()
+    assert page.evaluate("document.getElementById('boardGuidePopover').matches(':popover-open')")
+    page.keyboard.press("Escape")
+    assert (
+        page.evaluate("document.getElementById('boardGuidePopover').matches(':popover-open')")
+        is False
+    )
+
+    assert page_errors == []
+    assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_post_scan_setup_ergonomics_and_switching_scan_types(
+    page, live_dedupe_server: str, tmp_path: Path
+) -> None:
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    page.on("pageerror", lambda err: page_errors.append(str(err)))
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
+
+    media = tmp_path / "media"
+    media.mkdir()
+    dup_a = media / "dup_a.png"
+    Image.new("RGB", (64, 64), (25, 100, 180)).save(dup_a)
+    shutil.copyfile(dup_a, media / "dup_b.png")
+    letterbox = Image.new("RGB", (320, 240), (0, 0, 0))
+    letterbox.paste(Image.effect_noise((320, 180), 60).convert("RGB"), (0, 30))
+    letterbox.save(media / "letterbox.png")
+
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    # Scan #1: default duplicate cleanup.
+    page.locator("#paths").fill(str(media))
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    expect(page.locator("#scanPanel")).to_have_class("scan-panel collapsed")
+    expect(page.locator("#scanCollapseGoal")).to_have_text("Duplicates")
+    expect(page.locator("#scanCollapsePaths")).to_have_text(str(media))
+    expect(page.locator("#progressBar")).to_be_hidden()
+
+    # Expanding Scan setup post-scan gives a spacious scrollport, hides finished
+    # progress bars, fits within the viewport, and supports Esc / Back to results.
+    page.locator("#scanCollapse").click()
+    expect(page.locator("#scanPanel")).to_have_class("scan-panel")
+    expect(page.locator("#btnCollapseScan")).to_be_visible()
+    expect(page.locator("#progressBar")).to_be_hidden()
+    assert page.evaluate("document.getElementById('scanMain').clientHeight") >= 300
+    assert page.evaluate("document.documentElement.scrollHeight <= innerHeight + 1")
+
+    page.keyboard.press("Escape")
+    expect(page.locator("#scanPanel")).to_have_class("scan-panel collapsed")
+    assert page.evaluate("document.activeElement?.id") == "scanCollapse"
+
+    page.locator("#scanCollapse").click()
+    expect(page.locator("#btnCollapseScan")).to_be_visible()
+    page.locator("#btnCollapseScan").click()
+    expect(page.locator("#scanPanel")).to_have_class("scan-panel collapsed")
+
+    # Scan #2: switch to Crop and tune a crop sub-option without clobbering Scan goal.
+    page.locator("#scanCollapse").click()
+    page.locator("#scanPreset").select_option("crop")
+    page.locator("#optCropAggressiveness").select_option("aggressive")
+    expect(page.locator("#scanPreset")).to_have_value("crop")
+    page.locator("#btnScan").click()
+
+    expect(page.locator(".tab.active")).to_have_attribute("data-kind", "crop")
+    expect(page.locator("#scanCollapseGoal")).to_have_text("Crops")
+    expect(page.locator("#members .crop-card")).to_have_count(1, timeout=20_000)
+
+    # Scan #3: switch back to duplicate cleanup from Crop tab -> routes off Crop to All.
+    page.locator("#scanCollapse").click()
+    page.locator("#scanPreset").select_option("cleanup")
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+
+    expect(page.locator(".tab.active")).to_have_attribute("data-kind", "all")
+    expect(page.locator("#scanCollapseGoal")).to_have_text("Duplicates")
+    expect(page.locator("#countExact")).to_have_text("1", timeout=20_000)
+
+    assert page_errors == []
+    assert console_errors == []

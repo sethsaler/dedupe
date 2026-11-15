@@ -967,6 +967,24 @@ def test_cancel_and_help_stay_reachable_outside_collapsed_setup(tmp_path: Path) 
     assert '$("btnHelp")' in script
 
 
+def test_post_scan_setup_controls_and_routing_contract(tmp_path: Path) -> None:
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    html = client.get("/").get_data(as_text=True)
+
+    assert 'id="scanCollapseGoal"' in html
+    assert 'id="btnCollapseScan"' in html
+    assert 'class="scan-collapse-close-hint"' in html
+
+    static_dir = Path(web_app.__file__).parent / "static"
+    script = "\n".join(path.read_text() for path in sorted(static_dir.glob("*.js")))
+    assert "expandScanPanel" in script
+    assert "targetTabForScan" in script
+
+    modern_css = client.get("/static/modern.css").get_data(as_text=True)
+    assert ".scan-panel:not(.scanning) :is(.progress-bar, .stream-progress)" in modern_css
+
+
 def test_independent_review_decision_is_persisted_and_actionable(tmp_path: Path) -> None:
     result = _result(tmp_path)
     duplicate = result.groups[0]
@@ -3726,3 +3744,26 @@ def test_similarity_percentage_measures_turned_copy_in_its_orientation():
     # An upright copy is never labelled turned, even with orientation hashes.
     member.phash = keeper.phash
     assert match_orientation(member, keeper) is None
+
+
+def test_modern_web_platform_markup_and_layers(tmp_path: Path) -> None:
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    html = client.get("/").get_data(as_text=True)
+
+    for expected in (
+        '<meta name="color-scheme" content="light dark" />',
+        '<meta name="text-scale" content="scale" />',
+        '/static/modern.css',
+        'id="btnTheme"',
+        '<progress class="progress-bar" id="progressBar"',
+        '<search class="result-controls"',
+        '<dialog id="historyPanel"',
+        '<dialog class="modal-backdrop" id="modalBackdrop" closedby="any"',
+        '<dialog class="lightbox" id="lightbox" popover="manual"',
+        'id="toast" popover="manual"',
+    ):
+        assert expected in html
+
+    stylesheet = client.get("/static/app.css").get_data(as_text=True)
+    assert "@layer legacy, workspace, theme, modern;" in stylesheet

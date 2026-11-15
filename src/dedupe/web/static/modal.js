@@ -1,6 +1,6 @@
 // The preview-and-confirm sheet.
 
-import { $, trapTabKey } from "./util.js";
+import { $, promoteToastTopLayer } from "./util.js";
 
 // —— Confirm modal ——
 function formatCountdown(seconds) {
@@ -21,6 +21,7 @@ function confirmModal({
   validitySeconds = null,
 }) {
   return new Promise((resolve) => {
+    const dialog = $("modalBackdrop");
     $("modalTitle").textContent = title;
     $("modalBody").innerHTML = body;
     const btn = $("modalConfirm");
@@ -28,32 +29,32 @@ function confirmModal({
     btn.className = danger ? "btn danger" : "btn primary";
     const validity = $("modalValidity");
     let ticker = null;
+    let settled = false;
     const previousFocus = document.activeElement;
-    $("modalBackdrop").hidden = false;
+    if (!dialog.open) dialog.showModal();
     // Safe default: focus Cancel so a stray Enter can never confirm a
     // destructive action; Enter only confirms when Confirm itself has focus.
     $("modalCancel").focus();
+    promoteToastTopLayer();
 
     const cleanup = (ok) => {
+      if (settled) return;
+      settled = true;
       if (ticker !== null) clearInterval(ticker);
       ticker = null;
-      $("modalBackdrop").hidden = true;
       btn.removeEventListener("click", onOk);
       $("modalCancel").removeEventListener("click", onCancel);
-      document.removeEventListener("keydown", onKey);
+      dialog.removeEventListener("close", onDialogClose);
+      if (dialog.open) dialog.close();
       if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
       resolve(ok);
     };
     const onOk = () => cleanup(true);
     const onCancel = () => cleanup(false);
-      const onKey = (e) => {
-        if (e.key === "Escape") cleanup(false);
-        if (e.key === "Enter" && document.activeElement === btn) cleanup(true);
-        trapTabKey($("modalBackdrop"), e);
-      };
+    const onDialogClose = () => cleanup(false);
     btn.addEventListener("click", onOk);
     $("modalCancel").addEventListener("click", onCancel);
-    document.addEventListener("keydown", onKey);
+    dialog.addEventListener("close", onDialogClose);
 
     if (validitySeconds > 0) {
       const expiresAt = Date.now() + validitySeconds * 1000;
