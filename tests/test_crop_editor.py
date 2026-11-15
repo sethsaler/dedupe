@@ -202,3 +202,106 @@ def test_a_level_with_no_suggestion_starts_from_the_whole_picture(page, crop_rev
     page.keyboard.press("Escape")
     expect(card.locator(".crop-apply")).to_be_enabled()
     expect(card.locator(".evidence")).to_contain_text("25px left")
+
+
+def test_off_center_edge_drag_resizes_via_full_edge_bar(page, crop_review):
+    card = crop_review.first
+    card.hover()
+    frame = card.locator(".crop-frame").bounding_box()
+    box = card.locator(".crop-box").bounding_box()
+    handle_box = card.locator('.crop-handle[data-handle="nw"]').bounding_box()
+    assert handle_box["width"] >= 24 and handle_box["height"] >= 24
+
+    off_center_x = box["x"] + box["width"] * 0.2
+    _drag(page, (off_center_x, box["y"]), (off_center_x, box["y"] + frame["height"] * (25 / 240)))
+    page.wait_for_function("() => window.adjustRequests.length === 1")
+    updated = _last_box(page)
+    assert updated["top"] > 30
+    assert updated["left"] == 40 and updated["right"] == 280
+
+
+def test_unclipped_edge_handle_at_zero_frame_boundary(page, crop_review):
+    card = crop_review.first
+    card.locator(".crop-adjust").click()
+    expect(page.locator("#cropEditor")).to_be_visible()
+
+    page.locator('#cropEditor .ce-keep[data-side="top"]').click()
+    page.wait_for_function("() => window.adjustRequests.length === 1")
+    assert _last_box(page)["top"] == 0
+
+    frame = page.locator("#ceFrame").bounding_box()
+    nw_box = page.locator('#cropEditor .crop-handle[data-handle="nw"]').bounding_box()
+    assert nw_box["width"] >= 24 and nw_box["height"] >= 24
+
+    start_x = frame["x"] + frame["width"] * 0.25
+    _drag(page, (start_x, frame["y"]), (start_x, frame["y"] + frame["height"] * (48 / 240)))
+    page.wait_for_function("() => window.adjustRequests.length === 2")
+    assert _last_box(page)["top"] > 10
+
+
+def test_live_side_input_preview_updates_before_commit(page, crop_review):
+    card = crop_review.first
+    card.locator(".crop-adjust").click()
+    expect(page.locator("#cropEditor")).to_be_visible()
+
+    page.locator("#ceTop").fill("60")
+    assert page.evaluate("window.adjustRequests.length") == 0
+    ce_top = page.locator("#ceBox").evaluate("el => parseFloat(el.style.top)")
+    shade_top = page.locator("#ceShadeHole").evaluate("el => parseFloat(el.style.top)")
+    assert ce_top == pytest.approx(25.0, abs=0.2)
+    assert shade_top == pytest.approx(25.0, abs=0.2)
+
+    page.locator("#ceTop").press("Enter")
+    page.wait_for_function("() => window.adjustRequests.length === 1")
+    assert _last_box(page)["top"] == 60
+
+
+def test_editor_toggle_zone_and_v_shortcut(page, crop_review):
+    crop_review.first.locator(".crop-adjust").click()
+    expect(page.locator("#cropEditor")).to_be_visible()
+
+    toggle = page.locator("#ceToggleZone")
+    frame = page.locator("#ceFrame")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    toggle.click()
+    expect(frame).to_have_class(re.compile(r"\bcrop-zone-hidden\b"))
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+
+    page.keyboard.press("v")
+    expect(frame).not_to_have_class(re.compile(r"\bcrop-zone-hidden\b"))
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+
+
+def test_editor_aspect_ratio_preset_1_1_and_free(page, crop_review):
+    crop_review.first.locator(".crop-adjust").click()
+    expect(page.locator("#cropEditor")).to_be_visible()
+
+    page.locator('#ceAspect [data-aspect="1:1"]').click()
+    page.wait_for_function("() => window.adjustRequests.length === 1")
+    squared = _last_box(page)
+    assert squared["right"] - squared["left"] == squared["bottom"] - squared["top"]
+
+    box = page.locator("#ceBox").bounding_box()
+    frame = page.locator("#ceFrame").bounding_box()
+    right_x = box["x"] + box["width"]
+    mid_y = box["y"] + box["height"] / 2
+    _drag(page, (right_x, mid_y), (right_x - frame["width"] * (40 / 320), mid_y))
+    page.wait_for_function("() => window.adjustRequests.length === 2")
+    resized = _last_box(page)
+    assert resized["right"] - resized["left"] < squared["right"] - squared["left"]
+    assert resized["right"] - resized["left"] == resized["bottom"] - resized["top"]
+
+    page.locator('#ceAspect [data-aspect="free"]').click()
+    box_after = page.locator("#ceBox").bounding_box()
+    _drag(
+        page,
+        (box_after["x"] + box_after["width"], box_after["y"] + box_after["height"] / 2),
+        (
+            box_after["x"] + box_after["width"] + frame["width"] * (30 / 320),
+            box_after["y"] + box_after["height"] / 2,
+        ),
+    )
+    page.wait_for_function("() => window.adjustRequests.length === 3")
+    freed = _last_box(page)
+    assert freed["bottom"] - freed["top"] == resized["bottom"] - resized["top"]
+    assert freed["right"] - freed["left"] > resized["right"] - resized["left"]

@@ -8,8 +8,9 @@
 
 import {
   CROP_HANDLES, CROP_LEVELS, applyCrop, bindZone, chooseCropLevel, coversFrame, deriveBox,
-  evidenceFor, levelSwitchHtml, nudgedBox, placeInFrame, queueZone, renderCropReview,
-  resetCropZone, sameEdges, skipCrop, snapEdges, zoneBox,
+  draggedBox, effectiveBox, evidenceFor, hiddenZones, levelSwitchHtml, localAdjustments,
+  nudgedBox, placeZone, queueZone, renderCropReview, resetCropZone, sameEdges, skipCrop,
+  snapEdges, toggleCropZone, zoneBox,
 } from "./crop.js";
 import { currentGroup } from "./model.js";
 import { $, basename, isOverlayOpen, promoteToastTopLayer, syncAppInert, trapTabKey, withMediaVersion } from "./util.js";
@@ -22,6 +23,8 @@ let editorPath = null;
 let built = false;
 let working = false;
 let previousFocus = null;
+let aspectMode = "free";
+const previewOnly = new Set();
 
 const editor = () => $("cropEditor");
 const fieldFor = (side) => $(`ce${side[0].toUpperCase()}${side.slice(1)}`);
@@ -69,8 +72,131 @@ function layoutFrame(box) {
   frame.style.height = `${Math.max(1, Math.floor(box.height * scale))}px`;
 }
 
+function targetAspectRatio(mode, frame) {
+  if (mode === "original" && frame?.height > 0) return frame.width / frame.height;
+  if (mode === "16:9") return 16 / 9;
+  if (mode === "4:3") return 4 / 3;
+  if (mode === "1:1") return 1;
+  return null;
+}
+
+function syncAspectButtons() {
+  editor()?.querySelectorAll("#ceAspect [data-aspect]").forEach((button) => {
+    const chosen = button.dataset.aspect === aspectMode;
+    button.classList.toggle("chosen", chosen);
+    button.setAttribute("aria-pressed", String(chosen));
+  });
+}
+
+function aspectBoxFromSize(member, frame, anchor, handle, w, h, ratio) {
+  const minW = Math.min(MIN_ZONE_PX, frame.width);
+  const minH = Math.min(MIN_ZONE_PX, frame.height);
+  const even = member?.media_type === "video" ? 2 : 1;
+  const roundStep = (v) => Math.max(even, Math.round(v / even) * even);
+
+  let left = anchor.left;
+  let right = anchor.right;
+  let top = anchor.top;
+  let bottom = anchor.bottom;
+
+  const maxW = handle.includes("w")
+    ? right
+    : handle.includes("e")
+      ? frame.width - left
+      : frame.width;
+  const maxH = handle.includes("n")
+    ? bottom
+    : handle.includes("s")
+      ? frame.height - top
+      : frame.height;
+
+  let cw = Math.max(minW, Math.min(maxW, w));
+  let ch = cw / ratio;
+  if (ch > maxH) {
+    ch = maxH;
+    cw = ch * ratio;
+  }
+  if (ch < minH) {
+    ch = Math.min(maxH, minH);
+    cw = Math.min(maxW, ch * ratio);
+  }
+  cw = roundStep(cw);
+  ch = Math.max(minH, Math.min(maxH, roundStep(cw / ratio)));
+  cw = Math.max(minW, Math.min(maxW, roundStep(ch * ratio)));
+
+  if (handle.includes("w")) left = right - cw;
+  else if (handle.includes("e")) right = left + cw;
+  else {
+    const cx = (left + right) / 2;
+    left = Math.max(0, Math.min(frame.width - cw, Math.round(cx - cw / 2)));
+    right = left + cw;
+  }
+
+  if (handle.includes("n")) top = bottom - ch;
+  else if (handle.includes("s")) bottom = top + ch;
+  else {
+    const cy = (top + bottom) / 2;
+    top = Math.max(0, Math.min(frame.height - ch, Math.round(cy - ch / 2)));
+    bottom = top + ch;
+  }
+
+  return deriveBox(snapEdges(member, { left, top, right, bottom }, frame), frame);
+}
+
+function dragEditorBox(member, start, handle, dx, dy, snap) {
+  const ratio = targetAspectRatio(aspectMode, start);
+  if (!ratio || handle === "move") {
+    return draggedBox(member, start, handle, dx, dy, snap);
+  }
+  const raw = draggedBox(member, start, handle, dx, dy, snap);
+  if (handle === "e" || handle === "w") {
+    const w = raw.crop_width;
+    return aspectBoxFromSize(member, start, start, handle, w, Math.round(w / ratio), ratio);
+  }
+  if (handle === "n" || handle === "s") {
+    const h = raw.crop_height;
+    return aspectBoxFromSize(member, start, start, handle, Math.round(h * ratio), h, ratio);
+  }
+  const dw = Math.abs(raw.crop_width - start.crop_width) / Math.max(1, start.crop_width);
+  const dh = Math.abs(raw.crop_height - start.crop_height) / Math.max(1, start.crop_height);
+  const w = dw >= dh ? raw.crop_width : Math.round(raw.crop_height * ratio);
+  const h = dw >= dh ? Math.round(raw.crop_width / ratio) : raw.crop_height;
+  return aspectBoxFromSize(member, start, start, handle, w, h, ratio);
+}
+
+function applyAspectPreset(mode) {
+  aspectMode = mode;
+  syncAspectButtons();
+  const member = editorMember();
+  const box = member && zoneBox(member);
+  if (!box || working || mode === "free") return;
+  const ratio = targetAspectRatio(mode, box);
+  if (!ratio) return;
+  let w = box.crop_width;
+  let h = Math.round(w / ratio);
+  if (h > box.crop_height) {
+    h = box.crop_height;
+    w = Math.round(h * ratio);
+  }
+  const next = aspectBoxFromSize(member, box, box, "center", w, h, ratio);
+  if (!sameEdges(next, box)) {
+    previewOnly.delete(member.path);
+    queueZone(member.path, next);
+    paint(member, next);
+    renderCropReview(currentGroup());
+  }
+}
+
 function paint(member, box) {
-  placeInFrame($("ceBox"), box);
+  placeZone($("ceFrame"), $("ceBox"), box);
+  const hidden = hiddenZones.has(member.path);
+  $("ceFrame").classList.toggle("crop-zone-hidden", hidden);
+  const toggleBtn = $("ceToggleZone");
+  if (toggleBtn) {
+    toggleBtn.textContent = hidden ? "Show zone" : "Hide zone";
+    toggleBtn.setAttribute("aria-pressed", String(!hidden));
+  }
+  syncAspectButtons();
   const removed = removedFrom(box);
   for (const side of SIDES) {
     const field = fieldFor(side);
@@ -130,11 +256,7 @@ function draw() {
   if (!editor().classList.contains("crop-dragging")) paint(member, box);
 }
 
-// Set how much one side removes, in picture pixels (typed, or 0 from Keep).
-function setSide(side, pixels) {
-  const member = editorMember();
-  const start = member && zoneBox(member);
-  if (!start || working) return;
+function computeSideBox(member, start, side, pixels) {
   const clamp = (value, low, high) => Math.max(low, Math.min(high, Math.round(value)));
   const amount = Number.isFinite(pixels) ? pixels : 0;
   const edges = { left: start.left, top: start.top, right: start.right, bottom: start.bottom };
@@ -144,8 +266,33 @@ function setSide(side, pixels) {
   if (side === "bottom") edges.bottom = clamp(start.height - amount, start.top + minH, start.height);
   if (side === "left") edges.left = clamp(amount, 0, start.right - minW);
   if (side === "right") edges.right = clamp(start.width - amount, start.left + minW, start.width);
-  const next = deriveBox(snapEdges(member, edges, start), start);
-  if (!sameEdges(next, start)) queueZone(member.path, next);
+  return deriveBox(snapEdges(member, edges, start), start);
+}
+
+// Live local preview while typing in a side field (no save until change/blur).
+function previewSide(side, pixels) {
+  const member = editorMember();
+  const start = member && zoneBox(member);
+  if (!start || working || !Number.isFinite(pixels)) return;
+  const next = computeSideBox(member, start, side, pixels);
+  previewOnly.add(member.path);
+  localAdjustments.set(member.path, next);
+  paint(member, next);
+  const card = document.querySelector(`.crop-card[data-path="${CSS.escape(member.path)}"]`);
+  if (card) placeZone(card.querySelector(".crop-frame"), card.querySelector(".crop-box"), next);
+}
+
+// Set how much one side removes, in picture pixels (typed, or 0 from Keep).
+function setSide(side, pixels) {
+  const member = editorMember();
+  const start = member && zoneBox(member);
+  if (!start || working) return;
+  const hadPreview = previewOnly.delete(member.path);
+  const next = computeSideBox(member, start, side, pixels);
+  const committed = effectiveBox(member);
+  if (hadPreview || !sameEdges(next, start) || (committed && !sameEdges(next, committed))) {
+    queueZone(member.path, next);
+  }
   // Repaint either way: a clamped or snapped number replaces the one typed.
   const field = fieldFor(side);
   if (document.activeElement === field) field.value = String(removedFrom(next)[side]);
@@ -175,6 +322,7 @@ function step(delta) {
   const at = order.indexOf(editorMember(g));
   const next = order[at + delta];
   if (!next) return;
+  aspectMode = "free";
   editorPath = next.path;
   draw();
 }
@@ -199,6 +347,13 @@ function build() {
   if (built) return;
   built = true;
   const box = $("ceBox");
+  const thirds = document.createElement("span");
+  thirds.className = "crop-thirds";
+  thirds.setAttribute("aria-hidden", "true");
+  const badge = document.createElement("span");
+  badge.className = "crop-live-badge";
+  badge.setAttribute("aria-hidden", "true");
+  box.append(thirds, badge);
   for (const handle of CROP_HANDLES) {
     const grip = document.createElement("span");
     grip.className = `crop-handle ${handle}`;
@@ -212,10 +367,15 @@ function build() {
     focus: () => {},
     paint,
     dragEl: editor(),
+    blocked: (path) => hiddenZones.has(path),
+    dragBox: dragEditorBox,
     nudge,
     done: () => renderCropReview(currentGroup()),
   });
   for (const side of SIDES) {
+    fieldFor(side).addEventListener("input", (event) => {
+      previewSide(side, Number.parseInt(event.target.value, 10));
+    });
     fieldFor(side).addEventListener("change", (event) => {
       setSide(side, Number.parseInt(event.target.value, 10));
     });
@@ -223,9 +383,21 @@ function build() {
   editor().querySelectorAll(".ce-keep").forEach((button) => {
     button.addEventListener("click", () => setSide(button.dataset.side, 0));
   });
+  editor().querySelectorAll("#ceAspect [data-aspect]").forEach((button) => {
+    button.addEventListener("click", () => applyAspectPreset(button.dataset.aspect));
+  });
   $("ceApply").addEventListener("click", () => decide(true));
   $("ceSkip").addEventListener("click", () => decide(false));
-  $("ceReset").addEventListener("click", () => resetCropZone(editorPath));
+  $("ceReset").addEventListener("click", () => {
+    aspectMode = "free";
+    previewOnly.delete(editorPath);
+    resetCropZone(editorPath);
+  });
+  $("ceToggleZone")?.addEventListener("click", () => {
+    if (!editorPath) return;
+    toggleCropZone(editorPath);
+    draw();
+  });
   $("cePrev").addEventListener("click", () => step(-1));
   $("ceNext").addEventListener("click", () => step(1));
   $("ceClose").addEventListener("click", closeCropEditor);
@@ -241,6 +413,7 @@ function openCropEditor(path) {
   build();
   const wasOpen = cropEditorOpen();
   if (!wasOpen) previousFocus = document.activeElement;
+  aspectMode = "free";
   editorPath = path;
   if (!wasOpen) editor().showPopover?.();
   syncAppInert();
@@ -320,8 +493,14 @@ function handleCropEditorKey(event) {
   const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
   if (key === "c") decide(true);
   else if (key === "x") decide(false);
-  else if (key === "r") resetCropZone(editorPath);
-  else if (key === "]" || key === "PageDown") step(1);
+  else if (key === "r") {
+    aspectMode = "free";
+    previewOnly.delete(editorPath);
+    resetCropZone(editorPath);
+  } else if (key === "v" && editorPath) {
+    toggleCropZone(editorPath);
+    draw();
+  } else if (key === "]" || key === "PageDown") step(1);
   else if (key === "[" || key === "PageUp") step(-1);
   else if (["1", "2", "3"].includes(key)) {
     chooseCropLevel(currentGroup(), editorPath, CROP_LEVELS[Number(key) - 1]);

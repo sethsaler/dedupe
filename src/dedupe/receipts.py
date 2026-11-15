@@ -19,7 +19,7 @@ from pathlib import Path
 
 EXECUTED_PREFIX = "action"
 PREVIEW_PREFIX = "preview"
-UNDOABLE_ACTIONS = frozenset({"quarantine", "trash"})
+UNDOABLE_ACTIONS = frozenset({"quarantine", "trash", "crop"})
 
 
 class ReceiptError(RuntimeError):

@@ -19,6 +19,7 @@ from pathlib import Path
 from . import __version__
 from .actions import (
     apply_actions,
+    apply_crops,
     format_bytes,
     isolate_groups,
     summarize_scan,
@@ -120,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Find images and MP4/MOV videos framed by black bars, images framed in "
             "white or another flat colour, and screenshots with "
             "interface at the edges (status bar, app header, navigation bar, reply "
-            "field), and suggest a crop (apply crops in `dedupe ui`, Crop tab)"
+            "field), and suggest a crop (review in `dedupe ui` or apply with --action crop)"
         ),
     )
     scan.add_argument(
@@ -245,10 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument(
         "--action",
-        choices=["none", "trash", "quarantine", "isolate"],
+        choices=["none", "trash", "quarantine", "isolate", "crop"],
         default="none",
         help="Action after scan (default: report only). "
-        "'isolate' copies each group into review folders for human inspection.",
+        "'isolate' copies each group into review folders for human inspection; "
+        "'crop' applies suggested border crops in place (originals go to Trash).",
     )
     scan.add_argument("--quarantine-dir", type=str, default=None)
     scan.add_argument(
@@ -601,7 +603,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "decider": args.decider,
         "find_no_humans": args.find_no_humans,
         "count_faces": args.count_faces,
-        "find_black_borders": args.find_black_borders,
+        "find_black_borders": args.find_black_borders or args.action == "crop",
         "crop_aggressiveness": args.crop_aggressiveness,
         "find_low_resolution": not args.no_low_resolution,
         "low_resolution_images": "images" in args.low_resolution_types,
@@ -658,7 +660,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             f"Faces: {with_faces} file(s) with faces, "
             f"{multi_face} with more than one face ({len(counted)} analyzed)"
         )
-    if args.find_black_borders:
+    if args.find_black_borders or args.action == "crop":
         from .borders import suggested_crop
 
         crop_members = [
@@ -724,6 +726,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.kinds != "all" and args.action == "crop":
+            print(
+                "error: --kinds does not apply to --action crop",
+                file=sys.stderr,
+            )
+            return 2
         if args.kinds == "all":
             action_kinds = None
         elif args.kinds == "duplicates":
@@ -762,6 +770,125 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 roots=result.roots,
                 allow_cross_device=args.allow_cross_device,
             )
+        elif args.action == "crop":
+            from dataclasses import replace as dc_replace
+
+            from .borders import BORDER_LEVELS_SIGNATURE, BORDER_SIGNATURE
+            from .decision_log import append_decisions, make_crop_event
+
+            action_result, outcomes = apply_crops(
+                result.groups,
+                dry_run=dry,
+                roots=result.roots,
+                aggressiveness=args.crop_aggressiveness,
+                workers=args.workers,
+                cancelled=cancel_event.is_set,
+            )
+            if not dry and outcomes:
+                crop_groups_by_path = {
+                    member.path: group
+                    for group in result.groups
+                    if group.kind == GroupKind.CROP
+                    for member in group.members
+                }
+                events = []
+                updated_records = []
+                for path_str, (box, outcome) in outcomes.items():
+                    crop_group = crop_groups_by_path.get(path_str)
+                    member = next(
+                        (m for m in (crop_group.members if crop_group else [])
+                         if m.path == path_str),
+                        None,
+                    )
+                    if member is not None:
+                        pre_crop = dc_replace(member)
+                        events.append(make_crop_event(
+                            "applied",
+                            pre_crop,
+                            box,
+                            group_id=crop_group.id,
+                            source="cli",
+                            adjusted_box=box,
+                            level=args.crop_aggressiveness,
+                            after={
+                                "size": outcome.size,
+                                "width": outcome.width,
+                                "height": outcome.height,
+                                "original_in_trash": outcome.original_in_trash,
+                            },
+                            receipt_path=action_result.log_path,
+                        ))
+                    else:
+                        pre_crop = None
+                    st = outcome.stat
+                    patch = {
+                        "size": int(st.st_size),
+                        "mtime": st.st_mtime,
+                        "mtime_ns": st.st_mtime_ns,
+                        "ctime_ns": st.st_ctime_ns,
+                        "device": st.st_dev,
+                        "inode": st.st_ino,
+                        "width": outcome.width,
+                        "height": outcome.height,
+                        "sha256": None,
+                        "partial_hash": None,
+                        "phash": None,
+                        "dhash": None,
+                        "tile_phashes": None,
+                        "orientation_phashes": None,
+                        "video_fingerprint": None,
+                        "border_crop": "",
+                        "border_signature": BORDER_SIGNATURE,
+                        "border_crop_conservative": "",
+                        "border_crop_aggressive": "",
+                        "border_levels_signature": BORDER_LEVELS_SIGNATURE,
+                    }
+                    for rec in result.files:
+                        if rec.path == path_str:
+                            for k, v in patch.items():
+                                setattr(rec, k, v)
+                            updated_records.append(rec)
+                    for grp in result.groups:
+                        for rec in grp.members:
+                            if rec.path == path_str:
+                                for k, v in patch.items():
+                                    setattr(rec, k, v)
+                    if crop_group is not None and pre_crop is not None:
+                        crop_group.match_details.setdefault("cropped", {})[path_str] = {
+                            "box": box.encode(),
+                            "level": args.crop_aggressiveness,
+                            "levels": {
+                                "balanced": pre_crop.border_crop or "",
+                                "conservative": pre_crop.border_crop_conservative or "",
+                                "aggressive": pre_crop.border_crop_aggressive or "",
+                            },
+                            "original": outcome.original_in_trash,
+                            "after": {"size": outcome.size, "mtime_ns": st.st_mtime_ns},
+                        }
+                        if path_str not in crop_group.reviewed_paths:
+                            crop_group.reviewed_paths.append(path_str)
+                if not args.no_cache and updated_records:
+                    from .cache import HashCache
+
+                    cache = None
+                    try:
+                        cache = HashCache()
+                        cache.store_all(updated_records)
+                    except Exception:
+                        pass
+                    finally:
+                        if cache is not None:
+                            cache.close()
+                if events:
+                    try:
+                        append_decisions(events)
+                    except OSError:
+                        pass
+                if args.json_out:
+                    Path(args.json_out).write_text(
+                        json.dumps(result.to_dict(), indent=2),
+                        encoding="utf-8",
+                    )
         else:
             print(f"error: unknown action {args.action}", file=sys.stderr)
             return 2

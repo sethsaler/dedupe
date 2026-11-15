@@ -738,13 +738,13 @@ def test_undo_rejects_previews_and_unsupported_actions(
         roots=[str(tmp_path)],
         log_dir=tmp_path / "logs",
     )
-    with pytest.raises(ValueError, match="executed trash or quarantine"):
+    with pytest.raises(ValueError, match="executed trash, quarantine, or crop"):
         undo_action(preview.log_path or "", dry_run=False)
 
     receipt = json.loads(Path(action.log_path).read_text(encoding="utf-8"))
     receipt["action"] = "isolate"
     Path(action.log_path).write_text(json.dumps(receipt), encoding="utf-8")
-    with pytest.raises(ValueError, match="executed trash or quarantine"):
+    with pytest.raises(ValueError, match="executed trash, quarantine, or crop"):
         undo_action(action.log_path, dry_run=False)
 
 
@@ -943,3 +943,173 @@ def test_gif_keeper_drift_rechecks_later_frames(tmp_path: Path, change_animation
     valid, error = actions_module._revalidate_keeper(keeper, group)
     assert valid is not change_animation
     assert (error is not None) is change_animation
+
+
+def test_apply_crops_parallel_and_undo_and_tamper_refusal(tmp_path: Path, monkeypatch) -> None:
+    import shutil
+    import uuid
+
+    from PIL import Image
+
+    from dedupe.borders import BORDER_SIGNATURE
+
+    def _framed_png(path: Path) -> FileRecord:
+        img = Image.new("RGB", (320, 240), (0, 0, 0))
+        inner = Image.new("RGB", (320, 160), (40, 140, 210))
+        img.paste(inner, (0, 40))
+        img.save(path)
+        st = path.stat()
+        return FileRecord(
+            path=str(path.resolve()),
+            size=st.st_size,
+            mtime=st.st_mtime,
+            mtime_ns=st.st_mtime_ns,
+            ctime_ns=st.st_ctime_ns,
+            device=st.st_dev,
+            inode=st.st_ino,
+            width=320,
+            height=240,
+            media_type=MediaType.IMAGE,
+            extension=".png",
+            border_crop="0,40,320,200,320,240",
+            border_signature=BORDER_SIGNATURE,
+        )
+
+    trash_dir = tmp_path / "Trash"
+    logs = tmp_path / "logs"
+
+    class _FakeTrashBatch:
+        def __init__(self) -> None:
+            self.dirs = [str(trash_dir)]
+
+        def send(self, src: Path) -> Path:
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            dst = trash_dir / f"{uuid.uuid4().hex}-{src.name}"
+            shutil.move(str(src), str(dst))
+            return dst
+
+    monkeypatch.setattr(actions_module, "TrashBatch", _FakeTrashBatch)
+
+    one = _framed_png(tmp_path / "one.png")
+    two = _framed_png(tmp_path / "two.png")
+    skipped = _framed_png(tmp_path / "skipped.png")
+    protected = _framed_png(tmp_path / "protected.png")
+    protected.protected = True
+
+    group = DuplicateGroup(
+        id="crop-batch",
+        kind=GroupKind.CROP,
+        media_type=MediaType.IMAGE,
+        members=[one, two, skipped, protected],
+        reviewed_paths=[skipped.path],
+    )
+
+    preview, preview_outcomes = actions_module.apply_crops(
+        [group],
+        dry_run=True,
+        roots=[str(tmp_path)],
+        log_dir=logs,
+    )
+    assert preview.success_count == 2 and preview.fail_count == 1
+    failed_items = [item for item in preview.items if not item.ok]
+    assert "protected" in (failed_items[0].error or "").lower()
+    assert preview_outcomes == {}
+    with Image.open(one.path) as im:
+        assert im.size == (320, 240)
+
+    executed, outcomes = actions_module.apply_crops(
+        [group],
+        dry_run=False,
+        roots=[str(tmp_path)],
+        log_dir=logs,
+    )
+    assert executed.success_count == 2 and executed.fail_count == 1
+    assert set(outcomes) == {one.path, two.path}
+    with Image.open(one.path) as im1, Image.open(two.path) as im2, \
+         Image.open(skipped.path) as im_skip, Image.open(protected.path) as im_prot:
+        assert im1.size == (320, 160)
+        assert im2.size == (320, 160)
+        assert im_skip.size == (320, 240)
+        assert im_prot.size == (320, 240)
+
+    receipt = json.loads(Path(executed.log_path).read_text(encoding="utf-8"))
+    assert all(
+        entry.get("after_identity")
+        for entry in receipt["journal"]
+        if entry.get("result", {}).get("ok")
+    )
+
+    undone = undo_action(executed.log_path, dry_run=False)
+    assert undone.action == "undo:crop"
+    assert undone.success_count == 2 and undone.fail_count == 0
+    with Image.open(one.path) as im1, Image.open(two.path) as im2:
+        assert im1.size == (320, 240)
+        assert im2.size == (320, 240)
+
+    # Refresh records after restore, crop again, then tamper with one.png on disk.
+    one = _framed_png(Path(one.path))
+    two = _framed_png(Path(two.path))
+    group2 = DuplicateGroup(
+        id="crop-tamper",
+        kind=GroupKind.CROP,
+        media_type=MediaType.IMAGE,
+        members=[one],
+    )
+    executed2, _ = actions_module.apply_crops(
+        [group2], dry_run=False, roots=[str(tmp_path)], log_dir=logs,
+    )
+    Path(one.path).write_bytes(b"modified-after-crop")
+    tamper_preview = undo_action(executed2.log_path, dry_run=True)
+    assert tamper_preview.fail_count == 1
+    assert "changed after cropping" in (tamper_preview.items[0].error or "")
+
+
+def test_recover_interrupted_crop_journal_distinguishes_completed_and_pending(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    from PIL import Image
+
+    from dedupe.action_journal import ActionJournal, recover_interrupted_actions
+
+    trash_dir = tmp_path / "Trash"
+    trash_dir.mkdir()
+    done_path = tmp_path / "done.png"
+    pending_path = tmp_path / "pending.png"
+    Image.new("RGB", (320, 240), "blue").save(done_path)
+    Image.new("RGB", (320, 240), "red").save(pending_path)
+
+    logs = tmp_path / "logs"
+    journal = ActionJournal(
+        {
+            "action": "crop",
+            "dry_run": False,
+            "session_id": "test-crop-session",
+            "roots": [str(tmp_path)],
+        },
+        [
+            {"path": str(done_path), "size": done_path.stat().st_size, "destination": "Trash"},
+            {
+                "path": str(pending_path),
+                "size": pending_path.stat().st_size,
+                "destination": "Trash",
+            },
+        ],
+        logs,
+    )
+    # Index 0 began, original was moved to Trash preserving identity, and cropped file was written.
+    journal.begin(0, search_dirs=[str(trash_dir)])
+    moved_orig = trash_dir / "done.png"
+    shutil.move(str(done_path), str(moved_orig))
+    Image.new("RGB", (320, 160), "green").save(done_path)
+    journal.close()
+
+    recovered = recover_interrupted_actions(logs)
+    assert len(recovered) == 1
+    receipt = json.loads(Path(recovered[0]["log_path"]).read_text(encoding="utf-8"))
+    by_path = {item["path"]: item for item in receipt["items"]}
+    assert by_path[str(done_path)]["ok"] is True
+    assert by_path[str(done_path)]["destination"] == str(moved_orig)
+    assert by_path[str(pending_path)]["ok"] is False
+    assert "original is still present" in by_path[str(pending_path)]["error"]

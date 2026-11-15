@@ -365,3 +365,120 @@ def test_web_bulk_level_and_crop_all_use_it(tmp_path: Path, monkeypatch) -> None
     for path, size in expected.items():
         with Image.open(path) as cropped:
             assert cropped.size == size
+
+
+def test_web_crop_all_images_filter_and_action_undo_reconciles_crop_group(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEDUPE_THUMBNAIL_CACHE_DIR", str(tmp_path / "thumbs"))
+    media = tmp_path / "media"
+    media.mkdir()
+    img1 = _save(_framed(320, 240, top=40), media / "one.png")
+    img2 = _save(_framed(320, 240, top=40), media / "two.png")
+    vid = media / "clip.mp4"
+    vid.write_bytes(b"placeholder-video")
+
+    rec1 = _record(img1)
+    rec2 = _record(img2)
+    vid_stat = vid.stat()
+    vid_rec = FileRecord(
+        path=str(vid),
+        size=vid_stat.st_size,
+        mtime=vid_stat.st_mtime,
+        mtime_ns=vid_stat.st_mtime_ns,
+        ctime_ns=vid_stat.st_ctime_ns,
+        device=vid_stat.st_dev,
+        inode=vid_stat.st_ino,
+        width=640,
+        height=480,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        border_crop="0,60,640,420,640,480",
+        border_signature=BORDER_SIGNATURE,
+        border_crop_conservative="0,60,640,420,640,480",
+        border_crop_aggressive="0,60,640,420,640,480",
+        border_levels_signature=BORDER_LEVELS_SIGNATURE,
+    )
+    analyze_borders([rec1, rec2])
+    records = [rec1, rec2, vid_rec]
+    groups = build_crop_groups(records)
+    group = next(g for g in groups if g.kind == GroupKind.CROP)
+
+    class _CollisionSafeTrash:
+        trash_dir = tmp_path / "Trash"
+        counter = 0
+
+        def send(self, src: Path) -> Path:
+            self.trash_dir.mkdir(parents=True, exist_ok=True)
+            type(self).counter += 1
+            dst = self.trash_dir / f"{type(self).counter}-{src.name}"
+            shutil.move(str(src), str(dst))
+            return dst
+
+    monkeypatch.setattr(web_app, "TrashBatch", _CollisionSafeTrash)
+    from dedupe import actions as actions_module
+
+    monkeypatch.setattr(actions_module, "TrashBatch", _CollisionSafeTrash)
+    monkeypatch.setattr(web_app, "restore_original_in_place", borders.restore_original_in_place)
+
+    from dedupe.models import ScanResult
+
+    cache_path = tmp_path / "cache.sqlite3"
+    result = ScanResult(roots=[str(media)], files=records, groups=groups)
+    app = create_app(result, review_session_path=tmp_path / "session.json", cache_path=cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    bad_filter = client.post(
+        "/api/crop/apply-all",
+        json={"group_id": group.id, "scan_id": scan_id, "media_filter": "audio"},
+        headers=headers,
+    )
+    assert bad_filter.status_code == 400
+
+    applied = client.post(
+        "/api/crop/apply-all",
+        json={"group_id": group.id, "scan_id": scan_id, "media_filter": "images"},
+        headers=headers,
+    )
+    assert applied.status_code == 200
+    payload = applied.get_json()
+    assert payload["cropped_count"] == 2
+    assert payload["log_path"]
+    by_path = {m["path"]: m for m in payload["members"]}
+    assert by_path[rec1.path]["crop_state"] == "cropped"
+    assert by_path[rec2.path]["crop_state"] == "cropped"
+    assert by_path[vid_rec.path]["crop_state"] == "pending"
+
+    # Undo the batch receipt via /api/action/undo and verify live Crop group resets to pending.
+    preview = client.post(
+        "/api/action/undo",
+        json={"receipts": [payload["log_path"]], "scan_id": scan_id, "dry_run": True},
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    token = preview.get_json()["preview_token"]
+
+    undone = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [payload["log_path"]],
+            "scan_id": scan_id,
+            "dry_run": False,
+            "preview_token": token,
+        },
+        headers=headers,
+    )
+    assert undone.status_code == 200
+    assert undone.get_json()["success_count"] == 2
+
+    refreshed = client.get(f"/api/groups/{group.id}").get_json()
+    states = {m["path"]: m["crop_state"] for m in refreshed["members"]}
+    assert states[rec1.path] == "pending"
+    assert states[rec2.path] == "pending"
+    assert states[vid_rec.path] == "pending"
+    with Image.open(img1) as im1, Image.open(img2) as im2:
+        assert im1.size == (320, 240)
+        assert im2.size == (320, 240)

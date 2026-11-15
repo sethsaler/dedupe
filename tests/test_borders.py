@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -3675,3 +3676,92 @@ def test_only_mp4_family_videos_are_croppable(tmp_path: Path) -> None:
     assert not borders.is_croppable(record("clip.webm", MediaType.VIDEO))
     assert borders.is_croppable(record("photo.jpg", MediaType.IMAGE))
     assert not borders.is_croppable(record("clip.mp4", MediaType.IMAGE))
+
+
+def test_editable_folder_concurrent_crops_keep_readonly_mode(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+    folder = tmp_path / "readonly"
+    folder.mkdir()
+    first = _save(_framed(320, 240, top=40, bottom=40), folder / "first.png")
+    second = _save(_framed(320, 240, top=40, bottom=40), folder / "second.png")
+    first_rec = _record(first)
+    second_rec = _record(second)
+    trash_dir = tmp_path / "trash"
+    trash_dir.mkdir()
+    trash_lock = threading.Lock()
+
+    def send_to_trash(src: Path) -> Path:
+        with trash_lock:
+            dst = trash_dir / src.name
+            shutil.move(str(src), str(dst))
+            return dst
+
+    box = CropBox(left=0, top=40, right=320, bottom=200, width=320, height=240)
+    entered = threading.Barrier(2)
+    exiting = threading.Barrier(2)
+    os.chmod(folder, 0o555)
+    errors: list[BaseException] = []
+
+    def worker(record: FileRecord) -> None:
+        try:
+            with borders.editable_folder(folder):
+                entered.wait(timeout=5)
+                assert stat.S_IMODE(folder.stat().st_mode) & 0o200
+                exiting.wait(timeout=5)
+            crop_file_in_place(record, box, send_to_trash=send_to_trash)
+        except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+            errors.append(exc)
+
+    try:
+        t1 = threading.Thread(target=worker, args=(first_rec,))
+        t2 = threading.Thread(target=worker, args=(second_rec,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not errors
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o555
+        with Image.open(first) as im1, Image.open(second) as im2:
+            assert im1.size == (320, 160)
+            assert im2.size == (320, 160)
+    finally:
+        os.chmod(folder, 0o755)
+
+
+def test_video_thumbnail_bytes_skips_black_intro_and_honors_variant(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available")
+    from io import BytesIO
+
+    from dedupe.web import media as web_media
+
+    clip = tmp_path / "intro_black.mp4"
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=640x480:r=10:d=1",
+            "-f", "lavfi", "-i", "color=c=orange:s=640x480:r=10:d=3",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p[v]",
+            "-map", "[v]", "-c:v", "libx264", "-t", "4", "-y", str(clip),
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0 or not clip.is_file():
+        pytest.skip("ffmpeg libx264 synthetic test clip unavailable")
+
+    monkeypatch.setattr(
+        web_media, "VARIANT_MAX_SIDE", {"thumb": 320, "preview": 640, "full": None},
+    )
+    thumb = web_media.video_thumbnail_bytes(clip, variant="thumb")
+    preview = web_media.video_thumbnail_bytes(clip, variant="preview")
+    assert thumb is not None and preview is not None
+    lit, _score = web_media._video_frame_is_lit(thumb)
+    assert lit is True
+    with Image.open(BytesIO(thumb)) as thumb_img, Image.open(BytesIO(preview)) as preview_img:
+        assert max(thumb_img.size) == 320
+        assert max(preview_img.size) == 640

@@ -7,6 +7,7 @@ only when its destination still matches the content saved before the move.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -118,8 +119,14 @@ class ActionJournal:
             self._append(index, entry)
 
     def record(self, index: int, item: dict):
+        after_identity = None
+        if self.data.get("action") == "crop" and item.get("ok"):
+            with contextlib.suppress(OSError):
+                after_identity = _identity(Path(self.data["journal"][index]["path"]))
         with self.lock:
             entry = self.data["journal"][index]
+            if after_identity is not None:
+                entry["after_identity"] = after_identity
             uncertain = (
                 entry["state"] == "moving" and not item["ok"]
                 and not Path(entry["path"]).exists()
@@ -156,9 +163,78 @@ def _matches(path: Path, identity: dict) -> bool:
         return False
 
 
+def _recover_crop_entry(entry: dict, action: str) -> dict:
+    source = Path(entry["path"])
+    item = {"path": str(source), "action": action, "size": entry.get("size"), "ok": False}
+    identity = entry.get("identity", {})
+    if entry.get("state") == "pending":
+        if source.exists() or source.is_symlink():
+            item["error"] = "interrupted before crop; original is still present"
+            entry["recovery"] = "original_present"
+        else:
+            item["error"] = "original is missing; no crop was recorded"
+            entry["recovery"] = "uncertain"
+        return item
+
+    try:
+        st = source.lstat()
+        same_file = (st.st_dev, st.st_ino) == (
+            identity.get("device"), identity.get("inode"),
+        )
+    except OSError:
+        st = None
+        same_file = False
+
+    if same_file and _matches(source, identity):
+        item["error"] = "interrupted before crop; original is still present"
+        entry["recovery"] = "original_present"
+        return item
+
+    candidates: list[Path] = []
+    if entry.get("destination") and entry["destination"] != "Trash":
+        candidates = [Path(entry["destination"])]
+    else:
+        for directory in entry.get("search_dirs", []):
+            try:
+                candidates.extend(
+                    path for path in Path(directory).iterdir()
+                    if path.name == source.name or path.name.startswith(f"{source.stem} ")
+                    or path.name.startswith(f"{source.stem}_")
+                )
+            except OSError:
+                continue
+        same_files = []
+        for candidate in candidates:
+            try:
+                c_stat = candidate.lstat()
+                if (c_stat.st_dev, c_stat.st_ino) == (
+                    identity.get("device"), identity.get("inode"),
+                ):
+                    same_files.append(candidate)
+            except OSError:
+                pass
+        candidates = same_files
+    matches = [p for p in candidates if _matches(p, identity)]
+    if len(matches) == 1 and st is not None and not source.is_symlink() and S_ISREG(st.st_mode):
+        with contextlib.suppress(OSError):
+            entry["after_identity"] = _identity(source)
+        item.update(
+            ok=True,
+            destination=str(matches[0]),
+            size=identity.get("size") or entry.get("size"),
+        )
+        entry["recovery"] = "confirmed"
+    else:
+        item["error"] = "crop interrupted; destination could not be identified safely"
+        entry["recovery"] = "uncertain"
+    return item
+
+
 def _recover_entry(entry: dict, action: str) -> dict:
     if entry.get("state") == "complete":
         return entry["result"]
+    if action == "crop":
+        return _recover_crop_entry(entry, action)
     source = Path(entry["path"])
     item = {"path": str(source), "action": action, "size": entry.get("size"), "ok": False}
     if source.exists() or source.is_symlink():

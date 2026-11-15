@@ -540,3 +540,82 @@ def test_semantic_full_speed_flag_reaches_the_engine(tmp_path: Path, monkeypatch
     assert captured["semantic_full_speed"] is False
     assert cli.main([str(tmp_path), "--semantic", "--semantic-full-speed"]) == 0
     assert captured["semantic_full_speed"] is True
+
+
+def test_cli_crop_action_auto_enables_borders_persists_cache_and_undoes(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import shutil
+
+    import numpy as np
+    from PIL import Image
+
+    from dedupe import actions as actions_module
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEDUPE_CACHE_PATH", str(tmp_path / "cache.sqlite3"))
+
+    trash_dir = tmp_path / "Trash"
+
+    class _FakeTrashBatch:
+        counter = 0
+
+        def __init__(self) -> None:
+            self.dirs = [str(trash_dir)]
+
+        def send(self, src: Path) -> Path:
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            type(self).counter += 1
+            dst = trash_dir / f"{type(self).counter}-{src.name}"
+            shutil.move(str(src), str(dst))
+            return dst
+
+    monkeypatch.setattr(actions_module, "TrashBatch", _FakeTrashBatch)
+
+    media = tmp_path / "media"
+    media.mkdir()
+    canvas = np.zeros((240, 320, 3), dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    canvas[40:200] = rng.integers(60, 220, size=(160, 320, 3), dtype=np.uint8)
+    target = media / "letterbox.png"
+    Image.fromarray(canvas).save(target)
+
+    # Reject --kinds when paired with --action crop.
+    assert cli.main([str(media), "--action", "crop", "--kinds", "exact"]) == 2
+    assert "does not apply to --action crop" in capsys.readouterr().err
+
+    # Dry-run auto-enables border detection without --find-black-borders and writes no crop.
+    assert cli.main([str(media), "--action", "crop"]) == 0
+    out = capsys.readouterr().out
+    assert "DRY-RUN crop: 1 ok, 0 failed" in out
+    with Image.open(target) as im:
+        assert im.size == (320, 240)
+
+    # Execute crops in place, updates json-out, and persists clean cache verdict.
+    report = tmp_path / "report.json"
+    assert cli.main(
+        [str(media), "--action", "crop", "--execute", "--json", str(report)]
+    ) == 0
+    exec_out = capsys.readouterr().out
+    assert "EXECUTED crop: 1 ok, 0 failed" in exec_out
+    with Image.open(target) as im:
+        cropped_size = im.size
+        assert cropped_size[1] < 240
+    report_data = json.loads(report.read_text(encoding="utf-8"))
+    crop_groups = [g for g in report_data["groups"] if g["kind"] == "crop"]
+    assert crop_groups and str(target.resolve()) in crop_groups[0]["match_details"]["cropped"]
+
+    # Subsequent border scan skips already-cropped file via cached clean verdict.
+    second_report = tmp_path / "second.json"
+    assert cli.main([str(media), "--find-black-borders", "--json", str(second_report)]) == 0
+    capsys.readouterr()
+    second_data = json.loads(second_report.read_text(encoding="utf-8"))
+    assert not any(g["kind"] == "crop" for g in second_data["groups"])
+
+    # CLI undo restores original dimensions from Trash.
+    log_line = next(line for line in exec_out.splitlines() if line.startswith("Log: "))
+    receipt_path = log_line.split("Log: ", 1)[1].strip()
+    assert cli.main(["undo", receipt_path, "--execute"]) == 0
+    assert "EXECUTED undo: 1 ok" in capsys.readouterr().out
+    with Image.open(target) as im:
+        assert im.size == (320, 240)

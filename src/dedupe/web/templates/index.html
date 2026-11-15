@@ -452,6 +452,10 @@
             <button class="btn primary-soft" id="btnCropAll" type="button" hidden>
               Crop all remaining
             </button>
+            <button class="btn ghost" id="btnCropImages" type="button" hidden>
+              Crop images only
+            </button>
+            <span class="crop-progress" id="cropProgress" role="status" hidden></span>
             <button class="btn ghost" id="btnToggleCropZones" type="button" hidden aria-pressed="true" title="Hide every suggested crop zone to see the untouched pictures; show them again to see what a crop removes">
               Hide crop zones
             </button>
@@ -761,7 +765,11 @@
     <div class="ce-stage" id="ceStage">
       <div class="ce-frame" id="ceFrame">
         <img class="ce-image" id="ceImage" alt="" draggable="false" />
-        <span class="ce-box" id="ceBox" tabindex="0" role="group"></span>
+        <div class="crop-shade" id="ceShade" aria-hidden="true">
+          <div class="crop-shade-hole" id="ceShadeHole"></div>
+        </div>
+        <div class="crop-snap-guides" id="ceGuides" aria-hidden="true"></div>
+        <span class="ce-box crop-box" id="ceBox" tabindex="0" role="group"></span>
       </div>
     </div>
     <aside class="ce-panel">
@@ -793,11 +801,22 @@
           <button class="linkish ce-keep" data-side="left" type="button" title="Cut nothing from the left">Keep side</button>
         </div>
       </fieldset>
+      <div class="ce-aspect" role="group" aria-label="Aspect ratio preset">
+        <span class="ce-aspect-label">Aspect</span>
+        <div class="ce-aspect-chips" id="ceAspect">
+          <button class="crop-level-btn chosen" type="button" data-aspect="free" aria-pressed="true">Free</button>
+          <button class="crop-level-btn" type="button" data-aspect="original" aria-pressed="false">Original</button>
+          <button class="crop-level-btn" type="button" data-aspect="16:9" aria-pressed="false">16:9</button>
+          <button class="crop-level-btn" type="button" data-aspect="4:3" aria-pressed="false">4:3</button>
+          <button class="crop-level-btn" type="button" data-aspect="1:1" aria-pressed="false">1:1</button>
+        </div>
+      </div>
       <div class="ce-levels" id="ceLevels"></div>
       <div class="ce-actions">
         <button class="btn primary" id="ceApply" type="button" title="Crop to the zone shown — the original goes to the Trash (c)">Crop</button>
         <button class="btn ghost" id="ceSkip" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>
         <button class="btn ghost" id="ceReset" type="button" title="Put the suggested zone back (r)">Reset zone</button>
+        <button class="btn ghost" id="ceToggleZone" type="button" aria-pressed="true" title="Hide the crop zone to see the untouched picture (v)">Hide zone</button>
       </div>
       <div class="ce-nav">
         <button class="btn ghost" id="cePrev" type="button" title="Previous file to review ([)">‹ Previous</button>
@@ -806,7 +825,7 @@
       <p class="ce-hint">
         Drag the zone or its edges; an edge lands on the edges found at each level and on the picture's own edge (hold <kbd>Alt</kbd> to place it freely).
         <kbd>←↑↓→</kbd> move the zone, <kbd>⇧</kbd> its bottom and right edges, <kbd>Alt</kbd> its top and left edges.
-        <kbd>c</kbd> crop · <kbd>x</kbd> skip · <kbd>r</kbd> reset · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> level · <kbd>[</kbd> <kbd>]</kbd> previous / next · <kbd>Esc</kbd> done
+        <kbd>c</kbd> crop · <kbd>x</kbd> skip · <kbd>r</kbd> reset · <kbd>v</kbd> hide zone · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> level · <kbd>[</kbd> <kbd>]</kbd> previous / next · <kbd>Esc</kbd> done
       </p>
       <button class="btn ghost ce-close" id="ceClose" type="button">Done</button>
     </aside>

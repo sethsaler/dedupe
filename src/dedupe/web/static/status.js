@@ -205,7 +205,10 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (s.scan_settings?.paths?.length) state.lastScanSettings = s.scan_settings;
   $("btnRetryAnalysis").disabled = state.scanning || state.acting || !state.lastScanSettings;
   window.dispatchEvent(new CustomEvent("dedupe:work-state", { detail: {
-    busy: state.scanning || state.acting, scanId: state.scanId, done: s.progress?.done,
+    busy: state.scanning || state.acting,
+    scanId: state.scanId,
+    done: s.progress?.done,
+    cropProgress: s.crop_progress || null,
   } }));
   renderSession(s.review_session, s.progress?.message === "Resumed saved review");
   document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {

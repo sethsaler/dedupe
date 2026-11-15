@@ -16,7 +16,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
-from dataclasses import replace
+from dataclasses import asdict, replace
 from itertools import combinations
 from pathlib import Path
 from urllib.parse import urlparse
@@ -30,12 +30,15 @@ from flask import (
     send_file,
 )
 
+from ..action_journal import _identity as _file_identity
+from ..action_journal import atomic_json
 from ..actions import (
     ActionItem,
     ActionResult,
     TrashBatch,
     _write_action_log,
     apply_actions,
+    apply_crops,
     format_bytes,
     isolate_groups,
     undo_action,
@@ -43,6 +46,7 @@ from ..actions import (
 )
 from ..borders import (
     BORDER_DISMISSED,
+    BORDER_LEVELS_SIGNATURE,
     BORDER_SIGNATURE,
     CROP_LEVELS,
     CropBox,
@@ -77,6 +81,7 @@ from ..keep_decisions import update_keep_decisions
 from ..media_details import comparison_details
 from ..models import (
     GroupKind,
+    MediaType,
     ReviewPolicy,
     ScanProgress,
     ScanResult,
@@ -88,6 +93,7 @@ from ..people_score import (
     people_scoring_available,
     score_people,
 )
+from ..receipts import receipt_filename, resolve_log_dir
 from ..review_session import (
     ReviewSessionLoad,
     discard_review_session,
@@ -650,6 +656,8 @@ def create_app(
             "total": 0,
             "error": None,
         },
+        # Active batch crop progress ({done, total} or None).
+        "crop_progress": None,
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -1140,6 +1148,7 @@ def create_app(
             "decision_log_error": state["decision_log_error"],
             "trash_undo_cleared": state["trash_undo_cleared"],
             "recovered_actions": len(recovered_actions),
+            "crop_progress": state["crop_progress"],
             "scan_settings": state.get("last_scan_settings") or (result.scan_settings if result else {}),
             "system": {
                 "cpu_count": cpu,
@@ -2347,27 +2356,54 @@ def create_app(
             kept.append(group)
         result.groups = kept
 
-    def store_border_verdict(record, verdict: str) -> None:
-        """Remember a crop verdict for this exact file content across scans."""
+    def store_crop_records(records: list) -> None:
+        """Persist updated post-crop or restored border verdicts to HashCache."""
+        if not records:
+            return
         cache = None
         try:
             cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
-            cache.store_all([
-                replace(record, border_crop=verdict, border_signature=BORDER_SIGNATURE)
-            ])
+            cache.store_all(records)
         except (OSError, sqlite3.Error):
-            pass  # the decision still applies to this review; it just is not cached
+            pass
         finally:
             if cache is not None:
                 cache.close()
 
-    def write_crop_receipt(items: list) -> str | None:
+    def store_border_verdict(record, verdict: str) -> None:
+        """Remember a crop verdict for this exact file content across scans."""
+        store_crop_records([
+            replace(record, border_crop=verdict, border_signature=BORDER_SIGNATURE)
+        ])
+
+    def _safe_file_identity(path: Path) -> dict | None:
+        try:
+            return _file_identity(path)
+        except OSError:
+            return None
+
+    def write_crop_receipt(items: list, *, journal: list[dict] | None = None) -> str | None:
         if not items:
             return None
-        receipt = ActionResult(dry_run=False, action="crop", items=items)
         from datetime import UTC, datetime
 
+        receipt = ActionResult(dry_run=False, action="crop", items=items)
         receipt.completed_at = datetime.now(UTC).isoformat()
+        if journal is not None:
+            log_base = resolve_log_dir(None)
+            try:
+                log_base.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+                log_path = log_base / receipt_filename(
+                    dry_run=False, stamp=stamp, session_id=receipt.session_id
+                )
+                receipt.log_path = str(log_path)
+                payload = receipt.to_dict()
+                payload.update(status="complete", journal_version=1, journal=journal)
+                atomic_json(log_path, payload)
+                return receipt.log_path
+            except OSError:
+                receipt.log_path = None
         _write_action_log(receipt)
         return receipt.log_path
 
@@ -2448,6 +2484,7 @@ def create_app(
             "border_signature": BORDER_SIGNATURE,
             "border_crop_conservative": "",
             "border_crop_aggressive": "",
+            "border_levels_signature": BORDER_LEVELS_SIGNATURE,
         })
         drop_from_exact_groups_locked(member.path)
 
@@ -2565,19 +2602,32 @@ def create_app(
             state["acting"] = True
             roots = list(state["result"].roots)
         try:
+            before_id = _safe_file_identity(Path(member.path))
             outcome, box, error = crop_member(member, roots, TrashBatch(), box=requested)
             if error:
                 return jsonify({"error": error}), 400
-            log_path = write_crop_receipt([
-                ActionItem(
-                    path=member.path,
-                    ok=True,
-                    action="crop",
-                    destination=outcome.original_in_trash,
-                    group_id=group.id,
-                    size=member.size,
-                )
-            ])
+            after_id = _safe_file_identity(Path(member.path))
+            crop_item = ActionItem(
+                path=member.path,
+                ok=True,
+                action="crop",
+                destination=outcome.original_in_trash,
+                group_id=group.id,
+                size=member.size,
+            )
+            journal_entry = {
+                "path": member.path,
+                "size": member.size,
+                "destination": outcome.original_in_trash or "Trash",
+                "group_id": group.id,
+                "state": "complete",
+                "result": asdict(crop_item),
+            }
+            if before_id is not None:
+                journal_entry["identity"] = before_id
+            if after_id is not None:
+                journal_entry["after_identity"] = after_id
+            log_path = write_crop_receipt([crop_item], journal=[journal_entry])
             log_decisions([make_crop_event(
                 "applied", replace(member), suggested_crop(member, level) or box,
                 group_id=group.id, scan_id=state["scan_id"], source="single",
@@ -2590,9 +2640,11 @@ def create_app(
             )])
             with lock:
                 record_crop_locked(group, member, box, outcome)
+                snapshot = replace(member)
                 payload = finish_crop_locked(group)
                 payload["log_path"] = log_path
-                return jsonify(payload)
+            store_crop_records([snapshot])
+            return jsonify(payload)
         finally:
             with lock:
                 state["acting"] = False
@@ -2601,6 +2653,9 @@ def create_app(
     def api_crop_apply_all():
         """Crop every file in the review that has no decision yet."""
         data = request.get_json(silent=True) or {}
+        media_filter = data.get("media_filter") or "all"
+        if media_filter not in ("all", "images"):
+            return jsonify({"error": "media_filter must be 'all' or 'images'"}), 400
         with lock:
             group, refusal = begin_crop_work(data)
             if refusal:
@@ -2612,55 +2667,78 @@ def create_app(
                 m for m in group.members
                 if m.path not in decided
                 and not m.protected
+                and (media_filter != "images" or m.media_type != MediaType.VIDEO)
                 and effective_crop(group, m) is not None
             ]
+            boxes_by_path = {m.path: effective_crop(group, m) for m in pending}
+            levels_by_path = {m.path: chosen_crop_level(group, m) for m in pending}
             state["acting"] = True
+            state["crop_progress"] = {"done": 0, "total": len(pending)} if pending else None
             roots = list(state["result"].roots)
         try:
-            batch = TrashBatch()
-            items, failures, done = [], [], []
-            for member in pending:
-                outcome, box, error = crop_member(
-                    member, roots, batch, box=effective_crop(group, member)
+            done: list[tuple] = []
+            failures: list[dict] = []
+            log_path = None
+            if pending:
+                def on_progress(done_count: int, total_count: int, _path: str) -> None:
+                    with lock:
+                        state["crop_progress"] = {"done": done_count, "total": total_count}
+
+                batch_group = replace(
+                    group,
+                    members=pending,
+                    reviewed_paths=[],
+                    match_details={"crop_level": group.match_details.get("crop_level")},
                 )
-                if error:
-                    failures.append({"path": member.path, "error": error})
-                    continue
-                done.append((member, box, outcome))
-                items.append(ActionItem(
-                    path=member.path,
-                    ok=True,
-                    action="crop",
-                    destination=outcome.original_in_trash,
-                    group_id=group.id,
-                    size=member.size,
-                ))
-            log_path = write_crop_receipt(items)
-            log_decisions([
-                make_crop_event(
-                    "applied", replace(member),
-                    suggested_crop(member, chosen_crop_level(group, member)) or box,
-                    group_id=group.id, scan_id=state["scan_id"], source="bulk",
-                    adjusted_box=box, level=chosen_crop_level(group, member),
-                    after={
-                        "size": outcome.size, "width": outcome.width,
-                        "height": outcome.height,
-                        "original_in_trash": outcome.original_in_trash,
-                    },
-                    receipt_path=log_path,
+                action_result, outcomes = apply_crops(
+                    [batch_group],
+                    dry_run=False,
+                    roots=roots,
+                    boxes_by_path=boxes_by_path,
+                    media_filter=media_filter,
+                    progress=on_progress,
+                    trash_batch_factory=TrashBatch,
                 )
-                for member, box, outcome in done
-            ])
+                log_path = action_result.log_path
+                for member in pending:
+                    entry = outcomes.get(member.path)
+                    if entry is not None:
+                        box, outcome = entry
+                        done.append((member, box, outcome))
+                failures = [
+                    {"path": item.path, "error": item.error}
+                    for item in action_result.items
+                    if not item.ok
+                ]
+                log_decisions([
+                    make_crop_event(
+                        "applied", replace(member),
+                        suggested_crop(member, levels_by_path[member.path]) or box,
+                        group_id=group.id, scan_id=state["scan_id"], source="bulk",
+                        adjusted_box=box, level=levels_by_path[member.path],
+                        after={
+                            "size": outcome.size, "width": outcome.width,
+                            "height": outcome.height,
+                            "original_in_trash": outcome.original_in_trash,
+                        },
+                        receipt_path=log_path,
+                    )
+                    for member, box, outcome in done
+                ])
+            snapshots = []
             with lock:
                 for member, box, outcome in done:
                     record_crop_locked(group, member, box, outcome)
+                    snapshots.append(replace(member))
                 payload = finish_crop_locked(group)
                 payload["cropped_count"] = len(done)
                 payload["failures"] = failures
                 payload["log_path"] = log_path
-                return jsonify(payload)
+            store_crop_records(snapshots)
+            return jsonify(payload)
         finally:
             with lock:
+                state["crop_progress"] = None
                 state["acting"] = False
 
     @app.post("/api/crop/skip")
@@ -2820,9 +2898,14 @@ def create_app(
                     "border_signature": BORDER_SIGNATURE,
                     "border_crop_conservative": levels.get("conservative", ""),
                     "border_crop_aggressive": levels.get("aggressive", ""),
+                    "border_levels_signature": BORDER_LEVELS_SIGNATURE,
                 })
                 update_records_locked(path, before)
-                return jsonify(finish_crop_locked(group))
+                snapshot = replace(member) if member is not None else None
+                payload = finish_crop_locked(group)
+            if snapshot is not None:
+                store_crop_records([snapshot])
+            return jsonify(payload)
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -3602,12 +3685,99 @@ def create_app(
                     }
                 ), 400
             executed = [
-                undo_action(reference, dry_run=False) for reference in receipts
+                undo_action(reference, dry_run=False, trash_batch_factory=TrashBatch)
+                for reference in receipts
             ]
+            crop_reconciled = False
+            restored_snapshots = []
+            crop_undo_events = []
+            for run in executed:
+                if run.action != "undo:crop":
+                    continue
+                for undone_item in run.items:
+                    if not undone_item.ok or not undone_item.destination:
+                        continue
+                    restored_path = undone_item.destination
+                    try:
+                        restored_stat = os.lstat(restored_path)
+                    except OSError:
+                        restored_stat = None
+                    with lock:
+                        cur_result: ScanResult | None = state["result"]
+                        crop_group = (
+                            next((g for g in cur_result.groups if g.kind == GroupKind.CROP), None)
+                            if cur_result is not None
+                            else None
+                        )
+                        if crop_group is None:
+                            continue
+                        entry = (crop_group.match_details.get("cropped") or {}).pop(
+                            restored_path, None
+                        )
+                        if entry is None:
+                            continue
+                        (crop_group.match_details.get("adjusted_crops") or {}).pop(
+                            restored_path, None
+                        )
+                        crop_group.reviewed_paths = [
+                            p for p in crop_group.reviewed_paths if p != restored_path
+                        ]
+                        member = next(
+                            (m for m in crop_group.members if m.path == restored_path),
+                            None,
+                        )
+                        if member is not None:
+                            crop_undo_events.append(make_crop_event(
+                                "undone", replace(member, **(entry.get("before") or {})),
+                                CropBox.decode(entry["box"]),
+                                group_id=crop_group.id, scan_id=state["scan_id"],
+                                source="receipt",
+                                level=entry.get("level") or "balanced",
+                            ))
+                        before = dict(entry.get("before") or {})
+                        levels = dict(entry.get("levels") or {})
+                        applied_level = entry.get("level") or "balanced"
+                        if applied_level in CROP_LEVELS:
+                            levels[applied_level] = entry["box"]
+                        if restored_stat is not None:
+                            before.update({
+                                "size": int(restored_stat.st_size),
+                                "mtime": restored_stat.st_mtime,
+                                "mtime_ns": restored_stat.st_mtime_ns,
+                                "ctime_ns": restored_stat.st_ctime_ns,
+                                "device": restored_stat.st_dev,
+                                "inode": restored_stat.st_ino,
+                            })
+                        before.update({
+                            "border_crop": levels.get("balanced", entry["box"]),
+                            "border_signature": BORDER_SIGNATURE,
+                            "border_crop_conservative": levels.get("conservative", ""),
+                            "border_crop_aggressive": levels.get("aggressive", ""),
+                            "border_levels_signature": BORDER_LEVELS_SIGNATURE,
+                        })
+                        update_records_locked(restored_path, before)
+                        if member is not None:
+                            restored_snapshots.append(replace(member))
+                        crop_reconciled = True
+            if crop_undo_events:
+                log_decisions(crop_undo_events)
+            if crop_reconciled:
+                with lock:
+                    cur_result = state["result"]
+                    if cur_result is not None:
+                        crop_group = next(
+                            (g for g in cur_result.groups if g.kind == GroupKind.CROP),
+                            None,
+                        )
+                        if crop_group is not None:
+                            finish_crop_locked(crop_group)
+            if restored_snapshots:
+                store_crop_records(restored_snapshots)
             result = ActionResult(dry_run=False, action="undo")
             result.items = [item for run in executed for item in run.items]
             payload = result.to_dict()
             payload["log_paths"] = [run.log_path for run in executed if run.log_path]
+            payload["crop_reconciled"] = crop_reconciled
             return jsonify(payload)
         except ReceiptError as exc:
             return jsonify({"error": str(exc)}), 404

@@ -3129,30 +3129,55 @@ def _relock(path: Path, lock_bits: int) -> None:
         set_file_flags(path, file_flags(path) | lock_bits)
 
 
+_FOLDER_EDIT_LOCK = threading.Lock()
+_ACTIVE_FOLDERS: dict[Path, list] = {}
+
+
 @contextlib.contextmanager
 def editable_folder(folder: Path) -> Iterator[None]:
     """Let entries be added to and renamed in ``folder`` for the duration.
 
     Lifts a Finder lock and adds the owner's write bit when either is missing,
-    then restores both exactly as they were.
+    then restores both exactly as they were. Reference-counted per resolved
+    folder so concurrent workers in the same directory do not re-lock a folder
+    while another worker is still swapping a file into it.
     """
-    st = os.lstat(folder)
-    flags = int(getattr(st, "st_flags", 0))
-    _refuse_system_lock(folder, flags)
-    lock_bits = flags & USER_LOCK_FLAGS
-    mode = stat.S_IMODE(st.st_mode)
-    add_write = not mode & stat.S_IWUSR
-    if lock_bits:
-        set_file_flags(folder, flags & ~lock_bits)
+    key = folder.resolve(strict=False)
+    with _FOLDER_EDIT_LOCK:
+        entry = _ACTIVE_FOLDERS.get(key)
+        if entry is not None:
+            st = os.lstat(folder)
+            _refuse_system_lock(folder, int(getattr(st, "st_flags", 0)))
+            entry[0] += 1
+        else:
+            st = os.lstat(folder)
+            flags = int(getattr(st, "st_flags", 0))
+            _refuse_system_lock(folder, flags)
+            lock_bits = flags & USER_LOCK_FLAGS
+            mode = stat.S_IMODE(st.st_mode)
+            add_write = not mode & stat.S_IWUSR
+            if lock_bits:
+                set_file_flags(folder, flags & ~lock_bits)
+            try:
+                if add_write:
+                    os.chmod(folder, mode | stat.S_IWUSR)
+            except BaseException:
+                _relock(folder, lock_bits)
+                raise
+            _ACTIVE_FOLDERS[key] = [1, mode, add_write, lock_bits]
     try:
-        if add_write:
-            os.chmod(folder, mode | stat.S_IWUSR)
         yield
     finally:
-        if add_write:
-            with contextlib.suppress(OSError):
-                os.chmod(folder, mode)
-        _relock(folder, lock_bits)
+        with _FOLDER_EDIT_LOCK:
+            entry = _ACTIVE_FOLDERS[key]
+            entry[0] -= 1
+            if entry[0] == 0:
+                _ACTIVE_FOLDERS.pop(key, None)
+                _, orig_mode, did_add_write, orig_lock_bits = entry
+                if did_add_write:
+                    with contextlib.suppress(OSError):
+                        os.chmod(folder, orig_mode)
+                _relock(folder, orig_lock_bits)
 
 
 def _unlock_file(path: Path) -> int:

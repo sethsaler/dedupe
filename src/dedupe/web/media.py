@@ -20,7 +20,7 @@ from ..models import VIDEO_EXTS as VIDEO_EXTENSIONS
 
 BROWSER_SAFE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
 
-THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v6"
+THUMBNAIL_CACHE_VERSION = "dedupe-thumbs-v7"
 DEFAULT_THUMBNAIL_BUDGET_BYTES = 512 * 1024 * 1024
 PRUNE_MIN_INTERVAL_SECONDS = 120.0
 PRUNE_EVERY_N_WRITES = 32
@@ -104,26 +104,77 @@ def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
         return output.getvalue()
 
 
-def video_thumbnail_bytes(path: Path) -> bytes | None:
+def _video_frame_is_lit(data: bytes) -> tuple[bool, float]:
+    """Return ``(non_black, brightness_score)`` for an encoded JPEG frame."""
+    from PIL import Image, ImageStat
+
+    with Image.open(BytesIO(data)) as img:
+        stat = ImageStat.Stat(img.convert("L"))
+        mean = float(stat.mean[0])
+        peak = float(stat.extrema[0][1])
+        return (mean >= 8.0 or peak >= 28.0), mean + peak * 0.25
+
+
+def video_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes | None:
     if not shutil.which("ffmpeg"):
         return None
+    max_side = VARIANT_MAX_SIDE.get(variant, VARIANT_MAX_SIDE["thumb"])
+    if max_side is not None:
+        vf = (
+            f"scale=w='if(gte(iw*sar,ih),min({max_side},iw*sar),-2)'"
+            f":h='if(gte(iw*sar,ih),-2,min({max_side},ih))',setsar=1"
+        )
+    else:
+        vf = "scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1"
+
+    try:
+        from ..similar_video import probe_video_duration
+
+        duration = probe_video_duration(path)
+    except Exception:
+        duration = None
+
+    offsets = (
+        [round(duration * 0.27, 3), round(duration * 0.50, 3), 0.0]
+        if duration and duration > 0.4
+        else [1.0, 0.0]
+    )
+
+    fallback: tuple[float, bytes] | None = None
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         output_path = Path(tmp.name)
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i",
-                str(path), "-frames:v", "1", "-vf", r"scale=min(1600\,iw):-1", "-q:v", "2", "-y",
-                str(output_path),
-            ],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        data = output_path.read_bytes()
-        return data if data else None
-    except Exception:
-        return None
+        for offset in offsets:
+            try:
+                proc = subprocess.run(
+                    [
+                        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                        "-ss", f"{offset:.3f}", "-i", str(path), "-frames:v", "1",
+                        "-vf", vf, "-q:v", "2", "-y", str(output_path),
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception:
+                continue
+            if proc.returncode != 0:
+                continue
+            try:
+                data = output_path.read_bytes()
+            except OSError:
+                continue
+            if not data:
+                continue
+            try:
+                lit, score = _video_frame_is_lit(data)
+            except Exception:
+                return data
+            if lit:
+                return data
+            if fallback is None or score > fallback[0]:
+                fallback = (score, data)
+        return fallback[1] if fallback is not None else None
     finally:
         try:
             output_path.unlink(missing_ok=True)
@@ -170,7 +221,7 @@ def thumbnail_cache_file(key: str, *, cache_dir: Path | None = None) -> Path:
 
 def generate_thumbnail_bytes(path: Path, *, variant: str) -> bytes | None:
     if is_video(path):
-        return video_thumbnail_bytes(path)
+        return video_thumbnail_bytes(path, variant=variant)
     try:
         return image_thumbnail_bytes(path, variant=variant)
     except Exception:
