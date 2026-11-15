@@ -1048,11 +1048,14 @@ def find_similar_image_groups(
                 near_miss = True
         return False, near_miss
 
-    def cluster_progress(done: int, _total: int) -> None:
-        # Jobs are ordered by image, so the last finished job's image is a
-        # fair position in the library for the shared progress count.
-        if progress and done % 20 == 0:
-            progress("image-cluster", jobs[done - 1][0] + 1, len(hashed))
+    def cluster_progress(done: int, job_total: int, *, second_pass: bool = False) -> None:
+        # Comparing takes two passes, the pair checks and then the edited-copy
+        # checks on their near misses, and each is half of the shared count.
+        # Either can be most of the time, so both report.
+        if progress and (done % 20 == 0 or done == job_total):
+            half = len(hashed) // 2
+            position = half * done // job_total + (half if second_pass else 0)
+            progress("image-cluster", min(position, len(hashed) - 1), len(hashed))
 
     try:
         outcomes = map_parallel(
@@ -1085,6 +1088,7 @@ def find_similar_image_groups(
                 pending,
                 workers=n_workers,
                 backend="thread",
+                progress=lambda done, total: cluster_progress(done, total, second_pass=True),
                 cancelled=cancelled,
             )
             for (rec, other), same in zip(pending, verdicts, strict=True):

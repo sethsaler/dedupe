@@ -118,7 +118,7 @@ A scan over several folders can run two ways:
 
 ## Streaming and progress
 
-Groups stream to the UI the moment each one is finalized — the sidebar fills in during the scan rather than all at once at the end. The group list stays sorted with the most reclaimable space first. Progress reports include the current phase, files found and processed, groups found, elapsed time, and an ETA computed from the current phase's rate. The final message summarizes counts per category.
+Groups stream to the UI the moment each one is finalized — the sidebar fills in during the scan rather than all at once at the end. The group list stays sorted with the most reclaimable space first. Progress reports include the current phase, files found and processed, groups found, elapsed time, and an ETA computed from the current phase's rate. The processed count adds up every running check and only climbs: files served from the cache count as done, a check that hashes and then compares spends half its share on each, and a check that ends counts in full, so the count reaches its total when the last check finishes. The final message summarizes counts per category.
 
 ## Cancellation and failure
 
