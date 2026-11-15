@@ -263,3 +263,59 @@ def test_optional_video_cache_failure_falls_back_to_uncached_analysis(
     finally:
         if held is not None:
             held.close()
+
+
+def test_parallel_video_versions_matches_serial_and_skips_exact_copy_redecode(
+    version_media, tmp_path, monkeypatch
+) -> None:
+    import shutil
+    import threading
+
+    import dedupe.similar_video as module
+
+    work_dir = tmp_path / "copies"
+    work_dir.mkdir()
+    orig = work_dir / "original.mp4"
+    trim = work_dir / "trim.mp4"
+    intro = work_dir / "intro.mp4"
+    exact_copy = work_dir / "original_exact_copy.mp4"
+    shutil.copy2(version_media / "original.mp4", orig)
+    shutil.copy2(version_media / "trim.mp4", trim)
+    shutil.copy2(version_media / "intro.mp4", intro)
+    shutil.copy2(orig, exact_copy)
+
+    serial_matches = find_video_version_matches(
+        inventory([orig, trim, intro]),
+        workers=1,
+        use_cache=False,
+    )
+
+    real_batches = module._version_frame_batches
+    sample_calls: list[str] = []
+    lock = threading.Lock()
+
+    def counted_batches(path: str, timestamps: list[float], cancelled):
+        if len(timestamps) != 7:
+            with lock:
+                sample_calls.append(str(path))
+        return real_batches(path, timestamps, cancelled)
+
+    monkeypatch.setattr(module, "_version_frame_batches", counted_batches)
+
+    parallel_matches = find_video_version_matches(
+        inventory([orig, exact_copy, trim, intro]),
+        workers=4,
+        use_cache=False,
+    )
+
+    def normalize(matches):
+        return sorted(
+            (tuple(sorted(r.path for r in pair)), details["relation"], details["audio"])
+            for pair, details in matches
+            if exact_copy.name not in pair[0].path and exact_copy.name not in pair[1].path
+        )
+
+    assert normalize(parallel_matches) == normalize(serial_matches)
+    # Dense sampling must run once across {original, original_exact_copy}.
+    orig_family_calls = [p for p in sample_calls if orig.name in p or exact_copy.name in p]
+    assert len(orig_family_calls) == 1

@@ -632,9 +632,9 @@ def test_near_miss_pair_that_fails_offset_check_stays_separate(tmp_path: Path) -
 @pytest.mark.parametrize(
     ("cores", "workers", "hardware", "expected"),
     [
-        (16, 4, True, 2),
-        (8, 4, True, 1),
-        (64, 4, True, 2),  # capped
+        (16, 4, True, 6),
+        (8, 4, True, 2),
+        (64, 4, True, 6),  # capped
         (4, 4, True, 0),  # no cores to spare
         (16, 2, True, 0),  # a lower worker setting asks for a lighter scan
         (16, 4, False, 0),  # software is already the only decoder
@@ -651,6 +651,15 @@ def test_software_decode_jobs_are_added_only_beside_a_full_hardware_lane(
     )
 
     assert module._software_decode_workers(workers) == expected
+
+
+def test_explicit_worker_budget_expands_software_decode_lane(monkeypatch) -> None:
+    import dedupe.similar_video as module
+
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(module, "_hwaccel_args", lambda: ("-hwaccel", "videotoolbox"))
+
+    assert module._software_decode_workers(4, requested_workers=16) == 12
 
 
 def test_software_decode_job_does_not_try_the_hardware_decoder(
@@ -713,3 +722,166 @@ def test_hardware_lane_stays_at_its_cap_while_software_jobs_run_beside_it(monkey
     assert all(record.video_fingerprint for record in records)
     assert peak["hardware"] == module.DEFAULT_VIDEO_WORKERS_CAP
     assert 1 <= peak["software"] <= module.MAX_SOFTWARE_DECODE_WORKERS
+
+
+def test_exact_duplicate_videos_decode_once_and_reuse_cached_donor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.similar_video as module
+    from dedupe.cache import HashCache
+    from dedupe.scanner import inventory
+
+    payload = (b"video-prefix-0123" * 6000) + b"tail-bytes"
+    copies = [tmp_path / f"copy_{i}.mp4" for i in range(3)]
+    for path in copies:
+        path.write_bytes(payload)
+
+    fp = "v3:" + ",".join(["0123456789abcdef"] * 8)
+    decoded: list[str] = []
+
+    def fake_fingerprint(path, *, on_frame=None, software=False):
+        decoded.append(str(path))
+        return fp, 1920, 1080, 12.5
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(module, "compute_video_fingerprint", fake_fingerprint)
+
+    records = inventory(copies)
+    groups = find_similar_video_groups(records, workers=4)
+
+    assert len(decoded) == 1
+    assert len(groups) == 1 and len(groups[0]) == 3
+    assert all(r.video_fingerprint == fp and r.width == 1920 and r.duration == 12.5 for r in records)
+
+    cache = HashCache(tmp_path / "cache.sqlite3")
+    try:
+        cache.store_all(records)
+        fourth = tmp_path / "copy_3.mp4"
+        fourth.write_bytes(payload)
+        warm_records = inventory([*copies, fourth])
+        assert cache.hydrate(warm_records) == 3
+
+        decoded.clear()
+        warm_groups = find_similar_video_groups(warm_records, workers=4)
+    finally:
+        cache.close()
+
+    assert decoded == []
+    assert len(warm_groups) == 1 and len(warm_groups[0]) == 4
+    assert all(r.video_fingerprint == fp and r.height == 1080 for r in warm_records)
+
+
+def test_near_miss_verification_runs_in_parallel_and_deduplicates_frame_batches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import threading
+
+    import dedupe.similar_video as module
+
+    base = [0x0F0F0F0F0F0F0F0F ^ (i * 0x0111) for i in range(8)]
+    # 2 bits differing per frame => 16 bits? Wait: 9 bits diff per frame => mean_distance = 9 in (8, 16].
+    near = [h ^ 0x1FF for h in base]
+    fp_base = "v3:" + ",".join(f"{h:016x}" for h in base)
+    fp_near = "v3:" + ",".join(f"{h:016x}" for h in near)
+
+    def _diverse_frames():
+        out = []
+        for idx in range(7):
+            buf = bytearray(HASH_FRAME_SIZE * HASH_FRAME_SIZE)
+            for y in range(HASH_FRAME_SIZE):
+                for x in range(HASH_FRAME_SIZE):
+                    val = ((x * (idx + 1) + y * (idx + 3)) % 256)
+                    buf[y * HASH_FRAME_SIZE + x] = val
+            out.append(bytes(buf))
+        return out
+
+    diverse = _diverse_frames()
+    call_counts: dict[tuple[str, tuple[float, ...]], int] = {}
+    lock = threading.Lock()
+
+    def fake_batches(path: str, timestamps: list[float], cancelled) -> list[bytes]:
+        key = (path, tuple(round(t, 4) for t in timestamps))
+        with lock:
+            call_counts[key] = call_counts.get(key, 0) + 1
+        return list(diverse)
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(module, "_version_frame_batches", fake_batches)
+
+    def make_records():
+        recs = [
+            FileRecord(
+                path=str(tmp_path / "src.mp4"),
+                size=1000,
+                mtime=1.0,
+                media_type=MediaType.VIDEO,
+                extension=".mp4",
+                video_fingerprint=fp_base,
+                duration=10.0,
+            )
+        ]
+        for idx in range(1, 5):
+            recs.append(
+                FileRecord(
+                    path=str(tmp_path / f"near_{idx}.mp4"),
+                    size=1000 + idx,
+                    mtime=1.0,
+                    media_type=MediaType.VIDEO,
+                    extension=".mp4",
+                    video_fingerprint=fp_near,
+                    duration=10.0,
+                )
+            )
+        return recs
+
+    g_serial = find_similar_video_groups(make_records(), workers=1)
+    call_counts.clear()
+    g_parallel = find_similar_video_groups(make_records(), workers=4)
+
+    assert len(g_serial) == 1 and len(g_serial[0]) == 5
+    assert len(g_parallel) == 1 and len(g_parallel[0]) == 5
+    src_calls = [cnt for (p, _), cnt in call_counts.items() if p.endswith("src.mp4")]
+    assert src_calls == [1]
+
+
+def test_vectorized_clustering_matches_mixed_and_equal_length_fingerprints(monkeypatch) -> None:
+    import dedupe.similar_video as module
+    from dedupe.cache import DistinctReviews
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+
+    short_fp = "v3:" + ",".join(["0000000000000000"] * 4)
+    long_fp = "v3:" + ",".join(["0000000000000000"] * 8)
+    other_fp = "v3:" + ",".join(["ffffffffffffffff"] * 8)
+    records = [
+        FileRecord(
+            path="/short_unknown.mp4", size=100, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=short_fp, duration=None,
+        ),
+        FileRecord(
+            path="/long_20s.mp4", size=20, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=long_fp, duration=20.0,
+        ),
+        FileRecord(
+            path="/long_18s.mp4", size=21, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=long_fp, duration=18.0,
+        ),
+        FileRecord(
+            path="/too_short_17s.mp4", size=22, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=long_fp, duration=17.9,
+        ),
+        FileRecord(
+            path="/unrelated_20s.mp4", size=23, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=other_fp, duration=20.0,
+        ),
+    ]
+
+    groups = find_similar_video_groups(records, distinct=DistinctReviews.empty(), workers=1)
+    assert [{r.path for r in g} for g in groups] == [
+        {"/short_unknown.mp4", "/long_20s.mp4", "/long_18s.mp4", "/too_short_17s.mp4"}
+    ]
+    # Check exact 0.9 (18.0 / 20.0) vs 0.895 (17.9 / 20.0) duration cutoff directly.
+    at_cutoff = find_similar_video_groups([records[1], records[2], records[4]], workers=1)
+    assert [{r.path for r in g} for g in at_cutoff] == [{"/long_20s.mp4", "/long_18s.mp4"}]
+    below_cutoff = find_similar_video_groups([records[1], records[3], records[4]], workers=1)
+    assert below_cutoff == []

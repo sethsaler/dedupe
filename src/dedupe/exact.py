@@ -14,6 +14,7 @@ ProgressCb = Callable[[str, int, int], None]
 
 PARTIAL_SIZE = 64 * 1024
 CHUNK_SIZE = 1024 * 1024
+LARGE_SPARSE_FILTER_MIN_BYTES = 4 * 1024 * 1024
 
 # Error-kind prefixes; engine diagnostics classify on these.
 ERROR_PARTIAL_HASH_FAILED = "partial hash failed"
@@ -28,14 +29,31 @@ def file_partial_hash(path: str | Path, nbytes: int = PARTIAL_SIZE) -> str:
 
 
 def file_sha256(path: str | Path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+_DEFAULT_FILE_SHA256 = file_sha256
+
+
+def _file_sparse_mid_tail_hash(path: str | Path, size: int) -> str:
+    """Hash 64 KiB slices at the midpoint and tail of a large file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            h.update(chunk)
+        f.seek(size // 2)
+        h.update(f.read(PARTIAL_SIZE))
+        f.seek(max(0, size - PARTIAL_SIZE))
+        h.update(f.read(PARTIAL_SIZE))
     return h.hexdigest()
+
+
+def _sparse_job(item: tuple[str, int]) -> tuple[str, str | None]:
+    """Worker: (path, sparse_digest_or_none)."""
+    path, size = item
+    try:
+        return path, _file_sparse_mid_tail_hash(path, size)
+    except OSError:
+        return path, None
 
 
 def _partial_job(path: str) -> tuple[str, str | None, str | None]:
@@ -135,6 +153,60 @@ def find_exact_groups(
     # --- Full hash pass ---
     exact_groups: list[list[FileRecord]] = []
     full_candidates = [g for g in partial_buckets.values() if len(g) >= 2]
+    if default_hashes and file_sha256 is _DEFAULT_FILE_SHA256:
+        large_buckets = [
+            group
+            for group in full_candidates
+            if group[0].size >= LARGE_SPARSE_FILTER_MIN_BYTES
+            and any(not rec.sha256 for rec in group)
+        ]
+        if large_buckets:
+            other_buckets = [
+                group
+                for group in full_candidates
+                if not (
+                    group[0].size >= LARGE_SPARSE_FILTER_MIN_BYTES
+                    and any(not rec.sha256 for rec in group)
+                )
+            ]
+            sparse_items = [(rec.path, rec.size) for group in large_buckets for rec in group]
+            sparse_by_path: dict[str, str | None] = {}
+            if use_pool:
+                for path, digest in map_parallel(
+                    _sparse_job,
+                    sparse_items,
+                    workers=n_workers,
+                    backend="thread",
+                    cancelled=cancelled,
+                ):
+                    sparse_by_path[path] = digest
+            else:
+                for path, size in sparse_items:
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
+                    _, digest = _sparse_job((path, size))
+                    sparse_by_path[path] = digest
+            filtered_large: list[list[FileRecord]] = []
+            for group in large_buckets:
+                unreadable: list[FileRecord] = []
+                by_sparse: dict[str, list[FileRecord]] = defaultdict(list)
+                for rec in group:
+                    digest = sparse_by_path.get(rec.path)
+                    if digest is None:
+                        unreadable.append(rec)
+                    else:
+                        by_sparse[digest].append(rec)
+                for sub in by_sparse.values():
+                    if len(sub) >= 2:
+                        if unreadable:
+                            filtered_large.append(sub + unreadable)
+                            unreadable = []
+                        else:
+                            filtered_large.append(sub)
+                if unreadable:
+                    filtered_large.append(unreadable)
+            full_candidates = other_buckets + filtered_large
+
     full_total = sum(len(g) for g in full_candidates)
 
     full_targets: list[FileRecord] = []

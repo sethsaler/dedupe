@@ -214,3 +214,55 @@ def test_inventory_rejects_direct_photos_library_descendants(tmp_path: Path) -> 
 
     assert inventory([originals]) == []
     assert inventory([managed]) == []
+
+
+def test_large_prefix_collision_skips_full_sha256_when_middle_or_tail_differs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.exact as module
+
+    size = 5 * 1024 * 1024
+    head = b"H" * (128 * 1024)
+    mid_same = b"M" * (128 * 1024)
+    filler_zero = b"\x00" * (size // 2 - len(head))
+    tail_pad = b"\x00" * (size - len(head) - len(filler_zero) - len(mid_same) - 1024)
+
+    def make_file(name: str, mid_byte: bytes, tail_byte: bytes) -> FileRecord:
+        p = tmp_path / name
+        with open(p, "wb") as f:
+            f.write(head)
+            f.write(filler_zero)
+            f.write(mid_byte * len(mid_same))
+            f.write(tail_pad)
+            f.write(tail_byte * 1024)
+        st = p.stat()
+        return FileRecord(
+            path=str(p.resolve()),
+            size=st.st_size,
+            mtime=st.st_mtime,
+            media_type=MediaType.VIDEO,
+            extension=".mp4",
+        )
+
+    a = make_file("a.mp4", b"A", b"T")
+    b = make_file("b.mp4", b"A", b"T")
+    diff_mid = make_file("diff_mid.mp4", b"B", b"T")
+    diff_tail = make_file("diff_tail.mp4", b"A", b"Z")
+
+    digested_paths: list[str] = []
+    real_file_digest = module.hashlib.file_digest
+
+    def tracking_file_digest(fh, algo):
+        digested_paths.append(fh.name)
+        return real_file_digest(fh, algo)
+
+    monkeypatch.setattr(module.hashlib, "file_digest", tracking_file_digest)
+
+    # First check differing middle and tail alone -> 0 full file digests needed.
+    assert find_exact_groups([a, diff_mid, diff_tail], workers=2) == []
+    assert digested_paths == []
+
+    # With identical b alongside differing files, only a and b read their full 5 MiB.
+    groups = find_exact_groups([a, b, diff_mid, diff_tail], workers=2)
+    assert [{r.path for r in g} for g in groups] == [{a.path, b.path}]
+    assert sorted(digested_paths) == sorted([a.path, b.path])
