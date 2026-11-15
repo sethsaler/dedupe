@@ -1,54 +1,74 @@
 /* Light table theme: foundation tokens, shell, buttons, tabs.
-   Loads after app.css and design.css; equal-specificity rules here win by order.
+   Loads after app.css and design.css inside @layer theme.
    Scoped theme files: theme-setup, theme-review, theme-triage, theme-sheet, theme-lightbox. */
 
+@layer theme {
 /* ---------- Tokens ---------- */
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
 
-  /* Light (default). Dark values below. */
-  --lt-table: #FFFFFF;
-  --lt-loupe: #F2F2F0;
-  --lt-sleeve: #E2E2E0;
-  --lt-graphite: #6B6B6B;
-  --lt-faint: #707070; /* 4.95:1 on #FFFFFF */
-  --lt-ink: #111111;
-  --lt-pencil: #C92A14; /* 5.49:1 on #FFFFFF */
-  --lt-pencil-soft: #FDECE9;
+  --lt-table: light-dark(#FFFFFF, #111111);
+  --lt-loupe: light-dark(#F2F2F0, #1B1B1B);
+  --lt-sleeve: light-dark(#E2E2E0, #2C2C2C);
+  --lt-graphite: light-dark(#6B6B6B, #A0A0A0);
+  --lt-faint: light-dark(#707070, #8A8A8A);
+  --lt-ink: light-dark(#111111, #F2F2F0);
+  --lt-pencil: light-dark(#C92A14, #FF5A43);
+  --lt-pencil-soft: light-dark(#FDECE9, #3A1712);
+  --lt-keep: light-dark(#1A7A50, #3ECF8E);
+  --lt-keep-soft: light-dark(#E7F5EE, #122E21);
+  --lt-warn: light-dark(#9A6700, #F0B44A);
+  --lt-warn-soft: light-dark(#FEF5E4, #33240C);
+  --lt-focus: light-dark(#1D4ED8, #7CB4FF);
 
   --lt-display: "Inter Tight", "Inter", -apple-system, "SF Pro Display", system-ui, sans-serif;
   --lt-ui: "Inter", -apple-system, "SF Pro Text", system-ui, sans-serif;
   --lt-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
+:root[data-theme="light"] {
+  color-scheme: only light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: only dark;
+}
+
+@supports not (color: light-dark(#fff, #000)) {
+  :root {
+    --lt-table: #FFFFFF;
+    --lt-loupe: #F2F2F0;
+    --lt-sleeve: #E2E2E0;
+    --lt-graphite: #6B6B6B;
+    --lt-faint: #707070;
+    --lt-ink: #111111;
+    --lt-pencil: #C92A14;
+    --lt-pencil-soft: #FDECE9;
+    --lt-keep: #1A7A50;
+    --lt-keep-soft: #E7F5EE;
+    --lt-warn: #9A6700;
+    --lt-warn-soft: #FEF5E4;
+    --lt-focus: #1D4ED8;
+  }
+  :root[data-theme="dark"] {
     --lt-table: #111111;
     --lt-loupe: #1B1B1B;
     --lt-sleeve: #2C2C2C;
     --lt-graphite: #A0A0A0;
-    --lt-faint: #8A8A8A; /* 5.47:1 on #111111 */
+    --lt-faint: #8A8A8A;
     --lt-ink: #F2F2F0;
     --lt-pencil: #FF5A43;
     --lt-pencil-soft: #3A1712;
+    --lt-keep: #3ECF8E;
+    --lt-keep-soft: #122E21;
+    --lt-warn: #F0B44A;
+    --lt-warn-soft: #33240C;
+    --lt-focus: #7CB4FF;
   }
 }
 
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --lt-table: #111111;
-  --lt-loupe: #1B1B1B;
-  --lt-sleeve: #2C2C2C;
-  --lt-graphite: #A0A0A0;
-  --lt-faint: #8A8A8A; /* 5.47:1 on #111111 */
-  --lt-ink: #F2F2F0;
-  --lt-pencil: #FF5A43;
-  --lt-pencil-soft: #3A1712;
-}
-
 /* Legacy variables used by app.css and design.css, remapped onto the light-table
-   tokens. Defined once here; each resolves against the scheme's --lt-* values. */
+   tokens with restored semantic status differentiation. */
 :root {
   --bg: var(--lt-table);
   --bg-elev: var(--lt-table);
@@ -68,11 +88,11 @@
   --danger: var(--lt-pencil);
   --danger-2: var(--lt-pencil);
   --danger-soft: var(--lt-pencil-soft);
-  --warn: var(--lt-ink);
-  --warn-2: var(--lt-ink);
-  --ok: var(--lt-ink);
-  --ok-soft: var(--lt-loupe);
-  --keep: var(--lt-ink);
+  --warn: var(--lt-warn);
+  --warn-2: var(--lt-warn);
+  --ok: var(--lt-keep);
+  --ok-soft: var(--lt-keep-soft);
+  --keep: var(--lt-keep);
   --radius: 8px;
   --radius-sm: 6px;
   --font: var(--lt-ui);
@@ -83,7 +103,7 @@
 /* ---------- Base ---------- */
 body {
   font-family: var(--lt-ui);
-  font-size: 15px;
+  font-size: 0.9375rem;
   background: var(--lt-table);
   color: var(--lt-ink);
 }
@@ -524,4 +544,5 @@ a:focus-visible {
     transition: none;
     animation: none;
   }
+}
 }

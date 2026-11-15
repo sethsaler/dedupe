@@ -1,8 +1,10 @@
 /* Scoped theme (crop): the Crop review's contact sheet.
+   Loads inside @layer theme.
    Each print sits on a square loupe mat; the picture keeps its own aspect
    ratio inside it, so the suggested crop box can be drawn in image
    coordinates. Shaded pencil marks what the crop removes. */
 
+@layer theme {
 #members.crop-grid {
   grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--tile-size, 360px) * 0.75)), 1fr));
   gap: 22px 16px;
@@ -353,14 +355,13 @@
   position: fixed;
   inset: 0;
   z-index: 38;
-  display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
   background: var(--lt-table);
   color: var(--lt-ink);
 }
 
-.crop-editor[hidden] {
-  display: none;
+.crop-editor:is(:popover-open, .\:popover-open) {
+  display: grid;
 }
 
 .crop-editor .ce-stage {
@@ -584,4 +585,5 @@
     border-left: 0;
     border-top: 1px solid var(--lt-sleeve);
   }
+}
 }

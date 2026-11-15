@@ -11,19 +11,90 @@ const toastQueue = [];
 const TOAST_QUEUE_MAX = 4;
 let toastStickyVisible = false;
 let toastCurrentKey = "";
+let toastRemainingMs = 0;
+let toastDeadline = 0;
+let toastFocusBound = false;
+
+function isOverlayOpen(el) {
+  if (!el) return false;
+  if (el.open === true) return true;
+  try {
+    return el.matches(":popover-open") || el.classList.contains(":popover-open");
+  } catch {
+    return el.classList.contains(":popover-open");
+  }
+}
+
+function syncAppInert() {
+  const app = document.querySelector(".app");
+  if (!app) return;
+  app.inert = isOverlayOpen($("lightbox")) || isOverlayOpen($("cropEditor"));
+}
+
+function promoteToastTopLayer() {
+  const el = $("toast");
+  if (!el || !isOverlayOpen(el)) return;
+  el.hidePopover?.();
+  el.showPopover?.();
+}
+
+function announceToast(msg) {
+  if (typeof document.ariaNotify === "function") {
+    document.ariaNotify(msg);
+    return;
+  }
+  const live = $("toastLiveRegion");
+  if (!live) return;
+  live.textContent = "";
+  requestAnimationFrame(() => {
+    live.textContent = msg;
+  });
+}
+
+function startToastTimer(el, ms) {
+  clearTimeout(el._hideTimer);
+  if (!(ms > 0)) {
+    toastRemainingMs = 0;
+    toastDeadline = 0;
+    return;
+  }
+  toastRemainingMs = ms;
+  toastDeadline = Date.now() + ms;
+  el._hideTimer = setTimeout(hideToast, ms);
+}
+
+function bindToastFocusPause(el) {
+  if (!el || toastFocusBound) return;
+  toastFocusBound = true;
+  el.addEventListener("focusin", () => {
+    if (toastStickyVisible || !isOverlayOpen(el)) return;
+    clearTimeout(el._hideTimer);
+    if (toastDeadline > 0) {
+      toastRemainingMs = Math.max(1200, toastDeadline - Date.now());
+    }
+  });
+  el.addEventListener("focusout", (e) => {
+    if (toastStickyVisible || !isOverlayOpen(el)) return;
+    if (e.relatedTarget && el.contains(e.relatedTarget)) return;
+    if (toastRemainingMs > 0) startToastTimer(el, toastRemainingMs);
+  });
+}
 
 function hideToast() {
   const el = $("toast");
+  if (!el) return;
   el.classList.remove("show");
   clearTimeout(el._hideTimer);
   clearTimeout(el._fadeTimer);
+  toastRemainingMs = 0;
+  toastDeadline = 0;
+  if (isOverlayOpen(el)) el.hidePopover?.();
   el._fadeTimer = setTimeout(() => {
-    el.hidden = true;
     toastStickyVisible = false;
     toastCurrentKey = "";
-    // Flush the queue only after the fade, so toasts don't overlap visually.
+    // Flush the queue only after the exit fade, so toasts don't overlap visually.
     if (toastQueue.length) showToast(toastQueue.shift());
-  }, 220);
+  }, 150);
 }
 
 // Cycle Tab within an overlay (focus trap). Returns true when it handled the key.
@@ -59,6 +130,8 @@ function showToast({ msg, kind, actionLabel, onAction, duration }) {
   const message = $("toastMessage") || el;
   const action = $("toastAction");
   const dismiss = $("toastDismiss");
+  bindToastFocusPause(el);
+  clearTimeout(el._fadeTimer);
   message.textContent = msg;
   el.className = "toast" + (kind ? ` ${kind}` : "");
   if (action) {
@@ -73,14 +146,15 @@ function showToast({ msg, kind, actionLabel, onAction, duration }) {
     el.classList.toggle("has-action", Boolean(actionLabel));
   }
   if (dismiss) dismiss.hidden = false;
-  el.hidden = false;
+  if (isOverlayOpen(el)) el.hidePopover?.();
+  el.showPopover?.();
   void el.offsetWidth;
   el.classList.add("show");
-  clearTimeout(el._hideTimer);
+  announceToast(msg);
   toastStickyVisible = duration === undefined && Boolean(actionLabel || kind === "error");
   toastCurrentKey = `${kind}|${msg}`;
   const ms = duration ?? (toastStickyVisible ? 0 : 3400);
-  if (ms > 0) el._hideTimer = setTimeout(hideToast, ms);
+  startToastTimer(el, ms);
 }
 
 function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
@@ -88,7 +162,7 @@ function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
   const key = `${kind}|${msg}`;
   // A sticky toast (error / Undo) must survive until the user deals with it:
   // queue anything that arrives while one is up. Identical messages collapse.
-  if (toastStickyVisible && !$("toast").hidden) {
+  if (toastStickyVisible && isOverlayOpen($("toast"))) {
     if (key === toastCurrentKey || toastQueue.some((queued) => `${queued.kind}|${queued.msg}` === key)) {
       return;
     }
@@ -173,4 +247,4 @@ function withMediaVersion(url, path) {
   return version ? `${url}&v=${encodeURIComponent(version)}` : url;
 }
 
-export { $, hideToast, toast, trapTabKey, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml, noteMediaVersion, withMediaVersion };
+export { $, hideToast, toast, trapTabKey, isOverlayOpen, promoteToastTopLayer, syncAppInert, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml, noteMediaVersion, withMediaVersion };

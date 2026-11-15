@@ -512,8 +512,55 @@ def run_scan(
             with stage_lock:
                 stage_text[stage] = text
                 if total:
+                    previous = stage_counts.get(stage)
+                    if previous:
+                        stage_total = previous[1]
+                        if total != stage_total:
+                            # A stage counts only the files it has to work
+                            # on. The rest were served from the cache and are
+                            # done, so the stage keeps the total it began with.
+                            remaining = max(0, total - processed)
+                            processed = max(0, stage_total - remaining)
+                            total = stage_total
+                        # Reports from worker threads can arrive out of order.
+                        processed = max(processed, previous[0])
                     stage_counts[stage] = (processed, total)
                 _emit_stages_locked()
+
+        def _stage_finished(stage: str, text: str) -> None:
+            """A stage's closing note. Whatever it last counted, it is complete.
+
+            A stage that found its work in the cache, or had none, never
+            reports its last file, and the combined count would stay short of
+            the total for the rest of the scan.
+            """
+            with stage_lock:
+                stage_text[stage] = text
+                if stage in stage_counts:
+                    total = stage_counts[stage][1]
+                    stage_counts[stage] = (total, total)
+                _emit_stages_locked()
+
+        def _two_pass_progress(
+            stage: str,
+            text: str,
+            stage_total: int,
+            second_pass: bool,
+            processed: int,
+            total: int,
+        ) -> None:
+            """Progress of a stage that passes over its files twice.
+
+            Hashing is the first half and comparing the second, so the count
+            keeps climbing through the comparison instead of starting again.
+            A report without a total changes the text only.
+            """
+            if total <= 0 or stage_total <= 0:
+                _stage_progress(stage, text, 0, 0)
+                return
+            half = stage_total / 2
+            done = int(half * min(1.0, processed / total) + (half if second_pass else 0))
+            _stage_progress(stage, text, min(stage_total, done), stage_total)
 
         def publish_prebuilt(new_groups: list[DuplicateGroup]) -> None:
             """Append already-built review groups and stream them (thread-safe)."""
@@ -560,8 +607,15 @@ def run_scan(
             _emit_stages_locked()
 
         def exact_progress(phase: str, processed: int, total: int) -> None:
-            _stage_progress(
-                "exact", f"Exact hash {processed}/{total}", processed, total
+            # Only files sharing a size are hashed, so the hashing counts are
+            # a small part of the files this stage accounts for.
+            _two_pass_progress(
+                "exact",
+                f"Exact hash {processed}/{total}",
+                len(records),
+                "full" in phase,
+                processed,
+                total,
             )
 
         def img_progress(phase: str, processed: int, total: int) -> None:
@@ -571,8 +625,13 @@ def run_scan(
                 label = "clustering"
             else:
                 label = phase.replace("-", " ")
-            _stage_progress(
-                "image", f"Images {label}: {processed}/{total}", processed, total
+            _two_pass_progress(
+                "image",
+                f"Images {label}: {processed}/{total}",
+                image_count,
+                "hash" not in phase,
+                processed,
+                total,
             )
 
         def vid_progress(
@@ -585,7 +644,9 @@ def run_scan(
             else:
                 label = phase.replace("-", " ")
             text = message or f"Videos {label}: {processed}/{total}"
-            _stage_progress("video", text, processed, total)
+            _two_pass_progress(
+                "video", text, video_count, "hash" not in phase, processed, total
+            )
 
         def _exact_stage() -> float:
             started_at = time.monotonic()
@@ -597,11 +658,9 @@ def run_scan(
                     cancelled=cancelled,
                 )
                 count = publish(GroupKind.EXACT, exact_member_lists)
-                _stage_progress(
+                _stage_finished(
                     "exact",
                     f"Found {count} exact group{'s' if count != 1 else ''}",
-                    0,
-                    0,
                 )
                 return time.monotonic() - started_at
             finally:
@@ -621,11 +680,9 @@ def run_scan(
                 )
                 exact_done.wait()
                 count = publish(GroupKind.SIMILAR, img_groups)
-                _stage_progress(
+                _stage_finished(
                     "image",
                     f"Found {count} similar image group{'s' if count != 1 else ''}",
-                    0,
-                    0,
                 )
                 return time.monotonic() - started_at
             finally:
@@ -695,11 +752,9 @@ def run_scan(
                                 on_group(group)
                 else:
                     count = publish(GroupKind.SIMILAR, vid_groups)
-                _stage_progress(
+                _stage_finished(
                     "video",
                     f"Found {count} similar video group{'s' if count != 1 else ''}",
-                    0,
-                    0,
                 )
                 return time.monotonic() - started_at
             finally:
@@ -746,7 +801,7 @@ def run_scan(
                 raise
             except Exception as exc:
                 stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
-                _stage_progress("semantic", "Look-alikes unavailable", 0, 0)
+                _stage_finished("semantic", "Look-alikes unavailable")
                 return time.monotonic() - started_at
             waiting_since = time.monotonic()
             exact_done.wait()
@@ -790,7 +845,7 @@ def run_scan(
                 raise
             except Exception as exc:
                 stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
-                _stage_progress("semantic", "Look-alikes unavailable", 0, 0)
+                _stage_finished("semantic", "Look-alikes unavailable")
                 return time.monotonic() - started_at
             finally:
                 if judge is not None:
@@ -823,13 +878,11 @@ def run_scan(
                     if on_group:
                         on_group(group)
                 groups.sort(key=lambda x: x.reclaimable_bytes, reverse=True)
-            _stage_progress(
+            _stage_finished(
                 "semantic",
                 f"Found {set_count} set{'s' if set_count != 1 else ''} and "
                 f"{duplicate_count} look-alike duplicate group"
                 f"{'s' if duplicate_count != 1 else ''}",
-                0,
-                0,
             )
             return time.monotonic() - started_at
 
@@ -858,7 +911,7 @@ def run_scan(
                     cancelled=cancelled,
                     progress=resolution_progress,
                 )
-                _stage_progress("dims", "Dimensions ready", 0, 0)
+                _stage_finished("dims", "Dimensions ready")
                 return time.monotonic() - started_at
             finally:
                 # Always unblock review-group publishing, even on cancel/error.
@@ -922,22 +975,18 @@ def run_scan(
                 if run_faces:
                     # Confirmed Non-Human groups publish from the face stage
                     # once face counts land.
-                    _stage_progress(
+                    _stage_finished(
                         "human",
                         "Person detection finished; face counts will confirm "
                         "Non-Human candidates",
-                        0,
-                        0,
                     )
                 else:
                     publish_prebuilt(build_no_human_groups(no_human_files))
-                    _stage_progress(
+                    _stage_finished(
                         "human",
                         f"Found {len(no_human_files)} file"
                         f"{'' if len(no_human_files) == 1 else 's'} "
                         "without detected people",
-                        0,
-                        0,
                     )
                 return time.monotonic() - started_at
             finally:
@@ -964,12 +1013,10 @@ def run_scan(
             files_with_faces = sum(
                 1 for record in face_candidates if (record.face_count or 0) > 0
             )
-            _stage_progress(
+            _stage_finished(
                 "face",
                 f"Found faces in {files_with_faces} "
                 f"file{'s' if files_with_faces != 1 else ''}",
-                0,
-                0,
             )
             duration = time.monotonic() - started_at
             publish_prebuilt(build_faces_groups(face_candidates))
@@ -980,13 +1027,11 @@ def run_scan(
                 confirmed = build_no_human_groups(records)
                 confirmed_count = sum(len(group.members) for group in confirmed)
                 publish_prebuilt(confirmed)
-                _stage_progress(
+                _stage_finished(
                     "human",
                     f"Found {confirmed_count} file"
                     f"{'' if confirmed_count == 1 else 's'} "
                     "without detected people",
-                    0,
-                    0,
                 )
             return duration
 
@@ -1010,12 +1055,10 @@ def run_scan(
             )
             crop_groups = build_crop_groups(border_records, level=crop_aggressiveness)
             crop_count = sum(len(group.members) for group in crop_groups)
-            _stage_progress(
+            _stage_finished(
                 "borders",
                 f"Found {crop_count} file{'' if crop_count == 1 else 's'} "
                 "to crop",
-                0,
-                0,
             )
             duration = time.monotonic() - started_at
             publish_prebuilt(crop_groups)

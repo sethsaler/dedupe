@@ -4,13 +4,13 @@ import { api } from "./api.js";
 import { renderCropReview } from "./crop.js";
 import { renderExactReview } from "./exact.js";
 import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
-import { closeLightbox, openLightbox, updateLightbox } from "./lightbox.js";
+import { closeLightbox, lightboxOpen, openLightbox, updateLightbox } from "./lightbox.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
 import { boardActive, refreshBoardRow } from "./board.js";
 import { renderSwipeReview, swipeActive } from "./swipe.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
-import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, sleep, toast, withMediaVersion } from "./util.js";
+import { $, basename, escapeHtml, formatBytes, formatMtime, isOverlayOpen, setPreviewAspectRatio, sleep, toast, withMediaVersion } from "./util.js";
 
 const MEMBER_PAGE_SIZE = 50;
 let renderedGroupSnapshot = "";
@@ -362,7 +362,8 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   if (state.currentId !== id) memberObserver.disconnect();
   const myToken = ++state.selectToken;
   if (!silent) state.pendingGroupFocus = { id, from: document.activeElement };
-  const preserveMemberFocus = silent && state.currentId === id;
+  const sameGroup = state.currentId === id;
+  const preserveMemberFocus = silent && sameGroup;
   state.currentId = id;
   rememberFocusedGroup(id);
   if (!preserveMemberFocus) restartMemberList();
@@ -383,12 +384,23 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // A scan-completion refresh can finish while the user is moving through
   // member cards. Preserve the latest position and real DOM focus instead of
   // replacing the focused button underneath the next keystroke.
-  const focusedMemberCard = preserveMemberFocus
-    ? document.activeElement?.closest?.("#members .card")
+  const activeMemberCard = document.activeElement?.closest?.("#members .card");
+  const overlayOverSameGroup = sameGroup
+    && (lightboxOpen() || isOverlayOpen($("cropEditor")));
+  const keepMemberState = preserveMemberFocus
+    || Boolean(sameGroup && activeMemberCard)
+    || overlayOverSameGroup;
+  const focusedMemberCard = keepMemberState
+    ? (activeMemberCard || (overlayOverSameGroup
+      ? $("members").querySelector(".card.focused")
+      : null))
     : null;
-  const focusedMemberPath = focusedMemberCard?.dataset.path;
-  const focusedCropZone = focusedMemberCard
-    && document.activeElement?.classList?.contains("crop-box");
+  const focusedMemberPath = activeMemberCard && keepMemberState
+    ? activeMemberCard.dataset.path
+    : null;
+  const focusedCropZone = Boolean(
+    activeMemberCard && document.activeElement?.classList?.contains("crop-box"),
+  );
   if (focusedMemberCard) {
     const focusedIndex = Number(focusedMemberCard.dataset.index);
     if (Number.isFinite(focusedIndex)) state.memberFocus = focusedIndex;
@@ -1053,7 +1065,7 @@ async function reviewCandidate(group, path, remove) {
     }
     state.memberFocus = nextIndex;
     renderMembers(updated);
-    if (!$("lightbox").hidden) {
+    if (lightboxOpen()) {
       state.lightboxIndex = 0;
       updateLightbox();
     }
@@ -1145,7 +1157,7 @@ async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) 
     patchGroup(previous);
     renderMembers(previous);
     scheduleRender({ groupList: true, selection: true });
-    if (fromLightbox && !$("lightbox").hidden) {
+    if (fromLightbox && lightboxOpen()) {
       const failedMember = (previous.members || []).find((member) => member.path === path);
       state.lightboxItems = [
         failedMember
@@ -1177,7 +1189,7 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
     scheduleRender({ groupList: true, selection: true });
     // renderMembers rebuilt the lightbox list with the restored file back at
     // its sorted position; when the overlay is open, jump back to it.
-    if (fromLightbox && !$("lightbox").hidden) {
+    if (fromLightbox && lightboxOpen()) {
       const restoredIndex = state.lightboxItems.findIndex((item) => item.path === path);
       if (restoredIndex >= 0) {
         state.lightboxIndex = restoredIndex;

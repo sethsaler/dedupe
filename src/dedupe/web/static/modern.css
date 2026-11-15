@@ -1,0 +1,1013 @@
+/* Modern platform upgrades for Dedupe UI.
+   Loaded last inside `@layer modern`, keeping base layout contracts intact
+   while adopting modern CSS primitives, top-layer overlays, container queries,
+   custom form controls, scroll-state indicators, and light-dark() theming. */
+
+@property --fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@layer modern {
+  /* ---------- Root scaling, OS accent, and selective text wrapping ---------- */
+  :root {
+    accent-color: var(--lt-focus);
+    scrollbar-color: var(--lt-sleeve) transparent;
+    scrollbar-width: thin;
+  }
+
+  @supports not (scrollbar-color: auto) {
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: var(--lt-sleeve);
+      border-radius: 999px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+  }
+
+  h1,
+  h2,
+  h3,
+  .detail-header h2,
+  #modalTitle,
+  #helpTitle {
+    text-wrap: balance;
+  }
+
+  .brand h1 {
+    font-size: 1.375rem;
+  }
+
+  .detail-header h2 {
+    font-size: 1.875rem;
+  }
+
+  p,
+  .thresh-hint,
+  #presetHint,
+  #jobHint,
+  #candidateReviewDescription {
+    text-wrap: pretty;
+  }
+
+  /* ---------- Topbar actions & theme switcher ---------- */
+  .topbar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 44px;
+    padding: 0 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .theme-icon {
+    font-size: 0.9375rem;
+    line-height: 1;
+  }
+
+  /* ---------- Hit targets & keyboard focus visibility ---------- */
+  .btn,
+  .tab,
+  .guide-trigger,
+  .toast-action,
+  .toast-dismiss,
+  .lb-close,
+  .lb-nav,
+  #btnHelp,
+  #btnHistory {
+    min-block-size: 36px;
+  }
+
+  @media (pointer: coarse) {
+    .btn,
+    .tab,
+    .guide-trigger,
+    .toast-action,
+    .toast-dismiss,
+    .lb-close,
+    .lb-nav,
+    .theme-toggle {
+      min-block-size: 44px;
+      min-inline-size: 44px;
+    }
+  }
+
+  :is(
+    button,
+    a,
+    input,
+    select,
+    textarea,
+    summary,
+    [tabindex]
+  ):focus-visible {
+    outline: 2px solid var(--lt-focus);
+    outline-offset: 2px;
+  }
+
+  @media (forced-colors: active) {
+    .tab.active {
+      border-bottom: 2px solid Highlight;
+    }
+    .btn:focus-visible,
+    .tab:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible {
+      outline: 2px solid Highlight;
+    }
+    .scan-panel .options .chip-check input[type="checkbox"]:checked,
+    .display-toggles .toggle-option input[type="checkbox"]:checked {
+      background: Highlight;
+      border-color: Highlight;
+    }
+  }
+
+  /* ---------- Fieldsets, invalid states & path inputs ---------- */
+  .scan-panel .options fieldset.opt-group,
+  .scan-panel .options fieldset.low-resolution-bounds {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-inline-size: 0;
+  }
+
+  .scan-panel .options fieldset > legend.opt-label {
+    padding: 0;
+    margin-bottom: 6px;
+  }
+
+  input:user-invalid,
+  textarea:user-invalid,
+  select:user-invalid {
+    border-color: var(--lt-pencil);
+    box-shadow: 0 0 0 1px var(--lt-pencil);
+  }
+
+  /* ---------- Custom checkboxes using real <input type="checkbox"> ---------- */
+  .scan-panel .options .chip-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-block-size: 36px;
+    padding: 4px 10px 4px 2px;
+  }
+
+  .scan-panel .options .chip-check input[type="checkbox"] {
+    position: relative;
+    opacity: 1;
+    pointer-events: auto;
+    appearance: none;
+    -webkit-appearance: none;
+    flex: none;
+    inline-size: var(--checkbox-size, 1.125rem);
+    block-size: var(--checkbox-size, 1.125rem);
+    margin: 0;
+    border: 1.5px solid var(--lt-graphite);
+    border-radius: 4px;
+    background: var(--lt-table);
+    display: grid;
+    place-content: center;
+    cursor: pointer;
+    transition: background-color 0.12s ease, border-color 0.12s ease;
+  }
+
+  .scan-panel .options .chip-check input[type="checkbox"]::after {
+    content: "";
+    inline-size: 0.65rem;
+    block-size: 0.5rem;
+    transform: scale(0);
+    transition: transform 0.1s ease;
+    background: var(--lt-table);
+    clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+  }
+
+  .scan-panel .options .chip-check input[type="checkbox"]:checked {
+    background: var(--lt-ink);
+    border-color: var(--lt-ink);
+  }
+
+  .scan-panel .options .chip-check input[type="checkbox"]:checked::after {
+    transform: scale(1);
+  }
+
+  .scan-panel .options .chip-check input[type="checkbox"]:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .scan-panel .options .chip-check span {
+    padding: 2px 0;
+    border: 0;
+    background: transparent;
+    color: var(--lt-ink);
+  }
+
+  .scan-panel .options .chip-check span::before,
+  .scan-panel .options .chip-check span::after {
+    content: none;
+  }
+
+  /* ---------- Custom range sliders (separate WebKit & Firefox selectors) ---------- */
+  input[type="range"] {
+    appearance: none;
+    -webkit-appearance: none;
+    background: transparent;
+    min-block-size: 28px;
+    cursor: pointer;
+    --range-fill-pct: var(--slider-pct, 50%);
+  }
+
+  @supports (width: progress(1 from 0 to 2)) {
+    input[type="range"] {
+      --range-fill-pct: calc(progress(var(--control-value, 50) from var(--attr-min, 0) to var(--attr-max, 100)) * 100%);
+    }
+  }
+
+  input[type="range"]::-webkit-slider-runnable-track {
+    block-size: 6px;
+    border-radius: 999px;
+    background: linear-gradient(
+      to right,
+      var(--lt-ink) 0 var(--range-fill-pct),
+      var(--lt-sleeve) var(--range-fill-pct) 100%
+    );
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    margin-top: -7px;
+    inline-size: 20px;
+    block-size: 20px;
+    border-radius: 50%;
+    border: 2px solid var(--lt-table);
+    background: var(--lt-ink);
+    box-shadow: 0 1px 4px light-dark(rgba(0, 0, 0, 0.25), rgba(0, 0, 0, 0.6));
+  }
+
+  input[type="range"]::-moz-range-track {
+    block-size: 6px;
+    border-radius: 999px;
+    background: var(--lt-sleeve);
+  }
+
+  input[type="range"]::-moz-range-progress {
+    block-size: 6px;
+    border-radius: 999px;
+    background: var(--lt-ink);
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    inline-size: 20px;
+    block-size: 20px;
+    border-radius: 50%;
+    border: 2px solid var(--lt-table);
+    background: var(--lt-ink);
+  }
+
+  .lightbox input[type="range"]::-webkit-slider-runnable-track {
+    background: linear-gradient(
+      to right,
+      #f2f2f0 0 var(--range-fill-pct),
+      #333333 var(--range-fill-pct) 100%
+    );
+  }
+
+  .lightbox input[type="range"]::-webkit-slider-thumb {
+    border-color: #0e0e0e;
+    background: #f2f2f0;
+  }
+
+  .lightbox input[type="range"]::-moz-range-track {
+    background: #333333;
+  }
+
+  .lightbox input[type="range"]::-moz-range-progress {
+    background: #f2f2f0;
+  }
+
+  .lightbox input[type="range"]::-moz-range-thumb {
+    border-color: #0e0e0e;
+    background: #f2f2f0;
+  }
+
+  /* ---------- Native <progress> styling & indeterminate motion ---------- */
+  progress.progress-bar,
+  progress.stream-bar {
+    appearance: none;
+    -webkit-appearance: none;
+    display: block;
+    inline-size: 100%;
+    block-size: 8px;
+    border: 0;
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--lt-loupe);
+    container-type: inline-size;
+  }
+
+  progress.stream-bar {
+    block-size: 5px;
+  }
+
+  .scan-panel:not(.scanning) :is(.progress-bar, .stream-progress) {
+    display: none;
+  }
+
+  /* ---------- Post-scan setup bar & expanded setup panel ---------- */
+  .app:has(> .empty-state:not([hidden])) > .scan-panel:not(.collapsed):not(.scanning) > .scan-collapse {
+    display: none;
+  }
+
+  .scan-collapse-close-hint {
+    display: none;
+  }
+
+  .scan-collapse-goal {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--lt-loupe);
+    color: var(--lt-ink);
+    font-family: var(--lt-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  .scan-collapse-goal[hidden] {
+    display: none;
+  }
+
+  .scan-panel.collapsed {
+    gap: 6px 12px;
+    padding: 3px 0 5px;
+  }
+
+  .scan-panel.collapsed > .scan-collapse {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    inline-size: auto;
+    min-block-size: 30px;
+    max-inline-size: min(58%, 680px);
+    margin: 0;
+    padding: 3px 10px;
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 6px;
+    background: var(--lt-table);
+    color: var(--lt-ink);
+    transition: border-color 0.12s ease, background-color 0.12s ease;
+  }
+
+  @media (pointer: coarse) {
+    .scan-panel.collapsed > .scan-collapse {
+      min-block-size: 44px;
+    }
+  }
+
+  .scan-panel.collapsed > .scan-collapse:hover {
+    border-color: var(--lt-ink);
+    background: var(--lt-loupe);
+  }
+
+  .scan-panel.collapsed :is(.progress-msg, .session-status, .scan-quality) {
+    font-size: 0.8125rem;
+  }
+
+  .scan-panel.collapsed .session-status {
+    gap: 8px;
+    padding: 3px 10px;
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 6px;
+    background: var(--lt-table);
+  }
+
+  .scan-panel.collapsed .scan-quality {
+    padding: 3px 10px;
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 6px;
+    background: var(--lt-table);
+  }
+
+  .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) {
+    padding: 16px 20px 0;
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 8px;
+    background: var(--lt-table);
+    box-shadow: 0 12px 32px light-dark(rgba(17, 17, 17, 0.08), rgba(0, 0, 0, 0.45));
+  }
+
+  .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) > .scan-collapse .scan-collapse-close-hint {
+    display: inline;
+    margin-inline-start: auto;
+    padding-inline-start: 12px;
+    font-size: 0.75rem;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--lt-graphite);
+  }
+
+  .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed):not(.scanning) > :is(.progress-wrap, .scan-quality) {
+    display: none;
+  }
+
+  .group-empty-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .board-empty .btn {
+    margin-top: 8px;
+  }
+
+  progress.progress-bar::-webkit-progress-bar,
+  progress.stream-bar::-webkit-progress-bar {
+    background: var(--lt-loupe);
+    border-radius: 999px;
+  }
+
+  progress.progress-bar::-webkit-progress-value,
+  progress.stream-bar::-webkit-progress-value {
+    background: var(--lt-ink);
+    border-radius: 999px;
+    transition: width 0.2s ease;
+  }
+
+  progress.progress-bar::-moz-progress-bar,
+  progress.stream-bar::-moz-progress-bar {
+    background: var(--lt-ink);
+    border-radius: 999px;
+  }
+
+  @keyframes mwg-progress-indeterminate {
+    0% {
+      translate: -40cqi 0;
+    }
+    100% {
+      translate: 110cqi 0;
+    }
+  }
+
+  progress.progress-bar:indeterminate::-webkit-progress-value,
+  progress.stream-bar:indeterminate::-webkit-progress-value {
+    inline-size: 38cqi;
+    background: var(--lt-ink);
+    animation: mwg-progress-indeterminate 1.4s ease-in-out infinite;
+  }
+
+  progress.progress-bar:indeterminate::-moz-progress-bar,
+  progress.stream-bar:indeterminate::-moz-progress-bar {
+    inline-size: 38cqi;
+    background: var(--lt-ink);
+    animation: mwg-progress-indeterminate 1.4s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    progress.progress-bar:indeterminate::-webkit-progress-value,
+    progress.stream-bar:indeterminate::-webkit-progress-value,
+    progress.progress-bar:indeterminate::-moz-progress-bar,
+    progress.stream-bar:indeterminate::-moz-progress-bar {
+      animation-duration: 6s;
+    }
+  }
+
+  /* ---------- Top-layer dialogs & backdrop scroll containment ---------- */
+  dialog {
+    padding: 0;
+    border: 0;
+    color: inherit;
+    background: transparent;
+    max-width: none;
+    max-height: none;
+  }
+
+  dialog:modal {
+    overscroll-behavior: contain;
+  }
+
+  dialog::backdrop {
+    overflow: auto;
+    overscroll-behavior: contain;
+    background: light-dark(rgba(17, 17, 17, 0.42), rgba(0, 0, 0, 0.62));
+  }
+
+  #modalBackdrop[open],
+  #historyPanel[open] {
+    display: flex;
+    justify-content: flex-end;
+    align-items: stretch;
+    inline-size: 100vw;
+    block-size: 100dvh;
+    margin: 0;
+    padding: 0;
+    inset: 0;
+  }
+
+  #modalBackdrop .modal,
+  #historyPanel .history-drawer-inner {
+    animation: none;
+    transition:
+      opacity 0.12s ease-out,
+      transform 0.12s cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+
+  @starting-style {
+    #modalBackdrop[open] .modal,
+    #historyPanel[open] .history-drawer-inner {
+      opacity: 0;
+      transform: translateX(24px);
+    }
+  }
+
+  #historyPanel .history-drawer-inner {
+    box-sizing: border-box;
+    inline-size: min(480px, 100vw);
+    block-size: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: var(--lt-table);
+    color: var(--lt-ink);
+    border-inline-start: 1px solid var(--lt-sleeve);
+    padding: 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    box-shadow: -16px 0 40px light-dark(rgba(17, 17, 17, 0.08), rgba(0, 0, 0, 0.5));
+  }
+
+  #historyPanel .section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  #historyPanel .section-heading h2 {
+    margin: 0;
+    font-size: 1.375rem;
+  }
+
+  #helpBackdrop[open] {
+    display: grid;
+    place-items: center;
+    inline-size: 100vw;
+    block-size: 100dvh;
+    margin: 0;
+    padding: 16px;
+    inset: 0;
+  }
+
+  #helpBackdrop .modal.help-modal {
+    max-block-size: calc(100dvh - 32px);
+    transition: opacity 0.12s ease-out, transform 0.12s ease-out;
+  }
+
+  @starting-style {
+    #helpBackdrop[open] .modal.help-modal {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+  }
+
+  #modalBackdrop,
+  #helpBackdrop,
+  #historyPanel {
+    transition-property: opacity, overlay, display;
+    transition-duration: 0.12s;
+    transition-timing-function: ease-out;
+    transition-behavior: allow-discrete;
+  }
+
+  #lightbox,
+  #cropEditor {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    inline-size: 100vw;
+    block-size: 100dvh;
+    inset: 0;
+    transition-property: opacity, overlay, display;
+    transition-duration: 0.1s;
+    transition-timing-function: ease-out;
+    transition-behavior: allow-discrete;
+  }
+
+  #lightbox:is(:popover-open, .\:popover-open) {
+    display: grid;
+    padding: 48px 16px 16px;
+    opacity: 1;
+  }
+
+  #cropEditor:is(:popover-open, .\:popover-open) {
+    display: grid;
+    opacity: 1;
+  }
+
+  @starting-style {
+    #lightbox:is(:popover-open, .\:popover-open),
+    #cropEditor:is(:popover-open, .\:popover-open) {
+      opacity: 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #modalBackdrop .modal,
+    #historyPanel .history-drawer-inner,
+    #helpBackdrop .modal.help-modal {
+      transform: none;
+      transition: opacity 0.05s linear;
+    }
+    #modalBackdrop,
+    #helpBackdrop,
+    #historyPanel,
+    #lightbox,
+    #cropEditor {
+      transition-duration: 0.05s;
+    }
+    @starting-style {
+      #modalBackdrop[open] .modal,
+      #historyPanel[open] .history-drawer-inner,
+      #helpBackdrop[open] .modal.help-modal {
+        opacity: 0;
+        transform: none;
+      }
+    }
+  }
+
+  /* ---------- Top-layer persistent toast ---------- */
+  .toast-region {
+    display: contents;
+  }
+
+  #toast[popover] {
+    border-radius: 6px;
+  }
+
+  #toast:is(:popover-open, .\:popover-open) {
+    display: flex;
+    position: fixed;
+    inset: auto;
+    inset-block-end: max(20px, env(safe-area-inset-bottom));
+    inset-inline-start: 50%;
+    transform: translateX(-50%);
+    margin: 0;
+    opacity: 1;
+    pointer-events: auto;
+    transition-property: opacity, transform, overlay, display;
+    transition-duration: 0.12s;
+    transition-behavior: allow-discrete;
+  }
+
+  .app:has(> .actionbar:not([hidden])) ~ .toast-region #toast:is(:popover-open, .\:popover-open) {
+    inset-block-end: calc(var(--actionbar-h) + 12px);
+  }
+
+  @starting-style {
+    #toast:is(:popover-open, .\:popover-open) {
+      opacity: 0;
+      transform: translateX(-50%) translateY(8px);
+    }
+  }
+
+  /* ---------- Native anchor-positioned guide popovers ---------- */
+  .guide-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-block-size: 36px;
+    padding: 6px 12px;
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 6px;
+    background: var(--lt-table);
+    color: var(--lt-ink);
+    font: inherit;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .guide-trigger:hover {
+    border-color: var(--lt-ink);
+  }
+
+  .guide-popover-panel {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--lt-ink);
+    overflow: visible;
+  }
+
+  .guide-popover-panel .popover-body {
+    position: static;
+    margin: 0;
+    max-inline-size: min(460px, calc(100vw - 32px));
+    padding: 14px 16px;
+    background: var(--lt-table);
+    color: var(--lt-ink);
+    border: 1px solid var(--lt-sleeve);
+    border-radius: 8px;
+    box-shadow: 0 12px 32px light-dark(rgba(17, 17, 17, 0.12), rgba(0, 0, 0, 0.5));
+  }
+
+  #btnNonHumanGuide {
+    anchor-name: --nonhuman-guide;
+  }
+
+  #nonHumanGuidePopover {
+    position-anchor: --nonhuman-guide;
+  }
+
+  #btnCandidateGuide {
+    anchor-name: --candidate-guide;
+  }
+
+  #candidateGuidePopover {
+    position-anchor: --candidate-guide;
+  }
+
+  #btnBoardGuide {
+    anchor-name: --board-guide;
+  }
+
+  #boardGuidePopover {
+    position-anchor: --board-guide;
+  }
+
+  @supports (position-area: block-end) {
+    .guide-popover-panel:is(:popover-open, .\:popover-open) {
+      position: fixed;
+      position-area: block-end span-inline-start;
+      position-try-fallbacks: flip-block, flip-inline;
+      margin-block-start: 6px;
+    }
+  }
+
+  @supports not (position-area: block-end) {
+    .guide-popover-panel:is(:popover-open, .\:popover-open) {
+      margin: 72px auto auto;
+    }
+  }
+
+  /* ---------- Single-row tabs + scroll fade masks + anchor underline ---------- */
+  .filter-tabs {
+    position: relative;
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    scroll-snap-type: x proximity;
+  }
+
+  .filter-tabs .tab {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    scroll-snap-align: nearest;
+  }
+
+  @keyframes mwg-fade-start {
+    from { --fade-start: 0px; }
+    10% { --fade-start: 28px; }
+    to { --fade-start: 28px; }
+  }
+
+  @keyframes mwg-fade-end {
+    from { --fade-end: 28px; }
+    90% { --fade-end: 28px; }
+    to { --fade-end: 0px; }
+  }
+
+  @supports (animation-timeline: scroll()) {
+    .filter-tabs {
+      animation-name: mwg-fade-start, mwg-fade-end;
+      animation-duration: 1ms, 1ms;
+      animation-timeline: scroll(self inline), scroll(self inline);
+      mask-image: linear-gradient(
+        to right,
+        transparent,
+        #000 var(--fade-start),
+        #000 calc(100% - var(--fade-end)),
+        transparent
+      );
+    }
+  }
+
+  .filter-tabs.fade-left {
+    mask-image: linear-gradient(to right, transparent, #000 28px, #000 100%);
+  }
+
+  .filter-tabs.fade-right {
+    mask-image: linear-gradient(to right, #000 0%, #000 calc(100% - 28px), transparent);
+  }
+
+  .filter-tabs.fade-left.fade-right {
+    mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+  }
+
+  @supports (anchor-name: --active-tab) {
+    .filter-tabs .tab.active {
+      anchor-name: --active-tab;
+      border-bottom-color: transparent;
+    }
+
+    .filter-tabs:has(.tab.active)::after {
+      content: "";
+      position: absolute;
+      position-anchor: --active-tab;
+      inset-inline-start: anchor(left);
+      inline-size: anchor-size(width);
+      inset-block-end: 0;
+      block-size: 0;
+      border-bottom: 2px solid var(--lt-ink);
+      pointer-events: none;
+      transition: inset-inline-start 0.15s ease, inline-size 0.15s ease;
+    }
+  }
+
+  /* ---------- Desktop Sidebar Crush Fix & pane scroll containment ---------- */
+  @media (min-width: 901px) and (min-height: 600px) {
+    .app:has(> .results:not([hidden])) {
+      padding-bottom: 0;
+      gap: 10px;
+    }
+
+    .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) {
+      display: flex;
+      flex-direction: column;
+      max-height: none;
+      max-block-size: min(64dvh, 680px);
+      overflow: hidden;
+      padding: 0;
+    }
+
+    .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) > .scan-collapse {
+      flex-shrink: 0;
+      margin: 0;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--lt-sleeve);
+      background: var(--lt-loupe);
+      color: var(--lt-ink);
+    }
+
+    .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) > .scan-main {
+      flex: 1 1 auto;
+      min-block-size: 0;
+      max-inline-size: none;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 18px 20px 0;
+      scroll-padding-block-end: 76px;
+    }
+
+    .app:has(> .results:not([hidden])) > .scan-panel:not(.collapsed) .scan-action-bar {
+      margin-top: 4px;
+      padding: 12px 0 14px;
+    }
+
+    .app:has(> .results:not([hidden])):has(> .scan-panel:not(.collapsed)) #groupList {
+      min-block-size: 0;
+    }
+
+    .app:has(> .results:not([hidden])) .sidebar {
+      min-height: 0;
+    }
+
+    .app:has(> .results:not([hidden])) .result-controls {
+      flex: 0 1 auto;
+      max-block-size: 44%;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .app:has(> .results:not([hidden])) #groupList {
+      flex: 1 1 200px;
+      min-block-size: 200px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .app:has(> .results:not([hidden])) #main {
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+  }
+
+  /* ---------- Sticky board toolbar & scroll-state shadows ---------- */
+  .similar-board {
+    overflow-anchor: none;
+  }
+
+  .board-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    min-inline-size: 0;
+  }
+
+  .app:has(> .results:not([hidden])) .board-toolbar {
+    margin: 0 0 12px;
+    padding: 12px 16px;
+    position: sticky;
+    top: 0;
+    z-index: 6;
+    background: var(--lt-table);
+    border-bottom: 1px solid var(--lt-sleeve);
+  }
+
+  @supports (container-type: scroll-state) {
+    .app:has(> .results:not([hidden])) .board-toolbar {
+      container-type: scroll-state;
+      container-name: board-toolbar;
+    }
+
+    @container board-toolbar scroll-state(stuck: top) {
+      .board-heading h2 {
+        text-decoration: underline;
+        text-decoration-color: var(--lt-sleeve);
+        text-underline-offset: 4px;
+      }
+    }
+  }
+
+  /* ---------- Named inline-size container queries ---------- */
+  #optionsPanel {
+    container-type: inline-size;
+    container-name: scan-options;
+  }
+
+  @container scan-options (max-width: 520px) {
+    .low-resolution-bounds,
+    .semantic-fields {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .detail {
+    container-type: inline-size;
+    container-name: detail-pane;
+  }
+
+  @container detail-pane (max-width: 640px) {
+    .detail-header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .selection-toolbar,
+    .review-toolbar {
+      flex-direction: column;
+      align-items: stretch;
+    }
+  }
+
+  .similar-board {
+    container-type: inline-size;
+    container-name: board-pane;
+  }
+
+  @container board-pane (max-width: 720px) {
+    .board-toolbar {
+      gap: 10px;
+    }
+    .board-controls {
+      width: 100%;
+    }
+  }
+
+  /* ---------- Deferred offscreen rendering ---------- */
+  .board-row:nth-child(n + 6),
+  .card.copy-row:nth-child(n + 9) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 220px;
+  }
+}

@@ -3,7 +3,13 @@
 import { api } from "./api.js";
 import { undoAction } from "./actions.js";
 import { addStreamedGroup, loadGroups, markEmptyTabs } from "./groups.js";
-import { applyCapabilities, updateWorkersUI, workersEl } from "./settings.js";
+import {
+  applyCapabilities,
+  scanGoalShortLabel,
+  syncCollapseButtonVisibility,
+  updateWorkersUI,
+  workersEl,
+} from "./settings.js";
 import { state } from "./state.js";
 import { $, basename, escapeHtml, formatDuration, toast } from "./util.js";
 
@@ -37,14 +43,10 @@ function renderStreams(streams, scanning) {
             <span class="stream-name">${escapeHtml(name)}</span>
             <span class="stream-detail">${escapeHtml(detail)}</span>
           </div>
-          <div class="stream-bar"><div class="stream-fill" data-pct="${Math.max(pct, 4)}"></div></div>
+          <progress class="stream-bar" max="100"${total > 0 || stream.done ? ` value="${Math.max(pct, 4)}"` : ""} aria-label="${escapeHtml(name)} scan progress"></progress>
         </div>`;
     })
     .join("");
-  // The local CSP forbids style attributes, so widths are applied through CSSOM.
-  panel.querySelectorAll(".stream-fill").forEach((fill) => {
-    fill.style.width = `${fill.dataset.pct}%`;
-  });
 }
 
 // —— Status / groups ——
@@ -177,7 +179,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   const s = payload || (await api("/api/status"));
   const statusEl = $("scanStatus");
   const wrap = $("progressWrap");
-  const fill = $("progressFill");
+  const bar = $("progressBar");
   const msg = $("progressMsg");
   const top = $("topStats");
   const scanCompleted = state.scanning && !s.scanning && s.progress?.done;
@@ -263,8 +265,8 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     let pct = total ? Math.min(95, Math.round((done / total) * 100)) : 12;
     if (groupsSoFar > 0) pct = Math.max(pct, Math.min(98, 20 + groupsSoFar * 3));
     const shownPct = p.done ? 100 : Math.max(pct, 5);
-    fill.style.width = `${shownPct}%`;
-    $("progressBar").setAttribute("aria-valuenow", String(shownPct));
+    if (total === 0 && !p.done && groupsSoFar === 0) bar.removeAttribute("value");
+    else bar.value = shownPct;
     const baseMsg = p.message || p.phase || "";
     const parts = [
       total > 0 ? `${done}/${total}` : "",
@@ -281,8 +283,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     $("btnCancelScanProgress").hidden = true;
     $("btnScan").querySelector(".btn-label").textContent = "Scan";
     if (s.progress?.done) {
-      fill.style.width = "100%";
-      $("progressBar").setAttribute("aria-valuenow", "100");
+      bar.value = 100;
       msg.textContent = s.progress.message || "Done";
       statusEl.textContent = s.error ? `Error` : "Ready";
       if (s.error) statusEl.classList.add("error");
@@ -341,6 +342,17 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (versionChanged) state.groupsVersion = version;
   if (handleGroups && s.has_result && (versionChanged || (!s.scanning && s.progress?.done))) {
     await loadGroups({ preserveSelection: s.scanning });
+  }
+  syncCollapseButtonVisibility();
+  if (s.scanning || s.summary?.group_count > 0 || !$("results").hidden) {
+    if (!$("scanCollapsePaths").textContent) {
+      const paths = (s.scan_settings?.paths || s.review_session?.roots || []).join(", ");
+      if (paths) $("scanCollapsePaths").textContent = paths;
+    }
+    if ($("scanCollapseGoal").hidden && s.scan_settings) {
+      $("scanCollapseGoal").textContent = scanGoalShortLabel(s.scan_settings);
+      $("scanCollapseGoal").hidden = false;
+    }
   }
   if (!s.scanning && state.pollTimer) {
     clearInterval(state.pollTimer);

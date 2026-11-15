@@ -2,45 +2,47 @@
 
 import { boardActive, handleBoardKey } from "./board.js";
 import { handleCropKey } from "./crop.js";
-import { handleCropEditorKey } from "./cropeditor.js";
+import { cropEditorOpen, handleCropEditorKey } from "./cropeditor.js";
 import { openHelp, closeHelp } from "./help.js";
-import { closeLightbox, openLightbox } from "./lightbox.js";
-import { changeMemberPage, reviewCandidate, selectGroup, trashReviewCandidate } from "./members.js";
+import { closeLightbox, lightboxOpen, openLightbox } from "./lightbox.js";
+import { reviewCandidate, changeMemberPage, selectGroup, trashReviewCandidate } from "./members.js";
 import { currentGroup, groupNeedsAttention, isDecisionReview, isPagedIndependentReview } from "./model.js";
+import { collapseScanPanel } from "./settings.js";
 import { state } from "./state.js";
 import { decideSwipe, skipSwipe, swipeActive, undoSwipe } from "./swipe.js";
-import { $, toast, trapTabKey } from "./util.js";
+import { $, isOverlayOpen, toast, trapTabKey } from "./util.js";
 
 // —— Keyboard ——
 document.addEventListener("keydown", async (e) => {
   const tag = (e.target && e.target.tagName) || "";
   const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target?.isContentEditable;
+  const modalOpen = isOverlayOpen($("modalBackdrop")) || isOverlayOpen($("helpBackdrop")) || isOverlayOpen($("historyPanel"));
 
   if (e.key === "Escape") {
-    if (!$("lightbox").hidden) {
+    if (lightboxOpen()) {
       closeLightbox();
       e.preventDefault();
       return;
     }
-    if (!$("helpBackdrop").hidden) {
-      closeHelp();
+    if (cropEditorOpen() && handleCropEditorKey(e)) return;
+    if (modalOpen) return; // handled natively by modal <dialog>
+    if (
+      !$("results").hidden
+      && !$("scanPanel").classList.contains("collapsed")
+      && !state.scanning
+      && !document.querySelector('[popover="auto"]:popover-open')
+    ) {
+      collapseScanPanel();
+      $("scanCollapse").focus();
       e.preventDefault();
       return;
     }
-    if (!$("modalBackdrop").hidden) return; // handled by modal
   }
 
-    if (!$("helpBackdrop").hidden && e.key === "Tab") {
-      // Never let Tab escape an open overlay: when the trap has nothing to
-      // cycle (controls briefly hidden mid-repaint), swallow the key instead.
-      if (!trapTabKey($("helpBackdrop"), e)) e.preventDefault();
-      return;
-    }
+  if (modalOpen) return;
 
-    if (!$("modalBackdrop").hidden || !$("helpBackdrop").hidden) return;
-
-  // The crop editor is a dialog of its own: every key is its to take.
-  if ($("lightbox").hidden && handleCropEditorKey(e)) return;
+  // The crop editor is a top-layer popover: every key is its to take.
+  if (!lightboxOpen() && handleCropEditorKey(e)) return;
 
   if (!typing && (e.key === "?" || (e.shiftKey && e.key === "/"))) {
     openHelp();
@@ -48,7 +50,7 @@ document.addEventListener("keydown", async (e) => {
     return;
   }
 
-    if (!$("lightbox").hidden) {
+  if (lightboxOpen()) {
       if (e.key === "Tab") {
         // Same anti-escape guard as the help overlay: an empty moment in the
         // focusable set must not hand focus to the page behind the lightbox.

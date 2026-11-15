@@ -12,7 +12,7 @@ import {
   resetCropZone, sameEdges, skipCrop, snapEdges, zoneBox,
 } from "./crop.js";
 import { currentGroup } from "./model.js";
-import { $, basename, trapTabKey, withMediaVersion } from "./util.js";
+import { $, basename, isOverlayOpen, promoteToastTopLayer, syncAppInert, trapTabKey, withMediaVersion } from "./util.js";
 
 const SIDES = ["top", "right", "bottom", "left"];
 // The smallest zone the fields can make, matching a drag.
@@ -27,8 +27,7 @@ const editor = () => $("cropEditor");
 const fieldFor = (side) => $(`ce${side[0].toUpperCase()}${side.slice(1)}`);
 
 function cropEditorOpen() {
-  const el = editor();
-  return Boolean(el) && !el.hidden;
+  return isOverlayOpen(editor());
 }
 
 function editorMember(g = currentGroup()) {
@@ -240,9 +239,12 @@ function openCropEditor(path) {
   const member = g?.kind === "crop" ? (g.members || []).find((m) => m.path === path) : null;
   if (!editable(member)) return;
   build();
-  if (!cropEditorOpen()) previousFocus = document.activeElement;
+  const wasOpen = cropEditorOpen();
+  if (!wasOpen) previousFocus = document.activeElement;
   editorPath = path;
-  editor().hidden = false;
+  if (!wasOpen) editor().showPopover?.();
+  syncAppInert();
+  promoteToastTopLayer();
   draw();
   $("ceBox").focus({ preventScroll: true });
 }
@@ -250,7 +252,8 @@ function openCropEditor(path) {
 function closeCropEditor() {
   if (!cropEditorOpen()) return;
   const path = editorPath;
-  editor().hidden = true;
+  editor().hidePopover?.();
+  syncAppInert();
   editorPath = null;
   $("ceImage").removeAttribute("src");
   // Back to the zone that was being edited, where the page still shows it.
@@ -300,6 +303,7 @@ function handleCropEditorKey(event) {
   const typing = event.target?.tagName === "INPUT";
   if (typing) {
     if (event.key === "Enter") {
+      if (event.isComposing || event.keyCode === 229) return true;
       event.target.blur(); // commits the number through its change event
       $("ceBox").focus({ preventScroll: true });
       event.preventDefault();

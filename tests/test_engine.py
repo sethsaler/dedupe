@@ -1029,3 +1029,41 @@ def test_parallel_streams_say_whether_the_worker_count_was_chosen(
     run_scans_parallel(roots, workers=None, use_cache=False)
 
     assert seen == [True, True, False, False]
+
+
+def test_combined_progress_reaches_its_total_and_never_goes_back(tmp_path: Path) -> None:
+    """Every stage counts as complete when it ends, and none starts over.
+
+    Exact hashing only reports the files that share a size, and image
+    comparison follows image hashing, so the combined count once stopped at
+    half of its total for the rest of the scan.
+    """
+    for index in range(6):
+        _save(tmp_path / f"{index}.jpg", (40 * index, 255 - 40 * index, 20 * index))
+
+    def scan() -> list[tuple[int, int]]:
+        reports: list[tuple[int, int]] = []
+
+        def progress(prog) -> None:
+            if prog.phase == "processing":
+                reports.append((prog.files_processed, prog.files_found))
+
+        run_scan(
+            [tmp_path],
+            exact=True,
+            similar=True,
+            find_black_borders=True,
+            random_review_count=0,
+            cache_path=tmp_path / "cache.sqlite3",
+            progress=progress,
+        )
+        return reports
+
+    first = scan()
+    _save(tmp_path / "new.jpg", (10, 200, 120))
+    # The second scan works on one new file; the cache serves the rest.
+    for reports in (first, scan()):
+        assert reports
+        counts = [processed for processed, _total in reports]
+        assert counts == sorted(counts)
+        assert reports[-1][0] == reports[-1][1]

@@ -1,9 +1,8 @@
 /* Scoped theme (review): group rail, detail header, similar compare + board, action bar.
-   Loads after app.css, design.css and theme.css. Selectors are scoped to the
-   results/similar/action-bar contexts so the decision review, triage grids,
-   modals and lightbox keep their own step's rules. Red (--lt-pencil) marks only
-   things that will leave; keepers are ink. */
+   Loads inside @layer theme. Selectors are scoped to the results/similar/action-bar
+   contexts so the decision review, triage grids, modals and lightbox keep their own step's rules. */
 
+@layer theme {
 /* ---------- Results shell: flat index rail + one sleeve rule ---------- */
 .results {
   gap: 12px 0;
@@ -249,10 +248,9 @@
   flex: 1 1 320px;
 }
 
-/* Meta is the kicker above the title, mono and graphite. */
+/* Meta sits directly below the title in DOM order, mono and graphite. */
 .results .detail-heading #detailMeta {
-  order: -1;
-  margin: 0 0 8px;
+  margin: 6px 0 0;
   font-family: var(--lt-mono);
   font-size: 12px;
   line-height: 1.4;
@@ -1131,4 +1129,5 @@
 .results .review-filters > .filter-section {
   border-top: 1px solid var(--lt-sleeve);
   padding-top: 8px;
+}
 }

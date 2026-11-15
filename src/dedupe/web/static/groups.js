@@ -441,11 +441,15 @@ function renderGroupList() {
       : state.scanning ? "Results will appear here as the scan progresses."
       : state.allGroups.length ? "Choose another category to continue reviewing your files."
       : "Choose a folder and start a new scan to find files to review.";
+    const emptyActions = categoryHasGroups
+      ? '<div class="group-empty-actions"><button class="btn ghost" type="button" data-empty-action="clear">Clear filters</button></div>'
+      : !state.scanning
+        ? `<div class="group-empty-actions">${state.kind !== "all" && state.allGroups.length ? '<button class="btn ghost" type="button" data-empty-action="all">View all categories</button>' : ""}<button class="btn ghost" type="button" data-empty-action="setup">Change scan setup</button></div>`
+        : "";
     list.innerHTML = `<div class="group-empty">
       <strong>${title}</strong>
       <p>${hint}</p>
-      ${categoryHasGroups ? '<button class="btn ghost" type="button" data-empty-action="clear">Clear filters</button>'
-        : state.kind !== "all" && state.allGroups.length ? '<button class="btn ghost" type="button" data-empty-action="all">View all categories</button>' : ""}
+      ${emptyActions}
     </div>`;
     $("groupMore").innerHTML = "";
     syncEarlierSlot();

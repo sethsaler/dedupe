@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { reviewCandidate, setMemberSelected, trashReviewCandidate } from "./members.js";
 import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview } from "./model.js";
 import { state } from "./state.js";
-import { $, formatBytes, formatMtime, toast, withMediaVersion } from "./util.js";
+import { $, formatBytes, formatMtime, isOverlayOpen, promoteToastTopLayer, syncAppInert, toast, withMediaVersion } from "./util.js";
 
 const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
 
@@ -26,6 +26,10 @@ function fullUrl(path) {
   return withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(path)}&variant=full`, path);
 }
 
+function lightboxOpen() {
+  return isOverlayOpen($("lightbox"));
+}
+
 function openLightbox(index) {
   if (!state.lightboxItems.length) return;
   document.querySelectorAll("#members video").forEach((video) => video.pause());
@@ -36,7 +40,10 @@ function openLightbox(index) {
   )?.dataset.path || null;
   state.lightboxIndex = Math.max(0, Math.min(index, state.lightboxItems.length - 1));
   updateLightbox();
-  $("lightbox").hidden = false;
+  const lb = $("lightbox");
+  if (!lightboxOpen()) lb.showPopover?.();
+  syncAppInert();
+  promoteToastTopLayer();
   $("lbClose").focus();
 }
 
@@ -45,7 +52,9 @@ function closeLightbox() {
   $("lbVideo").pause();
   $("lbVideo").removeAttribute("src");
   $("lbVideo").load();
-  $("lightbox").hidden = true;
+  const lb = $("lightbox");
+  if (lightboxOpen()) lb.hidePopover?.();
+  syncAppInert();
   // Return to the control that opened the lightbox: an Enlarge button stays
   // an Enlarge button (its card's picture is the Trash now, so landing focus
   // there would arm the wrong key), anything else to the picture as before.
@@ -341,4 +350,4 @@ $("lightbox").addEventListener("touchend", (e) => {
   stepLightbox(delta < 0 ? 1 : -1);
 }, { passive: true });
 
-export { openLightbox, closeLightbox, updateLightbox };
+export { closeLightbox, lightboxOpen, openLightbox, updateLightbox };

@@ -2,7 +2,14 @@ import { api } from "./api.js";
 import { collectScanSettings, startScan } from "./scan.js";
 import { loadGroups } from "./groups.js";
 import { confirmModal } from "./modal.js";
-import { updateWorkersUI } from "./settings.js";
+import {
+  SCAN_PRESETS,
+  collapseScanPanel,
+  inferScanPreset,
+  scanGoalShortLabel,
+  syncCustomPresetHint,
+  updateWorkersUI,
+} from "./settings.js";
 import { state } from "./state.js";
 import { refreshStatus } from "./status.js";
 import { $, escapeHtml, toast } from "./util.js";
@@ -43,7 +50,10 @@ function restoreSettings(settings) {
     $(id).dispatchEvent(new Event("input"));
   }
   $("threshold").dispatchEvent(new Event("input"));
-  $("scanPreset").value = "custom";
+  const inferredPreset = inferScanPreset(settings);
+  $("scanPreset").value = inferredPreset;
+  if (inferredPreset === "custom") syncCustomPresetHint();
+  else $("presetHint").textContent = SCAN_PRESETS[inferredPreset]?.hint || "";
   $("semanticFields").hidden = !$("optSemantic").checked;
   updateWorkersUI();
 }
@@ -75,6 +85,13 @@ $("cleanupJob").addEventListener("change", () => {
     : "Save folders and settings together. Each job keeps its own review progress.";
 });
 
+$("scanPreset").addEventListener("change", () => {
+  const job = chosenJob();
+  if (!job) return;
+  $("jobHint").textContent =
+    `Selected job "${job.name}" will use these updated settings on Scan (or choose "New cleanup" to keep the job unchanged).`;
+});
+
 $("btnSaveJob").addEventListener("click", async () => {
   try {
     const settings = collectScanSettings();
@@ -88,10 +105,13 @@ $("btnSaveJob").addEventListener("click", async () => {
 });
 
 $("btnResumeJob").addEventListener("click", async () => {
+  const job = chosenJob();
+  if (!job) return;
   try {
-    await api("/api/review-session/resume", { method: "POST", body: JSON.stringify({ job_id: chosenJob().id }) });
+    await api("/api/review-session/resume", { method: "POST", body: JSON.stringify({ job_id: job.id }) });
     await refreshStatus();
     await loadGroups();
+    collapseScanPanel((job.settings?.paths || []).join(", "), scanGoalShortLabel(job.settings));
   } catch (error) { toast(error.message, "error"); }
 });
 

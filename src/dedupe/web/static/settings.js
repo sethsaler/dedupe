@@ -74,17 +74,42 @@ updateWorkersUI();
 // —— Scan panel collapse ——
 // The setup form folds into a slim bar once a scan starts (or when results
 // are already loaded) so the results below get the screen; the bar re-opens
-// the form on click and shows the scanned paths while collapsed.
-$("scanCollapse").addEventListener("click", () => {
-  const collapsed = $("scanPanel").classList.toggle("collapsed");
-  $("scanCollapse").setAttribute("aria-expanded", collapsed ? "false" : "true");
-});
+// the form on click and shows the active goal + scanned paths while collapsed.
+function syncCollapseButtonVisibility() {
+  const btn = $("btnCollapseScan");
+  if (!btn) return;
+  btn.hidden = $("results").hidden || state.scanning;
+}
 
-function collapseScanPanel(pathsText = "") {
+function collapseScanPanel(pathsText = "", goalLabel = "") {
   if (pathsText) $("scanCollapsePaths").textContent = pathsText;
+  if (goalLabel) {
+    $("scanCollapseGoal").textContent = goalLabel;
+    $("scanCollapseGoal").hidden = false;
+  }
   $("scanPanel").classList.add("collapsed");
   $("scanCollapse").setAttribute("aria-expanded", "false");
+  syncCollapseButtonVisibility();
 }
+
+function expandScanPanel({ focusId = null } = {}) {
+  $("scanPanel").classList.remove("collapsed");
+  $("scanCollapse").setAttribute("aria-expanded", "true");
+  const main = $("scanMain");
+  if (main) main.scrollTop = 0;
+  syncCollapseButtonVisibility();
+  if (focusId) $(focusId)?.focus();
+}
+
+$("scanCollapse").addEventListener("click", () => {
+  if ($("scanPanel").classList.contains("collapsed")) expandScanPanel();
+  else collapseScanPanel();
+});
+
+$("btnCollapseScan")?.addEventListener("click", () => {
+  collapseScanPanel();
+  $("scanCollapse").focus();
+});
 
 const settingIds = [
   "preferredFolders",
@@ -199,46 +224,114 @@ const GOAL_DETECTORS = [
 ];
 const DUPLICATES_HINT =
   "Find exact copies and similar versions, including resized or lightly edited media, across all folders.";
+const DETECTOR_LABELS = {
+  optExact: "Exact",
+  optSimilar: "Similar",
+  optSemantic: "Sets & look-alikes",
+  optVideoVersions: "Video clips & versions",
+  optDecider: "Decider verification",
+  optNoHumans: "Non-Human",
+  optCountFaces: "Faces",
+  optBlackBorders: "Crops",
+  optLowResolution: "Low resolution",
+  optRandomReview: "Random 50",
+};
 const SCAN_PRESETS = {
-  cleanup: { on: ["optExact", "optSimilar"], tab: null, hint: DUPLICATES_HINT },
+  cleanup: { on: ["optExact", "optSimilar"], tab: "all", badge: "Duplicates", hint: DUPLICATES_HINT },
   deep: {
     on: ["optExact", "optSimilar", "optSemantic", "optVideoVersions"],
     optional: ["optSemantic", "optVideoVersions"],
-    tab: null,
+    tab: "all",
+    badge: "Edited copies",
     hint: "Includes edited-copy discovery with DigUp; each look-alike needs review.",
   },
   crop: {
     on: ["optBlackBorders"],
     tab: "crop",
+    badge: "Crops",
     hint: "Find images and MP4/MOV videos framed by black bars, images framed in white or another flat colour, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop for each. Videos are re-encoded when cropped. Duplicates are not checked.",
   },
   faces: {
     on: ["optCountFaces"],
     tab: "faces",
+    badge: "Faces",
     hint: "Find images with faces, group shots first. Sort and filter them by how many faces appear.",
   },
   no_humans: {
     on: ["optNoHumans"],
     tab: "no_humans",
+    badge: "Non-Human",
     hint: "Find photos and videos with no person in them, for review one at a time.",
   },
   low_resolution: {
     on: ["optLowResolution"],
     tab: "low_resolution",
+    badge: "Low-res",
     hint: "Find media below the low-resolution bounds in Scan settings below (1 MP by default).",
   },
   random_review: {
     on: ["optRandomReview"],
     tab: "random_review",
+    badge: "Random 50",
     hint: "Pick 50 files at random for a quick spot check of the library.",
   },
   checkup: {
     on: ["optExact", "optSimilar", "optNoHumans", "optCountFaces", "optBlackBorders", "optLowResolution"],
     optional: ["optNoHumans", "optCountFaces"],
-    tab: null,
+    tab: "all",
+    badge: "Full checkup",
     hint: "Duplicates, crops, faces, photos without people, and low-resolution media in one pass. Slower.",
   },
 };
+
+function syncCustomPresetHint() {
+  const active = Object.entries(DETECTOR_LABELS)
+    .filter(([id]) => $(id)?.checked)
+    .map(([, label]) => label);
+  const separate = Boolean($("optParallel")?.checked);
+  if (!active.length) {
+    $("presetHint").textContent = separate
+      ? "Only folder browsing (Files tab) is enabled, scanning folders separately — pick a Scan goal or check detectors below."
+      : "Only folder browsing (Files tab) is enabled — pick a Scan goal or check detectors below.";
+    return;
+  }
+  $("presetHint").textContent = `Custom settings: ${active.join(", ")}${separate ? " (separate folders)" : ""}.`;
+}
+
+function settingsDetectorFlag(settings, detectorId) {
+  switch (detectorId) {
+    case "optExact": return Boolean(settings.exact);
+    case "optSimilar": return Boolean(settings.similar);
+    case "optSemantic": return Boolean(settings.semantic);
+    case "optVideoVersions": return Boolean(settings.video_versions);
+    case "optDecider": return Boolean(settings.decider);
+    case "optNoHumans": return Boolean(settings.find_no_humans);
+    case "optCountFaces": return Boolean(settings.count_faces);
+    case "optBlackBorders": return Boolean(settings.find_black_borders);
+    case "optLowResolution": return Boolean(settings.find_low_resolution);
+    case "optRandomReview": return Number(settings.random_review_count || 0) > 0;
+    case "optParallel": return Boolean(settings.parallel_streams);
+    default: return false;
+  }
+}
+
+function inferScanPreset(settings) {
+  if (!settings) return "custom";
+  for (const [preset, spec] of Object.entries(SCAN_PRESETS)) {
+    const on = new Set(spec.on);
+    const matches = GOAL_DETECTORS.every((id) => {
+      const expected = on.has(id) && !Boolean($(id)?.disabled);
+      return settingsDetectorFlag(settings, id) === expected;
+    });
+    if (matches) return preset;
+  }
+  return "custom";
+}
+
+function scanGoalShortLabel(settings = null) {
+  const preset = settings ? inferScanPreset(settings) : $("scanPreset").value;
+  return SCAN_PRESETS[preset]?.badge || "Custom";
+}
 
 // Inputs a goal cannot run without, and why (from the dependency gates).
 function goalBlocker(preset) {
@@ -256,6 +349,10 @@ function presetResultsTab() {
 }
 
 function applyScanPreset(preset) {
+  if (preset === "custom") {
+    syncCustomPresetHint();
+    return;
+  }
   const spec = SCAN_PRESETS[preset];
   if (!spec) return;
   const blocker = goalBlocker(preset);
@@ -299,7 +396,12 @@ $("scanPreset").addEventListener("change", () => applyScanPreset($("scanPreset")
 // Extra analysis remains available explicitly for subsequent scans in this page.
 $("scanPreset").value = "cleanup";
 applyScanPreset("cleanup");
-for (const id of settingIds) $(id).addEventListener("change", () => { $("scanPreset").value = "custom"; });
+for (const id of GOAL_DETECTORS) {
+  $(id).addEventListener("change", () => {
+    $("scanPreset").value = "custom";
+    syncCustomPresetHint();
+  });
+}
 
 // —— Recent paths ——
 function loadRecent() {
@@ -562,4 +664,20 @@ function lowResolutionMaxPixels(id) {
   return Math.round(megapixels * 1_000_000);
 }
 
-export { updateWorkersUI, workersEl, saveRecent, renderRecent, lowResolutionMaxPixels, collapseScanPanel, applyCapabilities, syncCrossFolderHint, presetResultsTab };
+export {
+  SCAN_PRESETS,
+  updateWorkersUI,
+  workersEl,
+  saveRecent,
+  renderRecent,
+  lowResolutionMaxPixels,
+  collapseScanPanel,
+  expandScanPanel,
+  applyCapabilities,
+  syncCrossFolderHint,
+  syncCollapseButtonVisibility,
+  syncCustomPresetHint,
+  inferScanPreset,
+  scanGoalShortLabel,
+  presetResultsTab,
+};
