@@ -6,6 +6,7 @@ single decoder thread, with one-pass frame extraction and small frame size.
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -16,16 +17,26 @@ import sys
 import tempfile
 import threading
 import time
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from pathlib import Path
+from typing import TypeVar
 
 from .cache import DistinctReviews
+from .exact import PARTIAL_SIZE, file_partial_hash, file_sha256
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
-from .parallel import DEFAULT_VIDEO_WORKERS_CAP, map_parallel, resolve_workers
+from .parallel import (
+    DEFAULT_VIDEO_WORKERS_CAP,
+    DEFAULT_WORKERS_CAP,
+    map_parallel,
+    resolve_workers,
+)
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 ProgressCb = Callable[[str, int, int, str | None], None]
 
@@ -40,10 +51,41 @@ MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
 FRAME_WIDTH = 320
 HASH_FRAME_SIZE = 32
 # Software-decode fingerprint jobs run beside the hardware-decode ones: one
-# per this many cores, up to the maximum.
-CORES_PER_SOFTWARE_DECODE = 8
-MAX_SOFTWARE_DECODE_WORKERS = 2
+# per this many spare cores, up to the automatic maximum.
+CORES_PER_SOFTWARE_DECODE = 2
+MAX_SOFTWARE_DECODE_WORKERS = 6
 HASH_FRAME_FILTER = f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,format=gray"
+
+_DECODE_LANE = threading.local()
+_THREAD_SCRATCH = threading.local()
+_SCRATCH_DIRS: set[Path] = set()
+_SCRATCH_LOCK = threading.Lock()
+
+
+@atexit.register
+def _cleanup_scratch_dirs() -> None:
+    with _SCRATCH_LOCK:
+        dirs = list(_SCRATCH_DIRS)
+        _SCRATCH_DIRS.clear()
+    for directory in dirs:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _thread_scratch_dir() -> Path:
+    """Return a lazily-created per-thread scratch directory cleaned up on exit."""
+    scratch = getattr(_THREAD_SCRATCH, "dir", None)
+    if scratch is None or not scratch.exists():
+        scratch = Path(tempfile.mkdtemp(prefix="dedupe-vidhash-"))
+        _THREAD_SCRATCH.dir = scratch
+        with _SCRATCH_LOCK:
+            _SCRATCH_DIRS.add(scratch)
+    return scratch
+
+
+def _next_scratch_seq() -> int:
+    seq = getattr(_THREAD_SCRATCH, "seq", 0) + 1
+    _THREAD_SCRATCH.seq = seq
+    return seq
 
 
 def ffmpeg_available() -> bool:
@@ -277,23 +319,27 @@ def _extract_hash_frames_once(
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
     for timestamp in timestamps:
         cmd += [*hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
-    with tempfile.TemporaryDirectory(prefix="dedupe-vidhash-") as tmp:
-        targets = [Path(tmp) / f"frame_{index:03d}.raw" for index in range(len(timestamps))]
-        for index, target in enumerate(targets):
-            cmd += [
-                "-map",
-                f"{index}:v",
-                "-an",
-                "-sn",
-                "-vf",
-                HASH_FRAME_FILTER,
-                "-frames:v",
-                "1",
-                "-f",
-                "rawvideo",
-                "-y",
-                str(target),
-            ]
+    scratch = _thread_scratch_dir()
+    seq = _next_scratch_seq()
+    targets = [
+        scratch / f"frame_{seq}_{index:03d}.raw" for index in range(len(timestamps))
+    ]
+    for index, target in enumerate(targets):
+        cmd += [
+            "-map",
+            f"{index}:v",
+            "-an",
+            "-sn",
+            "-vf",
+            HASH_FRAME_FILTER,
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-y",
+            str(target),
+        ]
+    try:
         result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
         if result.returncode != 0:
             return []
@@ -307,6 +353,12 @@ def _extract_hash_frames_once(
                 return []
             frames.append(raw)
         return frames
+    finally:
+        for target in targets:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _extract_seek_frame_ppm(
@@ -498,6 +550,20 @@ def compute_video_fingerprint(
         return "v3:" + ",".join(str(frame_hash) for frame_hash in hashes), width, height, duration
 
 
+@lru_cache(maxsize=128)
+def _aligned_indexes_cached(
+    left_len: int, right_len: int
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    count = min(left_len, right_len)
+    if count == 0:
+        return (), ()
+    if count == 1:
+        return (0,), (0,)
+    left_indexes = tuple(round(i * (left_len - 1) / (count - 1)) for i in range(count))
+    right_indexes = tuple(round(i * (right_len - 1) / (count - 1)) for i in range(count))
+    return left_indexes, right_indexes
+
+
 def aligned_position_indexes(
     left_len: int, right_len: int
 ) -> tuple[list[int], list[int]]:
@@ -506,14 +572,8 @@ def aligned_position_indexes(
     Shared by video grouping, action revalidation, and the UI's similarity
     percentages so every comparison aligns frames the same way.
     """
-    count = min(left_len, right_len)
-    if count == 0:
-        return [], []
-    if count == 1:
-        return [0], [0]
-    left_indexes = [round(i * (left_len - 1) / (count - 1)) for i in range(count)]
-    right_indexes = [round(i * (right_len - 1) / (count - 1)) for i in range(count)]
-    return left_indexes, right_indexes
+    left_indexes, right_indexes = _aligned_indexes_cached(left_len, right_len)
+    return list(left_indexes), list(right_indexes)
 
 
 def video_fingerprint_distances(a: str, b: str) -> list[int] | None:
@@ -559,7 +619,9 @@ def _video_fingerprint_job(
         return path, None, None, None, None, f"{ERROR_VIDEO_FINGERPRINT_FAILED}: {exc}"
 
 
-def _software_decode_workers(video_workers: int) -> int:
+def _software_decode_workers(
+    video_workers: int, *, requested_workers: int | None = None
+) -> int:
     """Extra fingerprint jobs that decode on the CPU beside the hardware ones.
 
     The hardware decoder is one shared device: past a few jobs it is the
@@ -572,7 +634,268 @@ def _software_decode_workers(video_workers: int) -> int:
     """
     if video_workers < DEFAULT_VIDEO_WORKERS_CAP or not _hwaccel_args():
         return 0
-    return min(MAX_SOFTWARE_DECODE_WORKERS, (os.cpu_count() or 1) // CORES_PER_SOFTWARE_DECODE)
+    spare_cores = max(0, (os.cpu_count() or 1) - video_workers)
+    if requested_workers is not None and requested_workers > DEFAULT_WORKERS_CAP:
+        return min(
+            spare_cores,
+            max(MAX_SOFTWARE_DECODE_WORKERS, int(requested_workers) - video_workers),
+        )
+    return min(MAX_SOFTWARE_DECODE_WORKERS, spare_cores // CORES_PER_SOFTWARE_DECODE)
+
+
+def _run_on_video_lanes(
+    fn: Callable[[T], R],
+    items: Sequence[T],
+    *,
+    workers: int | None,
+    progress: Callable[[int, int], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[R]:
+    """Run ``items`` across the hardware lane plus any spare-core software lanes."""
+    hw_workers = resolve_workers(workers, cap=DEFAULT_VIDEO_WORKERS_CAP)
+    sw_workers = _software_decode_workers(hw_workers, requested_workers=workers)
+    total_workers = hw_workers + sw_workers
+    hardware_slots = threading.BoundedSemaphore(hw_workers)
+
+    def wrapped(item: T) -> R:
+        prev = getattr(_DECODE_LANE, "software", False)
+        if not sw_workers:
+            _DECODE_LANE.software = False
+            try:
+                return fn(item)
+            finally:
+                _DECODE_LANE.software = prev
+        acquired = hardware_slots.acquire(blocking=False)
+        _DECODE_LANE.software = not acquired
+        try:
+            return fn(item)
+        finally:
+            _DECODE_LANE.software = prev
+            if acquired:
+                hardware_slots.release()
+
+    return map_parallel(
+        wrapped,
+        items,
+        workers=total_workers,
+        # ffmpeg spawns real OS processes -> threads buy true parallelism.
+        backend="thread",
+        progress=progress,
+        cancelled=cancelled,
+    )
+
+
+def _copy_video_fingerprint(donor: FileRecord, target: FileRecord) -> None:
+    """Copy a resolved video fingerprint and stream metadata onto an exact sibling."""
+    target.video_fingerprint = donor.video_fingerprint
+    if donor.width:
+        target.width = donor.width
+    if donor.height:
+        target.height = donor.height
+    if donor.duration is not None:
+        target.duration = donor.duration
+
+
+def _safe_partial_hash(path: str) -> tuple[str, str | None]:
+    try:
+        return path, file_partial_hash(path)
+    except OSError:
+        return path, None
+
+
+def _safe_sha256(path: str) -> tuple[str, str | None]:
+    try:
+        return path, file_sha256(path)
+    except OSError:
+        return path, None
+
+
+def _evaluate_candidate_pairs(
+    hashed: list[FileRecord],
+    fingerprints: list[tuple[int, ...]],
+    *,
+    threshold: int,
+    max_frame_distance: int,
+    distinct: DistinctReviews,
+    cancelled: Callable[[], bool] | None,
+) -> tuple[dict[str, set[str]], list[tuple[FileRecord, FileRecord]]]:
+    """Compare candidate pairs using vectorized popcount within ±10% duration windows."""
+    import numpy as np
+
+    adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
+    verify_pairs: dict[tuple[int, int], tuple[FileRecord, FileRecord]] = {}
+    verify_limit = threshold * VERIFY_DISTANCE_FACTOR
+
+    known_durations = sorted(
+        (float(record.duration), index)
+        for index, record in enumerate(hashed)
+        if record.duration is not None and record.duration > 0
+    )
+    unknown_indexes = [
+        index
+        for index, record in enumerate(hashed)
+        if record.duration is None or record.duration <= 0
+    ]
+
+    def _record_pair(
+        u: int, v: int, mean_distance: float, max_distance: int
+    ) -> None:
+        first, second = (u, v) if u < v else (v, u)
+        a, b = hashed[first], hashed[second]
+        if distinct and distinct.is_distinct(a, b):
+            return
+        if mean_distance <= threshold and max_distance <= max_frame_distance:
+            adjacency[a.path].add(b.path)
+            adjacency[b.path].add(a.path)
+        elif mean_distance <= verify_limit:
+            verify_pairs[(first, second)] = (a, b)
+
+    def _check_mixed_pair(u: int, v: int) -> None:
+        left, right = fingerprints[u], fingerprints[v]
+        if (
+            (left[0] ^ right[0]).bit_count() > max_frame_distance
+            or (left[-1] ^ right[-1]).bit_count() > max_frame_distance
+        ):
+            return
+        left_indexes, right_indexes = _aligned_indexes_cached(len(left), len(right))
+        if not left_indexes:
+            return
+        distances = [
+            (left[li] ^ right[ri]).bit_count()
+            for li, ri in zip(left_indexes, right_indexes, strict=True)
+        ]
+        _record_pair(u, v, sum(distances) / len(distances), max(distances))
+
+    if known_durations:
+        kd_durations_list = [duration for duration, _ in known_durations]
+        kd_indices = [index for _, index in known_durations]
+        k_count = len(known_durations)
+        kd_lengths = np.array([len(fingerprints[idx]) for idx in kd_indices], dtype=np.int64)
+        kd_first = np.array([fingerprints[idx][0] for idx in kd_indices], dtype=np.uint64)
+        kd_last = np.array([fingerprints[idx][-1] for idx in kd_indices], dtype=np.uint64)
+        width = max(int(kd_lengths.max()), 1)
+        kd_fps = np.zeros((k_count, width), dtype=np.uint64)
+        for pos, idx in enumerate(kd_indices):
+            fp = fingerprints[idx]
+            kd_fps[pos, : len(fp)] = fp
+
+        for pos, d_a in enumerate(kd_durations_list):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            u = kd_indices[pos]
+            end = bisect_right(kd_durations_list, d_a / 0.9 + 1e-9)
+            if end <= pos + 1:
+                continue
+            first_dist = _popcount64(kd_first[pos + 1 : end] ^ kd_first[pos])
+            last_dist = _popcount64(kd_last[pos + 1 : end] ^ kd_last[pos])
+            rel = np.flatnonzero(
+                (first_dist <= max_frame_distance) & (last_dist <= max_frame_distance)
+            )
+            if not rel.size:
+                continue
+            rel = rel + (pos + 1)
+            left_len = int(kd_lengths[pos])
+            same_mask = kd_lengths[rel] == left_len
+
+            if np.any(same_mask):
+                same_rel = rel[same_mask]
+                dists = _popcount64(kd_fps[same_rel, :left_len] ^ kd_fps[pos : pos + 1, :left_len])
+                means = dists.sum(axis=1) / left_len
+                maxs = dists.max(axis=1)
+                keep = np.flatnonzero(means <= verify_limit)
+                for k_i in keep.tolist():
+                    c_pos = int(same_rel[k_i])
+                    d_b = kd_durations_list[c_pos]
+                    if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                        continue
+                    _record_pair(u, kd_indices[c_pos], float(means[k_i]), int(maxs[k_i]))
+
+            if not np.all(same_mask):
+                for c_pos in rel[~same_mask].tolist():
+                    d_b = kd_durations_list[c_pos]
+                    if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                        continue
+                    _check_mixed_pair(u, kd_indices[c_pos])
+
+        for u in unknown_indexes:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            left = fingerprints[u]
+            left_len = len(left)
+            first_dist = _popcount64(kd_first ^ np.uint64(left[0]))
+            last_dist = _popcount64(kd_last ^ np.uint64(left[-1]))
+            rel = np.flatnonzero(
+                (first_dist <= max_frame_distance) & (last_dist <= max_frame_distance)
+            )
+            if not rel.size:
+                continue
+            same_mask = kd_lengths[rel] == left_len
+            if np.any(same_mask):
+                same_rel = rel[same_mask]
+                left_arr = np.array(left, dtype=np.uint64)[None, :]
+                dists = _popcount64(kd_fps[same_rel, :left_len] ^ left_arr)
+                means = dists.sum(axis=1) / left_len
+                maxs = dists.max(axis=1)
+                keep = np.flatnonzero(means <= verify_limit)
+                for k_i in keep.tolist():
+                    c_pos = int(same_rel[k_i])
+                    _record_pair(u, kd_indices[c_pos], float(means[k_i]), int(maxs[k_i]))
+            if not np.all(same_mask):
+                for c_pos in rel[~same_mask].tolist():
+                    _check_mixed_pair(u, kd_indices[c_pos])
+
+    for p, u in enumerate(unknown_indexes):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        for v in unknown_indexes[p + 1 :]:
+            _check_mixed_pair(u, v)
+
+    to_verify = [verify_pairs[k] for k in sorted(verify_pairs)]
+    return adjacency, to_verify
+
+
+class _FrameBatchCache:
+    """Thread-safe singleflight cache for extracted verification frame batches."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, tuple[float, ...]], list] = {}
+
+    def get(
+        self,
+        path: str,
+        timestamps: list[float],
+        cancelled: Callable[[], bool] | None,
+    ) -> list[bytes]:
+        key = (path, tuple(round(float(t), 6) for t in timestamps))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = [threading.Event(), None, None]
+                self._entries[key] = entry
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            event = entry[0]
+            while not event.wait(timeout=0.05):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+            if entry[2] is not None:
+                raise entry[2]
+            return entry[1]
+        try:
+            frames = _version_frame_batches(path, timestamps, cancelled)
+        except BaseException as exc:
+            with self._lock:
+                entry[2] = exc
+                if isinstance(exc, InterruptedError):
+                    self._entries.pop(key, None)
+            entry[0].set()
+            raise
+        entry[1] = frames
+        entry[0].set()
+        return frames
 
 
 def find_similar_video_groups(
@@ -583,6 +906,7 @@ def find_similar_video_groups(
     progress: ProgressCb | None = None,
     workers: int | None = None,
     cancelled: Callable[[], bool] | None = None,
+    exact_done: threading.Event | None = None,
 ) -> list[list[FileRecord]]:
     """Cluster near-identical videos by fingerprint Hamming distance."""
     distinct = distinct or DistinctReviews.empty()
@@ -594,8 +918,6 @@ def find_similar_video_groups(
         if progress:
             progress("video-hash", 0, 0, "")
         return []
-
-    video_workers = resolve_workers(workers, cap=DEFAULT_VIDEO_WORKERS_CAP)
 
     total = len(videos)
     # v3 uses direct timeline seeks and raw grayscale frames. Recompute cached
@@ -612,11 +934,31 @@ def find_similar_video_groups(
     progress_lock = threading.Lock()
 
     if need:
-        by_path = {r.path: r for r in need}
         for record in need:
             # A failed upgrade must never leave a legacy fingerprint eligible
             # for clustering or persistence back into the cache.
             record.video_fingerprint = None
+
+        need_paths = {r.path for r in need}
+        donors_by_size_sha: dict[tuple[int, str], FileRecord] = {}
+        for r in videos:
+            if r.path not in need_paths and r.size > 0 and r.sha256 and r.video_fingerprint:
+                donors_by_size_sha.setdefault((r.size, r.sha256), r)
+
+        remaining_need: list[FileRecord] = []
+        for r in need:
+            donor = (
+                donors_by_size_sha.get((r.size, r.sha256))
+                if r.size > 0 and r.sha256
+                else None
+            )
+            if donor is not None:
+                _copy_video_fingerprint(donor, r)
+                videos_done += 1
+                if progress:
+                    progress("video-hash", videos_done, total, "")
+            else:
+                remaining_need.append(r)
 
         def on_frame(frame: int, n_frames: int) -> None:
             with progress_lock:
@@ -628,44 +970,180 @@ def find_similar_video_groups(
                         f"Video hashing: {videos_done}/{total} · frame {frame}/{n_frames}",
                     )
 
-        software_workers = _software_decode_workers(video_workers)
-        hardware_slots = threading.BoundedSemaphore(video_workers)
+        def _apply_fingerprint_results(
+            targets: list[FileRecord],
+            results: list[tuple[str, str | None, int | None, int | None, float | None, str | None]],
+        ) -> None:
+            nonlocal videos_done
+            by_path = {r.path: r for r in targets}
+            for path, fp, w, h, dur, err in results:
+                rec = by_path[path]
+                if err:
+                    rec.error = err
+                else:
+                    rec.video_fingerprint = fp
+                    if w:
+                        rec.width = w
+                    if h:
+                        rec.height = h
+                    if dur is not None:
+                        rec.duration = dur
+                videos_done += 1
+                if progress:
+                    progress("video-hash", videos_done, total, "")
 
-        def job(path: str) -> tuple[str, str | None, int | None, int | None, float | None, str | None]:
-            if not software_workers:
-                return _video_fingerprint_job(path, on_frame=on_frame)
-            # Jobs beyond the hardware lane's width decode on the CPU.
-            if not hardware_slots.acquire(blocking=False):
-                return _video_fingerprint_job(path, on_frame=on_frame, software=True)
-            try:
-                return _video_fingerprint_job(path, on_frame=on_frame)
-            finally:
-                hardware_slots.release()
+        def _fingerprint_batch(targets: list[FileRecord]) -> None:
+            if not targets:
+                return
+            results = _run_on_video_lanes(
+                lambda path: _video_fingerprint_job(
+                    path,
+                    on_frame=on_frame,
+                    software=bool(getattr(_DECODE_LANE, "software", False)),
+                ),
+                [r.path for r in targets],
+                workers=workers,
+                cancelled=cancelled,
+            )
+            _apply_fingerprint_results(targets, results)
 
-        results = map_parallel(
-            job,
-            [r.path for r in need],
-            workers=video_workers + software_workers,
-            # ffmpeg spawns real OS processes → threads buy true parallelism.
-            backend="thread",
-            progress=None,
-            cancelled=cancelled,
-        )
-        for path, fp, w, h, dur, err in results:
-            rec = by_path[path]
-            if err:
-                rec.error = err
-            else:
-                rec.video_fingerprint = fp
-                if w:
-                    rec.width = w
-                if h:
-                    rec.height = h
-                if dur is not None:
-                    rec.duration = dur
-            videos_done += 1
-            if progress:
-                progress("video-hash", videos_done, total, "")
+        if remaining_need:
+            size_counts: dict[int, int] = defaultdict(int)
+            for r in videos:
+                if r.size > 0:
+                    size_counts[r.size] += 1
+            shared_sizes = {
+                r.size
+                for r in remaining_need
+                if r.size > 0 and size_counts[r.size] >= 2
+            }
+
+            partial_by_path: dict[str, str] = {}
+            if shared_sizes:
+                partial_targets: list[str] = []
+                for r in videos:
+                    if r.size not in shared_sizes:
+                        continue
+                    if r.partial_hash:
+                        partial_by_path[r.path] = r.partial_hash
+                    else:
+                        partial_targets.append(r.path)
+                if partial_targets:
+                    partial_results = map_parallel(
+                        _safe_partial_hash,
+                        partial_targets,
+                        workers=resolve_workers(workers, cap=DEFAULT_WORKERS_CAP),
+                        backend="thread",
+                        cancelled=cancelled,
+                    )
+                    for path, ph in partial_results:
+                        if ph is not None:
+                            partial_by_path[path] = ph
+
+            remaining_set = {r.path for r in remaining_need}
+            buckets: dict[tuple[int, str], list[FileRecord]] = defaultdict(list)
+            for r in videos:
+                if r.size in shared_sizes:
+                    ph = partial_by_path.get(r.path)
+                    if ph is not None:
+                        buckets[(r.size, ph)].append(r)
+
+            wave1: list[FileRecord] = []
+            deferred: list[FileRecord] = []
+            assigned_to_wave: set[str] = set()
+            for bucket in buckets.values():
+                if len(bucket) < 2:
+                    continue
+                has_cached_donor = any(
+                    r.path not in remaining_set and r.video_fingerprint for r in bucket
+                )
+                picked_donor = has_cached_donor
+                for r in bucket:
+                    if r.path not in remaining_set or r.path in assigned_to_wave:
+                        continue
+                    assigned_to_wave.add(r.path)
+                    if not picked_donor:
+                        wave1.append(r)
+                        picked_donor = True
+                    else:
+                        deferred.append(r)
+            for r in remaining_need:
+                if r.path not in assigned_to_wave:
+                    wave1.append(r)
+
+            _fingerprint_batch(wave1)
+
+            if deferred:
+                if exact_done is not None:
+                    while not exact_done.wait(timeout=0.05):
+                        if cancelled and cancelled():
+                            raise InterruptedError("scan cancelled")
+
+                bucket_by_key: dict[tuple[int, str], list[FileRecord]] = defaultdict(list)
+                for key, bucket in buckets.items():
+                    if len(bucket) >= 2:
+                        bucket_by_key[key] = bucket
+
+                deferred_keys: dict[str, tuple[int, str]] = {}
+                for r in deferred:
+                    ph = partial_by_path.get(r.path)
+                    if ph is not None:
+                        deferred_keys[r.path] = (r.size, ph)
+
+                # Identify candidate donors with valid fingerprints in those buckets.
+                donor_candidates: list[FileRecord] = []
+                for key in set(deferred_keys.values()):
+                    for r in bucket_by_key.get(key, ()):
+                        if r.video_fingerprint:
+                            donor_candidates.append(r)
+
+                wave2: list[FileRecord] = []
+                if donor_candidates:
+                    sha_by_path: dict[str, str] = {}
+                    sha_targets: list[str] = []
+                    seen_sha_targets: set[str] = set()
+                    for r in donor_candidates + deferred:
+                        if r.path in seen_sha_targets:
+                            continue
+                        seen_sha_targets.add(r.path)
+                        if r.sha256:
+                            sha_by_path[r.path] = r.sha256
+                        elif r.size <= PARTIAL_SIZE and r.path in partial_by_path:
+                            sha_by_path[r.path] = partial_by_path[r.path]
+                        else:
+                            sha_targets.append(r.path)
+                    if sha_targets:
+                        sha_results = map_parallel(
+                            _safe_sha256,
+                            sha_targets,
+                            workers=resolve_workers(workers, cap=DEFAULT_WORKERS_CAP),
+                            backend="thread",
+                            cancelled=cancelled,
+                        )
+                        for path, sh in sha_results:
+                            if sh is not None:
+                                sha_by_path[path] = sh
+
+                    valid_donors: dict[tuple[int, str], FileRecord] = {}
+                    for r in donor_candidates:
+                        sh = sha_by_path.get(r.path)
+                        if sh is not None:
+                            valid_donors.setdefault((r.size, sh), r)
+
+                    for r in deferred:
+                        sh = sha_by_path.get(r.path)
+                        donor = valid_donors.get((r.size, sh)) if sh is not None else None
+                        if donor is not None:
+                            _copy_video_fingerprint(donor, r)
+                            videos_done += 1
+                            if progress:
+                                progress("video-hash", videos_done, total, "")
+                        else:
+                            wave2.append(r)
+                else:
+                    wave2 = deferred
+
+                _fingerprint_batch(wave2)
 
     if progress:
         progress("video-hash", videos_done, total, "")
@@ -674,83 +1152,50 @@ def find_similar_video_groups(
     if len(hashed) < 2:
         return []
 
-    adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
     fingerprints = [_fingerprint_hashes(record.video_fingerprint or "") for record in hashed]
-
-    # Duration is already part of the match contract. Use its allowed ±10% range
-    # as an exact candidate index instead of comparing every pair. Unlike a broad
-    # Hamming BK-tree search, this remains quick with common black intro frames.
-    known_durations = sorted(
-        (record.duration, index)
-        for index, record in enumerate(hashed)
-        if record.duration is not None and record.duration > 0
-    )
-    duration_values = [duration for duration, _index in known_durations]
-    unknown_duration_indexes = {
-        index
-        for index, record in enumerate(hashed)
-        if record.duration is None or record.duration <= 0
-    }
     max_frame_distance = max(threshold * 2, 4)
-    to_verify: list[tuple[FileRecord, FileRecord]] = []
+    adjacency, to_verify = _evaluate_candidate_pairs(
+        hashed,
+        fingerprints,
+        threshold=threshold,
+        max_frame_distance=max_frame_distance,
+        distinct=distinct,
+        cancelled=cancelled,
+    )
 
-    for i, a in enumerate(hashed):
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        if a.duration is not None and a.duration > 0:
-            start = bisect_left(duration_values, a.duration * 0.9)
-            end = bisect_right(duration_values, a.duration / 0.9)
-            indexes = sorted(
-                {
-                    index
-                    for _duration, index in known_durations[start:end]
-                    if index > i
-                }
-                | {index for index in unknown_duration_indexes if index > i}
-            )
-        else:
-            indexes = range(i + 1, len(hashed))
-        left = fingerprints[i]
-        for j in indexes:
-            b = hashed[j]
-            # Only pay for the lookup when reviews exist.
-            if distinct and distinct.is_distinct(a, b):
-                continue
-            right = fingerprints[j]
-            # These aligned positions are necessarily under the existing maximum.
-            if (
-                (left[0] ^ right[0]).bit_count() > max_frame_distance
-                or (left[-1] ^ right[-1]).bit_count() > max_frame_distance
-            ):
-                continue
-            left_indexes, right_indexes = aligned_position_indexes(
-                len(left), len(right)
-            )
-            distances = [
-                (left[li] ^ right[ri]).bit_count()
-                for li, ri in zip(left_indexes, right_indexes, strict=True)
-            ]
-            if not distances:
-                continue
-            mean_distance = sum(distances) / len(distances)
-            # Near-identical: durations should be close when both known
-            if a.duration and b.duration and a.duration > 0 and b.duration > 0:
-                ratio = min(a.duration, b.duration) / max(a.duration, b.duration)
-                if ratio < 0.9:
-                    continue
-            if mean_distance > threshold or max(distances) > max_frame_distance:
-                if mean_distance <= threshold * VERIFY_DISTANCE_FACTOR:
-                    to_verify.append((a, b))
-                continue
-            adjacency[a.path].add(b.path)
-            adjacency[b.path].add(a.path)
-        if progress and (i + 1) % 5 == 0:
-            progress("video-cluster", i + 1, len(hashed), "")
+    if to_verify:
+        frame_cache = _FrameBatchCache()
+        remaining_verify: list[tuple[FileRecord, FileRecord]] = []
+        for a, b in to_verify:
+            if a.size > 0 and a.size == b.size and a.sha256 and a.sha256 == b.sha256:
+                adjacency[a.path].add(b.path)
+                adjacency[b.path].add(a.path)
+            else:
+                remaining_verify.append((a, b))
 
-    for a, b in to_verify:
-        if _same_footage_after_reframing(a, b, cancelled):
-            adjacency[a.path].add(b.path)
-            adjacency[b.path].add(a.path)
+        if remaining_verify:
+            def verify_progress(done: int, total_items: int) -> None:
+                if progress:
+                    progress(
+                        "video-cluster",
+                        done,
+                        total_items,
+                        f"Verifying video matches: {done}/{total_items}",
+                    )
+
+            verified = _run_on_video_lanes(
+                lambda pair: _same_footage_after_reframing(
+                    pair[0], pair[1], cancelled, frame_cache=frame_cache
+                ),
+                remaining_verify,
+                workers=workers,
+                progress=verify_progress,
+                cancelled=cancelled,
+            )
+            for (a, b), matched in zip(remaining_verify, verified, strict=True):
+                if matched:
+                    adjacency[a.path].add(b.path)
+                    adjacency[b.path].add(a.path)
 
     if progress:
         progress("video-cluster", len(hashed), len(hashed), "")
@@ -759,7 +1204,11 @@ def find_similar_video_groups(
 
 
 def _same_footage_after_reframing(
-    a: FileRecord, b: FileRecord, cancelled: Callable[[], bool] | None,
+    a: FileRecord,
+    b: FileRecord,
+    cancelled: Callable[[], bool] | None,
+    *,
+    frame_cache: _FrameBatchCache | None = None,
 ) -> bool:
     """Verify a near-miss pair at its start- and end-aligned offsets.
 
@@ -773,7 +1222,7 @@ def _same_footage_after_reframing(
         return False
     for offset in sorted({0.0, round(float(b.duration) - float(a.duration), 3)}, key=abs):
         try:
-            if _verify_video_offset(a, b, offset, cancelled):
+            if _verify_video_offset(a, b, offset, cancelled, frame_cache=frame_cache):
                 return True
         except InterruptedError:
             raise
@@ -827,12 +1276,17 @@ def _version_timestamps(duration: float) -> list[float]:
 def _version_frame_batches(
     path: str, timestamps: list[float], cancelled: Callable[[], bool] | None,
 ) -> list[bytes]:
+    software = bool(getattr(_DECODE_LANE, "software", False))
+    hwaccel = () if software else _hwaccel_args()
     frames: list[bytes] = []
     for start in range(0, len(timestamps), 12):
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
         chunk = timestamps[start:start + 12]
-        frames.extend(_extract_hash_frames_once(path, chunk, (), cancelled=cancelled))
+        chunk_frames = _extract_hash_frames_once(path, chunk, hwaccel, cancelled=cancelled)
+        if not chunk_frames and hwaccel:
+            chunk_frames = _extract_hash_frames_once(path, chunk, (), cancelled=cancelled)
+        frames.extend(chunk_frames)
     if len(frames) != len(timestamps):
         raise ValueError("incomplete video version samples")
     return frames
@@ -846,15 +1300,46 @@ def _version_cache_identity(record: FileRecord) -> str:
     ], separators=(",", ":"))
 
 
+def _extract_version_samples_uncached(
+    record: FileRecord,
+    cancelled: Callable[[], bool] | None,
+) -> tuple[float | None, int | None, int | None, list[tuple[float, int]], str | None]:
+    import imagehash
+    import numpy as np
+    from PIL import Image
+
+    try:
+        duration = record.duration
+        width, height = record.width, record.height
+        if not duration or not math.isfinite(duration):
+            duration, probed_w, probed_h = probe_video(record.path)
+            if probed_w:
+                width = probed_w
+            if probed_h:
+                height = probed_h
+        if not duration or duration < VERSION_MIN_SECONDS:
+            return duration, width, height, [], None
+        timestamps = _version_timestamps(duration)
+        frames = _version_frame_batches(record.path, timestamps, cancelled)
+        extracted: list[tuple[float, int]] = []
+        for timestamp, raw in zip(timestamps, frames, strict=True):
+            # Blank frames and nearly uniform fades are not useful candidate evidence.
+            if float(np.frombuffer(raw, dtype=np.uint8).std()) < 8:
+                continue
+            im = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
+            extracted.append((timestamp, int(str(imagehash.phash(im)), 16)))
+        return duration, width, height, extracted, None
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        return None, None, None, [], str(exc)
+
+
 def _version_samples(
     record: FileRecord, connection: sqlite3.Connection | None,
     cancelled: Callable[[], bool] | None,
     cache_errors: list[str] | None = None,
 ) -> list[tuple[float, int]]:
-    import imagehash
-    import numpy as np
-    from PIL import Image
-
     key = _version_cache_identity(record) if connection is not None else None
     if connection is not None:
         try:
@@ -879,22 +1364,15 @@ def _version_samples(
                     return samples
             except (KeyError, TypeError, ValueError):
                 pass
-    duration = record.duration
-    if not duration or not math.isfinite(duration):
-        duration, record.width, record.height = probe_video(record.path)
-        record.duration = duration
-    if not duration or duration < VERSION_MIN_SECONDS:
-        return []
-    timestamps = _version_timestamps(duration)
-    frames = _version_frame_batches(record.path, timestamps, cancelled)
-    samples = []
-    for timestamp, raw in zip(timestamps, frames, strict=True):
-        # Blank frames and nearly uniform fades are not useful candidate evidence.
-        if float(np.frombuffer(raw, dtype=np.uint8).std()) < 8:
-            continue
-        im = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
-        samples.append((timestamp, int(str(imagehash.phash(im)), 16)))
-    if connection is not None:
+    duration, width, height, samples, err = _extract_version_samples_uncached(record, cancelled)
+    if err is not None:
+        raise ValueError(err)
+    record.duration = duration
+    if width:
+        record.width = width
+    if height:
+        record.height = height
+    if connection is not None and duration and duration >= VERSION_MIN_SECONDS:
         try:
             connection.execute(
                 "INSERT OR REPLACE INTO samples(identity, samples) VALUES (?, ?)",
@@ -986,6 +1464,8 @@ def _offset_candidates(
 def _verify_video_offset(
     a: FileRecord, b: FileRecord, offset: float,
     cancelled: Callable[[], bool] | None,
+    *,
+    frame_cache: _FrameBatchCache | None = None,
 ) -> dict | None:
     """Verify distributed samples across the overlap, not just matching titles.
 
@@ -1003,8 +1483,13 @@ def _verify_video_offset(
     if overlap < VERSION_MIN_SECONDS or overlap < min(da, db) * 0.8:
         return None
     times = [start + overlap * fraction for fraction in (0.08, 0.22, 0.36, 0.5, 0.64, 0.78, 0.92)]
-    left = _version_frame_batches(a.path, times, cancelled)
-    right = _version_frame_batches(b.path, [t + offset for t in times], cancelled)
+    right_times = [t + offset for t in times]
+    if frame_cache is not None:
+        left = frame_cache.get(a.path, times, cancelled)
+        right = frame_cache.get(b.path, right_times, cancelled)
+    else:
+        left = _version_frame_batches(a.path, times, cancelled)
+        right = _version_frame_batches(b.path, right_times, cancelled)
     distances, residuals, hashes = [], [], []
     for ra, rb in zip(left, right, strict=True):
         ia = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), ra)
@@ -1053,6 +1538,8 @@ def _audio_window(path: str, start: float, duration: float, cancelled) -> bytes:
 def compare_video_audio(
     a: str, b: str, ranges: dict[str, list[float]],
     *, cancelled: Callable[[], bool] | None = None,
+    presence_cache: dict[str, bool] | None = None,
+    presence_lock: threading.Lock | None = None,
 ) -> str:
     """Conservative audio comparison of two distributed windows of the overlap.
 
@@ -1062,8 +1549,25 @@ def compare_video_audio(
     import numpy as np
     from scipy.signal import correlate
 
+    def _has_audio(path: str) -> bool:
+        if presence_cache is None:
+            return _audio_stream_present(path, cancelled)
+        if presence_lock is not None:
+            with presence_lock:
+                if path in presence_cache:
+                    return presence_cache[path]
+        elif path in presence_cache:
+            return presence_cache[path]
+        present = _audio_stream_present(path, cancelled)
+        if presence_lock is not None:
+            with presence_lock:
+                presence_cache[path] = present
+        else:
+            presence_cache[path] = present
+        return present
+
     try:
-        presence = [_audio_stream_present(path, cancelled) for path in (a, b)]
+        presence = [_has_audio(path) for path in (a, b)]
         if presence == [False, False]:
             return "none"
         if presence[0] != presence[1]:
@@ -1110,10 +1614,11 @@ def find_video_version_matches(
     sampling can miss very short excerpts in long movies; it never proves that
     unsampled frames/audio are identical.
     """
-    del workers  # Analysis is intentionally serial and cancellable to bound ffmpeg RAM.
     videos = [r for r in records if r.media_type == MediaType.VIDEO]
     if len(videos) < 2 or not ffmpeg_available():
         return []
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     if cache_path is None:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
         cache_path = base / "dedupe" / "video-versions.sqlite3"
@@ -1132,39 +1637,277 @@ def find_video_version_matches(
                 if connection is not None:
                     connection.close()
                     connection = None
-        samples = []
+
+        samples: list[list[tuple[float, int]]] = [[] for _ in videos]
+        identities: list[str | None] = [None] * len(videos)
+        uncached_indices: list[int] = []
+        done_count = 0
+
         for i, record in enumerate(videos):
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
-            try:
-                samples.append(_version_samples(record, connection, cancelled, cache_errors))
-            except InterruptedError:
-                raise
-            except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
-                samples.append([])
-                if errors is not None:
-                    errors.append(f"video version analysis failed: {record.path}: {exc}")
-            if cache_errors and connection is not None:
-                # One failed cache operation disables it for the remainder of
-                # this scan. Already extracted samples remain usable.
-                connection.close()
-                connection = None
-            if progress:
-                progress("video-versions", i + 1, len(videos), "Finding video excerpts")
-        matches = []
+            cached_hit = False
+            if connection is not None:
+                try:
+                    key = _version_cache_identity(record)
+                    identities[i] = key
+                except OSError as exc:
+                    if errors is not None:
+                        errors.append(f"video version analysis failed: {record.path}: {exc}")
+                    done_count += 1
+                    if progress:
+                        progress("video-versions", done_count, len(videos), "Finding video excerpts")
+                    continue
+                try:
+                    row = connection.execute(
+                        "SELECT samples FROM samples WHERE identity = ?", (key,),
+                    ).fetchone()
+                except sqlite3.Error as exc:
+                    cache_errors.append(str(exc))
+                    connection.close()
+                    connection = None
+                    row = None
+                if row:
+                    try:
+                        data = json.loads(row[0])
+                        duration = float(data["duration"])
+                        cached_samples = [(float(t), int(h, 16)) for t, h in data["samples"]]
+                        if (
+                            math.isfinite(duration) and duration > 0
+                            and len(cached_samples) <= VERSION_SAMPLE_LIMIT
+                            and all(
+                                0 <= t < duration and 0 <= h < (1 << 64)
+                                for t, h in cached_samples
+                            )
+                        ):
+                            record.duration = duration
+                            samples[i] = cached_samples
+                            cached_hit = True
+                    except (KeyError, TypeError, ValueError):
+                        pass
+            if cached_hit:
+                done_count += 1
+                if progress:
+                    progress("video-versions", done_count, len(videos), "Finding video excerpts")
+            else:
+                uncached_indices.append(i)
+
+        sha_by_idx: dict[int, str] = {
+            i: r.sha256 for i, r in enumerate(videos) if r.sha256
+        }
+
+        if uncached_indices:
+            uncached_set = set(uncached_indices)
+            size_counts: dict[int, int] = defaultdict(int)
+            for r in videos:
+                if r.size > 0:
+                    size_counts[r.size] += 1
+            shared_sizes = {
+                videos[i].size
+                for i in uncached_indices
+                if videos[i].size > 0 and size_counts[videos[i].size] >= 2
+            }
+
+            if shared_sizes:
+                colliding = [i for i, r in enumerate(videos) if r.size in shared_sizes]
+                partial_by_idx: dict[int, str] = {}
+                partial_needed: list[tuple[int, str]] = []
+                for idx in colliding:
+                    rec = videos[idx]
+                    if rec.partial_hash:
+                        partial_by_idx[idx] = rec.partial_hash
+                    elif idx not in sha_by_idx:
+                        partial_needed.append((idx, rec.path))
+                if partial_needed:
+                    part_results = map_parallel(
+                        _safe_partial_hash,
+                        [path for _, path in partial_needed],
+                        workers=resolve_workers(workers, cap=DEFAULT_WORKERS_CAP),
+                        backend="thread",
+                        cancelled=cancelled,
+                    )
+                    for (idx, _path), (_p, ph) in zip(partial_needed, part_results, strict=True):
+                        if ph is not None:
+                            partial_by_idx[idx] = ph
+
+                partial_buckets: dict[tuple[int, str], list[int]] = defaultdict(list)
+                for idx in colliding:
+                    ph = partial_by_idx.get(idx)
+                    if ph is not None:
+                        partial_buckets[(videos[idx].size, ph)].append(idx)
+
+                sha_needed: list[tuple[int, str]] = []
+                for (sz, _ph), group_idxs in partial_buckets.items():
+                    if len(group_idxs) < 2:
+                        continue
+                    for idx in group_idxs:
+                        if idx not in sha_by_idx:
+                            if sz <= PARTIAL_SIZE and idx in partial_by_idx:
+                                sha_by_idx[idx] = partial_by_idx[idx]
+                            else:
+                                sha_needed.append((idx, videos[idx].path))
+                if sha_needed:
+                    sha_results = map_parallel(
+                        _safe_sha256,
+                        [path for _, path in sha_needed],
+                        workers=resolve_workers(workers, cap=DEFAULT_WORKERS_CAP),
+                        backend="thread",
+                        cancelled=cancelled,
+                    )
+                    for (idx, _path), (_p, sh) in zip(sha_needed, sha_results, strict=True):
+                        if sh is not None:
+                            sha_by_idx[idx] = sh
+
+            cached_by_sha: dict[tuple[int, str], int] = {}
+            for i, rec in enumerate(videos):
+                if i in uncached_set or rec.size <= 0 or not rec.duration:
+                    continue
+                sh = sha_by_idx.get(i)
+                if sh is not None:
+                    cached_by_sha.setdefault((rec.size, sh), i)
+
+            to_store: list[tuple[str, str]] = []
+            representatives: list[int] = []
+            rep_by_sha: dict[tuple[int, str], int] = {}
+            siblings_by_rep: dict[int, list[int]] = defaultdict(list)
+
+            for i in uncached_indices:
+                rec = videos[i]
+                sh = sha_by_idx.get(i) if rec.size > 0 else None
+                key_sha = (rec.size, sh) if sh is not None else None
+                if key_sha is not None and key_sha in cached_by_sha:
+                    donor_idx = cached_by_sha[key_sha]
+                    donor = videos[donor_idx]
+                    donor_samples = list(samples[donor_idx])
+                    rec.duration = donor.duration
+                    if donor.width:
+                        rec.width = donor.width
+                    if donor.height:
+                        rec.height = donor.height
+                    samples[i] = donor_samples
+                    if (
+                        connection is not None
+                        and identities[i]
+                        and donor.duration
+                        and donor.duration >= VERSION_MIN_SECONDS
+                    ):
+                        to_store.append((
+                            identities[i],
+                            json.dumps({
+                                "duration": donor.duration,
+                                "samples": [(t, f"{h:016x}") for t, h in donor_samples],
+                            }),
+                        ))
+                    done_count += 1
+                    if progress:
+                        progress("video-versions", done_count, len(videos), "Finding video excerpts")
+                elif key_sha is not None and key_sha in rep_by_sha:
+                    siblings_by_rep[rep_by_sha[key_sha]].append(i)
+                else:
+                    if key_sha is not None:
+                        rep_by_sha[key_sha] = i
+                    representatives.append(i)
+
+            if representatives:
+                base_done = done_count
+                remaining_total = len(videos) - base_done
+
+                def sample_progress(done: int, rep_total: int) -> None:
+                    if progress and rep_total > 0:
+                        reported = base_done + (done * remaining_total) // rep_total
+                        progress("video-versions", reported, len(videos), "Finding video excerpts")
+
+                extracted_results = _run_on_video_lanes(
+                    lambda idx: _extract_version_samples_uncached(videos[idx], cancelled),
+                    representatives,
+                    workers=workers,
+                    progress=sample_progress,
+                    cancelled=cancelled,
+                )
+
+                for rep_idx, (dur, w, h, extracted, err) in zip(
+                    representatives, extracted_results, strict=True
+                ):
+                    group_idxs = [rep_idx, *siblings_by_rep.get(rep_idx, ())]
+                    for idx in group_idxs:
+                        rec = videos[idx]
+                        if err is not None:
+                            samples[idx] = []
+                            if errors is not None:
+                                errors.append(f"video version analysis failed: {rec.path}: {err}")
+                        else:
+                            rec.duration = dur
+                            if w:
+                                rec.width = w
+                            if h:
+                                rec.height = h
+                            samples[idx] = list(extracted)
+                            if (
+                                connection is not None
+                                and identities[idx]
+                                and dur
+                                and dur >= VERSION_MIN_SECONDS
+                            ):
+                                to_store.append((
+                                    identities[idx],
+                                    json.dumps({
+                                        "duration": dur,
+                                        "samples": [(t, f"{hv:016x}") for t, hv in extracted],
+                                    }),
+                                ))
+
+                if progress:
+                    progress("video-versions", len(videos), len(videos), "Finding video excerpts")
+
+            if connection is not None and to_store:
+                try:
+                    connection.executemany(
+                        "INSERT OR REPLACE INTO samples(identity, samples) VALUES (?, ?)",
+                        to_store,
+                    )
+                    connection.commit()
+                except sqlite3.Error as exc:
+                    cache_errors.append(str(exc))
+
         pairs = _version_candidate_pairs(samples, cancelled)
+        candidate_items: list[tuple[int, int, list[tuple[float, float]]]] = []
         for (i, j), votes in pairs.items():
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
             a, b = videos[i], videos[j]
             if distinct and distinct.is_distinct(a, b):
                 continue
+            sha_a = sha_by_idx.get(i)
+            if (
+                a.size > 0
+                and a.size == b.size
+                and sha_a is not None
+                and sha_a == sha_by_idx.get(j)
+            ):
+                # Byte-identical copies always produce same_footage + matching audio.
+                continue
+            candidate_items.append((i, j, votes))
+
+        if not candidate_items:
+            return []
+
+        frame_cache = _FrameBatchCache()
+        audio_presence_cache: dict[str, bool] = {}
+        audio_presence_lock = threading.Lock()
+
+        def _verify_candidate(
+            item: tuple[int, int, list[tuple[float, float]]],
+        ) -> tuple[list[FileRecord], dict] | None:
+            i, j, votes = item
+            a, b = videos[i], videos[j]
             step = max(float(a.duration or 0), float(b.duration or 0)) / VERSION_SAMPLE_LIMIT
             offsets = _offset_candidates(votes, max(0.25, step))
             evidence = None
             for offset in offsets:
                 try:
-                    evidence = _verify_video_offset(a, b, offset, cancelled)
+                    evidence = _verify_video_offset(
+                        a, b, offset, cancelled, frame_cache=frame_cache
+                    )
                 except InterruptedError:
                     raise
                 except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
@@ -1172,15 +1915,29 @@ def find_video_version_matches(
                 if evidence:
                     break
             if evidence is None:
-                continue
-            evidence["audio"] = compare_video_audio(a.path, b.path, evidence["ranges"], cancelled=cancelled)
+                return None
+            evidence["audio"] = compare_video_audio(
+                a.path,
+                b.path,
+                evidence["ranges"],
+                cancelled=cancelled,
+                presence_cache=audio_presence_cache,
+                presence_lock=audio_presence_lock,
+            )
             evidence["audio_scope"] = "sampled overlap"
             evidence["manual_review"] = True
             # Same-footage pairs with agreeing audio retain the standard matcher.
             if evidence["relation"] == "same_footage" and evidence["audio"] in {"same", "none"}:
-                continue
-            matches.append(([a, b], evidence))
-        return matches
+                return None
+            return [a, b], evidence
+
+        verified = _run_on_video_lanes(
+            _verify_candidate,
+            candidate_items,
+            workers=workers,
+            cancelled=cancelled,
+        )
+        return [match for match in verified if match is not None]
     finally:
         if connection is not None:
             connection.close()

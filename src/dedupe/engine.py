@@ -48,6 +48,7 @@ from .models import (
 )
 from .parallel import (
     DEFAULT_IMAGE_WORKERS_CAP,
+    DEFAULT_VIDEO_WORKERS_CAP,
     map_parallel,
     resolve_workers,
     split_cpu_budget,
@@ -699,6 +700,7 @@ def run_scan(
                     progress=vid_progress,
                     workers=n_workers,
                     cancelled=cancelled,
+                    exact_done=exact_done,
                 )
                 exact_done.wait()
                 if video_versions:
@@ -712,6 +714,9 @@ def run_scan(
                     )
                     by_pair = {tuple(sorted(m.path for m in members)): (members, details)
                                for members, details in versions}
+                    with publish_lock:
+                        exact_sets = list(exact_path_sets)
+                    audio_pairs = []
                     for members in vid_groups:
                         keeper_path = pick_suggested_keep(members)
                         keeper = next(m for m in members if m.path == keeper_path)
@@ -721,11 +726,27 @@ def run_scan(
                             key = tuple(sorted((keeper.path, member.path)))
                             if key in by_pair:
                                 continue
+                            if any(
+                                keeper.path in exact_set and member.path in exact_set
+                                for exact_set in exact_sets
+                            ):
+                                continue
                             duration = min(keeper.duration or 0, member.duration or 0)
                             ranges = {m.path: [0, duration] for m in (keeper, member)}
-                            audio = compare_video_audio(
-                                keeper.path, member.path, ranges, cancelled=cancelled,
-                            )
+                            audio_pairs.append((key, keeper, member, ranges))
+                    if audio_pairs:
+                        audio_results = map_parallel(
+                            lambda item: compare_video_audio(
+                                item[1].path, item[2].path, item[3], cancelled=cancelled
+                            ),
+                            audio_pairs,
+                            workers=resolve_workers(n_workers, cap=DEFAULT_VIDEO_WORKERS_CAP),
+                            backend="thread",
+                            cancelled=cancelled,
+                        )
+                        for (key, keeper, member, ranges), audio in zip(
+                            audio_pairs, audio_results, strict=True
+                        ):
                             by_pair[key] = ([keeper, member], {
                                 "ranges": ranges, "relation": "same_footage", "audio": audio,
                                 "audio_scope": "sampled overlap", "manual_review": True,
