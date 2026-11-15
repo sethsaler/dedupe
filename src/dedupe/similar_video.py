@@ -908,30 +908,51 @@ def _version_samples(
     return samples
 
 
+# Hash pairs compared per batch of the candidate join: bounds its working
+# arrays to tens of megabytes however many videos a scan holds.
+_VERSION_JOIN_BATCH_PAIRS = 1 << 21
+
+
 def _version_candidate_pairs(
     samples: list[list[tuple[float, int]]],
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[tuple[int, int], list[tuple[float, float]]]:
     """Index frame hashes once; avoid decoding or testing every pair of videos."""
-    import pybktree
+    import numpy as np
 
     occurrences: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for index, timeline in enumerate(samples):
         for timestamp, fingerprint in timeline:
             occurrences[fingerprint].append((index, timestamp))
-    tree = pybktree.BKTree(lambda a, b: (a ^ b).bit_count(), occurrences)
+    if not occurrences:
+        return {}
+    # Every distinct hash is compared with every other in vectorised batches.
+    # A tree index prunes almost nothing at this radius on 64-bit hashes, and
+    # walking one in Python took minutes for a thousand videos.
+    keys = sorted(occurrences)
+    values = np.array(keys, dtype=np.uint64)
+    weights = np.array([len(occurrences[key]) for key in keys], dtype=np.int64)
+    rows = max(1, _VERSION_JOIN_BATCH_PAIRS // len(keys))
+    near: dict[int, list[int]] = {}
+    for begin in range(0, len(keys), rows):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        # Off-grid cuts shift samples by a fraction of a second. Candidate
+        # lookup is deliberately looser than the aligned verification.
+        distances = _popcount64(values[begin:begin + rows, None] ^ values[None, :])
+        hits = distances <= 10
+        # Generic repeated title cards must not expand into an unbounded join.
+        bounded = np.flatnonzero(hits @ weights <= 256)
+        for row in bounded.tolist():
+            columns = np.flatnonzero(hits[row])
+            order = np.argsort(distances[row, columns], kind="stable")
+            near[keys[begin + row]] = [keys[column] for column in columns[order].tolist()]
     candidates: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
     for i, timeline in enumerate(samples):
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
         for ta, fingerprint in timeline:
-            # Off-grid cuts shift samples by a fraction of a second. Candidate
-            # lookup is deliberately looser than the aligned verification.
-            matches = tree.find(fingerprint, 10)
-            # Generic repeated title cards must not expand into an unbounded join.
-            if sum(len(occurrences[h]) for _distance, h in matches) > 256:
-                continue
-            for _distance, matched in matches:
+            for matched in near.get(fingerprint, ()):
                 for j, tb in occurrences[matched]:
                     if j > i:
                         candidates[(i, j)].append((ta, tb))
@@ -939,6 +960,16 @@ def _version_candidate_pairs(
         pair: votes for pair, votes in candidates.items()
         if len({ta for ta, _tb in votes}) >= 3 and len({tb for _ta, tb in votes}) >= 3
     }
+
+
+def _popcount64(values):
+    """Set bits of each uint64 in an array, whatever its shape."""
+    import numpy as np
+
+    if hasattr(np, "bitwise_count"):
+        return np.bitwise_count(values)
+    as_bytes = np.ascontiguousarray(values).view(np.uint8).reshape(*values.shape, 8)
+    return np.unpackbits(as_bytes, axis=-1).sum(axis=-1)
 
 
 def _offset_candidates(
