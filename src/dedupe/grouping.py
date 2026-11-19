@@ -97,10 +97,6 @@ def cluster_around_best(
     )
     by_path = {record.path: record for record in records}
     remaining = set(by_path)
-    reviews = distinct or DistinctReviews.empty()
-
-    def is_distinct(path_a: str, path_b: str) -> bool:
-        return reviews.is_distinct(by_path[path_a], by_path[path_b])
 
     groups: list[list[FileRecord]] = []
     for keeper in ordered:
@@ -119,9 +115,12 @@ def cluster_around_best(
             reverse=True,
         )
         members = [keeper]
-        for match in matches:
-            if not any(is_distinct(match.path, member.path) for member in members):
-                members.append(match)
+        if distinct:
+            for match in matches:
+                if not any(distinct.is_distinct(match, by_path[member.path]) for member in members):
+                    members.append(match)
+        else:
+            members.extend(matches)
         if len(members) < 2:
             remaining.remove(keeper.path)
             continue

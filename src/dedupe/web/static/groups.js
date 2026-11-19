@@ -35,7 +35,8 @@ async function fetchAllGroups(token) {
       offset += batch.length;
       if (collected.length === batch.length && collected.length < total) {
         // Paint the first page immediately so streamed groups appear without delay.
-        state.allGroups = collected;
+        // Live events may update the visible page while pagination continues.
+        state.allGroups = collected.slice();
         renderGroupList();
       }
       if (!batch.length || collected.length >= total) break;
@@ -50,21 +51,21 @@ async function fetchAllGroups(token) {
 }
 
 function renderTabCounts() {
-  const memberCount = (kind) => state.allGroups
-    .filter((g) => g.kind === kind)
-    .reduce((count, g) => count + (g.member_count || 0), 0);
-  $("countAll").textContent = state.allGroups.length;
-  $("countExact").textContent = state.allGroups.filter((g) => g.kind === "exact").length;
-  $("countSimilar").textContent = state.allGroups.filter((g) => g.kind === "similar").length;
-  $("countSets").textContent = state.allGroups.filter((g) => g.kind === "sets").length;
-  $("countLowResolution").textContent = memberCount("low_resolution");
-  $("countRandomReview").textContent = memberCount("random_review");
-  $("countNoHumans").textContent = memberCount("no_humans");
-  $("countFaces").textContent = memberCount("faces");
-  $("countCrop").textContent = memberCount("crop");
-  const countAllFiles = $("countAllFiles");
-  if (countAllFiles) countAllFiles.textContent = memberCount("all_files");
-  markEmptyTabs();
+  const counts = new Map([["all", state.allGroups.length]]);
+  for (const group of state.allGroups) {
+    const count = group.kind === "exact" || group.kind === "similar" || group.kind === "sets"
+      ? 1 : (group.member_count || 0);
+    counts.set(group.kind, (counts.get(group.kind) || 0) + count);
+  }
+  for (const tab of document.querySelectorAll(".filter-tabs .tab")) {
+    const count = counts.get(tab.dataset.kind) || 0;
+    tab.querySelector(".tab-count").textContent = count;
+    tab.classList.toggle("empty", count === 0);
+  }
+  if (state.groups.length) {
+    $("emptyState").hidden = true;
+    $("results").hidden = false;
+  }
 }
 
 // Empty categories stay clickable but recede.
@@ -102,11 +103,6 @@ async function loadGroups({ preserveSelection = false } = {}) {
   applyResultControls();
   renderTabCounts();
 
-  if (state.groups.length) {
-    $("emptyState").hidden = true;
-    $("results").hidden = false;
-  }
-
   scheduleRender({ groupList: true, selection: true });
   if (state.currentId) {
     const still = state.groups.find((g) => g.id === state.currentId);
@@ -140,30 +136,37 @@ async function loadGroups({ preserveSelection = false } = {}) {
   }
 }
 
-// One group pushed by the SSE stream mid-scan: fold it into the local view
-// without refetching the whole list.
+// Each full fetch installs a new array. Index that array on the first live
+// event so replayed groups replace their original row in discovery order.
+const streamedPositions = new WeakMap();
 
 function addStreamedGroup(g) {
   if (!g || !g.id) return;
-  const existing = state.allGroups.findIndex((candidate) => candidate.id === g.id);
-  if (existing >= 0) state.allGroups[existing] = g;
-  else state.allGroups.push(g);
-  applyResultControls();
+  const all = state.allGroups;
+  let positions = streamedPositions.get(all);
+  if (!positions) {
+    positions = new Map(all.map((group, index) => [group.id, index]));
+    streamedPositions.set(all, positions);
+  }
+  const index = positions.get(g.id);
+  if (index === undefined) {
+    positions.set(g.id, all.length);
+    all.push(g);
+  } else {
+    all[index] = g;
+  }
+  scheduleRender({ streamedGroups: true, selection: true });
+}
+
+// Called after the list is filtered and sorted for this frame. Keep focus
+// on the first matching arrival even if a later match sorts ahead of it.
+function finishStreamedGroupRender() {
   renderTabCounts();
-  if (state.groups.length) {
-    $("emptyState").hidden = true;
-    $("results").hidden = false;
-  }
-  scheduleRender({ groupList: true, selection: true });
-  if (
-    !state.currentId
-    && state.groups.length
-    && !$("results").hidden
-    && !$("detailEmpty").hidden
-  ) {
-    selectGroup(state.groups[0].id, { silent: true })
-      .catch((e) => toast(e.message || String(e), "error"));
-  }
+  if (state.currentId || $("detailEmpty").hidden || !state.groups.length) return;
+  const visible = new Set(state.groups);
+  const first = state.allGroups.find((group) => visible.has(group));
+  selectGroup(first.id, { silent: true })
+    .catch((e) => toast(e.message || String(e), "error"));
 }
 
 function numericFilter(id) {
@@ -538,4 +541,4 @@ function ensureGroupVisible(id) {
   renderGroupList();
 }
 
-export { loadGroups, addStreamedGroup, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, markEmptyTabs, rememberFocusedGroup };
+export { loadGroups, addStreamedGroup, finishStreamedGroupRender, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, markEmptyTabs, rememberFocusedGroup };

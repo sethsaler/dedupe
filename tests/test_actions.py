@@ -253,6 +253,49 @@ def test_revalidates_immediately_before_destructive_operation(
     assert "changed since scan" in (result.items[0].error or "")
 
 
+def test_immediate_check_includes_overlapping_group_outside_action_scope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    a = _rec(tmp_path / "a.jpg", b"same")
+    b = _rec(tmp_path / "b.jpg", b"same")
+    c = _rec(tmp_path / "c.jpg", b"different")
+    exact, similar = build_groups([[a, b]], [[b, c]])
+    exact.suggested_keep = a.path
+    exact.selected_for_removal = [b.path]
+    similar.suggested_keep = c.path
+    validate = actions_module.validate_file_record
+    checks = 0
+
+    def change_other_keeper(record, roots=None):
+        nonlocal checks
+        if record.path == c.path:
+            checks += 1
+            if checks == 2:
+                Path(c.path).write_bytes(b"changed after the batch check")
+        return validate(record, roots)
+
+    monkeypatch.setattr(actions_module, "validate_file_record", change_other_keeper)
+    result = apply_actions(
+        [exact, similar], action="quarantine", kinds={"exact"},
+        quarantine_dir=tmp_path / "q", dry_run=False, roots=[str(tmp_path)]
+    )
+    assert checks == 2
+    assert result.success_count == 0
+    assert "retained member is stale" in result.items[0].error
+    assert Path(b.path).exists()
+
+
+def test_trash_batch_lists_shared_directory_once(tmp_path: Path, monkeypatch) -> None:
+    directory = tmp_path / "trash"
+    listings = []
+    monkeypatch.setattr(actions_module, "_trash_dirs_for", lambda _: [directory])
+    monkeypatch.setattr(actions_module, "_list_names", lambda path: listings.append(path) or set())
+    batch = actions_module.TrashBatch()
+    batch._dirs_for(tmp_path / "one" / "a.jpg")
+    batch._dirs_for(tmp_path / "two" / "b.jpg")
+    assert listings == [directory]
+
+
 def _fake_send_to_trash(dest_dir: Path):
     """Redirect trash into a temp directory so tests don't pollute the real Trash."""
 

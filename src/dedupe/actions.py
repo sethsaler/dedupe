@@ -327,7 +327,8 @@ class TrashBatch:
             dirs = _trash_dirs_for(src)
             self._dirs_by_parent[key] = dirs
             for directory in dirs:
-                self._known.setdefault(directory, _list_names(directory))
+                if directory not in self._known:
+                    self._known[directory] = _list_names(directory)
         return dirs
 
     def send(self, src: Path) -> Path | None:
@@ -401,15 +402,9 @@ def _send_to_trash(src: Path, batch: TrashBatch | None = None) -> Path | None:
 SYMLINK_REFUSAL = "refusing to act on a symbolic link"
 
 
-def validate_record_with_stat(
-    record: FileRecord, roots: list[str] | None = None
+def _scoped_file_stat(
+    path: Path, roots: list[str] | None
 ) -> tuple[str | None, os.stat_result | None]:
-    """Validate ``record`` from a single ``lstat`` and return that stat alongside.
-
-    One ``lstat`` answers "is it a symlink", "is it a regular file", and every
-    identity comparison, so callers never need to stat the same file again.
-    """
-    path = Path(record.path)
     try:
         st = os.lstat(path)
         if S_ISLNK(st.st_mode):
@@ -420,19 +415,50 @@ def validate_record_with_stat(
             return "file is outside the scanned roots", st
     except OSError as exc:
         return str(exc), None
+    return None, st
 
+
+def _identity_error(record: FileRecord, st: os.stat_result) -> str | None:
     if int(st.st_size) != int(record.size):
-        return f"file changed since scan (size {record.size} -> {st.st_size})", st
+        return f"file changed since scan (size {record.size} -> {st.st_size})"
     if record.device is not None and int(st.st_dev) != int(record.device):
-        return "file changed since scan (device differs)", st
+        return "file changed since scan (device differs)"
     if record.inode is not None and int(st.st_ino) != int(record.inode):
-        return "file changed since scan (inode differs)", st
+        return "file changed since scan (inode differs)"
     if record.mtime_ns is not None:
         if int(st.st_mtime_ns) != int(record.mtime_ns):
-            return "file changed since scan (modified time differs)", st
+            return "file changed since scan (modified time differs)"
     elif abs(float(st.st_mtime) - float(record.mtime)) >= 0.001:
-        return "file changed since scan (modified time differs)", st
-    return None, st
+        return "file changed since scan (modified time differs)"
+    return None
+
+
+def validate_record_with_stat(
+    record: FileRecord, roots: list[str] | None = None
+) -> tuple[str | None, os.stat_result | None]:
+    """Validate the scanned identity and root scope and return the same stat."""
+    error, st = _scoped_file_stat(Path(record.path), roots)
+    if error is None and st is not None:
+        error = _identity_error(record, st)
+    return error, st
+
+
+def validate_saved_records(records: list[FileRecord], roots: list[str]) -> str | None:
+    """Revalidate one saved path shared by the inventory and review groups.
+
+    Legacy sessions can contain different snapshots of the same path. Resume
+    retains the path if any snapshot matches and otherwise reports the first error.
+    """
+    error, st = _scoped_file_stat(Path(records[0].path), roots)
+    if error or st is None:
+        return error
+    first_error = None
+    for record in records:
+        error = _identity_error(record, st)
+        if error is None:
+            return None
+        first_error = first_error or error
+    return first_error
 
 
 def validate_file_record(record: FileRecord, roots: list[str] | None = None) -> str | None:
@@ -521,12 +547,39 @@ def _revalidate_keeper(
         return False, f"retained member is unavailable: {exc}"
 
 
+@dataclass
+class _KeeperCheck:
+    group: DuplicateGroup
+    keep: FileRecord | None
+    candidates: list[FileRecord]
+
+
+def _plan_keeper_checks(
+    groups: list[DuplicateGroup], selected: set[str]
+) -> list[_KeeperCheck]:
+    """Index membership once. Each move still checks current content and identity."""
+    batch: list[_KeeperCheck] = []
+    for group in groups:
+        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
+            continue
+        candidates = [m for m in group.members if m.path in selected]
+        if not candidates:
+            continue
+        retained = [m for m in group.members if m.path not in selected]
+        keep = next(
+            (m for m in retained if m.path == group.suggested_keep),
+            retained[0] if retained else None,
+        )
+        batch.append(_KeeperCheck(group, keep, candidates))
+    return batch
+
+
 def _preflight_action(
-    groups: list[DuplicateGroup],
+    records: dict[str, FileRecord],
     paths: list[str],
+    keeper_checks: list[_KeeperCheck],
     roots: list[str] | None,
     *,
-    check_paths: set[str] | None = None,
     dest_dir: Path | None = None,
     device_cache: dict[str, int | None] | None = None,
     verified_hashes: dict[str, tuple[str, os.stat_result]] | None = None,
@@ -536,10 +589,8 @@ def _preflight_action(
     When ``dest_dir`` is given, selections that would have to cross a filesystem
     boundary to reach it are rejected here, before anything is touched.
     """
-    records = {member.path: member for group in groups for member in group.members}
     errors: dict[str, str] = {}
-    paths_to_check = paths if check_paths is None else [p for p in paths if p in check_paths]
-    for path in paths_to_check:
+    for path in paths:
         record = records.get(path)
         if record is None:
             errors[path] = "selection is not present in the scan result"
@@ -550,23 +601,11 @@ def _preflight_action(
         if error:
             errors[path] = error
 
-    selected = set(paths)
-    for group in groups:
-        member_paths = {member.path for member in group.members}
-        touched = selected.intersection(member_paths)
-        if not touched or (check_paths is not None and not touched.intersection(check_paths)):
-            continue
-        if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES:
-            continue
-        retained = [member for member in group.members if member.path not in selected]
-        keep = next(
-            (member for member in retained if member.path == group.suggested_keep),
-            retained[0] if retained else None,
-        )
+    for check in keeper_checks:
+        keep = check.keep
         if keep is None:
-            for path in touched:
-                if check_paths is None or path in check_paths:
-                    errors[path] = "refusing to remove every member of a duplicate group"
+            for member in check.candidates:
+                errors[member.path] = "refusing to remove every member of a duplicate group"
             continue
         keep_error = validate_file_record(keep, roots)
         if keep_error:
@@ -575,25 +614,19 @@ def _preflight_action(
             except OSError:
                 current_stat = None
             if _is_metadata_drift_error(keep_error, current_stat, keep):
-                valid, rehash_error = _revalidate_keeper(keep, group, current_stat)
+                valid, rehash_error = _revalidate_keeper(keep, check.group, current_stat)
                 if valid:
                     keep_error = None
                 else:
                     keep_error = rehash_error
             if keep_error:
-                for path in touched:
-                    if check_paths is None or path in check_paths:
-                        errors[path] = f"retained member is stale: {keep_error}"
+                for member in check.candidates:
+                    errors[member.path] = f"retained member is stale: {keep_error}"
                 continue
-        if group.kind != GroupKind.EXACT:
+        if check.group.kind != GroupKind.EXACT:
             continue
         current_hashes: dict[str, str] = {}
-        members_to_verify = [
-            member
-            for member in group.members
-            if member.path in touched
-            and (check_paths is None or member.path in check_paths)
-        ] + [keep]
+        members_to_verify = [*check.candidates, keep]
         try:
             for member in members_to_verify:
                 if member.path in errors:
@@ -614,9 +647,8 @@ def _preflight_action(
                 if current_hashes[member.path] != keep_hash:
                     errors[member.path] = "file is no longer an exact duplicate of the keeper"
         except OSError as exc:
-            for member in members_to_verify:
-                if member.path in selected:
-                    errors.setdefault(member.path, str(exc))
+            for member in check.candidates:
+                errors.setdefault(member.path, str(exc))
     return errors
 
 
@@ -681,19 +713,16 @@ def apply_actions(
 
     device_cache: dict[str, int | None] = {}
     guarded_dest = qdir if (qdir is not None and not allow_cross_device) else None
+    records = {member.path: member for group in all_safety_groups for member in group.members}
+    batch_checks = _plan_keeper_checks(all_safety_groups, selected)
     preflight_errors = _preflight_action(
-        all_safety_groups,
+        records,
         paths,
+        batch_checks,
         roots,
         dest_dir=guarded_dest,
         device_cache=device_cache,
     )
-
-    sizes = {
-        member.path: member.size
-        for group in all_safety_groups
-        for member in group.members
-    }
 
     # Names are reserved up front so concurrent workers never pick the same
     # quarantine destination.
@@ -707,9 +736,15 @@ def apply_actions(
 
     trash_batch = TrashBatch()
     journal_indexes = {path: index for index, path in enumerate(paths)}
+    checks_by_path: dict[str, list[_KeeperCheck]] = {}
     if not dry_run:
+        for check in batch_checks:
+            for candidate in check.candidates:
+                checks_by_path.setdefault(candidate.path, []).append(
+                    _KeeperCheck(check.group, check.keep, [candidate])
+                )
         result._journal = ActionJournal(result.to_dict(), [
-            {"path": path, "size": sizes.get(path),
+            {"path": path, "size": records[path].size if path in records else None,
              "destination": str(destinations[path]) if path in destinations else "Trash"}
             for path in paths
         ], log_dir)
@@ -717,7 +752,7 @@ def apply_actions(
 
     def _apply_one(path_str: str) -> ActionItem:
         src = Path(path_str)
-        size = sizes.get(path_str)
+        size = records[path_str].size if path_str in records else None
         if path_str in preflight_errors:
             return ActionItem(
                 path=path_str,
@@ -734,10 +769,10 @@ def apply_actions(
         # Revalidate immediately before this file's destructive operation.
         verified_hashes = {}
         immediate_errors = _preflight_action(
-            all_safety_groups,
-            paths,
+            records,
+            [path_str],
+            checks_by_path.get(path_str, []),
             roots,
-            check_paths={path_str},
             dest_dir=guarded_dest,
             device_cache=device_cache,
             verified_hashes=verified_hashes,

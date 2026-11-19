@@ -141,14 +141,18 @@ def aligned_detail_matches(left, right, *, valid=None) -> bool:
         if not support.any():
             continue
         checked = True
+        # A changed window must exceed both thresholds. Ordinary re-exports
+        # often have too few large residuals to justify computing local SSIM.
+        high_residual = support & (uniform_filter(difference, window) > LOCAL_RESIDUAL_MAX)
+        if np.count_nonzero(high_residual) < MIN_CHANGED_WINDOWS:
+            continue
         mean_a, mean_b = uniform_filter(a, window), uniform_filter(b, window)
         variance_a = np.maximum(0, uniform_filter(a * a, window) - mean_a * mean_a)
         variance_b = np.maximum(0, uniform_filter(b * b, window) - mean_b * mean_b)
         covariance = uniform_filter(a * b, window) - mean_a * mean_b
         structural_error = np.maximum(0, variance_a + variance_b - 2 * covariance)
         structural_error /= variance_a + variance_b + STRUCTURE_STABILIZER
-        residual = uniform_filter(difference, window)
-        changed = support & (structural_error > STRUCTURE_ERROR_MAX) & (residual > LOCAL_RESIDUAL_MAX)
+        changed = high_residual & (structural_error > STRUCTURE_ERROR_MAX)
         if np.count_nonzero(changed) >= MIN_CHANGED_WINDOWS:
             return False
     return checked

@@ -168,10 +168,19 @@ class FileRecord:
             return int(self.mtime_ns)
         return int(self.mtime * 1_000_000_000)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
         # Inventory records contain only immutable scalars. Avoid asdict's
         # recursive copying on every API response and review-session save.
-        d = {f.name: getattr(self, f.name) for f in fields(self)}
+        if compact:
+            # Session readers default missing optional fields to None. Keep
+            # meaningful zero, False and empty-string detector verdicts.
+            d = {
+                name: value
+                for name in _FILE_FIELD_NAMES
+                if (value := getattr(self, name)) is not None or name not in _NULLABLE_FILE_FIELDS
+            }
+        else:
+            d = {name: getattr(self, name) for name in _FILE_FIELD_NAMES}
         d["media_type"] = self.media_type.value
         return d
 
@@ -185,7 +194,9 @@ class FileRecord:
             size=int(data["size"]),
             mtime=float(data["mtime"]),
             media_type=mt,
-            extension=data.get("extension", Path(data["path"]).suffix.lower()),
+            extension=(
+                data["extension"] if "extension" in data else Path(data["path"]).suffix.lower()
+            ),
             keeper_preference=int(data.get("keeper_preference", 0)),
             capture_metadata=data.get("capture_metadata"),
             device=data.get("device"),
@@ -224,6 +235,10 @@ class FileRecord:
             border_levels_signature=data.get("border_levels_signature"),
             error=data.get("error"),
         )
+
+
+_FILE_FIELD_NAMES = tuple(f.name for f in fields(FileRecord))
+_NULLABLE_FILE_FIELDS = {f.name for f in fields(FileRecord) if f.default is None}
 
 
 @dataclass
@@ -289,13 +304,13 @@ class ReviewGroup:
         # keep largest as fallback
         return max(0, total - max(m.size for m in self.members))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
         return {
             "id": self.id,
             "kind": self.kind.value,
             "policy": self.policy.value,
             "media_type": self.media_type.value,
-            "members": [m.to_dict() for m in self.members],
+            "members": [m.to_dict(compact=compact) for m in self.members],
             "selected_for_removal": list(self.selected_for_removal),
             "reviewed_paths": list(self.reviewed_paths),
             "suggested_keep": self.suggested_keep,
@@ -389,16 +404,19 @@ def effective_selected_paths(
             # the file, so only the other reviews' decisions protect it.
             protected.update(set(group.reviewed_paths) - set(group.selected_for_removal))
     ordered: list[str] = []
-    sizes: dict[str, int] = {}
+    selected: set[str] = set()
     for group in groups:
+        if not group.selected_for_removal:
+            continue
         members = {member.path: member for member in group.members}
+        reviewed = (
+            set(group.reviewed_paths)
+            if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES else None
+        )
         for path in group.selected_for_removal:
             if path in protected:
                 continue
-            if (
-                group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
-                and path not in group.reviewed_paths
-            ):
+            if reviewed is not None and path not in reviewed:
                 continue
             if (
                 group.kind == GroupKind.NO_HUMANS
@@ -406,11 +424,10 @@ def effective_selected_paths(
                 and not may_enter_no_person_review(members[path])
             ):
                 continue
-            if path in members and path not in sizes:
+            if path in members and path not in selected:
                 ordered.append(path)
-                sizes[path] = members[path].size
+                selected.add(path)
 
-    selected = set(ordered)
     for group in groups:
         if group.policy == ReviewPolicy.INDEPENDENT_CANDIDATES or not group.members:
             continue
@@ -543,12 +560,12 @@ class ScanResult:
             sizes.get(path, 0) for path in effective_selected_paths(self.groups)
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
         self.recompute_stats()
         return {
             "roots": list(self.roots),
-            "files": [f.to_dict() for f in self.files],
-            "groups": [g.to_dict() for g in self.groups],
+            "files": [f.to_dict(compact=compact) for f in self.files],
+            "groups": [g.to_dict(compact=compact) for g in self.groups],
             "exact_groups": self.exact_groups,
             "similar_groups": self.similar_groups,
             "no_human_files": self.no_human_files,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 from dedupe.grouping import build_groups
@@ -57,6 +58,50 @@ def test_review_session_round_trip_is_private(tmp_path: Path) -> None:
     assert loaded.result.groups[0].selected_for_removal == result.groups[0].selected_for_removal
     assert stat.S_IMODE(session_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(session_path.parent.stat().st_mode) == 0o700
+
+
+def test_saved_records_omit_only_unset_optional_values(tmp_path: Path) -> None:
+    session_path = tmp_path / "state" / "review.json"
+    result = _result(tmp_path)
+    record = result.files[0]
+    record.border_crop = ""
+    record.face_count = 0
+    record.capture_metadata = False
+
+    save_review_session(result, session_path)
+    saved = json.loads(session_path.read_bytes())["result"]
+    for row in (saved["files"][0], saved["groups"][0]["members"][0]):
+        assert "phash" not in row
+        assert row["border_crop"] == ""
+        assert row["face_count"] == 0
+        assert row["capture_metadata"] is False
+    assert "phash" in result.to_dict()["files"][0]
+    assert load_review_session(session_path).result.to_dict() == result.to_dict()
+
+
+def test_legacy_session_checks_disk_once_per_path(tmp_path: Path, monkeypatch) -> None:
+    from dedupe import actions
+
+    session_path = tmp_path / "review.json"
+    result = _result(tmp_path)
+    # One stale inventory snapshot and one group-only record. Both current
+    # group members must survive regardless of their inventory representation.
+    result.files = [replace(result.files[0], size=0)]
+    session_path.write_text(json.dumps({"version": 1, "result": result.to_dict()}))
+    checked = []
+    scoped_stat = actions._scoped_file_stat
+
+    def count_stat(path, roots):
+        checked.append(str(path))
+        return scoped_stat(path, roots)
+
+    monkeypatch.setattr(actions, "_scoped_file_stat", count_stat)
+    loaded = load_review_session(session_path)
+    assert loaded.error is None
+    assert loaded.pruned_files == 0
+    paths = [r.path for r in result.groups[0].members]
+    assert sorted(checked) == sorted(paths)
+    assert [r.path for r in loaded.result.groups[0].members] == paths
 
 
 def test_distinct_participants_round_trip(tmp_path: Path) -> None:

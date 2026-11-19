@@ -104,6 +104,24 @@ def test_cache_reuses_hashes_after_same_filesystem_move(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_hydrate_ignores_old_algorithm_at_path_and_reuses_current_identity(tmp_path):
+    stale = _record(tmp_path / "photo.jpg", inode=10)
+    alias = _record(tmp_path / "renamed.jpg", inode=10)
+    alias.phash = "1" * 16
+    unrelated = _record(tmp_path / "other.jpg", inode=11)
+    with closing(HashCache(tmp_path / "hashes.sqlite3")) as cache:
+        cache.store_all([stale, alias, unrelated])
+        cache._conn.execute(
+            "UPDATE hashes SET algorithm_version = 'obsolete' WHERE path IN (?, ?)",
+            (stale.path, unrelated.path),
+        )
+        stale.phash = unrelated.phash = None
+
+        assert cache.hydrate([stale, unrelated]) == 1
+        assert stale.phash == alias.phash
+        assert unrelated.phash is None
+
+
 def test_cache_round_trips_person_decision_without_hashes(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     original = _record(tmp_path / "photo.jpg", inode=10)
