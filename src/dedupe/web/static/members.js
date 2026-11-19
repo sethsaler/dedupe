@@ -14,6 +14,7 @@ import { $, basename, escapeHtml, formatBytes, formatMtime, isOverlayOpen, setPr
 
 const MEMBER_PAGE_SIZE = 50;
 let renderedGroupSnapshot = "";
+let renderedGroupId = null;
 
 // Fit the stage and its actual controls above the action bar. This responds to
 // open guides, wrapped captions, and short laptop screens, not a guessed vh.
@@ -57,16 +58,19 @@ $("members").addEventListener("click", (event) => {
 
 // The member sort select is kind-aware: each listed kind gets its own option
 // set, and its first option is the server order (no client re-sort).
-// "people-asc" orders by the people-likelihood score (least likely to show
-// people first); missing scores are computed on demand for the open group.
+// Both people metrics are computed on demand for the open group.
 const PEOPLE_SORT = "people-asc";
 const PEOPLE_SORT_OPTION = [PEOPLE_SORT, "Fewest people first"];
+const COVERAGE_SORT = "non-person-coverage-desc";
+const COVERAGE_HINT = "Estimated area outside detected person boxes, averaged over sampled video or animation frames. Not exact segmentation. For ordering only.";
+const COVERAGE_SORT_OPTION = [COVERAGE_SORT, "Non-person coverage", COVERAGE_HINT];
 const MEMBER_SORT_OPTIONS = {
   faces: [
     ["faces-desc", "Most faces first"],
     ["faces-asc", "Fewest faces first"],
     ["newest", "Newest first"],
     PEOPLE_SORT_OPTION,
+    COVERAGE_SORT_OPTION,
   ],
   all_files: [
     ["path", "Folder order (path)"],
@@ -74,17 +78,19 @@ const MEMBER_SORT_OPTIONS = {
     ["newest", "Newest first"],
     ["oldest", "Oldest first"],
     PEOPLE_SORT_OPTION,
+    COVERAGE_SORT_OPTION,
   ],
   no_humans: [
     ["newest", "Newest first"],
     PEOPLE_SORT_OPTION,
+    COVERAGE_SORT_OPTION,
   ],
 };
 
 function memberSortOptions(kind) {
   const options = MEMBER_SORT_OPTIONS[kind];
   if (!options || state.capabilities?.people_score !== false) return options || null;
-  return options.filter(([value]) => value !== PEOPLE_SORT);
+  return options.filter(([value]) => value !== PEOPLE_SORT && value !== COVERAGE_SORT);
 }
 
 // People-likelihood filter cutoffs, calibrated on a labeled COCO sample:
@@ -109,65 +115,122 @@ function byPeopleScore(a, b) {
   return (a.people_score || 0) - (b.people_score || 0) || a.path.localeCompare(b.path);
 }
 
-// On-demand scoring: one request per group per scan, then poll for progress.
-const peopleScoreRequested = new Set();
-let peopleScoringPoll = null;
+// Highest coverage first, using the raw value rather than the displayed percent.
+function byNonPersonCoverage(a, b) {
+  const aMissing = a.non_person_coverage == null;
+  const bMissing = b.non_person_coverage == null;
+  if (aMissing !== bMissing) return aMissing ? 1 : -1;
+  return (b.non_person_coverage ?? 0) - (a.non_person_coverage ?? 0)
+    || a.path.localeCompare(b.path);
+}
 
-function peopleScoringSummary(scoring) {
-  return `Ranking by people likelihood… ${scoring.done}/${scoring.total}`;
+const coveragePercent = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+
+function peopleMetricsFor(kind) {
+  const sort = memberSortFor(kind);
+  const metrics = [];
+  if (sort === COVERAGE_SORT) metrics.push("non_person_coverage");
+  if (sort === PEOPLE_SORT || peopleFilterFor(kind) != null) metrics.push("people_score");
+  return metrics;
+}
+
+// The endpoint has one scoring job at a time. Refresh the open group when it
+// finishes so a changed group, sort, or filter can request its still-missing
+// metric. Remember attempts per metric so unreadable media never loops.
+let peopleScoreScanId = null;
+const peopleScoreRequested = new Set();
+let peopleJob = null;
+
+function peopleJobCurrent(job) {
+  return peopleJob === job && job.scanId === state.scanId && !state.scanning;
+}
+
+function peopleScoringSummary(scoring, g) {
+  if (!scoring?.running || scoring.scan_id !== state.scanId || scoring.group_id !== g.id
+    || !peopleMetricsFor(g.kind).includes(scoring.metric)) return null;
+  const name = scoring.metric === "non_person_coverage" ? "non-person coverage" : "people likelihood";
+  return `Ranking by ${name}… ${scoring.done}/${scoring.total}`;
 }
 
 function showPeopleScoringProgress(scoring) {
-  for (const id of ["memberPagination", "memberPaginationBottom"]) {
-    const summary = $(id)?.querySelector(".member-page-summary");
-    if (summary && !$(id).hidden) summary.textContent = peopleScoringSummary(scoring);
-  }
-}
-
-function followPeopleScoring(groupId) {
-  if (peopleScoringPoll) clearTimeout(peopleScoringPoll);
-  const tick = async () => {
-    peopleScoringPoll = null;
-    let scoring;
-    try {
-      scoring = await api("/api/people-scores");
-    } catch {
-      return;
-    }
-    state.peopleScoring = scoring;
-    if (scoring.running) {
-      if (state.currentId === groupId) showPeopleScoringProgress(scoring);
-      peopleScoringPoll = setTimeout(tick, 400);
-      return;
-    }
-    if (scoring.error) toast(scoring.error, "error");
-    if (state.currentId === groupId) await selectGroup(groupId, { silent: true });
-  };
-  peopleScoringPoll = setTimeout(tick, 200);
+  const g = currentGroup();
+  const text = g && peopleScoringSummary(scoring, g);
+  // Don't paint progress into another group's detail while its fetch is in flight.
+  if (!text || renderedGroupId !== g.id || $("detailBody").hidden) return;
+  $("memberPagination").querySelector(".member-page-summary").textContent = text;
 }
 
 async function ensurePeopleScores(g) {
-  if (state.capabilities?.people_score === false || state.scanning) return;
-  const key = `${state.scanId}:${g.id}`;
-  if (peopleScoreRequested.has(key)) return;
+  if (!state.scanId || state.scanning) return;
+  if (peopleScoreScanId !== state.scanId) {
+    peopleScoreScanId = state.scanId;
+    peopleScoreRequested.clear();
+    peopleJob = null;
+  }
+  if (peopleJob) return;
+  const keyFor = (groupId, metric) => JSON.stringify([groupId, metric]);
   const deleted = new Set(g.deleted_paths || []);
-  if (!(g.members || []).some((m) => m.people_score == null && !deleted.has(m.path))) return;
-  peopleScoreRequested.add(key);
+  const metric = peopleMetricsFor(g.kind).find((field) =>
+    !peopleScoreRequested.has(keyFor(g.id, field))
+      && (g.members || []).some((m) => m[field] == null && !deleted.has(m.path)),
+  );
+  if (!metric) return;
+  const job = { scanId: state.scanId, status: null };
+  peopleJob = job;
+  let status;
+  let failure;
+  let refresh = false;
   try {
-    const scoring = await api("/api/people-scores", {
-      method: "POST",
-      body: JSON.stringify({ scan_id: state.scanId, group_id: g.id }),
-    });
-    state.peopleScoring = scoring;
-    if (scoring.running) {
-      showPeopleScoringProgress(scoring);
-      followPeopleScoring(g.id);
-    } else if (state.currentId === g.id) {
-      await selectGroup(g.id, { silent: true });
+    try {
+      status = await api("/api/people-scores", {
+        method: "POST",
+        body: JSON.stringify({
+          scan_id: job.scanId,
+          group_id: g.id,
+          ...(metric === "non_person_coverage" ? { metric } : {}),
+        }),
+      });
+    } catch (error) {
+      if (error.status !== 409 || !peopleJobCurrent(job)) throw error;
+      // Another browser tab may have started a job for a different group.
+      status = await api("/api/people-scores");
+      if (!status.running || status.scan_id !== job.scanId) throw error;
     }
+    if (!peopleJobCurrent(job) || status.scan_id !== job.scanId) return;
+    refresh = true;
+    const groupId = status.group_id;
+    const activeMetric = status.metric;
+    peopleScoreRequested.add(keyFor(groupId, activeMetric));
+    while (status.running && peopleJobCurrent(job)) {
+      job.status = status;
+      showPeopleScoringProgress(status);
+      await sleep(400);
+      if (!peopleJobCurrent(job)) return;
+      status = await api("/api/people-scores");
+      if (status.scan_id !== job.scanId) {
+        refresh = false;
+        return;
+      }
+      if (status.group_id !== groupId || status.metric !== activeMetric) break;
+    }
+    if (status.scan_id === job.scanId && status.group_id === state.currentId
+      && status.group_id === groupId && status.metric === activeMetric
+      && peopleMetricsFor(currentGroup()?.kind).includes(activeMetric)) failure = status.error;
   } catch (error) {
-    peopleScoreRequested.delete(key);
-    toast(error.message || "Could not rank by people likelihood", "error");
+    if (peopleJobCurrent(job)) {
+      if (state.currentId === g.id) failure = error.message || "Could not rank by people metrics";
+      peopleScoreRequested.add(keyFor(g.id, metric));
+    }
+  } finally {
+    const current = peopleJobCurrent(job);
+    if (peopleJob === job) peopleJob = null;
+    if (current) {
+      if (failure) toast(failure, "error");
+      const open = currentGroup();
+      if (refresh && open && (open.id === g.id || peopleMetricsFor(open.kind).length)) {
+        await selectGroup(open.id, { silent: true }).catch((error) => toast(error.message, "error"));
+      }
+    }
   }
 }
 
@@ -512,6 +575,7 @@ function renderMembers(g, { append = false } = {}) {
   // The Similar board owns the screen; the hidden detail pane stays as is.
   if (boardActive()) return;
   renderedGroupSnapshot = JSON.stringify(g);
+  renderedGroupId = g.id;
   const box = $("members");
   if (!append) {
     stopInlineVideo();
@@ -554,11 +618,13 @@ function renderMembers(g, { append = false } = {}) {
   let allMembers = g.members || [];
   const memberSort = memberSortFor(g.kind);
   const peopleMax = peopleFilterFor(g.kind);
-  if (memberSort === PEOPLE_SORT || peopleMax != null) ensurePeopleScores(g);
+  if (peopleMetricsFor(g.kind).length) ensurePeopleScores(g);
   if (peopleMax != null) {
     allMembers = allMembers.filter((m) => m.people_score != null && m.people_score <= peopleMax);
   }
-  if (memberSort === PEOPLE_SORT) {
+  if (memberSort === COVERAGE_SORT) {
+    allMembers = [...allMembers].sort(byNonPersonCoverage);
+  } else if (memberSort === PEOPLE_SORT) {
     allMembers = [...allMembers].sort(byPeopleScore);
   } else if (g.kind === "faces" && memberSort !== "faces-desc") {
     allMembers = [...allMembers].sort(
@@ -566,8 +632,7 @@ function renderMembers(g, { append = false } = {}) {
         ? (a, b) => (b.mtime || 0) - (a.mtime || 0)
         : (a, b) => (a.face_count || 0) - (b.face_count || 0),
     );
-  }
-  if (g.kind === "all_files" && memberSort !== "path" && memberSort !== PEOPLE_SORT) {
+  } else if (g.kind === "all_files" && memberSort !== "path") {
     const byPath = (a, b) => a.path.localeCompare(b.path);
     allMembers = [...allMembers].sort(
       memberSort === "largest"
@@ -608,15 +673,12 @@ function renderMembers(g, { append = false } = {}) {
     : gridPaged
     ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
     : allMembers;
-  const scoring = state.peopleScoring;
-  const summaryText = (memberSort === PEOPLE_SORT || peopleMax != null)
-    && scoring?.running && scoring.group_id === g.id
-    ? peopleScoringSummary(scoring)
-    : allMembers.length
+  const resultCount = allMembers.length
     ? singleReview
       ? `${pageStart + 1} of ${allMembers.length}`
       : `${pageStart + 1}–${Math.min(pageStart + members.length, allMembers.length)} of ${allMembers.length}`
     : "0 results";
+  const summaryText = peopleScoringSummary(peopleJob?.status, g) ?? resultCount;
   syncMemberPagination(pageCount, summaryText, singleReview);
   $("memberPaginationBottom").hidden = true;
   if (gridPaged && !focusReview && members.length < allMembers.length) {
@@ -633,7 +695,11 @@ function renderMembers(g, { append = false } = {}) {
     const optionsKey = options ? `${g.kind}:${options.length}` : "";
     if (options && sortSelect.dataset.kind !== optionsKey) {
       sortSelect.replaceChildren(
-        ...options.map(([value, label]) => new Option(label, value)),
+        ...options.map(([value, label, hint]) => {
+          const option = new Option(label, value);
+          if (hint) option.title = hint;
+          return option;
+        }),
       );
       sortSelect.dataset.kind = optionsKey;
     }
@@ -807,6 +873,7 @@ function renderMembers(g, { append = false } = {}) {
               ${(m.male_face_count || 0) > 0 ? `<span class="face-count multi" title="Male faces estimated by InsightFace genderage (heuristic)">${m.male_face_count} male${m.male_face_count === 1 ? "" : "s"}</span>` : ""}
             </div>
             <div class="evidence">${escapeHtml(evidence)}</div>
+            ${m.non_person_coverage != null || memberSort === COVERAGE_SORT ? `<div class="non-person-coverage" title="${COVERAGE_HINT}">Non-person coverage: ${m.non_person_coverage == null ? "Unknown" : `${coveragePercent.format(m.non_person_coverage)}%`}</div>` : ""}
             <div class="card-actions">
               ${actions}
               ${singleReview && !deleted && !clickTrash ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}

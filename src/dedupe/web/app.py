@@ -84,6 +84,8 @@ from ..models import (
     effective_selected_paths,
 )
 from ..people_score import (
+    PEOPLE_MEDIA_TYPES,
+    has_current_non_person_coverage,
     has_current_people_score,
     people_scoring_available,
     score_people,
@@ -641,11 +643,12 @@ def create_app(
         # Similar groups dissolved by a whole-group distinct review, keyed by
         # group id, so /api/similar/restore-group can undo the review.
         "dissolved_similar": {},
-        # On-demand people-likelihood scoring for one group's members.
+        # On-demand people metrics for one group's members.
         "people_scoring": {
             "running": False,
             "scan_id": None,
             "group_id": None,
+            "metric": None,
             "done": 0,
             "total": 0,
             "error": None,
@@ -775,6 +778,8 @@ def create_app(
             # A score from an older model would sort against current ones.
             if not has_current_people_score(member):
                 member_payload["people_score"] = None
+            if not has_current_non_person_coverage(member):
+                member_payload["non_person_coverage"] = None
         if group.kind == GroupKind.SETS:
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 score = group.match_scores.get(member.path)
@@ -1417,15 +1422,14 @@ def create_app(
 
     @app.post("/api/people-scores")
     def api_people_scores_start():
-        """Score one group's members for "least likely to show people" ordering.
-
-        Scoring only reads files and writes advice (a 0–1 score per file) to
-        the records, the hash cache, and the review session. It never selects
-        or moves anything, so it is not an action and holds no action lock;
-        it is refused during scans because the result is about to be replaced.
-        """
+        """Populate one group's people metrics for ordering, not selection."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
+        metric = data.get("metric", "people_score")
+        if metric not in ("people_score", "non_person_coverage"):
+            return jsonify({"error": "unknown people metric"}), 400
+        require_coverage = metric == "non_person_coverage"
+        is_current = has_current_non_person_coverage if require_coverage else has_current_people_score
         with lock:
             if not capabilities.get("people_score"):
                 return jsonify({"error": people_scoring_available()[1]}), 400
@@ -1444,12 +1448,15 @@ def create_app(
                 if scoring["group_id"] == group_id and scoring["scan_id"] == state["scan_id"]:
                     return jsonify(people_scoring_payload_locked())
                 return jsonify({"error": "another folder is still being scored"}), 409
-            pending = [m for m in group.members if not has_current_people_score(m)]
+            pending = [
+                m for m in group.members if m.media_type in PEOPLE_MEDIA_TYPES and not is_current(m)
+            ]
             scan_id = state["scan_id"]
             state["people_scoring"] = {
                 "running": bool(pending),
                 "scan_id": scan_id,
                 "group_id": group_id,
+                "metric": metric,
                 "done": 0,
                 "total": len(pending),
                 "error": None,
@@ -1474,6 +1481,7 @@ def create_app(
                     pending,
                     progress=progress,
                     cancelled=lambda: not still_current(),
+                    require_coverage=require_coverage,
                 )
             except InterruptedError:
                 error = "scoring stopped because the results changed"
@@ -1483,7 +1491,7 @@ def create_app(
                 cache = None
                 try:
                     cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
-                    cache.store_all([record for record in scored if record.people_score is not None])
+                    cache.store_all([record for record in scored if is_current(record)])
                 except (OSError, sqlite3.Error):
                     pass  # scores still apply to this session; they just are not cached
                 finally:

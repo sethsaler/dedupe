@@ -78,6 +78,11 @@
   grid-row: 4;
 }
 
+#members.triage-grid .triage-card:not(.focus-card) .non-person-coverage {
+  grid-column: 1 / -1;
+  grid-row: 5;
+}
+
 /* Square loupe mat, 4px radius. Media letterboxes inside it. */
 #members.triage-grid .triage-card .thumb-wrap {
   background: var(--lt-loupe);

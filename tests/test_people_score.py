@@ -19,10 +19,13 @@ from dedupe.people_score import (
     PEOPLE_MODEL_PATH,
     PEOPLE_MODEL_SHA256,
     PeopleScorer,
+    has_current_non_person_coverage,
     has_current_people_score,
     least_likely_first_key,
+    non_person_coverage,
     people_score_signature,
     score_people,
+    score_record,
 )
 from dedupe.scanner import inventory
 from dedupe.web.app import create_app
@@ -92,6 +95,36 @@ def test_person_boxes_hug_the_person(tmp_path: Path) -> None:
         assert scorer.person_boxes(np.asarray(image.convert("RGB"))) == []
 
 
+@pytest.mark.parametrize(
+    ("boxes", "expected"),
+    [
+        ([], 100.0),
+        ([(-1.0, -1.0, 2.0, 2.0)], 0.0),
+        ([(0.0, 0.0, 0.5, 1.0), (0.25, 0.0, 0.75, 1.0)], 25.0),
+        ([(0.0, 0.0, 0.5, 0.5), (0.5, 0.5, 1.0, 1.0)], 50.0),
+        ([(0.0, -1.0, 0.5, 0.5), (2.0, 2.0, 3.0, 3.0)], 75.0),
+    ],
+)
+def test_non_person_coverage_is_complement_of_clipped_box_union(boxes, expected) -> None:
+    assert non_person_coverage(boxes) == pytest.approx(expected)
+
+
+def test_animation_coverage_averages_frames_without_averaging_confidence(tmp_path: Path) -> None:
+    path = tmp_path / "animation.gif"
+    frames = [Image.new("RGB", (20, 20), (value, 0, 0)) for value in (0, 50, 100)]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=200)
+    record, = inventory([tmp_path])
+
+    class TestScorer:
+        def frame_metrics(self, frame):
+            value = float(frame[0, 0, 0])
+            return 1 - value / 100, value
+
+    assert score_record(record, TestScorer()) == 1.0
+    assert record.non_person_coverage == 50.0
+    assert has_current_non_person_coverage(record)
+
+
 def test_least_likely_first_ordering_puts_unscored_files_last() -> None:
     def record(name: str, score: float | None) -> FileRecord:
         return FileRecord(
@@ -132,6 +165,8 @@ def test_unreadable_media_is_left_unscored(tmp_path: Path) -> None:
 
     assert records[0].people_score is None
     assert records[0].people_score_signature is None
+    assert records[0].non_person_coverage is None
+    assert records[0].non_person_coverage_signature is None
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
@@ -148,6 +183,8 @@ def test_videos_score_the_most_person_like_sampled_frame(tmp_path: Path) -> None
 
     assert records[0].media_type == MediaType.VIDEO
     assert records[0].people_score is not None and records[0].people_score > 0.5
+    assert 0.0 < records[0].non_person_coverage < 75.0
+    assert has_current_non_person_coverage(records[0])
 
 
 def test_scores_round_trip_through_the_hash_cache_until_the_file_changes(
@@ -312,6 +349,52 @@ def test_web_scores_a_group_on_demand_and_caches_it(media: Path, tmp_path: Path)
     )
     assert again.status_code == 200
     assert again.get_json()["running"] is False
+
+
+def test_web_backfills_non_person_coverage_without_changing_selection(
+    media: Path, tmp_path: Path
+) -> None:
+    (media / "unreadable.jpg").write_bytes(b"not an image")
+    app = _files_app(media, tmp_path)
+    result = app.extensions["dedupe_state"]["result"]
+    for record in result.files:
+        record.people_score = 0.5
+        record.people_score_signature = people_score_signature()
+        record.non_person_coverage = 30.0
+        record.non_person_coverage_signature = "old-coverage-method"
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    group = next(g for g in client.get("/api/groups").get_json()["groups"]
+                 if g["kind"] == "all_files")
+    assert all(m["non_person_coverage"] is None for m in group["members"])
+    data = {"scan_id": scan_id, "group_id": group["id"]}
+    assert client.post("/api/people-scores", json=data, headers=headers).status_code == 200
+    bad = client.post("/api/people-scores", json={**data, "metric": "other"}, headers=headers)
+    assert bad.status_code == 400
+
+    started = client.post(
+        "/api/people-scores", json={**data, "metric": "non_person_coverage"}, headers=headers
+    )
+    assert started.status_code == 202
+    done = _wait_for_scoring(client)
+    assert done["error"] is None
+    assert done["metric"] == "non_person_coverage"
+    assert done["done"] == done["total"] == 3
+
+    updated = client.get(f"/api/groups/{group['id']}").get_json()
+    scores = {Path(m["path"]).name: m["non_person_coverage"] for m in updated["members"]}
+    assert scores["still-life.png"] == 100.0
+    assert 0.0 < scores["astronaut.png"] < 75.0
+    assert scores["unreadable.jpg"] is None
+    assert updated["selected_for_removal"] == group["selected_for_removal"]
+    assert updated["reviewed_paths"] == group["reviewed_paths"]
+
+    cache = HashCache(tmp_path / "web-cache.sqlite3")
+    fresh = inventory([media])
+    assert cache.hydrate(fresh) == 2
+    cache.close()
+    assert {Path(r.path).name: r.non_person_coverage for r in fresh} == scores
 
 
 def test_web_hides_scores_from_an_older_model(media: Path, tmp_path: Path) -> None:
