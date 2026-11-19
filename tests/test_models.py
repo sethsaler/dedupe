@@ -70,6 +70,7 @@ def test_file_record_serialization_preserves_fields_and_round_trips() -> None:
         path="/photos/image.jpg", size=1234, mtime=123.5,
         media_type=MediaType.IMAGE, extension=".jpg", width=1920,
         mtime_ns=123500000000, face_count=0, phash="abcdef", error="unreadable",
+        non_person_coverage=95.25, non_person_coverage_signature="coverage-v1",
     )
     expected = asdict(record)
     expected["media_type"] = "image"
@@ -78,3 +79,9 @@ def test_file_record_serialization_preserves_fields_and_round_trips() -> None:
     assert FileRecord.from_dict(payload) == record
     payload["path"] = "/another.jpg"
     assert record.path == "/photos/image.jpg"
+
+    del payload["non_person_coverage"]
+    del payload["non_person_coverage_signature"]
+    legacy = FileRecord.from_dict(payload)
+    assert legacy.non_person_coverage is None
+    assert legacy.non_person_coverage_signature is None

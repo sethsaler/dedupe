@@ -1,9 +1,11 @@
 """Hash cache identity and algorithm-version tests."""
 
 import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
-from dedupe.cache import HashCache
+from dedupe.cache import CACHE_ALGORITHM_VERSION, HashCache
 from dedupe.models import FileRecord, MediaType
 
 
@@ -142,6 +144,105 @@ def test_cache_round_trips_face_count_without_hashes(tmp_path: Path) -> None:
     assert same.face_detector == "opencv_yunet"
     assert same.face_detection_signature == original.face_detection_signature
     cache.close()
+
+
+def test_cache_round_trips_non_person_coverage_until_file_changes(tmp_path: Path) -> None:
+    db_path = tmp_path / "hashes.sqlite3"
+    path = tmp_path / "photo.jpg"
+    original = _record(path, inode=10)
+    original.ctime_ns = 1_000_000_000
+    original.phash = None
+    original.non_person_coverage = 0.0
+    original.non_person_coverage_signature = "coverage-v1"
+    with closing(HashCache(db_path)) as cache:
+        cache.store_all([original])
+
+    same = _record(path, inode=10)
+    same.phash = None
+    same.ctime_ns = original.ctime_ns
+    changed = _record(path, inode=10)
+    changed.ctime_ns = 2_000_000_000
+    with closing(HashCache(db_path)) as cache:
+        assert cache.hydrate([same, changed]) == 1
+        assert same.non_person_coverage == 0.0
+        assert same.non_person_coverage_signature == original.non_person_coverage_signature
+        assert cache.get(changed) is None
+        assert changed.non_person_coverage is None
+        assert changed.non_person_coverage_signature is None
+
+        same.non_person_coverage = 73.25
+        same.non_person_coverage_signature = "coverage-v2"
+        cache.store_all([same])
+        fresh = _record(path, inode=10)
+        fresh.ctime_ns = original.ctime_ns
+        assert cache.hydrate([fresh]) == 1
+        assert fresh.non_person_coverage == 73.25
+        assert fresh.non_person_coverage_signature == "coverage-v2"
+
+
+def test_cache_ignores_incomplete_non_person_coverage(tmp_path: Path) -> None:
+    unsigned = _record(tmp_path / "unsigned.jpg", inode=10)
+    unsigned.phash = None
+    unsigned.non_person_coverage = 100.0
+    value_missing = _record(tmp_path / "missing.jpg", inode=11)
+    value_missing.phash = None
+    value_missing.non_person_coverage_signature = "coverage-v1"
+    with closing(HashCache(tmp_path / "hashes.sqlite3")) as cache:
+        cache.store_all([unsigned, value_missing])
+        assert cache.get(unsigned) is None
+        assert cache.get(value_missing) is None
+
+        unsigned.phash = value_missing.phash = "1" * 16
+        cache.store_all([unsigned, value_missing])
+        fresh = [
+            _record(tmp_path / "unsigned.jpg", inode=10),
+            _record(tmp_path / "missing.jpg", inode=11),
+        ]
+        assert cache.hydrate(fresh) == 2
+        assert all(r.non_person_coverage is None for r in fresh)
+        assert all(r.non_person_coverage_signature is None for r in fresh)
+
+
+def test_legacy_hash_table_gains_non_person_coverage_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "hashes.sqlite3"
+    photo = _record(tmp_path / "photo.jpg", inode=10)
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("""
+            CREATE TABLE hashes (
+                path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL,
+                algorithm_version TEXT NOT NULL, media_type TEXT, width INTEGER,
+                height INTEGER, sha256 TEXT, partial_hash TEXT, phash TEXT, dhash TEXT,
+                video_fingerprint TEXT, duration REAL, people_score REAL,
+                people_score_signature TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO hashes (path, size, mtime, algorithm_version, media_type, "
+            "phash, people_score, people_score_signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                photo.path, photo.size, photo.mtime, CACHE_ALGORITHM_VERSION,
+                "image", "f", 0.7, "people-score-v1",
+            ),
+        )
+
+    with closing(HashCache(db_path)) as cache:
+        assert cache.hydrate([photo]) == 1
+        assert photo.phash == "f"
+        assert photo.people_score == 0.7
+        assert photo.people_score_signature == "people-score-v1"
+        row = cache.get(photo)
+        assert row is not None
+        assert row["non_person_coverage"] is None
+        assert row["non_person_coverage_signature"] is None
+        photo.non_person_coverage = 100.0
+        photo.non_person_coverage_signature = "coverage-v1"
+        cache.store_all([photo])
+
+        fresh = _record(tmp_path / "photo.jpg", inode=10)
+        assert cache.hydrate([fresh]) == 1
+        assert fresh.non_person_coverage == 100.0
+        assert fresh.non_person_coverage_signature == "coverage-v1"
+        assert fresh.people_score == 0.7
 
 
 def test_cache_round_trips_distinct_pair_until_a_file_changes(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ import hashlib
 import threading
 from collections.abc import Callable
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 
 from .image_frames import animation_frame_count
@@ -39,6 +40,9 @@ from .parallel import map_parallel, resolve_workers
 ProgressCb = Callable[[int, int], None]
 
 PEOPLE_SCORE_VERSION = "people-score-v1"
+NON_PERSON_COVERAGE_VERSION = "non-person-box-union-v1"
+COVERAGE_CONFIDENCE = 0.3
+PersonBox = tuple[float, float, float, float]
 PEOPLE_MODEL_PATH = Path(__file__).parent / "assets" / "person_detection_yolox_tiny.onnx"
 PEOPLE_MODEL_SHA256 = "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
 PEOPLE_INPUT_SIZE = 512
@@ -72,6 +76,40 @@ def has_current_people_score(record: FileRecord) -> bool:
         record.people_score is not None
         and record.people_score_signature == people_score_signature()
     )
+
+
+def non_person_coverage_signature() -> str:
+    return (
+        f"{people_score_signature()}|{NON_PERSON_COVERAGE_VERSION}"
+        f"|confidence={COVERAGE_CONFIDENCE}|animation=first-middle-last"
+    )
+
+
+def has_current_non_person_coverage(record: FileRecord) -> bool:
+    return (
+        record.non_person_coverage is not None
+        and record.non_person_coverage_signature == non_person_coverage_signature()
+    )
+
+
+def non_person_coverage(boxes: list[PersonBox]) -> float:
+    """Percentage outside the union of clipped, frame-relative person boxes."""
+    # Sweep slabs delimited by box edges, merging vertical spans within each.
+    clipped = []
+    for x0, y0, x1, y1 in boxes:
+        left, top, right, bottom = max(0.0, x0), max(0.0, y0), min(1.0, x1), min(1.0, y1)
+        if left < right and top < bottom:
+            clipped.append((left, top, right, bottom))
+    edges = sorted({edge for left, _, right, _ in clipped for edge in (left, right)})
+    area = 0.0
+    for left, right in pairwise(edges):
+        spans = sorted((y0, y1) for x0, y0, x1, y1 in clipped if x0 < right and x1 > left)
+        height = end = 0.0
+        for top, bottom in spans:
+            height += max(0.0, bottom - max(top, end))
+            end = max(end, bottom)
+        area += (right - left) * height
+    return 100.0 * (1.0 - min(1.0, area))
 
 
 def people_scoring_available() -> tuple[bool, str | None]:
@@ -149,9 +187,7 @@ class PeopleScorer:
         scores = output[:, 4] * output[:, _PERSON_COLUMN]
         return float(max(0.0, min(1.0, scores.max())))
 
-    def person_boxes(
-        self, rgb, *, threshold: float = 0.3
-    ) -> list[tuple[float, float, float, float]]:
+    def person_boxes(self, rgb, *, threshold: float = 0.3) -> list[PersonBox]:
         """Person boxes in ``rgb`` as fractions ``(x0, y0, x1, y1)``.
 
         YOLOX rows are grid-relative: centers decode as
@@ -159,12 +195,23 @@ class PeopleScorer:
         letterboxed input pixels, then scale back by the letterbox ratio.
         Overlapping duplicates are merged with standard NMS.
         """
-        cv2, np = self.cv2, self.np
         height, width = rgb.shape[:2]
         if not height or not width:
             return []
         output, ratio = self._forward(rgb)
         scores = output[:, 4] * output[:, _PERSON_COLUMN]
+        return self._decode_boxes(output, scores, ratio, width, height, threshold)
+
+    def frame_metrics(self, rgb) -> tuple[float, float]:
+        """Compute presence confidence and non-person area in a single model pass."""
+        height, width = rgb.shape[:2]
+        output, ratio = self._forward(rgb)
+        scores = output[:, 4] * output[:, _PERSON_COLUMN]
+        boxes = self._decode_boxes(output, scores, ratio, width, height, COVERAGE_CONFIDENCE)
+        return float(max(0.0, min(1.0, scores.max()))), non_person_coverage(boxes)
+
+    def _decode_boxes(self, output, scores, ratio, width, height, threshold) -> list[PersonBox]:
+        cv2, np = self.cv2, self.np
         keep = scores >= threshold
         if not keep.any():
             return []
@@ -257,9 +304,13 @@ def _video_frames(record: FileRecord):
 
 
 def score_record(record: FileRecord, scorer: PeopleScorer) -> float | None:
-    """Score one file in place. A failure leaves no score (sorts as unknown)."""
-    record.people_score = None
-    record.people_score_signature = None
+    """Populate both metrics in place; unreadable files keep any prior current results."""
+    if not has_current_people_score(record):
+        record.people_score = None
+        record.people_score_signature = None
+    if not has_current_non_person_coverage(record):
+        record.non_person_coverage = None
+        record.non_person_coverage_signature = None
     if record.media_type not in PEOPLE_MEDIA_TYPES:
         return None
     try:
@@ -267,16 +318,16 @@ def score_record(record: FileRecord, scorer: PeopleScorer) -> float | None:
             frames = _video_frames(record)
         else:
             frames = _image_frames(Path(record.path), max_frames=3)
-        best = None
-        for frame in frames:
-            value = scorer.score_rgb(frame)
-            best = value if best is None else max(best, value)
+        metrics = [scorer.frame_metrics(frame) for frame in frames]
     except Exception:
         return None
-    if best is None:
+    if not metrics:
         return None
-    record.people_score = round(best, 4)
+    scores, coverage = zip(*metrics, strict=True)
+    record.people_score = round(max(scores), 4)
     record.people_score_signature = people_score_signature()
+    record.non_person_coverage = sum(coverage) / len(coverage)
+    record.non_person_coverage_signature = non_person_coverage_signature()
     return record.people_score
 
 
@@ -286,12 +337,14 @@ def score_people(
     workers: int | None = None,
     progress: ProgressCb | None = None,
     cancelled: Callable[[], bool] | None = None,
+    require_coverage: bool = False,
 ) -> list[FileRecord]:
-    """Score every media record without a current score; return those scored now."""
+    """Populate both metrics for media missing the requested one."""
+    is_current = has_current_non_person_coverage if require_coverage else has_current_people_score
     pending = [
         record
         for record in records
-        if record.media_type in PEOPLE_MEDIA_TYPES and not has_current_people_score(record)
+        if record.media_type in PEOPLE_MEDIA_TYPES and not is_current(record)
     ]
     if not pending:
         if progress:

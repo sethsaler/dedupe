@@ -38,10 +38,10 @@ _UPSERT_SQL = """
         human_detection_status, human_detector, human_detection_signature,
         human_frames_analyzed, human_max_confidence, face_count, face_detector,
         face_detection_signature, ctime_ns, people_score, people_score_signature,
-        border_crop, border_signature, border_crop_conservative,
-        border_crop_aggressive, border_levels_signature
+        non_person_coverage, non_person_coverage_signature, border_crop, border_signature,
+        border_crop_conservative, border_crop_aggressive, border_levels_signature
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?)
+              ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
         size=excluded.size,
         mtime=excluded.mtime,
@@ -71,6 +71,8 @@ _UPSERT_SQL = """
         face_detection_signature=excluded.face_detection_signature,
         people_score=excluded.people_score,
         people_score_signature=excluded.people_score_signature,
+        non_person_coverage=excluded.non_person_coverage,
+        non_person_coverage_signature=excluded.non_person_coverage_signature,
         border_crop=excluded.border_crop,
         border_signature=excluded.border_signature,
         border_crop_conservative=excluded.border_crop_conservative,
@@ -110,6 +112,8 @@ def _upsert_row(rec: FileRecord) -> tuple:
         rec.ctime_ns,
         rec.people_score,
         rec.people_score_signature,
+        rec.non_person_coverage,
+        rec.non_person_coverage_signature,
         rec.border_crop,
         rec.border_signature,
         rec.border_crop_conservative,
@@ -267,6 +271,8 @@ class HashCache:
                 face_detection_signature TEXT,
                 people_score REAL,
                 people_score_signature TEXT,
+                non_person_coverage REAL,
+                non_person_coverage_signature TEXT,
                 border_crop TEXT,
                 border_signature TEXT,
                 border_crop_conservative TEXT,
@@ -328,6 +334,8 @@ class HashCache:
             "face_detection_signature": "TEXT",
             "people_score": "REAL",
             "people_score_signature": "TEXT",
+            "non_person_coverage": "REAL",
+            "non_person_coverage_signature": "TEXT",
             "border_crop": "TEXT",
             "border_signature": "TEXT",
             "border_crop_conservative": "TEXT",
@@ -732,6 +740,9 @@ class HashCache:
         if row.get("people_score") is not None and row.get("people_score_signature"):
             rec.people_score = row["people_score"]
             rec.people_score_signature = row["people_score_signature"]
+        if row.get("non_person_coverage") is not None and row.get("non_person_coverage_signature"):
+            rec.non_person_coverage = row["non_person_coverage"]
+            rec.non_person_coverage_signature = row["non_person_coverage_signature"]
         if row.get("border_signature") and row.get("border_crop") is not None:
             rec.border_crop = row["border_crop"]
             rec.border_signature = row["border_signature"]
@@ -831,6 +842,7 @@ class HashCache:
                 or has_person_decision
                 or has_face_count
                 or (rec.people_score is not None and bool(rec.people_score_signature))
+                or (rec.non_person_coverage is not None and bool(rec.non_person_coverage_signature))
                 or (rec.border_crop is not None and bool(rec.border_signature))
             ):
                 rows.append(_upsert_row(rec))

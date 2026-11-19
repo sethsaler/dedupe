@@ -1585,7 +1585,8 @@ kbd {
 .focus-card .card-body { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 20px; align-items: center; }
 .focus-card .card-body .name { grid-column: 1; }
 .focus-card .card-body .card-meta { grid-column: 1; }
-.focus-card .card-body .path, .focus-card .card-body .evidence { grid-column: 1 / -1; }
+.focus-card .card-body .path, .focus-card .card-body .evidence,
+.focus-card .card-body .non-person-coverage { grid-column: 1 / -1; }
 .focus-card .card-actions { grid-column: 2; grid-row: 1 / 3; border: 0; padding: 0; margin: 0; align-items: center; }
 .card-actions .linkish, .swipe-card-tools .linkish { white-space: nowrap; }
 .focus-card .candidate-actions { min-width: 340px; }
@@ -1766,6 +1767,11 @@ kbd {
   display: flex;
   flex-wrap: wrap;
   gap: 6px 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.card-body .non-person-coverage {
   color: var(--muted);
   font-size: 0.75rem;
 }

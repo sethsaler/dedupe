@@ -147,6 +147,9 @@ class FileRecord:
     ctime_ns: int | None = None
     # Reference-library members can be compared but never removed or moved.
     protected: bool = False
+    # Estimated percentage of the image not covered by people (0–100).
+    non_person_coverage: float | None = None
+    non_person_coverage_signature: str | None = None
 
     @property
     def path_obj(self) -> Path:
@@ -212,6 +215,8 @@ class FileRecord:
             face_detection_signature=data.get("face_detection_signature"),
             people_score=data.get("people_score"),
             people_score_signature=data.get("people_score_signature"),
+            non_person_coverage=data.get("non_person_coverage"),
+            non_person_coverage_signature=data.get("non_person_coverage_signature"),
             border_crop=data.get("border_crop"),
             border_signature=data.get("border_signature"),
             border_crop_conservative=data.get("border_crop_conservative"),

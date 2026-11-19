@@ -3136,6 +3136,109 @@ def test_files_review_sorts_and_filters_by_people_likelihood(page, tmp_path: Pat
 
 
 @pytest.mark.e2e
+def test_non_person_coverage_ranks_files_without_changing_review_decisions(
+    page, tmp_path: Path, monkeypatch
+) -> None:
+    from dedupe.people_score import non_person_coverage_signature, people_score_signature
+    from dedupe.scanner import inventory
+
+    media = tmp_path / "media"
+    media.mkdir()
+    coverage = {
+        "a-unknown.png": None,
+        "b-lower.png": 91.021,
+        "c-higher.png": 91.024,
+        "d-zero.png": 0.0,
+    }
+    for name in coverage:
+        Image.new("RGB", (32, 32), "navy").save(media / name)
+    records = inventory([media])
+    for record in records:
+        record.people_score = 0.25
+        record.people_score_signature = people_score_signature()
+        record.face_count = 0
+        record.human_detection_status = "no_person_detected"
+        record.human_detection_signature = human_detection_signature()
+        if Path(record.path).name == "a-unknown.png":
+            record.non_person_coverage = 100.0
+            record.non_person_coverage_signature = "old model"
+    groups = [
+        ReviewGroup(kind.value, kind, MediaType.IMAGE, list(records), root=str(media))
+        for kind in (GroupKind.FACES, GroupKind.NO_HUMANS)
+    ]
+    finish_scoring = threading.Event()
+    scoring_calls = []
+
+    def score(pending, *, progress, cancelled, require_coverage):
+        scoring_calls.append(require_coverage)
+        assert finish_scoring.wait(10)
+        for index, record in enumerate(pending, 1):
+            assert not cancelled()
+            value = coverage[Path(record.path).name]
+            if value is not None:
+                record.non_person_coverage = value
+                record.non_person_coverage_signature = non_person_coverage_signature()
+            progress(index, len(pending))
+        return pending
+
+    monkeypatch.setattr("dedupe.web.app.people_scoring_available", lambda: (True, None))
+    monkeypatch.setattr("dedupe.web.app.score_people", score)
+    app = create_app(ScanResult(roots=[str(media)], files=records, groups=groups),
+                     review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator('.tab[data-kind="all_files"]').click()
+        names = page.locator("#members .card .name")
+        expect(names).to_have_text(list(coverage))
+        progress = page.locator("#memberPagination .member-page-summary")
+        sort = page.locator("#memberSort")
+        with page.expect_request(
+            lambda req: req.url.endswith("/api/people-scores") and req.method == "POST"
+        ) as request:
+            sort.select_option(label="Non-person coverage")
+        assert request.value.post_data_json["metric"] == "non_person_coverage"
+        expect(progress).to_contain_text("Ranking by non-person coverage")
+        expect(page.locator("#members .non-person-coverage")).to_have_text(
+            ["Non-person coverage: Unknown"] * 4
+        )
+
+        for kind in (GroupKind.FACES, GroupKind.NO_HUMANS):
+            page.locator(f'.tab[data-kind="{kind.value}"]').click()
+            expect(page.locator("#detailTitle")).to_contain_text(
+                "Faces" if kind == GroupKind.FACES else "Non-Human"
+            )
+            expect(sort.locator("option", has_text="Non-person coverage")).to_have_count(1)
+            expect(progress).not_to_contain_text("Ranking")
+
+        page.locator('.tab[data-kind="all_files"]').click()
+        expect(progress).to_contain_text("Ranking by non-person coverage")
+        finish_scoring.set()
+        expect(names).to_have_text(["c-higher.png", "b-lower.png", "d-zero.png", "a-unknown.png"])
+        badges = page.locator("#members .non-person-coverage")
+        expect(badges.first).to_be_visible()
+        expect(badges).to_have_text([
+            "Non-person coverage: 91%", "Non-person coverage: 91%",
+            "Non-person coverage: 0%", "Non-person coverage: Unknown",
+        ])
+        expect(badges.first).to_have_attribute("title", re.compile(
+            r"outside detected person boxes.*sampled video or animation frames.*Not exact segmentation"
+        ))
+        expect(progress).not_to_contain_text("Ranking")
+        expect(page.locator("#members .card.selected, #members .card.deleted")).to_have_count(0)
+        page.locator("#btnFocusView").click()
+        expect(names).to_have_text(["c-higher.png"])
+        expect(badges).to_be_visible()
+        assert scoring_calls == [True]
+        assert all(Path(record.path).exists() for record in records)
+        assert all(not group.selected_for_removal and not group.reviewed_paths for group in groups)
+        assert errors == []
+
+
+@pytest.mark.e2e
 def test_review_goal_scans_only_its_detector_and_opens_its_tab(
     page, live_dedupe_server: str, tmp_path: Path
 ) -> None:

@@ -296,6 +296,22 @@ The no-person review can use `opencv` (fast default), `photon` (Moondream 3.1 th
 
 The bundled YuNet model comes from the official OpenCV Model Zoo. Its MIT license is included at `src/dedupe/assets/LICENSE-YUNET.txt`.
 
+### Non-person coverage (highest first)
+
+In the web UI, open **Files**, choose a folder, and pick **Non-person coverage**
+from the sort menu. Dedupe analyzes the folder on demand, shows an estimated
+percentage on each scored card, and puts the highest percentages first.
+Files it cannot score appear last. The sort is also available in **Non-Human**
+and **Faces**.
+
+The estimate is the percentage of the frame outside the combined bounding boxes
+of detected people. Overlapping boxes count only once. It is not a pixel-perfect
+silhouette measurement: boxes can include background, and 100% means that no
+person was detected in the sampled frames, not that the file is free of people.
+Videos average up to five evenly spaced frames; animations use the first, middle,
+and last frames. The feature uses the same local OpenCV model as people likelihood
+(and ffmpeg for video). It never selects or removes files.
+
 ### People likelihood (least likely first)
 
 The Non-Human review answers yes/no. To *order* any set of files with the likeliest
