@@ -11,6 +11,21 @@ from dedupe.similar_image import clear_image_comparison_cache
 FIXTURE = Path(__file__).parent / "fixtures" / "astronaut.png"
 
 
+def test_tone_curve_fits_exact_medians_with_masked_pixels_and_missing_levels():
+    import numpy as np
+
+    from dedupe.edited_copy import _tone_curve
+
+    # Level 10 has an even sample count and a half-integer median. Level 30
+    # has an odd sample count after masking. Level 20 has too few samples to fit.
+    source = np.repeat([10, 20, 30], [20, 2, 22]).astype(np.uint8)
+    target = np.array([12] * 10 + [15] * 10 + [255] * 2 + [50] * 11 + [80] * 11, dtype=np.uint8)
+    valid = np.ones_like(source, dtype=bool)
+    valid[22] = False
+    result = _tone_curve(source, target, valid)
+    np.testing.assert_array_equal(result, np.repeat([13, 46, 80], [20, 2, 22]))
+
+
 @pytest.mark.parametrize("change", ["smile", "hair", "pose"])
 @pytest.mark.parametrize("brightness", [1.0, 1.08])
 def test_geometry_cannot_hide_small_local_changes(tmp_path, change, brightness):

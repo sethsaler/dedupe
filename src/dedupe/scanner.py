@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 from collections.abc import Callable, Iterable
-from fnmatch import fnmatch
+from fnmatch import fnmatch, translate
 from pathlib import Path
 
 from .models import (
@@ -57,6 +59,20 @@ def media_extensions(
     return exts
 
 
+def _exclusion_matcher(patterns: set[str]) -> Callable[[str, Path], bool]:
+    # Match all globs with one regex, using the same platform normalization
+    # as fnmatch for both the basename and the root-relative path.
+    match = re.compile("|".join(translate(os.path.normcase(p)) for p in patterns)).match
+
+    def excluded(name: str, relative: Path) -> bool:
+        return bool(
+            match(os.path.normcase(name.lower()))
+            or match(os.path.normcase(relative.as_posix().lower()))
+        )
+
+    return excluded
+
+
 def inventory(
     roots: Iterable[str | Path],
     *,
@@ -77,18 +93,11 @@ def inventory(
     exclusion_patterns = {e.strip().lower() for e in (exclusions or []) if e.strip()}
     # Always skip common junk / system folders + our own review output
     exclusion_patterns |= BUILTIN_EXCLUSIONS
+    excluded = _exclusion_matcher(exclusion_patterns)
 
     records: list[FileRecord] = []
     seen_inodes: set[tuple[int, int]] = set()
     found = 0
-
-    def excluded(name: str, relative: Path) -> bool:
-        name_lower = name.lower()
-        rel_lower = relative.as_posix().lower()
-        return any(
-            fnmatch(name_lower, pattern) or fnmatch(rel_lower, pattern)
-            for pattern in exclusion_patterns
-        )
 
     for root in roots:
         if cancelled and cancelled():
@@ -123,28 +132,33 @@ def inventory(
         ):
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
+            directory = Path(dirpath)
+            relative_dir = directory.relative_to(root_path)
+            try:
+                canonical_dir = directory.resolve(strict=True)
+            except (OSError, RuntimeError):
+                dirnames.clear()
+                continue
+            if not canonical_dir.is_relative_to(root_path):
+                dirnames.clear()
+                continue
             # Prune excluded / hidden dirs in-place
             pruned: list[str] = []
             for d in dirnames:
                 if not include_hidden and d.startswith("."):
                     continue
-                candidate = Path(dirpath) / d
-                try:
-                    relative = candidate.relative_to(root_path)
-                except ValueError:
+                if excluded(d, relative_dir / d):
                     continue
-                if excluded(d, relative):
-                    continue
+                candidate = canonical_dir / d
                 try:
-                    if candidate.is_symlink():
+                    st = candidate.lstat()
+                    if stat.S_ISLNK(st.st_mode):
                         if not follow_symlinks:
                             continue
                         resolved = candidate.resolve(strict=True)
                         if resolved != root_path and root_path not in resolved.parents:
                             continue
                         st = resolved.stat()
-                    else:
-                        st = candidate.stat()
                     inode_key = (st.st_dev, st.st_ino)
                     if inode_key in seen_dir_inodes:
                         continue
@@ -159,24 +173,19 @@ def inventory(
                     raise InterruptedError("scan cancelled")
                 if not include_hidden and name.startswith("."):
                     continue
-                path = Path(dirpath) / name
-                try:
-                    relative = path.relative_to(root_path)
-                except ValueError:
-                    continue
-                if excluded(name, relative):
-                    continue
-                if path.suffix.lower() not in exts:
+                path = canonical_dir / name
+                if path.suffix.lower() not in exts or excluded(name, relative_dir / name):
                     continue
                 try:
-                    if path.is_symlink():
+                    st = path.lstat()
+                    if stat.S_ISLNK(st.st_mode):
                         if not follow_symlinks:
                             continue
                         resolved = path.resolve(strict=True)
                         if resolved != root_path and root_path not in resolved.parents:
                             continue
                         path = resolved
-                    st = path.stat()
+                        st = path.stat()
                     inode_key = (st.st_dev, st.st_ino)
                     if inode_key in seen_inodes:
                         continue
@@ -211,7 +220,7 @@ def preview_exclusions(
     Bounded by ``max_visits`` entries; ``truncated`` reports when the cap hit.
     """
     user_patterns = [e.strip().lower() for e in exclusions if e.strip()]
-    all_patterns = set(user_patterns) | BUILTIN_EXCLUSIONS
+    excluded = _exclusion_matcher(set(user_patterns) | BUILTIN_EXCLUSIONS)
     counts = {pattern: 0 for pattern in user_patterns}
     examples: dict[str, list[str]] = {pattern: [] for pattern in user_patterns}
     visited = 0
@@ -227,14 +236,6 @@ def preview_exclusions(
                 if len(examples[pattern]) < 3:
                     examples[pattern].append(str(root_path / relative))
 
-    def excluded(name: str, relative: Path) -> bool:
-        name_lower = name.lower()
-        rel_lower = relative.as_posix().lower()
-        return any(
-            fnmatch(name_lower, pattern) or fnmatch(rel_lower, pattern)
-            for pattern in all_patterns
-        )
-
     for root in roots:
         if truncated:
             break
@@ -245,15 +246,14 @@ def preview_exclusions(
             note(root_path.name, Path(root_path.name), root_path.parent)
             continue
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            directory = Path(dirpath)
+            relative_dir = directory.relative_to(root_path)
             pruned: list[str] = []
             for d in dirnames:
                 if d.startswith("."):
                     continue
-                candidate = Path(dirpath) / d
-                try:
-                    relative = candidate.relative_to(root_path)
-                except ValueError:
-                    continue
+                candidate = directory / d
+                relative = relative_dir / d
                 note(d, relative, root_path)
                 visited += 1
                 if excluded(d, relative) or candidate.is_symlink():
@@ -263,12 +263,7 @@ def preview_exclusions(
             for name in filenames:
                 if name.startswith("."):
                     continue
-                path = Path(dirpath) / name
-                try:
-                    relative = path.relative_to(root_path)
-                except ValueError:
-                    continue
-                note(name, relative, root_path)
+                note(name, relative_dir / name, root_path)
                 visited += 1
             if visited >= max_visits:
                 truncated = True
@@ -293,13 +288,13 @@ def _record_for_file(
         if path.suffix.lower() not in exts:
             return None
         st = stat_result or path.stat()
-        if not path.is_file():
+        if not stat.S_ISREG(st.st_mode):
             return None
         media = classify_media(path)
         if media == MediaType.OTHER:
             return None
         return FileRecord(
-            path=str(path.resolve()),
+            path=str(path),
             size=int(st.st_size),
             mtime=float(st.st_mtime),
             media_type=media,

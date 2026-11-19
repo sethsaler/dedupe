@@ -1041,8 +1041,8 @@ def test_reduced_decode_hashes_stay_close_to_full_decode_hashes(tmp_path: Path) 
     assert full - reduced <= 2
 
 
-def test_hashes_from_an_older_decode_are_computed_again(tmp_path: Path) -> None:
-    """A cached record whose tiles carry an older version is hashed afresh."""
+def test_hashes_from_an_older_decode_are_computed_again(tmp_path: Path, monkeypatch) -> None:
+    """An obsolete fingerprint needs one decode to refresh every hash."""
     import dedupe.similar_image as module
 
     a, b = tmp_path / "a.jpg", tmp_path / "b.jpg"
@@ -1055,8 +1055,17 @@ def test_hashes_from_an_older_decode_are_computed_again(tmp_path: Path) -> None:
         record.dhash = "0" * 16
         record.tile_phashes = "t3:" + ",".join(["0" * 16] * 5)
 
+    original = module._image_hash_job
+    decoded = []
+
+    def hash_job(path):
+        decoded.append(path)
+        return original(path)
+
+    monkeypatch.setattr(module, "_image_hash_job", hash_job)
     find_similar_image_groups(records, workers=1)
 
+    assert decoded == [record.path for record in records]
     assert [record.phash for record in records] == current
     assert all(
         record.tile_phashes.startswith(f"{module.TILE_HASH_VERSION}:") for record in records

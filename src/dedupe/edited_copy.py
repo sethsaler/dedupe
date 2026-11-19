@@ -156,20 +156,19 @@ def _tone_curve(source, target, valid):
     """
     import numpy as np
 
-    levels = source[valid].astype(np.int64)
-    values = target[valid].astype(np.float64)
-    order = np.argsort(levels, kind="stable")
-    levels, values = levels[order], values[order]
-    starts = np.searchsorted(levels, np.arange(257))
-    curve = np.full(256, np.nan)
-    for level in range(256):
-        chunk = values[starts[level]:starts[level + 1]]
-        if len(chunk) >= TONE_CURVE_MIN_SAMPLES:
-            curve[level] = np.median(chunk)
-    known = ~np.isnan(curve)
+    # Both images contain 8-bit levels. A joint histogram gives the same
+    # per-level medians without sorting every valid pixel.
+    bins = source[valid].astype(np.intp) * 256 + target[valid]
+    counts = np.bincount(bins, minlength=256 * 256).reshape(256, 256)
+    totals = counts.sum(axis=1)
+    known = totals >= TONE_CURVE_MIN_SAMPLES
     if known.sum() < 2:
         return source
-    curve = np.interp(np.arange(256), np.flatnonzero(known), curve[known])
+    cumulative = counts[known].cumsum(axis=1)
+    middle = totals[known, None] // 2
+    lower = (cumulative > (totals[known, None] - 1) // 2).argmax(axis=1)
+    upper = (cumulative > middle).argmax(axis=1)
+    curve = np.interp(np.arange(256), np.flatnonzero(known), (lower + upper) / 2)
     curve = np.maximum.accumulate(curve)
     return np.clip(curve[source], 0, 255).astype(np.uint8)
 

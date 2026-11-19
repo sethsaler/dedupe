@@ -763,51 +763,47 @@ class HashCache:
         device/inode fallback pass for path misses) instead of 1–2 round trips
         per record, which dominates scan startup on 10k+ file libraries.
         """
-        rows_by_path: dict[str, dict] = {}
-        paths = [rec.path for rec in records]
-        for start in range(0, len(paths), HYDRATE_BATCH_SIZE):
-            chunk = paths[start : start + HYDRATE_BATCH_SIZE]
-            placeholders = ",".join("?" for _ in chunk)
-            for row in self._conn.execute(
-                f"SELECT * FROM hashes WHERE algorithm_version = ? "
-                f"AND path IN ({placeholders})",
-                (CACHE_ALGORITHM_VERSION, *chunk),
-            ):
-                rows_by_path[row["path"]] = row
-
         hits = 0
-        misses: list[FileRecord] = []
-        for rec in records:
-            row = rows_by_path.get(rec.path)
-            cached = self._validate_row(rec, row) if row is not None else None
-            if cached is None:
-                misses.append(rec)
-                continue
-            hits += 1
-            self._apply_row(rec, cached)
+        fallback_candidates: list[FileRecord] = []
+        for start in range(0, len(records), HYDRATE_BATCH_SIZE):
+            chunk = records[start : start + HYDRATE_BATCH_SIZE]
+            paths = [rec.path for rec in chunk]
+            placeholders = ",".join("?" for _ in paths)
+            # Look up the primary keys first. Including algorithm_version in
+            # this predicate can make SQLite scan every row of that version
+            # for each batch instead of seeking the requested paths.
+            rows_by_path = {
+                row["path"]: row
+                for row in self._conn.execute(
+                    f"SELECT * FROM hashes WHERE path IN ({placeholders})", paths
+                )
+                if row["algorithm_version"] == CACHE_ALGORITHM_VERSION
+            }
+            for rec in chunk:
+                row = rows_by_path.get(rec.path)
+                cached = self._validate_row(rec, row) if row is not None else None
+                if cached is not None:
+                    hits += 1
+                    self._apply_row(rec, cached)
+                elif rec.device is not None and rec.inode is not None:
+                    fallback_candidates.append(rec)
 
         # Identity fallback for path misses: reuse hashes after a rename/move
         # on the same filesystem (same device+inode, same size and media type).
-        fallback_candidates = [
-            rec for rec in misses if rec.device is not None and rec.inode is not None
-        ]
-        if fallback_candidates:
-            identities: dict[tuple, list[dict]] = {}
-            for start in range(0, len(fallback_candidates), HYDRATE_BATCH_SIZE):
-                chunk = fallback_candidates[start : start + HYDRATE_BATCH_SIZE]
-                pairs = ",".join("(?,?)" for _ in chunk)
-                params: list = [CACHE_ALGORITHM_VERSION]
-                for rec in chunk:
-                    params.extend((rec.device, rec.inode))
-                for row in self._conn.execute(
-                    f"SELECT * FROM hashes WHERE algorithm_version = ? "
-                    f"AND (device, inode) IN ({pairs}) ORDER BY path",
-                    params,
-                ):
-                    identities.setdefault((row["device"], row["inode"]), []).append(
-                        dict(row)
-                    )
-            for rec in fallback_candidates:
+        for start in range(0, len(fallback_candidates), HYDRATE_BATCH_SIZE):
+            chunk = fallback_candidates[start : start + HYDRATE_BATCH_SIZE]
+            pairs = ",".join("(?,?)" for _ in chunk)
+            params: list = [CACHE_ALGORITHM_VERSION]
+            for rec in chunk:
+                params.extend((rec.device, rec.inode))
+            identities: dict[tuple, list[sqlite3.Row]] = {}
+            for row in self._conn.execute(
+                f"SELECT * FROM hashes WHERE algorithm_version = ? "
+                f"AND (device, inode) IN ({pairs}) ORDER BY path",
+                params,
+            ):
+                identities.setdefault((row["device"], row["inode"]), []).append(row)
+            for rec in chunk:
                 candidates = identities.get((rec.device, rec.inode), [])
                 for row in candidates:
                     if row["media_type"] != rec.media_type.value:

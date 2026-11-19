@@ -40,8 +40,12 @@ function groupSelectedCount(g) {
 }
 
 function groupComplete(g) {
-  const protectedCount = (g.members || []).filter((member) => member.protected).length;
-  if (isIndependentReview(g)) return (g.members || []).every((member) => member.protected || (g.reviewed_paths || []).includes(member.path));
+  const members = g.members || [];
+  if (isIndependentReview(g)) {
+    const reviewed = new Set(g.reviewed_paths || []);
+    return members.every((member) => member.protected || reviewed.has(member.path));
+  }
+  const protectedCount = members.reduce((count, member) => count + (member.protected ? 1 : 0), 0);
   return (g.selected_for_removal || []).length >= Math.max(0, (g.member_count || 0) - Math.max(1, protectedCount));
 }
 

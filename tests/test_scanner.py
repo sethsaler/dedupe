@@ -81,6 +81,21 @@ def test_inventory_applies_user_exclusions_to_names_and_paths(tmp_path: Path) ->
     assert [Path(r.path).name for r in records] == ["portrait.png"]
 
 
+def test_inventory_followed_links_use_canonical_paths_and_lexical_exclusions(tmp_path):
+    root = tmp_path / "media"
+    target = root / "target"
+    kept = _touch(target / "keep.jpg")
+    _touch(target / "skip1.jpg")
+    outside = _touch(tmp_path / "elsewhere" / "outside.jpg")
+    (root / "alias").symlink_to(target, target_is_directory=True)
+    (target / "outside-link.jpg").symlink_to(outside)
+    (root / "external").symlink_to(outside.parent, target_is_directory=True)
+
+    records = inventory([root], follow_symlinks=True, exclusions=["TARGET", "alias/SKIP[0-9].jpg"])
+
+    assert [r.path for r in records] == [str(kept)]
+
+
 def test_inventory_skips_missing_roots_and_accepts_a_file_root(tmp_path: Path) -> None:
     single = _touch(tmp_path / "single.jpg")
 

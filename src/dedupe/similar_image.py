@@ -791,7 +791,7 @@ class HammingIndex:
         for begin in range(0, len(queries), step):
             batch = queries[begin : begin + step]
             if indexed:
-                rows, columns = [], []
+                matches = []
                 for (lo, mask, _table), (values, starts, counts, order) in zip(
                     self.buckets, self._sorted, strict=True
                 ):
@@ -803,23 +803,26 @@ class HammingIndex:
                     within = np.arange(int(ends[-1]) if len(ends) else 0) - np.repeat(
                         ends - sizes, sizes
                     )
-                    rows.append(np.repeat(hit, sizes))
-                    columns.append(order[np.repeat(starts[slots[hit]], sizes) + within])
-                # A pair agreeing on several chunks is found once per chunk.
-                pairs = np.unique(
-                    np.concatenate(rows) * np.int64(len(self.keys)) + np.concatenate(columns)
-                )
+                    row = np.repeat(hit, sizes)
+                    column = order[np.repeat(starts[slots[hit]], sizes) + within]
+                    near = self._popcount(self.values[column] ^ batch[row]) <= radius
+                    matches.append(row[near] * np.int64(len(self.keys)) + column[near])
+                # Most chunk collisions fail the full-distance check. Sort and
+                # deduplicate just the matches, which can agree on several chunks.
+                pairs = np.unique(np.concatenate(matches))
                 row, column = np.divmod(pairs, len(self.keys))
+                distances = self._popcount(self.values[column] ^ batch[row])
             else:
                 row = np.repeat(np.arange(len(batch)), len(self.keys))
                 column = np.tile(np.arange(len(self.keys)), len(batch))
-            distances = self._popcount(self.values[column] ^ batch[row])
-            near = np.flatnonzero(distances <= radius)
+                distances = self._popcount(self.values[column] ^ batch[row])
+                near = distances <= radius
+                row, distances, column = row[near], distances[near], column[near]
             keys = self.keys
             found.extend(
                 (begin + r, d, keys[c])
                 for r, d, c in zip(
-                    row[near].tolist(), distances[near].tolist(), column[near].tolist(), strict=True
+                    row.tolist(), distances.tolist(), column.tolist(), strict=True
                 )
             )
         return found
@@ -862,28 +865,21 @@ def find_similar_image_groups(
         return []
 
     # Compute hashes (parallel when uncached)
-    need = [
-        r for r in media
-        if not (r.phash and r.dhash)
+    need = []
+    backfilling = set()
+    for record in media:
         # Tiles carry the version of the decode that produced every hash of
-        # the file. Never compare hashes from an older decode with current ones.
-        or not decode_tile_phashes(r.tile_phashes)
-    ]
-    # Stills cached before orientation lookup existed are hashed once more to
-    # add it. Their stored hashes stay valid, so they are kept if that fails:
-    # such a file is still found upright, just not turned.
-    backfill = [
-        r for r in media
-        if r.media_type == MediaType.IMAGE
-        and r.phash
-        and r.dhash
-        and not decode_orientation_phashes(r.orientation_phashes)
-    ]
-    for record in need:
-        record.phash = record.dhash = record.tile_phashes = None
-        record.orientation_phashes = None
-    need += backfill
-    backfilling = {r.path for r in backfill}
+        # the file. Discard obsolete hashes before trying the decode again.
+        if not (record.phash and record.dhash and decode_tile_phashes(record.tile_phashes)):
+            record.phash = record.dhash = record.tile_phashes = None
+            record.orientation_phashes = None
+            need.append(record)
+        elif record.media_type == MediaType.IMAGE and not decode_orientation_phashes(
+            record.orientation_phashes
+        ):
+            # Only the turns are missing. Keep upright hashes if backfill fails.
+            backfilling.add(record.path)
+            need.append(record)
     cached = total - len(need)
     if need:
         by_path = {r.path: r for r in need}

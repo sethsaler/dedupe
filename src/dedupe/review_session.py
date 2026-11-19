@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 
-from .actions import validate_file_record
-from .models import ReviewPolicy, ScanResult
+from .actions import validate_saved_records
+from .models import FileRecord, ReviewPolicy, ScanResult
+from .parallel import map_parallel, resolve_workers
 
 REVIEW_SESSION_VERSION = 1
 MAX_REVIEW_SESSION_BYTES = 64 * 1024 * 1024
@@ -102,7 +103,7 @@ def save_review_session(
     envelope = {
         "version": REVIEW_SESSION_VERSION,
         "saved_at": saved_at,
-        "result": result.to_dict(),
+        "result": result.to_dict(compact=True),
     }
     if deleted_files:
         envelope["deleted_files"] = dict(deleted_files)
@@ -154,36 +155,25 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
             if isinstance(destination, str)
         }
 
-    valid_paths: set[str] = set()
+    # Trashed review candidates are absent on purpose. Keep their undo control.
+    valid_paths = set(report.deleted_files)
     invalid: dict[str, str] = {}
     # Group members can exist outside result.files in older exports; validate them too.
-    records = list(result.files) + [
-        member for group in result.groups for member in group.members
-    ]
-    keep_without_stat = {
-        # Trashed review candidates are absent from their original path on
-        # purpose; keep them so the per-candidate undo survives a restart.
-        record.path
-        for record in records
-        if record.path in report.deleted_files
-    }
-    valid_paths |= keep_without_stat
-    to_validate = [record for record in records if record.path not in keep_without_stat]
+    snapshots: dict[str, list[FileRecord]] = {}
+    for record in chain(result.files, *(group.members for group in result.groups)):
+        if record.path not in valid_paths:
+            snapshots.setdefault(record.path, []).append(record)
 
-    def _validate(record):
-        return record.path, validate_file_record(record, result.roots)
+    def _validate(records):
+        return records[0].path, validate_saved_records(records, result.roots)
 
-    # One lstat per file, parallelized: resume validation is the slowest part
-    # of UI startup on a large saved review when run serially.
-    workers = min(8, max(1, (os.cpu_count() or 2) - 1))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="review-revalidate") as pool:
-        for validated_path, error in pool.map(_validate, to_validate):
-            if error is None:
-                valid_paths.add(validated_path)
-            else:
-                invalid.setdefault(validated_path, error)
-    for valid_path in valid_paths:
-        invalid.pop(valid_path, None)
+    for validated_path, error in map_parallel(
+        _validate, list(snapshots.values()), workers=resolve_workers(None)
+    ):
+        if error is None:
+            valid_paths.add(validated_path)
+        else:
+            invalid[validated_path] = error
     result.files = [record for record in result.files if record.path in valid_paths]
     groups = []
     for group in result.groups:

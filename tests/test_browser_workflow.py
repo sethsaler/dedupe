@@ -2967,6 +2967,59 @@ def test_date_sort_handles_large_inventory(page, live_dedupe_server: str) -> Non
 
 
 @pytest.mark.e2e
+def test_streamed_group_replay_and_filtered_focus(page, live_dedupe_server: str) -> None:
+    first = "visible-first"
+    page.route(f"**/api/groups/{first}", lambda route: route.fulfill(json={
+        "id": first, "kind": "exact", "media_type": "image", "member_count": 2,
+        "members": [{"path": first + "-keep"}, {"path": first + "-copy"}],
+        "suggested_keep": first + "-keep", "selected_for_removal": [first + "-copy"],
+    }))
+    page.goto(live_dedupe_server)
+    result = page.evaluate("""async () => {
+      const {state} = await import('/static/state.js');
+      const {addStreamedGroup} = await import('/static/groups.js');
+      const makeGroup = (id, size) => ({
+        id, kind: 'exact', media_type: 'image', member_count: 2, reclaimable_bytes: size,
+        members: [{path: id + '-keep'}, {path: id + '-copy'}], selected_for_removal: [id + '-copy'],
+      });
+      state.currentId = 'a';
+      document.querySelector('#resultSort').value = 'reclaimable';
+      const snapshot = async () => {
+        await new Promise(requestAnimationFrame);
+        return [
+          state.allGroups.map(g => g.id),
+          [...document.querySelectorAll('.group-item')].map(row => row.dataset.id),
+          document.querySelector('#countExact').textContent,
+        ];
+      };
+      state.allGroups = [makeGroup('a', 5)];
+      addStreamedGroup(makeGroup('b', 10));
+      addStreamedGroup(makeGroup('a', 20));
+      const first = await snapshot();
+      // A completed fetch installs a fresh discovery order for replayed ids.
+      state.allGroups = [makeGroup('b', 10)];
+      addStreamedGroup(makeGroup('a', 20));
+      addStreamedGroup(makeGroup('b', 30));
+      const second = await snapshot();
+      state.currentId = null;
+      document.querySelector('#detailEmpty').hidden = false;
+      document.querySelector('#resultSearch').value = 'visible';
+      addStreamedGroup(makeGroup('hidden', 50));
+      await snapshot();
+      const hiddenFocus = state.currentId;
+      addStreamedGroup(makeGroup('visible-first', 15));
+      addStreamedGroup(makeGroup('visible-later', 40));
+      const filtered = await snapshot();
+      return {batches: [first, second], hiddenFocus, shown: filtered[1], focus: state.currentId};
+    }""")
+    assert result["batches"] == [[["a", "b"], ["a", "b"], "2"], [["b", "a"], ["b", "a"], "2"]]
+    assert result["hiddenFocus"] is None
+    assert result["shown"] == ["visible-later", "visible-first"]
+    assert result["focus"] == first
+    expect(page.locator("#members .card").first).to_have_attribute("data-path", first + "-keep")
+
+
+@pytest.mark.e2e
 def test_sidebar_partial_window_shift_keeps_scroll_anchor(page, live_dedupe_server: str) -> None:
     page.goto(live_dedupe_server)
     offsets = page.evaluate("""async () => {
