@@ -411,6 +411,73 @@ def test_web_hides_scores_from_an_older_model(media: Path, tmp_path: Path) -> No
     assert all(member["people_score"] is None for member in files_group["members"])
 
 
+def test_web_hands_scoring_to_the_newly_requested_folder(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    roots = []
+    for folder in ("first", "second"):
+        root = tmp_path / folder
+        root.mkdir()
+        for index in range(2):
+            _no_people_image(root / f"{folder}-{index}.png")
+        roots.append(root)
+    stalled = threading.Event()
+
+    def score(pending, *, progress, cancelled, require_coverage):
+        for index, record in enumerate(pending, 1):
+            while record.path.endswith("first-1.png"):
+                stalled.set()
+                if cancelled():
+                    raise InterruptedError("scan cancelled")
+                time.sleep(0.01)
+            record.people_score = 0.01
+            record.people_score_signature = people_score_signature()
+            progress(index, len(pending))
+        return pending
+
+    monkeypatch.setattr("dedupe.web.app.score_people", score)
+    result = ScanResult(roots=[str(root) for root in roots], files=inventory(roots), groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "web-cache.sqlite3")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    groups = {Path(group["root"]).name: group["id"]
+              for group in client.get("/api/groups").get_json()["groups"]}
+
+    def start(folder: str):
+        return client.post(
+            "/api/people-scores",
+            json={"scan_id": scan_id, "group_id": groups[folder]},
+            headers=headers,
+        )
+
+    assert start("first").status_code == 202
+    assert stalled.wait(10)
+    taken_over = start("second")
+    assert taken_over.status_code == 202
+    assert taken_over.get_json()["group_id"] == groups["second"]
+    done = _wait_for_scoring(client)
+    assert (done["group_id"], done["done"], done["error"]) == (groups["second"], 2, None)
+
+    def scores(folder: str) -> list:
+        group = client.get(f"/api/groups/{groups[folder]}").get_json()
+        return [member["people_score"] for member in group["members"]]
+
+    assert scores("second") == [0.01, 0.01]
+    # The interrupted folder keeps the file it finished, in memory and in the cache.
+    assert scores("first") == [0.01, None]
+    deadline = time.monotonic() + 10
+    while True:  # each job writes its scores after it stops
+        cache = HashCache(tmp_path / "web-cache.sqlite3")
+        cached = cache.hydrate(inventory(roots))
+        cache.close()
+        if cached == 3 or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert cached == 3
+
+
 def test_web_refuses_stale_or_unknown_scoring_requests(media: Path, tmp_path: Path) -> None:
     app = _files_app(media, tmp_path)
     client = app.test_client()
