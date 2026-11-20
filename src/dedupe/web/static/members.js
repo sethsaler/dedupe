@@ -134,8 +134,10 @@ function peopleMetricsFor(kind) {
   return metrics;
 }
 
-// The endpoint has one scoring job at a time. Refresh the open group when it
-// finishes so a changed group, sort, or filter can request its still-missing
+// The endpoint has one scoring job at a time, and the open group owns it:
+// opening another group that needs scores takes the job over, and the group
+// left behind resumes when it is opened again. Refresh the open group when a
+// job finishes so a changed sort or filter can request its still-missing
 // metric. Remember attempts per metric so unreadable media never loops.
 let peopleScoreScanId = null;
 const peopleScoreRequested = new Set();
@@ -167,7 +169,7 @@ async function ensurePeopleScores(g) {
     peopleScoreRequested.clear();
     peopleJob = null;
   }
-  if (peopleJob) return;
+  if (peopleJob?.groupId === g.id) return;
   const keyFor = (groupId, metric) => JSON.stringify([groupId, metric]);
   const deleted = new Set(g.deleted_paths || []);
   const metric = peopleMetricsFor(g.kind).find((field) =>
@@ -175,7 +177,9 @@ async function ensurePeopleScores(g) {
       && (g.members || []).some((m) => m[field] == null && !deleted.has(m.path)),
   );
   if (!metric) return;
-  const job = { scanId: state.scanId, status: null };
+  // The job being replaced did not finish: let its group ask again later.
+  if (peopleJob?.requested) peopleScoreRequested.delete(peopleJob.requested);
+  const job = { scanId: state.scanId, groupId: g.id, requested: null, status: null };
   peopleJob = job;
   let status;
   let failure;
@@ -200,7 +204,9 @@ async function ensurePeopleScores(g) {
     refresh = true;
     const groupId = status.group_id;
     const activeMetric = status.metric;
-    peopleScoreRequested.add(keyFor(groupId, activeMetric));
+    job.groupId = groupId;
+    job.requested = keyFor(groupId, activeMetric);
+    peopleScoreRequested.add(job.requested);
     while (status.running && peopleJobCurrent(job)) {
       job.status = status;
       showPeopleScoringProgress(status);
@@ -737,7 +743,8 @@ function renderMembers(g, { append = false } = {}) {
     const hiddenDeleted = !state.showDeleted && deletedPaths.size;
     const modifiedWindow = g.kind === "all_files" ? MODIFIED_LABELS[state.memberModified] : null;
     const peopleLabel = peopleMax != null ? PEOPLE_FILTER_LABELS[state.memberPeople] : null;
-    const scoringNow = scoring?.running && scoring.group_id === g.id;
+    // The request for this folder may still be on its way to the server.
+    const scoringNow = peopleJob?.groupId === g.id;
     box.innerHTML = `<div class="triage-empty">${
       hiddenDeleted
         ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`

@@ -653,6 +653,9 @@ def create_app(
             "total": 0,
             "error": None,
         },
+        # Identity of the job that owns "people_scoring". Opening another
+        # folder replaces it; the replaced job stops at its next file.
+        "people_scoring_job": None,
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -1412,6 +1415,8 @@ def create_app(
                     return jsonify(group_payload(g))
         return jsonify({"error": "not found"}), 404
 
+    people_scoring_gate = threading.Lock()
+
     def people_scoring_payload_locked() -> dict:
         return dict(state["people_scoring"])
 
@@ -1444,14 +1449,18 @@ def create_app(
             if group is None:
                 return jsonify({"error": "not found"}), 404
             scoring = state["people_scoring"]
-            if scoring["running"]:
-                if scoring["group_id"] == group_id and scoring["scan_id"] == state["scan_id"]:
-                    return jsonify(people_scoring_payload_locked())
-                return jsonify({"error": "another folder is still being scored"}), 409
+            if (scoring["running"] and scoring["group_id"] == group_id
+                    and scoring["scan_id"] == state["scan_id"]):
+                return jsonify(people_scoring_payload_locked())
+            # The folder on screen wins: a job still ranking another folder
+            # (or an earlier review) is replaced and stops at its next file,
+            # keeping the scores it already produced.
             pending = [
                 m for m in group.members if m.media_type in PEOPLE_MEDIA_TYPES and not is_current(m)
             ]
             scan_id = state["scan_id"]
+            job = object()
+            state["people_scoring_job"] = job
             state["people_scoring"] = {
                 "running": bool(pending),
                 "scan_id": scan_id,
@@ -1464,45 +1473,55 @@ def create_app(
             if not pending:
                 return jsonify(people_scoring_payload_locked())
 
-        def still_current() -> bool:
+        def scan_current() -> bool:
             with lock:
                 return state["scan_id"] == scan_id and not state["scanning"]
 
+        def still_current() -> bool:
+            with lock:
+                return state["people_scoring_job"] is job and scan_current()
+
         def progress(done: int, _total: int) -> None:
             with lock:
-                if state["people_scoring"]["scan_id"] == scan_id:
+                if state["people_scoring_job"] is job:
                     state["people_scoring"]["done"] = done
 
         def work() -> None:
             error = None
-            scored: list = []
-            try:
-                scored = score_people(
-                    pending,
-                    progress=progress,
-                    cancelled=lambda: not still_current(),
-                    require_coverage=require_coverage,
-                )
-            except InterruptedError:
-                error = "scoring stopped because the results changed"
-            except Exception as exc:  # model failure: report, never crash the server
-                error = f"people scoring failed: {exc}"
+            # A replaced job finishes its in-flight file before the next starts.
+            with people_scoring_gate:
+                try:
+                    if not still_current():
+                        raise InterruptedError
+                    score_people(
+                        pending,
+                        progress=progress,
+                        cancelled=lambda: not still_current(),
+                        require_coverage=require_coverage,
+                    )
+                except InterruptedError:
+                    error = "scoring stopped because the results changed"
+                except Exception as exc:  # model failure: report, never crash the server
+                    error = f"people scoring failed: {exc}"
+            # Records are scored in place, so an interrupted job still keeps
+            # (and caches) what it finished; reopening its folder resumes.
+            scored = [record for record in pending if is_current(record)]
             if scored:
                 cache = None
                 try:
                     cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
-                    cache.store_all([record for record in scored if is_current(record)])
+                    cache.store_all(scored)
                 except (OSError, sqlite3.Error):
                     pass  # scores still apply to this session; they just are not cached
                 finally:
                     if cache is not None:
                         cache.close()
             with lock:
-                if state["people_scoring"]["scan_id"] == scan_id:
+                if state["people_scoring_job"] is job:
                     state["people_scoring"]["running"] = False
                     state["people_scoring"]["error"] = error
                     state["people_scoring"]["done"] = state["people_scoring"]["total"]
-            if error is None and still_current():
+            if scored and scan_current():
                 schedule_persist()
 
         threading.Thread(target=work, name="dedupe-people-scores", daemon=True).start()

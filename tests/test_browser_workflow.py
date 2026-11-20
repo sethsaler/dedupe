@@ -3189,6 +3189,70 @@ def test_files_review_sorts_and_filters_by_people_likelihood(page, tmp_path: Pat
 
 
 @pytest.mark.e2e
+def test_opening_another_folder_takes_over_people_scoring(page, tmp_path: Path, monkeypatch) -> None:
+    """A folder opened while another is still being ranked is ranked right away."""
+    from dedupe.people_score import people_score_signature
+    from dedupe.scanner import inventory
+
+    roots = []
+    for folder in ("first", "second"):
+        root = tmp_path / folder
+        root.mkdir()
+        for index in range(2):
+            Image.new("RGB", (32, 32), "navy").save(root / f"{folder}-{index}.png")
+        roots.append(root)
+    release_first = threading.Event()
+    calls = []
+
+    def score(pending, *, progress, cancelled, require_coverage):
+        folder = Path(pending[0].path).parent.name
+        calls.append((folder, len(pending)))
+        for index, record in enumerate(pending, 1):
+            # The first folder scores one file, then stalls until released.
+            while record.path.endswith("first-1.png") and not release_first.wait(0.02):
+                if cancelled():
+                    raise InterruptedError("scan cancelled")
+            record.people_score = 0.01
+            record.people_score_signature = people_score_signature()
+            progress(index, len(pending))
+        return pending
+
+    monkeypatch.setattr("dedupe.web.app.people_scoring_available", lambda: (True, None))
+    monkeypatch.setattr("dedupe.web.app.score_people", score)
+    result = ScanResult(roots=[str(root) for root in roots], files=inventory(roots), groups=[])
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator('.tab[data-kind="all_files"]').click()
+        first = page.locator(".group-item", has_text="first")
+        second = page.locator(".group-item", has_text="second")
+        names = page.locator("#members .card .name")
+        first.click()
+        expect(names).to_have_text(["first-0.png", "first-1.png"])
+        page.locator("#memberPeople").select_option("probably-none")
+        expect(page.locator("#members .triage-empty")).to_have_text("Ranking by people likelihood…")
+
+        second.click()
+        expect(names).to_have_text(["second-0.png", "second-1.png"])
+
+        # Going back resumes the interrupted folder with only its unranked file.
+        first.click()
+        expect(names).to_have_text(["first-0.png"])
+        expect(page.locator("#memberPagination .member-page-summary")).to_have_text(
+            "Ranking by people likelihood… 0/1"
+        )
+        release_first.set()
+        expect(names).to_have_text(["first-0.png", "first-1.png"])
+        assert calls == [("first", 2), ("second", 2), ("first", 1)]
+        expect(page.locator("#toast")).to_be_hidden()
+        assert errors == []
+
+
+@pytest.mark.e2e
 def test_non_person_coverage_ranks_files_without_changing_review_decisions(
     page, tmp_path: Path, monkeypatch
 ) -> None:
