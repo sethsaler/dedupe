@@ -424,6 +424,9 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
         : `Restored ${res.success_count} file${res.success_count === 1 ? "" : "s"} to their original locations`,
       res.fail_count ? "error" : "ok",
     );
+    await loadGroups();
+    await refreshStatus();
+    window.dispatchEvent(new CustomEvent("dedupe:undo-complete", { detail: { res } }));
     setActionBusy(false);
   } catch (e) {
     const stale = e.data?.preview_stale

@@ -26,20 +26,44 @@ def list_history(log_dir=None, *, cache_path=None, limit=50, offset=0) -> dict:
             row["items"] = items[:200]
             row["items_truncated"] = len(items) > 200
             row["restorable_count"] = 0
+            after_by_path = {
+                entry["path"]: entry.get("after_identity")
+                for entry in (data.get("journal") or [])
+                if isinstance(entry, dict) and entry.get("path")
+            }
             for item in items:
                 if not item.get("ok") or not row["undoable"]:
                     continue
                 destination = Path(item["destination"])
                 source = Path(item["path"])
-                if destination.is_file() and not destination.is_symlink() and not (
+                if summary.action == "crop":
+                    after_id = after_by_path.get(item["path"])
+                    try:
+                        source_ok = (
+                            source.is_file()
+                            and not source.is_symlink()
+                            and (after_id is None or source.stat().st_size == after_id.get("size"))
+                        )
+                    except OSError:
+                        source_ok = False
+                    if destination.is_file() and not destination.is_symlink() and source_ok:
+                        row["restorable_count"] += 1
+                elif destination.is_file() and not destination.is_symlink() and not (
                     source.exists() or source.is_symlink()
                 ):
                     row["restorable_count"] += 1
             if row["undoable"] and row["restorable_count"] != summary.success_count:
                 row["undoable"] = False
                 row["undo_blocked_reason"] = (
-                    "Some files are no longer at their recorded destinations, or an original "
-                    "path is occupied. They may already have been restored."
+                    (
+                        "Some originals are no longer in the Trash, or a cropped file changed "
+                        "since cropping. They may already have been restored."
+                    )
+                    if summary.action == "crop"
+                    else (
+                        "Some files are no longer at their recorded destinations, or an original "
+                        "path is occupied. They may already have been restored."
+                    )
                 )
             if row["status"] == "running":
                 row["undoable"] = False

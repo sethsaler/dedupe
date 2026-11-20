@@ -96,3 +96,70 @@ def test_history_reconsider_requires_token_and_current_session(tmp_path):
     fresh_client, _headers, _scan_id = client_for(tmp_path)
     assert fresh_client.get("/api/history").get_json()["decision_count"] == 0
     assert all(Path(record.path).exists() for record in members)
+
+
+def test_history_evaluates_crop_receipt_undoability_and_detects_tamper(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import shutil
+
+    from PIL import Image
+
+    from dedupe import actions as actions_module
+    from dedupe.borders import BORDER_SIGNATURE
+    from dedupe.models import DuplicateGroup, GroupKind
+
+    trash_dir = tmp_path / "Trash"
+
+    class _FakeTrashBatch:
+        def __init__(self) -> None:
+            self.dirs = [str(trash_dir)]
+
+        def send(self, src: Path) -> Path:
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            dst = trash_dir / src.name
+            shutil.move(str(src), str(dst))
+            return dst
+
+    monkeypatch.setattr(actions_module, "TrashBatch", _FakeTrashBatch)
+
+    img_path = tmp_path / "letterboxed.png"
+    img = Image.new("RGB", (320, 240), (0, 0, 0))
+    img.paste(Image.new("RGB", (320, 160), (50, 150, 220)), (0, 40))
+    img.save(img_path)
+    st = img_path.stat()
+    record = FileRecord(
+        path=str(img_path.resolve()),
+        size=st.st_size,
+        mtime=st.st_mtime,
+        mtime_ns=st.st_mtime_ns,
+        ctime_ns=st.st_ctime_ns,
+        device=st.st_dev,
+        inode=st.st_ino,
+        width=320,
+        height=240,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        border_crop="0,40,320,200,320,240",
+        border_signature=BORDER_SIGNATURE,
+    )
+    crop_group = DuplicateGroup(
+        id="crop", kind=GroupKind.CROP, media_type=MediaType.IMAGE, members=[record],
+    )
+    executed, _ = actions_module.apply_crops(
+        [crop_group],
+        dry_run=False,
+        roots=[str(tmp_path)],
+        log_dir=tmp_path / "logs",
+    )
+    assert executed.success_count == 1
+
+    client, _headers, _scan_id = client_for(tmp_path)
+    entry = client.get("/api/history").get_json()["actions"][0]
+    assert entry["action"] == "crop"
+    assert entry["undoable"] is True
+
+    # Modifying the cropped file invalidates in-place undo from history.
+    img_path.write_bytes(b"externally-edited")
+    entry_after = client.get("/api/history").get_json()["actions"][0]
+    assert entry_after["undoable"] is False

@@ -15,6 +15,7 @@
 // original goes to the Trash, so every crop has an Undo. Skip declines a
 // suggestion; it is remembered so the same file is not suggested again.
 
+import { undoAction } from "./actions.js";
 import { api } from "./api.js";
 import { updateGroupListItem } from "./groups.js";
 import { openLightbox } from "./lightbox.js";
@@ -175,6 +176,18 @@ function snapTargets(member, frame) {
   return { x: [...x], y: [...y] };
 }
 
+const HANDLE_CURSORS = {
+  move: "move",
+  n: "ns-resize",
+  s: "ns-resize",
+  e: "ew-resize",
+  w: "ew-resize",
+  nw: "nwse-resize",
+  se: "nwse-resize",
+  ne: "nesw-resize",
+  sw: "nesw-resize",
+};
+
 function snapped(value, targets, reach) {
   let best = value;
   let nearest = reach;
@@ -188,15 +201,59 @@ function snapped(value, targets, reach) {
   return best;
 }
 
+function formatLiveBadge(box) {
+  if (!box) return "";
+  const sides = [
+    ["L", box.left],
+    ["T", box.top],
+    ["R", box.width - box.right],
+    ["B", box.height - box.bottom],
+  ]
+    .filter(([, px]) => px > 0)
+    .map(([tag, px]) => `-${px}${tag}`);
+  return sides.length
+    ? `${box.crop_width}×${box.crop_height} (${sides.join(" ")})`
+    : `${box.crop_width}×${box.crop_height}`;
+}
+
+function updateLiveBadge(boxEl, box) {
+  const badge = boxEl?.querySelector?.(".crop-live-badge");
+  if (badge) badge.textContent = formatLiveBadge(box);
+}
+
+function renderSnapGuides(guidesEl, frame, targets, box) {
+  if (!guidesEl || !frame || !targets) return;
+  const nodes = [];
+  for (const x of targets.x) {
+    if (x <= 0 || x >= frame.width) continue;
+    const guide = document.createElement("span");
+    guide.className = "crop-guide-x";
+    if (box && (box.left === x || box.right === x)) guide.classList.add("snapped");
+    guide.style.left = `${(x / frame.width) * 100}%`;
+    nodes.push(guide);
+  }
+  for (const y of targets.y) {
+    if (y <= 0 || y >= frame.height) continue;
+    const guide = document.createElement("span");
+    guide.className = "crop-guide-y";
+    if (box && (box.top === y || box.bottom === y)) guide.classList.add("snapped");
+    guide.style.top = `${(y / frame.height) * 100}%`;
+    nodes.push(guide);
+  }
+  guidesEl.replaceChildren(...nodes);
+}
+
 // The zone after dragging ``start`` by (dx, dy) picture pixels: "move"
 // slides it inside the frame; a handle name drags its named edge(s).
-// ``snap`` ({x, y, reach}) pulls a dragged edge onto a nearby target.
+// ``snap`` ({x, y, reachX, reachY, reach}) pulls a dragged edge onto a nearby target.
 function draggedBox(member, start, handle, dx, dy, snap = null) {
   const frame = start;
   const minW = Math.max(1, Math.min(MIN_CROP_PX, frame.width));
   const minH = Math.max(1, Math.min(MIN_CROP_PX, frame.height));
-  const snapX = (value) => (snap ? snapped(value, snap.x, snap.reach) : value);
-  const snapY = (value) => (snap ? snapped(value, snap.y, snap.reach) : value);
+  const reachX = snap ? (snap.reachX ?? snap.reach ?? 0) : 0;
+  const reachY = snap ? (snap.reachY ?? snap.reach ?? 0) : 0;
+  const snapX = (value) => (snap ? snapped(value, snap.x, reachX) : value);
+  const snapY = (value) => (snap ? snapped(value, snap.y, reachY) : value);
   const clamp = (value, low, high) => Math.max(low, Math.min(high, Math.round(value)));
   let edges = edgesOf(start);
   if (handle === "move") {
@@ -301,7 +358,7 @@ function cropBoxHtml(member, name, editable) {
   const handles = CROP_HANDLES
     .map((handle) => `<span class="crop-handle ${handle}" data-handle="${handle}" aria-hidden="true"></span>`)
     .join("");
-  return `<span class="crop-box editable" tabindex="0" role="group" aria-label="${escapeHtml(cropBoxLabel(name))}" title="Drag to move · drag an edge or corner to resize · double-click to adjust it large">${handles}</span>`;
+  return `<span class="crop-box editable" tabindex="0" role="group" aria-label="${escapeHtml(cropBoxLabel(name))}" title="Drag to move · drag an edge or corner to resize · double-click to adjust it large"><span class="crop-thirds" aria-hidden="true"></span><span class="crop-live-badge" aria-hidden="true"></span>${handles}</span>`;
 }
 
 // The level switch under a card's evidence line. Every level is offered —
@@ -350,13 +407,14 @@ function cardHtml(g, member, index) {
            <button class="btn ghost crop-skip" data-path="${escapeHtml(member.path)}" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>`;
   return `
     <article class="card crop-card ${state_} ${zoneHidden ? "crop-zone-hidden" : ""} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
-      <button class="thumb-wrap crop-thumb" type="button" data-path="${escapeHtml(member.path)}" aria-label="Open ${escapeHtml(name)} in the lightbox">
+      <div class="thumb-wrap crop-thumb" tabindex="0" role="group" data-path="${escapeHtml(member.path)}" aria-label="Open ${escapeHtml(name)} in the lightbox">
         <span class="crop-frame" data-width="${width || ""}" data-height="${height || ""}">
           <img class="crop-image" src="${thumbUrl(member)}" alt="Preview of ${escapeHtml(name)}" loading="lazy" decoding="async" />
+          ${showsCrop ? '<span class="crop-shade" aria-hidden="true"><span class="crop-shade-hole"></span></span><span class="crop-snap-guides" aria-hidden="true"></span>' : ""}
           ${showsCrop ? cropBoxHtml(member, name, editable) : ""}
         </span>
         ${badge}
-      </button>
+      </div>
       <div class="card-body">
         <div class="name" title="${escapeHtml(member.path)}">${escapeHtml(name)}</div>
         <div class="path" title="${escapeHtml(member.path)}">${escapeHtml(member.path)}</div>
@@ -394,7 +452,7 @@ function layoutCard(card, member) {
   const crop = effectiveBox(member);
   if (!crop) return;
   const box = card.querySelector(".crop-box");
-  if (box) placeInFrame(box, crop);
+  if (box || frame) placeZone(frame, box, crop);
   const image = card.querySelector(".crop-image");
   if (image && member.crop_state === "cropped") placeInFrame(image, member.crop || crop);
 }
@@ -405,6 +463,13 @@ function placeInFrame(element, crop) {
   element.style.top = `${(crop.top / crop.height) * 100}%`;
   element.style.width = `${(crop.crop_width / crop.width) * 100}%`;
   element.style.height = `${(crop.crop_height / crop.height) * 100}%`;
+}
+
+// Position both the crop box and its clipped outside shade hole together.
+function placeZone(frameEl, boxEl, crop) {
+  if (boxEl) placeInFrame(boxEl, crop);
+  const hole = frameEl?.querySelector?.(".crop-shade-hole");
+  if (hole) placeInFrame(hole, crop);
 }
 
 // What a card shows; a card is rebuilt only when this changes.
@@ -472,7 +537,7 @@ function bindCard(card) {
     if (event.target.closest("button, a, input, label")) return;
     focusCard(Number(card.dataset.index));
   });
-  card.querySelector(".crop-thumb")?.addEventListener("click", () => {
+  const openThumbLightbox = () => {
     // A click that began on the crop zone selects or drags the zone; only a
     // click on the picture around it opens the lightbox.
     const stamped = suppressThumbClick.get(card.dataset.path);
@@ -482,6 +547,24 @@ function bindCard(card) {
     }
     state.memberFocus = Number(card.dataset.index);
     openLightbox(state.memberFocus);
+  };
+  const thumbEl = card.querySelector(".crop-thumb");
+  thumbEl?.addEventListener("click", openThumbLightbox);
+  thumbEl?.addEventListener("keydown", (event) => {
+    if (event.target !== thumbEl) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      openThumbLightbox();
+    } else if (event.key === " ") {
+      event.preventDefault();
+    }
+  });
+  thumbEl?.addEventListener("keyup", (event) => {
+    if (event.target !== thumbEl) return;
+    if (event.key === " ") {
+      event.preventDefault();
+      openThumbLightbox();
+    }
   });
   card.querySelectorAll(".crop-level-btn").forEach((button) => {
     button.addEventListener("click", () => {
@@ -583,30 +666,59 @@ function bindZone(boxEl, host) {
     const startX = event.clientX;
     const startY = event.clientY;
     const targets = snapTargets(member, start);
+    const guidesEl = frame.querySelector(".crop-snap-guides");
     let current = start;
+    let ended = false;
     host.dragEl.classList.add("crop-dragging");
+    host.dragEl.classList.toggle("alt-free", event.altKey);
+    host.dragEl.dataset.dragCursor = HANDLE_CURSORS[handle] || "move";
     boxEl.dataset.dragHandle = handle;
+    updateLiveBadge(boxEl, current);
+    renderSnapGuides(guidesEl, start, targets, current);
 
     const onMove = (moveEvent) => {
-      if (rect.width <= 0 || rect.height <= 0) return;
+      if (ended || rect.width <= 0 || rect.height <= 0) return;
       const dx = ((moveEvent.clientX - startX) / rect.width) * start.width;
       const dy = ((moveEvent.clientY - startY) / rect.height) * start.height;
       // Alt places the edge freely, between the edges it would snap to.
+      host.dragEl.classList.toggle("alt-free", moveEvent.altKey);
       const snap = moveEvent.altKey
         ? null
-        : { ...targets, reach: (SNAP_SCREEN_PX / rect.width) * start.width };
-      const next = draggedBox(member, start, handle, dx, dy, snap);
+        : {
+          ...targets,
+          reachX: (SNAP_SCREEN_PX / rect.width) * start.width,
+          reachY: (SNAP_SCREEN_PX / rect.height) * start.height,
+        };
+      const next = host.dragBox
+        ? host.dragBox(member, start, handle, dx, dy, snap, moveEvent)
+        : draggedBox(member, start, handle, dx, dy, snap);
       if (sameEdges(next, current)) return;
       current = next;
       localAdjustments.set(path, current);
       host.paint(member, current);
+      updateLiveBadge(boxEl, current);
+      renderSnapGuides(guidesEl, start, targets, current);
     };
     const onEnd = () => {
+      if (ended) return;
+      ended = true;
       boxEl.removeEventListener("pointermove", onMove);
       boxEl.removeEventListener("pointerup", onEnd);
       boxEl.removeEventListener("pointercancel", onEnd);
-      host.dragEl.classList.remove("crop-dragging");
+      boxEl.removeEventListener("lostpointercapture", onEnd);
+      try {
+        if (boxEl.hasPointerCapture?.(event.pointerId)) {
+          boxEl.releasePointerCapture(event.pointerId);
+        }
+      } catch {
+        /* capture may already be released */
+      }
+      host.dragEl.classList.remove("crop-dragging", "alt-free");
+      delete host.dragEl.dataset.dragCursor;
       delete boxEl.dataset.dragHandle;
+      const badge = boxEl.querySelector(".crop-live-badge");
+      if (badge) badge.textContent = "";
+      if (guidesEl) guidesEl.replaceChildren();
       suppressThumbClick.set(path, Date.now());
       if (sameEdges(current, start)) {
         // A plain click: the zone is selected; its owner already took focus.
@@ -619,6 +731,7 @@ function bindZone(boxEl, host) {
     boxEl.addEventListener("pointermove", onMove);
     boxEl.addEventListener("pointerup", onEnd);
     boxEl.addEventListener("pointercancel", onEnd);
+    boxEl.addEventListener("lostpointercapture", onEnd);
   });
   // The page's key map leaves Alt chords to the browser, so the zone takes
   // its own: Alt+arrows move the top and left edges.
@@ -652,7 +765,7 @@ function bindCropBox(card, boxEl) {
       markFocused();
     },
     paint: (member, box) => {
-      placeInFrame(boxEl, box);
+      placeZone(card.querySelector(".crop-frame"), boxEl, box);
       syncEvidence(card, member, box);
     },
     dragEl: card,
@@ -792,7 +905,7 @@ function nudgeCropZone(boxEl, event) {
     Math.max(1, Math.round(start.height * 0.01)),
   );
   if (!sameEdges(next, start)) {
-    placeInFrame(boxEl, next);
+    placeZone(card.querySelector(".crop-frame"), boxEl, next);
     syncEvidence(card, member, next);
     queueZone(path, next);
   }
@@ -856,17 +969,52 @@ function toggleAllCropZones() {
 
 $("btnToggleCropZones")?.addEventListener("click", toggleAllCropZones);
 
+function renderCropProgress(progress) {
+  const el = $("cropProgress");
+  if (!el) return;
+  if (!progress || !progress.total) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.textContent = `Cropping ${progress.done || 0} of ${progress.total}…`;
+}
+
+window.addEventListener("dedupe:work-state", (event) => {
+  renderCropProgress(event.detail?.cropProgress || null);
+});
+
+window.addEventListener("dedupe:undo-complete", () => {
+  const g = currentGroup();
+  if (!g || g.kind !== "crop") return;
+  for (const member of g.members || []) {
+    if (member.crop_state !== "cropped") {
+      noteMediaVersion(member.path, `${member.size}-${member.crop_state}`);
+    }
+  }
+  renderCropReview(g);
+});
+
 function updateCropMeta(g) {
   const members = g.members || [];
   const cropped = members.filter((m) => m.crop_state === "cropped").length;
   const skipped = members.filter((m) => m.crop_state === "skipped").length;
   const pending = pendingMembers(g).length;
-  const croppable = croppableMembers(g).length;
+  const croppable = croppableMembers(g);
+  const croppableCount = croppable.length;
+  const imageCount = croppable.filter((m) => m.media_type === "image").length;
+  const videoCount = croppableCount - imageCount;
   $("detailMeta").textContent =
     `${pending} to review · ${cropped} cropped · ${skipped} skipped · originals go to the Trash, so every crop can be undone`;
   const all = $("btnCropAll");
-  all.hidden = croppable === 0;
-  all.textContent = `Crop all ${croppable} remaining`;
+  all.hidden = croppableCount === 0;
+  all.textContent = `Crop all ${croppableCount} remaining`;
+  const imgs = $("btnCropImages");
+  if (imgs) {
+    imgs.hidden = !(imageCount > 0 && videoCount > 0);
+    imgs.textContent = `Crop ${imageCount} image${imageCount === 1 ? "" : "s"} only`;
+  }
   const levelAll = $("cropLevelAll");
   if (levelAll && document.activeElement !== levelAll) {
     levelAll.value = g.crop_level || "balanced";
@@ -1130,14 +1278,20 @@ async function undoCrop(g, path) {
   }
 }
 
-async function cropAllRemaining() {
+async function cropAllRemaining(mediaFilter = "all") {
   const g = currentGroup();
   if (!g || g.kind !== "crop") return;
-  const pending = croppableMembers(g);
+  const allCroppable = croppableMembers(g);
+  const pending = mediaFilter === "images"
+    ? allCroppable.filter((member) => member.media_type === "image")
+    : allCroppable;
   if (!pending.length) return;
   const videos = pending.filter((member) => member.media_type === "video").length;
+  const title = mediaFilter === "images"
+    ? `Crop ${pending.length} image${pending.length === 1 ? "" : "s"}?`
+    : `Crop ${pending.length} file${pending.length === 1 ? "" : "s"}?`;
   const ok = await confirmModal({
-    title: `Crop ${pending.length} file${pending.length === 1 ? "" : "s"}?`,
+    title,
     body: `<p>Each file is cropped to the zone shown on its card (dragged zones included) and rewritten in place. The originals go to the Trash, and each crop can be undone from its card.</p>${videos ? `<p>${videos} video${videos === 1 ? "" : "s"} will be re-encoded, which can take a while.</p>` : ""}<p class="muted">Skipped and already cropped files are left alone.</p>`,
     confirmLabel: `Crop ${pending.length}`,
     danger: false,
@@ -1146,8 +1300,10 @@ async function cropAllRemaining() {
   const scanId = state.scanId;
   if (pending.some((member) => busy.has(member.path))) return;
   for (const member of pending) busy.add(member.path);
+  let pollTimer = null;
   try {
     $("btnCropAll").disabled = true;
+    if ($("btnCropImages")) $("btnCropImages").disabled = true;
     // Freeze edits first, then drain each file's queue and save any newer
     // debounced (or previously failed) edit before applying the whole pile.
     for (const member of pending) {
@@ -1161,24 +1317,43 @@ async function cropAllRemaining() {
       if (local && !await saveAdjustment(path, local)) return;
     }
     if (state.scanId !== scanId || currentGroup()?.id !== g.id) return;
-    const updated = await post("/api/crop/apply-all", { group_id: g.id, scan_id: state.scanId });
+    renderCropProgress({ done: 0, total: pending.length });
+    pollTimer = setInterval(async () => {
+      try {
+        const s = await api("/api/status");
+        if (s.crop_progress) renderCropProgress(s.crop_progress);
+      } catch {
+        /* ignore transient status poll errors during crop batch */
+      }
+    }, 250);
+    const updated = await post("/api/crop/apply-all", {
+      group_id: g.id,
+      scan_id: state.scanId,
+      media_filter: mediaFilter,
+    });
     applyUpdate(updated);
     dismissCropUndoToast();
     const failed = (updated.failures || []).length;
+    const undoReceipt = updated.cropped_count > 0 && updated.log_path ? updated.log_path : null;
     toast(
       `Cropped ${updated.cropped_count} file${updated.cropped_count === 1 ? "" : "s"}`
         + (failed ? ` · ${failed} could not be cropped (${updated.failures[0].error})` : ""),
       failed ? "error" : "ok",
+      undoReceipt ? { actionLabel: "Undo", onAction: () => undoAction([undoReceipt]) } : {},
     );
   } catch (error) {
     toast(error.message, "error");
   } finally {
+    if (pollTimer) clearInterval(pollTimer);
+    renderCropProgress(null);
     for (const member of pending) busy.delete(member.path);
     $("btnCropAll").disabled = false;
+    if ($("btnCropImages")) $("btnCropImages").disabled = false;
   }
 }
 
-$("btnCropAll")?.addEventListener("click", cropAllRemaining);
+$("btnCropAll")?.addEventListener("click", () => cropAllRemaining("all"));
+$("btnCropImages")?.addEventListener("click", () => cropAllRemaining("images"));
 
 // Keyboard: c crops the focused file, x skips it, e opens its zone in the
 // large editor, v toggles its crop zone, 1/2/3 switch its aggressiveness
@@ -1224,7 +1399,8 @@ function handleCropKey(event) {
 
 export {
   CROP_HANDLES, CROP_LEVELS, applyCrop, bindZone, chooseCropLevel, commitZone, coversFrame,
-  deriveBox, effectiveBox, evidenceFor, handleCropKey, levelSwitchHtml, nudgedBox,
-  placeInFrame, queueZone, renderCropReview, resetCropZone, sameEdges, skipCrop, snapEdges,
-  updateCropMeta, zoneBox,
+  deriveBox, draggedBox, effectiveBox, evidenceFor, formatLiveBadge, handleCropKey,
+  hiddenZones, levelSwitchHtml, localAdjustments, nudgedBox, placeInFrame, placeZone,
+  queueZone, renderCropReview, renderSnapGuides, resetCropZone, sameEdges, skipCrop,
+  snapEdges, toggleCropZone, updateCropMeta, updateLiveBadge, zoneBox,
 };

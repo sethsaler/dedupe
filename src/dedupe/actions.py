@@ -8,10 +8,12 @@ import os
 import shutil
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
+from typing import TYPE_CHECKING
 
 from .action_journal import ActionJournal, atomic_json, recover_interrupted_actions
 from .exact import file_sha256
@@ -40,6 +42,9 @@ from .similar_video import (
     compute_video_fingerprint,
     video_fingerprint_distances,
 )
+
+if TYPE_CHECKING:
+    from .borders import CropBox, CropOutcome
 
 # Destructive file work is I/O bound; a small pool hides move/copy latency
 # without saturating the disk or the system Trash service.
@@ -834,14 +839,207 @@ def apply_actions(
     return result
 
 
+def apply_crops(
+    groups: list[DuplicateGroup],
+    *,
+    dry_run: bool = True,
+    roots: list[str] | None = None,
+    aggressiveness: str | None = None,
+    boxes_by_path: dict[str, CropBox] | None = None,
+    media_filter: str = "all",
+    log_dir: str | Path | None = None,
+    workers: int | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    trash_batch_factory: Callable[[], TrashBatch] | None = None,
+) -> tuple[ActionResult, dict[str, tuple[CropBox, CropOutcome]]]:
+    """Apply or preview automatic border crops for pending Crop review members."""
+    from .borders import crop_file_in_place, suggested_crop
+
+    if media_filter not in ("all", "images"):
+        raise ValueError("media_filter must be 'all' or 'images'")
+
+    candidates: list[tuple[DuplicateGroup, FileRecord, CropBox]] = []
+    seen_paths: set[str] = set()
+    for group in groups:
+        if group.kind != GroupKind.CROP:
+            continue
+        match_details = group.match_details or {}
+        decided = set(group.reviewed_paths) | set(match_details.get("cropped") or {})
+        level = aggressiveness or match_details.get("crop_level") or "balanced"
+        for member in group.members:
+            if member.path in decided or member.path in seen_paths:
+                continue
+            if media_filter == "images" and member.media_type == MediaType.VIDEO:
+                continue
+            if boxes_by_path is not None and member.path in boxes_by_path:
+                box = boxes_by_path[member.path]
+            else:
+                box = suggested_crop(member, level)
+            if box is None:
+                continue
+            seen_paths.add(member.path)
+            candidates.append((group, member, box))
+
+    preflight_errors: dict[str, str] = {}
+    for _group, member, _box in candidates:
+        if member.protected:
+            preflight_errors[member.path] = "This file is in a protected library"
+            continue
+        error, _st = validate_record_with_stat(member, roots)
+        if error:
+            preflight_errors[member.path] = error
+
+    result = ActionResult(dry_run=dry_run, action="crop")
+    outcomes: dict[str, tuple[CropBox, CropOutcome]] = {}
+    if not candidates:
+        if dry_run:
+            result.completed_at = datetime.now(UTC).isoformat()
+            _write_action_log(result, log_dir)
+        return result, outcomes
+
+    if dry_run:
+        for group, member, _box in candidates:
+            err = preflight_errors.get(member.path)
+            if err:
+                result.items.append(
+                    ActionItem(
+                        path=member.path,
+                        ok=False,
+                        action="crop",
+                        error=err,
+                        group_id=group.id,
+                        size=member.size,
+                    )
+                )
+            else:
+                result.items.append(
+                    ActionItem(
+                        path=member.path,
+                        ok=True,
+                        action="crop",
+                        destination="Trash",
+                        group_id=group.id,
+                        size=member.size,
+                    )
+                )
+        result.completed_at = datetime.now(UTC).isoformat()
+        _write_action_log(result, log_dir)
+        return result, outcomes
+
+    journal_indexes = {member.path: idx for idx, (_g, member, _b) in enumerate(candidates)}
+    result._journal = ActionJournal(
+        result.to_dict(),
+        [
+            {
+                "path": member.path,
+                "size": member.size,
+                "destination": "Trash",
+                "group_id": group.id,
+            }
+            for group, member, _box in candidates
+        ],
+        log_dir,
+    )
+    result.log_path = str(result._journal.path)
+
+    trash_batch = (trash_batch_factory or TrashBatch)()
+    video_sem = threading.Semaphore(2)
+    outcomes_lock = threading.Lock()
+    progress_lock = threading.Lock()
+    done_count = 0
+    total = len(candidates)
+
+    def _crop_one(entry: tuple[DuplicateGroup, FileRecord, CropBox]) -> ActionItem:
+        nonlocal done_count
+        group, member, box = entry
+        if cancelled and cancelled():
+            return ActionItem(
+                path=member.path,
+                ok=False,
+                action="crop",
+                error="cancelled",
+                group_id=group.id,
+                size=member.size,
+            )
+        err = preflight_errors.get(member.path)
+        if not err and member.protected:
+            err = "This file is in a protected library"
+        if not err:
+            err, _st = validate_record_with_stat(member, roots)
+        if err:
+            item = ActionItem(
+                path=member.path,
+                ok=False,
+                action="crop",
+                error=err,
+                group_id=group.id,
+                size=member.size,
+            )
+        else:
+            src = Path(member.path)
+            idx = journal_indexes[member.path]
+            try:
+                result._journal.begin(idx, search_dirs=_trash_dirs_for(src))
+                if member.media_type == MediaType.VIDEO:
+                    with video_sem:
+                        outcome = crop_file_in_place(member, box, send_to_trash=trash_batch.send)
+                else:
+                    outcome = crop_file_in_place(member, box, send_to_trash=trash_batch.send)
+                with outcomes_lock:
+                    outcomes[member.path] = (box, outcome)
+                item = ActionItem(
+                    path=member.path,
+                    ok=True,
+                    action="crop",
+                    destination=outcome.original_in_trash or "Trash",
+                    group_id=group.id,
+                    size=member.size,
+                )
+            except Exception as exc:
+                item = ActionItem(
+                    path=member.path,
+                    ok=False,
+                    action="crop",
+                    error=f"could not crop: {exc}",
+                    group_id=group.id,
+                    size=member.size,
+                )
+        try:
+            result._journal.record(journal_indexes[member.path], asdict(item))
+        except OSError as exc:
+            result.log_error = str(exc)
+        if progress is not None:
+            with progress_lock:
+                done_count += 1
+                current_done = done_count
+            progress(current_done, total, member.path)
+        return item
+
+    try:
+        result.items = map_parallel(
+            _crop_one,
+            candidates,
+            workers=resolve_workers(workers, cap=DEFAULT_ACTION_WORKERS_CAP),
+        )
+    except BaseException:
+        result._journal.close()
+        raise
+
+    result.completed_at = datetime.now(UTC).isoformat()
+    _write_action_log(result, log_dir)
+    return result, outcomes
+
+
 def undo_action(
     action_log: str | Path,
     *,
     dry_run: bool = True,
     log_dir: str | Path | None = None,
     receipt_dir: str | Path | None = None,
+    trash_batch_factory: Callable[[], TrashBatch] | None = None,
 ) -> ActionResult:
-    """Restore a completed trash or quarantine action from its receipt.
+    """Restore a completed trash, quarantine, or crop action from its receipt.
 
     ``action_log`` may be a path to a receipt or a receipt id (see
     :mod:`dedupe.receipts`); ids are resolved against ``receipt_dir`` (default:
@@ -860,14 +1058,19 @@ def undo_action(
     if data.get("status") == "running":
         raise ValueError("this action is still running; wait before restoring its files")
     action = str(data.get("action") or "")
-    if data.get("dry_run") or action not in ("trash", "quarantine"):
-        raise ValueError("only executed trash or quarantine receipts can be undone")
+    if data.get("dry_run") or action not in ("trash", "quarantine", "crop"):
+        raise ValueError("only executed trash, quarantine, or crop receipts can be undone")
     undo_kind = f"undo:{action}"
 
     result = ActionResult(dry_run=dry_run, action=undo_kind)
     recorded_identities = {
         entry["path"]: entry.get("identity")
         for entry in data.get("journal", []) if isinstance(entry, dict) and entry.get("path")
+    }
+    recorded_after_identities = {
+        entry["path"]: entry.get("after_identity")
+        for entry in data.get("journal", [])
+        if isinstance(entry, dict) and entry.get("path")
     }
     planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
@@ -877,21 +1080,60 @@ def undo_action(
         original = Path(item["path"])
         size = item.get("size")
         error = None
-        if action == "trash" and item["destination"] == "Trash":
-            error = "trash destination was not recorded; restore this one in Finder"
-        elif moved.is_symlink():
-            error = "moved file became a symbolic link"
-        elif not moved.is_file():
-            error = "moved file no longer exists at its recorded destination"
-        elif original.exists() or original.is_symlink():
-            error = "original path is already occupied"
-        elif (identity := recorded_identities.get(str(original))):
-            try:
-                if (moved.stat().st_size != identity["size"]
-                        or file_sha256(moved) != identity["sha256"]):
-                    error = "moved file changed since the cleanup"
-            except OSError as exc:
-                error = f"moved file could not be verified: {exc}"
+        if action == "crop":
+            if item["destination"] == "Trash":
+                error = "trash destination was not recorded; restore this one in Finder"
+            elif moved.is_symlink():
+                error = "original in Trash became a symbolic link"
+            elif not moved.is_file():
+                error = "original no longer exists in the Trash"
+            elif original.is_symlink():
+                error = "cropped file path became a symbolic link"
+            elif not original.is_file():
+                error = "cropped file is no longer at its path"
+            elif (identity := recorded_identities.get(str(original))):
+                try:
+                    if (
+                        moved.stat().st_size != identity["size"]
+                        or file_sha256(moved) != identity["sha256"]
+                    ):
+                        error = "original in Trash changed since the crop"
+                except OSError as exc:
+                    error = f"original in Trash could not be verified: {exc}"
+            elif size is not None:
+                try:
+                    if moved.stat().st_size != int(size):
+                        error = "original in Trash changed since the crop"
+                except OSError as exc:
+                    error = f"original in Trash could not be verified: {exc}"
+            if error is None and (after_id := recorded_after_identities.get(str(original))):
+                try:
+                    if (
+                        original.stat().st_size != after_id["size"]
+                        or file_sha256(original) != after_id["sha256"]
+                    ):
+                        error = (
+                            "the cropped file changed after cropping; restore the original "
+                            "manually from the Trash"
+                        )
+                except OSError as exc:
+                    error = f"cropped file could not be verified: {exc}"
+        else:
+            if action == "trash" and item["destination"] == "Trash":
+                error = "trash destination was not recorded; restore this one in Finder"
+            elif moved.is_symlink():
+                error = "moved file became a symbolic link"
+            elif not moved.is_file():
+                error = "moved file no longer exists at its recorded destination"
+            elif original.exists() or original.is_symlink():
+                error = "original path is already occupied"
+            elif (identity := recorded_identities.get(str(original))):
+                try:
+                    if (moved.stat().st_size != identity["size"]
+                            or file_sha256(moved) != identity["sha256"]):
+                        error = "moved file changed since the cleanup"
+                except OSError as exc:
+                    error = f"moved file could not be verified: {exc}"
         if error:
             result.items.append(
                 ActionItem(
@@ -919,6 +1161,16 @@ def undo_action(
                 )
             )
     else:
+        undo_trash = (
+            (trash_batch_factory or TrashBatch)()
+            if (not dry_run and planned and action == "crop")
+            else None
+        )
+        restore_original_in_place = None
+        if not dry_run and planned and action == "crop":
+            from .borders import restore_original_in_place as _restore_original_in_place
+
+            restore_original_in_place = _restore_original_in_place
         if not dry_run and planned:
             result._journal = ActionJournal(result.to_dict(), [
                 {"path": str(moved), "destination": str(original), "size": size}
@@ -928,15 +1180,25 @@ def undo_action(
         for index, (moved, original, size) in enumerate(planned):
             try:
                 if not dry_run:
-                    if original.exists() or original.is_symlink():
-                        raise OSError("original path became occupied before restore")
-                    if moved.is_symlink():
-                        raise OSError("moved file became a symbolic link")
-                    result._journal.begin(index)
-                    original.parent.mkdir(parents=True, exist_ok=True)
-                    # Restores are always allowed to cross volumes: the
-                    # quarantine folder or Trash may live on another disk.
-                    _move_file(moved, original, allow_cross_device=True)
+                    if action == "crop":
+                        if original.is_symlink() or not original.is_file():
+                            raise OSError("cropped file is no longer at its path")
+                        if moved.is_symlink():
+                            raise OSError("original in Trash became a symbolic link")
+                        result._journal.begin(index)
+                        restore_original_in_place(
+                            original, moved, send_to_trash=undo_trash.send
+                        )
+                    else:
+                        if original.exists() or original.is_symlink():
+                            raise OSError("original path became occupied before restore")
+                        if moved.is_symlink():
+                            raise OSError("moved file became a symbolic link")
+                        result._journal.begin(index)
+                        original.parent.mkdir(parents=True, exist_ok=True)
+                        # Restores are always allowed to cross volumes: the
+                        # quarantine folder or Trash may live on another disk.
+                        _move_file(moved, original, allow_cross_device=True)
                 result.items.append(
                     ActionItem(
                         path=str(moved),
