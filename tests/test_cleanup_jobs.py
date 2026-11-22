@@ -376,3 +376,145 @@ def test_switching_jobs_flushes_pending_review_decisions(
     saved = load_review_session(JobStore(tmp_path / "review.json").session_path(first_id)).result
     assert saved is not None
     assert effective_selected_paths(saved.groups) == []
+
+
+def test_job_store_splits_baseline_file_supports_legacy_and_skips_failed_files(
+    tmp_path: Path,
+) -> None:
+    from dedupe.models import FileRecord, MediaType
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    good_path = _image(root / "good.png")
+    bad_path = _image(root / "bad.png")
+    store = JobStore(tmp_path / "review.json")
+    job = store.save("Daily", _settings(root))
+    job_id = job["id"]
+
+    good_rec = FileRecord(
+        path=str(good_path.resolve()),
+        size=good_path.stat().st_size,
+        mtime=good_path.stat().st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+    )
+    bad_rec = FileRecord(
+        path=str(bad_path.resolve()),
+        size=bad_path.stat().st_size,
+        mtime=bad_path.stat().st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        error="image hash failed: corrupt frame",
+    )
+    scan_res = ScanResult(
+        roots=[str(root.resolve())],
+        files=[good_rec, bad_rec],
+        groups=[],
+        errors=[bad_rec.error],
+        job_id=job_id,
+        scan_settings=_settings(root),
+    )
+    store.finish_scan(scan_res)
+
+    meta_raw = json.loads(store._path(job_id).read_text())
+    assert "baseline" not in meta_raw
+    assert store.baseline_path(job_id).is_file()
+
+    # Job listing must stay compact without loading baseline dictionaries.
+    listed = store.list()
+    assert len(listed) == 1
+    assert "baseline" not in listed[0]
+
+    # Loaded job merges the external baseline cleanly and excluded the failed record.
+    loaded = store.get(job_id)
+    assert set(loaded["baseline"]) == {good_rec.path}
+
+    # Legacy inline baseline inside {job_id}.json still reads cleanly.
+    store.baseline_path(job_id).unlink()
+    meta_raw["baseline"] = {good_rec.path: file_identity(good_rec)}
+    store._path(job_id).write_text(json.dumps(meta_raw))
+    assert set(store.get(job_id)["baseline"]) == {good_rec.path}
+
+    # Removing the job deletes both metadata and external baseline files.
+    store.save("Daily", _settings(root), job_id=job_id)
+    store.finish_scan(scan_res)
+    store.remove(job_id)
+    assert not store._path(job_id).exists()
+    assert not store.baseline_path(job_id).exists()
+
+
+def test_focus_new_arrivals_preserves_multi_member_sets_and_excludes_protected_independent(
+    tmp_path: Path,
+) -> None:
+    from dedupe.models import DuplicateGroup, FileRecord, MediaType
+
+    def make_rec(name: str, *, protected: bool = False) -> FileRecord:
+        p = _image(tmp_path / name)
+        st = p.stat()
+        return FileRecord(
+            path=str(p.resolve()),
+            size=st.st_size,
+            mtime=st.st_mtime,
+            media_type=MediaType.IMAGE,
+            extension=".png",
+            device=st.st_dev,
+            inode=st.st_ino,
+            mtime_ns=st.st_mtime_ns,
+            ctime_ns=st.st_ctime_ns,
+            protected=protected,
+        )
+
+    old = make_rec("old.png")
+    old2 = make_rec("old2.png")
+    arrival = make_rec("new.png")
+    prot_arrival = make_rec("prot_new.png", protected=True)
+    baseline = {old.path: file_identity(old), old2.path: file_identity(old2)}
+
+    result = ScanResult(
+        roots=[str(tmp_path.resolve())],
+        files=[old, old2, arrival, prot_arrival],
+        groups=[
+            DuplicateGroup(
+                id="all-files",
+                kind=GroupKind.ALL_FILES,
+                media_type=MediaType.IMAGE,
+                members=[old, arrival],
+            ),
+            DuplicateGroup(
+                id="set-touching-arrival",
+                kind=GroupKind.SETS,
+                media_type=MediaType.IMAGE,
+                members=[old, arrival],
+            ),
+            DuplicateGroup(
+                id="set-old-only",
+                kind=GroupKind.SETS,
+                media_type=MediaType.IMAGE,
+                members=[old, old2],
+            ),
+            DuplicateGroup(
+                id="lowres",
+                kind=GroupKind.LOW_RESOLUTION,
+                media_type=MediaType.IMAGE,
+                members=[old, arrival, prot_arrival],
+                selected_for_removal=[old.path, arrival.path, prot_arrival.path],
+            ),
+            DuplicateGroup(
+                id="exact",
+                kind=GroupKind.EXACT,
+                media_type=MediaType.IMAGE,
+                members=[prot_arrival, arrival],
+                suggested_keep=prot_arrival.path,
+                selected_for_removal=[arrival.path],
+            ),
+        ],
+    )
+
+    arrivals_count = focus_new_arrivals(result, baseline)
+    assert arrivals_count == 2
+    by_id = {g.id: g for g in result.groups}
+    assert "all-files" not in by_id
+    assert "set-old-only" not in by_id
+    assert {m.path for m in by_id["set-touching-arrival"].members} == {old.path, arrival.path}
+    assert [m.path for m in by_id["lowres"].members] == [arrival.path]
+    assert {m.path for m in by_id["exact"].members} == {prot_arrival.path, arrival.path}

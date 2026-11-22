@@ -1,16 +1,18 @@
 // Status polling + SSE stream, scan progress, session banner, diagnostics.
 
 import { api } from "./api.js";
-import { undoAction } from "./actions.js";
+import { undoAction, updateSelectionSummary } from "./actions.js";
 import { addStreamedGroup, loadGroups, markEmptyTabs } from "./groups.js";
 import {
   applyCapabilities,
+  expandScanPanel,
   scanGoalShortLabel,
   syncCollapseButtonVisibility,
   updateWorkersUI,
   workersEl,
 } from "./settings.js";
 import { state } from "./state.js";
+import { syncRangeInput } from "./theme.js";
 import { $, basename, escapeHtml, formatDuration, toast } from "./util.js";
 
 // —— Per-folder parallel scan streams ——
@@ -50,21 +52,63 @@ function renderStreams(streams, scanning) {
 }
 
 // —— Status / groups ——
-function renderDiagnostics(summary) {
+function summarizeDiagnostics(summary) {
   const diagnostics = summary?.diagnostics;
+  const stages = Object.entries(diagnostics?.stages || {});
+  const failed = stages.reduce((total, [, stage]) => total + (stage.failed || 0), 0);
+  const warnings = [...(summary?.errors || [])];
+  for (const [name, stage] of stages) {
+    for (const warning of stage.warnings || []) {
+      warnings.push(`${name.replaceAll("_", " ")}: ${warning}`);
+    }
+  }
+  return { diagnostics, stages, failed, warnings };
+}
+
+function issueBadgeText(failed, warningCount) {
+  const parts = [];
+  if (failed > 0) parts.push(`${failed} failed`);
+  if (warningCount > 0) parts.push(`${warningCount} warning${warningCount === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
+function renderDiagnostics(summary) {
+  const { diagnostics, stages, failed, warnings } = summarizeDiagnostics(summary);
   const panel = $("scanQuality");
-  if (!diagnostics || !Object.keys(diagnostics.stages || {}).length) {
+  const retryBtn = $("btnRetryAnalysis");
+  const badge = $("scanQualityBadge");
+  if (!diagnostics || !stages.length) {
     panel.hidden = true;
+    panel.open = false;
+    delete panel.dataset.autoOpened;
+    if (badge) badge.hidden = true;
+    if (retryBtn) retryBtn.hidden = true;
     return;
   }
   panel.hidden = false;
-  const stages = Object.entries(diagnostics.stages);
-  const failed = stages.reduce((total, [, stage]) => total + (stage.failed || 0), 0);
-  const warnings = [...(summary.errors || [])];
-  for (const [name, stage] of stages) {
-    for (const warning of stage.warnings || []) warnings.push(`${name.replaceAll("_", " ")}: ${warning}`);
+  const incomplete = failed > 0 || warnings.length > 0;
+  const issueText = issueBadgeText(failed, warnings.length);
+  if (badge) {
+    badge.hidden = !incomplete;
+    badge.textContent = issueText;
   }
-  $("scanQualitySummary").textContent = `· ${formatDuration(diagnostics.total_duration_seconds)} · ${diagnostics.cache_hits || 0} cache hits${diagnostics.first_duplicate_seconds != null ? ` · first duplicate ${formatDuration(diagnostics.first_duplicate_seconds)}` : ""}`;
+  if (retryBtn) retryBtn.hidden = !incomplete;
+  if (incomplete) {
+    if (!panel.dataset.autoOpened) {
+      panel.open = true;
+      panel.dataset.autoOpened = "1";
+    }
+  } else {
+    delete panel.dataset.autoOpened;
+  }
+  $("scanQualitySummary").textContent = [
+    formatDuration(diagnostics.total_duration_seconds),
+    `${diagnostics.cache_hits || 0} cache hits`,
+    diagnostics.first_duplicate_seconds != null
+      ? `first duplicate ${formatDuration(diagnostics.first_duplicate_seconds)}`
+      : "",
+    issueText,
+  ].filter(Boolean).map((part) => `· ${part}`).join(" ");
   $("scanQualityGrid").innerHTML = stages.map(([name, stage]) => {
     // Stage warnings are capped server-side; say so instead of implying the
     // shown list is complete.
@@ -84,7 +128,6 @@ function renderDiagnostics(summary) {
     : "";
   $("scanQualityWarnings").innerHTML =
     shown.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("") + hiddenNote;
-  const incomplete = failed > 0 || warnings.length > 0;
   $("scanQualityWarning").hidden = !incomplete;
   $("scanQualityWarning").textContent = incomplete
     ? `Analysis is incomplete: ${failed ? `${failed} item${failed === 1 ? "" : "s"} failed` : "scan warnings were reported"}. Review warnings before acting.`
@@ -173,16 +216,34 @@ $("btnDismissSession").addEventListener("click", () => {
   $("sessionStatus").hidden = true;
 });
 
+let statusSeq = 0;
+
 async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   // With no payload this is the polling path; SSE status events pass theirs
   // in and stream groups separately (group/reset events) instead of refetching.
+  const seq = ++statusSeq;
   const s = payload || (await api("/api/status"));
+  if (!payload && seq !== statusSeq) return s;
   const statusEl = $("scanStatus");
   const wrap = $("progressWrap");
   const bar = $("progressBar");
   const msg = $("progressMsg");
   const top = $("topStats");
-  const scanCompleted = state.scanning && !s.scanning && s.progress?.done;
+  const completedPendingStart =
+    state.pendingScanStart
+    && !s.scanning
+    && Boolean(s.progress?.done)
+    && Boolean(s.scan_id)
+    && s.scan_id !== state.pendingScanPriorId;
+  const scanCompleted = (state.scanning || completedPendingStart) && !s.scanning && s.progress?.done;
+  if (completedPendingStart) state.pendingScanStart = false;
+  if (s.scan_id) {
+    if (!s.scanning && s.progress?.done) {
+      state.completedScanId = s.scan_id;
+    } else if (s.scanning && state.completedScanId === s.scan_id) {
+      state.completedScanId = null;
+    }
+  }
 
   // A new scan ends in-app undo for files trashed from the earlier review;
   // say so once instead of letting the restore control silently vanish.
@@ -208,9 +269,13 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     busy: state.scanning || state.acting, scanId: state.scanId, done: s.progress?.done,
   } }));
   renderSession(s.review_session, s.progress?.message === "Resumed saved review");
-  document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
-    element.disabled = state.scanning || state.acting;
-  });
+  if (state.scanning || state.acting) {
+    document.querySelectorAll("#actionBar button, #actionBar input").forEach((element) => {
+      element.disabled = true;
+    });
+  } else {
+    updateSelectionSummary();
+  }
 
   // Gate dependency-bound scan options (OpenCV/Photon/ffmpeg) once known.
   if (s.capabilities && s.capabilities !== state.capabilities) {
@@ -246,6 +311,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
       state.autoWorkers = auto;
       workersEl.max = String(Math.max(8, Math.min(32, maxW)));
       updateWorkersUI();
+      syncRangeInput(workersEl);
     }
   }
 
@@ -261,26 +327,41 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     const total = p.files_found || 0;
     const done = p.files_processed || 0;
     const groupsSoFar = p.groups_found || 0;
-    // Soft progress while hashing; bump near-complete as groups stream in
-    let pct = total ? Math.min(95, Math.round((done / total) * 100)) : 12;
-    if (groupsSoFar > 0) pct = Math.max(pct, Math.min(98, 20 + groupsSoFar * 3));
-    const shownPct = p.done ? 100 : Math.max(pct, 5);
-    if (total === 0 && !p.done && groupsSoFar === 0) bar.removeAttribute("value");
-    else bar.value = shownPct;
-    const baseMsg = p.message || p.phase || "";
+    const newOnly = Boolean(s.scan_settings?.new_only || state.lastScanSettings?.new_only);
+    if (p.done) {
+      bar.value = 100;
+    } else if (total > 0) {
+      bar.value = Math.max(2, Math.min(99, Math.round((done / total) * 100)));
+    } else {
+      bar.removeAttribute("value");
+    }
+    const rawMsg = p.message || p.phase || "";
+    const baseMsg = newOnly
+      ? (rawMsg && p.phase !== "starting"
+        ? `Checking new arrivals against baseline… (${rawMsg})`
+        : "Checking new arrivals against baseline…")
+      : rawMsg;
+    const elapsedText = Number(p.elapsed_seconds) >= 1
+      ? `${formatDuration(p.elapsed_seconds)} elapsed`
+      : "";
     const parts = [
       total > 0 ? `${done}/${total}` : "",
       baseMsg,
-      groupsSoFar > 1 || groupsSoFar === 1
+      groupsSoFar > 0
         ? `${groupsSoFar} group${groupsSoFar === 1 ? "" : "s"} so far`
         : "",
+      elapsedText,
       p.eta_seconds > 0 ? `about ${formatDuration(p.eta_seconds)} left` : "",
     ];
     msg.textContent = parts.filter(Boolean).join(" · ");
   } else {
     $("btnScan").disabled = false;
     $("btnCancelScan").hidden = true;
+    $("btnCancelScan").disabled = false;
+    $("btnCancelScan").textContent = "Cancel";
     $("btnCancelScanProgress").hidden = true;
+    $("btnCancelScanProgress").disabled = false;
+    $("btnCancelScanProgress").textContent = "Cancel scan";
     $("btnScan").querySelector(".btn-label").textContent = "Scan";
     if (s.progress?.done) {
       bar.value = 100;
@@ -295,12 +376,14 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
 
   if (s.summary) {
     renderDiagnostics(s.summary);
+    const { failed, warnings } = summarizeDiagnostics(s.summary);
+    const issueLabel = issueBadgeText(failed, warnings.length);
     const scanningNote = s.scanning ? " · live" : "";
     const reviewCount = s.summary.group_count;
     // One compact chip: the per-category counts live on the tabs below.
     top.innerHTML = `
       <span class="stat-chip"><span class="dot"></span><strong>${reviewCount}</strong> groups${scanningNote}<span class="stat-sep" aria-hidden="true">·</span><span class="reclaim-dot dot"></span><strong>${s.summary.reclaimable_human}</strong> reclaimable</span>
-      ${s.summary.errors?.length ? `<span class="stat-chip muted-chip">${s.summary.errors.length} warning${s.summary.errors.length === 1 ? "" : "s"}</span>` : ""}
+      ${issueLabel ? `<span class="stat-chip muted-chip">${escapeHtml(issueLabel)}</span>` : ""}
     `;
     // Show results as soon as we have a result shell (even 0 groups) while scanning,
     // or whenever summary is present after scan.
@@ -313,6 +396,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     $("countAll").textContent = s.summary.group_count;
     $("countExact").textContent = s.summary.exact_groups;
     $("countSimilar").textContent = s.summary.similar_groups;
+    if ($("countSets")) $("countSets").textContent = s.summary.sets_groups || 0;
     $("countLowResolution").textContent = s.summary.low_resolution_files || 0;
     $("countRandomReview").textContent = s.summary.random_review_files || 0;
     $("countNoHumans").textContent = s.summary.no_human_files || 0;
@@ -323,6 +407,10 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
     markEmptyTabs();
   } else {
     $("scanQuality").hidden = true;
+    $("scanQuality").open = false;
+    delete $("scanQuality").dataset.autoOpened;
+    if ($("scanQualityBadge")) $("scanQualityBadge").hidden = true;
+    if ($("btnRetryAnalysis")) $("btnRetryAnalysis").hidden = true;
     top.innerHTML = s.error
       ? `<span class="stat-chip muted-chip">Error: ${escapeHtml(s.error)}</span>`
       : `<span class="stat-chip muted-chip">No scan yet</span>`;
@@ -340,7 +428,11 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   const versionChanged =
     Number.isFinite(version) && version !== state.groupsVersion;
   if (versionChanged) state.groupsVersion = version;
-  if (handleGroups && s.has_result && (versionChanged || (!s.scanning && s.progress?.done))) {
+  const needsFinalLoad =
+    !s.scanning
+    && Boolean(s.progress?.done)
+    && (scanCompleted || !Number.isFinite(version) || state.loadedGroupsVersion !== version);
+  if (handleGroups && s.has_result && (versionChanged || needsFinalLoad)) {
     await loadGroups({ preserveSelection: s.scanning });
   }
   syncCollapseButtonVisibility();
@@ -361,6 +453,9 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   if (scanCompleted) {
     if (s.error) toast(s.error, "error");
     else toast(s.progress.message || "Scan complete", "ok");
+    if ((s.error || s.progress?.phase === "cancelled" || s.progress?.phase === "error") && !s?.summary?.group_count) {
+      expandScanPanel();
+    }
   }
   // A resumed session whose files all pruned away loads as a baffling empty
   // review; explain it once and point at a fresh scan.
@@ -439,8 +534,23 @@ function openEventStream() {
       /* malformed event; the next reset resyncs */
     }
   });
-  source.addEventListener("reset", () => {
-    state.groupsVersion = -1;
+  source.addEventListener("reset", (event) => {
+    let resetPayload = null;
+    try {
+      resetPayload = JSON.parse(event.data || "{}");
+    } catch {
+      resetPayload = null;
+    }
+    if (resetPayload?.scan_id) {
+      state.scanId = resetPayload.scan_id;
+    }
+    if (resetPayload?.scanning) {
+      state.groupsVersion = -1;
+      state.loadedGroupsVersion = -1;
+      return;
+    }
+    const resetVersion = Number(resetPayload?.groups_version);
+    state.groupsVersion = Number.isFinite(resetVersion) ? resetVersion : -1;
     loadGroups().catch((e) => toast(e.message || String(e), "error"));
   });
   source.onerror = () => {

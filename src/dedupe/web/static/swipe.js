@@ -10,12 +10,12 @@ import { noteReviewPair, recordReview, undoReview } from "./review-metrics.js";
 import { wireComparison } from "./comparison.js";
 import { boardActive } from "./board.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
-import { lightboxOpen, openLightbox, updateLightbox } from "./lightbox.js";
+import { closeLightbox, lightboxOpen, openLightbox, updateLightbox } from "./lightbox.js";
 import { selectGroup } from "./members.js";
-import { currentGroup, patchGroup } from "./model.js";
+import { currentGroup, lightboxItemFor, patchGroup } from "./model.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
-import { $, basename, escapeHtml, formatBytes, formatMtime, toast } from "./util.js";
+import { $, basename, escapeHtml, formatBytes, formatMtime, isOverlayOpen, toast, withMediaVersion } from "./util.js";
 
 const COMMIT_PX = 130; // horizontal travel that commits a swipe
 const DRAG_GRAB_PX = 8; // movement before a horizontal drag engages
@@ -23,6 +23,20 @@ const FLICK_VELOCITY = 500; // px/s fast enough to commit without full travel
 
 const reducedMotion = () =>
   typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+let activeSpringCancel = null;
+let activeFlyOff = false;
+
+function cleanupActiveFlyOff() {
+  if (activeSpringCancel) {
+    activeSpringCancel();
+    activeSpringCancel = null;
+  }
+  if (activeFlyOff) {
+    activeFlyOff = false;
+    state.swipeBusy = false;
+  }
+}
 
 // The deck is the single-group Similar view unless the list is chosen; on the
 // Similar tab a "board" preference shows the board instead of any one group.
@@ -32,7 +46,7 @@ function swipeActive() {
 }
 
 // The reference copy the deck is compared against — the suggested keeper until
-// the user re-anchors with "Use as reference".
+// the user re-anchors with "Use as reference" or "Keep right · Trash left".
 function anchorFor(g) {
   const deleted = new Set(g.deleted_paths || []);
   const memberPaths = new Set((g.members || []).map((member) => member.path));
@@ -73,12 +87,17 @@ function undoStackFor(groupId) {
 
 function restoreToDeck(groupId, path) {
   const order = state.swipeDeckOrder.get(groupId) || [];
-  if (!order.includes(path)) order.unshift(path);
-  state.swipeDeckOrder.set(groupId, order);
+  const filtered = order.filter((item) => item !== path);
+  filtered.unshift(path);
+  state.swipeDeckOrder.set(groupId, filtered);
 }
 
-function previewUrl(path) {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}&variant=preview`;
+function previewUrl(member) {
+  return withMediaVersion(
+    `/api/thumbnail?path=${encodeURIComponent(member.path)}&variant=preview`,
+    member.path,
+    member.media_version,
+  );
 }
 
 function memberByPath(g, path) {
@@ -90,16 +109,22 @@ function memberMeta(member) {
     && member.width > 0 && member.height > 0
     ? `${member.width}×${member.height}`
     : "—";
-  return [formatBytes(member.size), dims, member.duration != null ? `${Number(member.duration).toFixed(1)}s` : null, formatMtime(member.mtime)].filter(Boolean).join(" · ");
+  return [
+    formatBytes(member.size),
+    dims,
+    member.duration != null ? `${Number(member.duration).toFixed(1)}s` : null,
+    formatMtime(member.mtime),
+  ].filter(Boolean).join(" · ");
 }
 
 function mediaHtml(member) {
   const fileName = basename(member.path);
   const mediaUrl = `/api/media?path=${encodeURIComponent(member.path)}`;
+  const preview = previewUrl(member);
   if (member.media_type === "video") {
-    return `<video src="${mediaUrl}" poster="${previewUrl(member.path)}" controls muted loop playsinline preload="metadata" aria-label="Play ${escapeHtml(fileName)}"></video>`;
+    return `<video src="${mediaUrl}" poster="${escapeHtml(preview)}" controls muted loop playsinline preload="metadata" aria-label="Play ${escapeHtml(fileName)}"></video>`;
   }
-  return `<img src="${member.media_type === "gif" ? mediaUrl : previewUrl(member.path)}" alt="Preview of ${escapeHtml(fileName)}" draggable="false" decoding="async" />`;
+  return `<img src="${member.media_type === "gif" ? mediaUrl : escapeHtml(preview)}" alt="Preview of ${escapeHtml(fileName)}" draggable="false" decoding="async" />`;
 }
 
 // Similarity is computed against the suggested keeper; after a re-anchor the
@@ -152,6 +177,7 @@ function sideHtml(member, { tag, tagClass = "", card = false, meta = "", extraCl
 }
 
 function renderSwipeReview(g) {
+  cleanupActiveFlyOff();
   const box = $("members");
   box.querySelectorAll("video").forEach((video) => {
     video.pause();
@@ -180,21 +206,9 @@ function renderSwipeReview(g) {
 
   // The lightbox compares each candidate against the reference; the reference
   // itself sits at index 0 so its panel opens the full view too.
-  const lightboxEntry = (member, keeper) => ({
-    path: member.path,
-    mediaType: member.media_type,
-    keeper,
-    kind: g.kind,
-    size: member.size,
-    width: member.width,
-    height: member.height,
-    mtime: member.mtime,
-    similarityPercent: member.similarity_percent,
-    orientationLabel: member.orientation_label,
-  });
   state.lightboxItems = [
-    ...(anchorMember ? [lightboxEntry(anchorMember, anchor)] : []),
-    ...deck.map((path) => lightboxEntry(memberByPath(g, path), anchor)),
+    ...(anchorMember ? [lightboxItemFor(anchorMember, g, anchor)] : []),
+    ...deck.map((path) => memberByPath(g, path)).filter(Boolean).map((m) => lightboxItemFor(m, g, anchor)),
   ];
 
   const done = deck.length === 0;
@@ -205,12 +219,21 @@ function renderSwipeReview(g) {
   const candidate = done ? null : memberByPath(g, deck[0]);
   if (candidate && anchorMember) noteReviewPair(anchorMember.path, candidate.path);
 
+  const locked = Boolean(state.scanning);
+  const keeperReasonText = anchor === g.suggested_keep
+    ? (g.cleanup?.keeper_reason || "ranked by resolution, size, date, and path")
+    : "Your chosen reference";
+  const keepRightDisabled = locked || Boolean(anchorMember?.protected);
+  const keepRightTitle = anchorMember?.protected
+    ? "The left reference is in a protected library"
+    : "Keep the right photo as reference and move the left reference to Trash (Shift+K)";
+
   const pairHtml = done
     ? `<div class="swipe-done">
         <strong>All ${decided} ${decided === 1 ? "copy" : "copies"} reviewed</strong>
         <p class="muted">${trashedCount ? `${trashedCount} moved to Trash · ` : ""}the reference and every different photo stay on disk.</p>
         <div class="swipe-done-actions">
-          ${undoStack.length ? '<button class="btn ghost" id="swipeUndoDone" type="button">Undo last decision</button>' : ""}
+          ${undoStack.length ? `<button class="btn ghost" id="swipeUndoDone" type="button"${locked ? " disabled" : ""}>Undo last decision</button>` : ""}
           <button class="btn primary-soft" id="swipeNext" type="button">Next group</button>
         </div>
       </div>`
@@ -221,29 +244,33 @@ function renderSwipeReview(g) {
           extraClass: "swipe-keeper",
         }) : ""}
         <div class="swipe-vs">
-          <button class="swipe-btn swipe-same" id="swipeSame" type="button"
+          <button class="swipe-btn swipe-same" id="swipeSame" type="button"${locked ? " disabled" : ""}
                   title="Same photo — this copy moves to Trash (undoable)">
             <kbd>←</kbd><strong>Same · Trash copy</strong>
           </button>
           <span class="swipe-vs-badge" aria-hidden="true">vs</span>
-          <button class="swipe-btn swipe-diff" id="swipeDiff" type="button"
+          <button class="swipe-btn swipe-diff" id="swipeDiff" type="button"${locked ? " disabled" : ""}
                   title="Different — keep both, the pair never re-matches">
             <strong>Different · Keep both</strong><kbd>→</kbd>
+          </button>
+          <button class="swipe-btn swipe-keep-right" id="swipeKeepRight" type="button"${keepRightDisabled ? " disabled" : ""}
+                  title="${escapeHtml(keepRightTitle)}">
+            <strong>Keep right · Trash left</strong><kbd>⇧K</kbd>
           </button>
         </div>
         ${sideHtml(candidate, { card: true, meta: similarityChip(candidate, g, anchor) })}
       </div>
       <div class="comparison-summary" id="comparisonSummary" aria-live="polite">
-        <span>${escapeHtml(g.cleanup?.reason || "Compare each copy with the reference")}. Reference: ${escapeHtml(g.cleanup?.keeper_reason || "your choice")}.</span>
+        <span>${escapeHtml(g.cleanup?.reason || "Compare each copy with the reference")}. Reference: ${escapeHtml(keeperReasonText)}.</span>
         ${candidate.media_type === "video" && anchorMember?.media_type === "video" ? '<label><input type="checkbox" id="syncVideos" /> Synchronize playback and seeking</label>' : '<span>Expand for overlay, difference, and shared zoom. Crops may require visual alignment.</span>'}
         <span id="comparisonMetadata">Reading metadata…</span>
       </div>
       <div class="swipe-mid">
         <span class="swipe-progress">${decided} / ${total} reviewed${deck.length > 1 ? ` · ${deck.length - 1} after this` : ""}</span>
         <button class="linkish" id="swipeSkip" type="button" ${deck.length < 2 ? "disabled" : ""} title="Decide later — send this copy to the back of the queue">Skip</button>
-        <button class="linkish" id="swipeUndo" type="button" ${undoStack.length ? "" : "disabled"}>Undo</button>
+        <button class="linkish" id="swipeUndo" type="button" ${undoStack.length && !locked ? "" : "disabled"}>Undo</button>
       </div>
-      <p class="swipe-hint muted"><kbd>←</kbd> same photo (Trash) · <kbd>→</kbd> different (keep both) · drag the copy too · <kbd>Enter</kbd> compares closely · <kbd>⌫</kbd> undoes</p>`;
+      <p class="swipe-hint muted"><kbd>←</kbd> same photo (Trash) · <kbd>→</kbd> different (keep both) · <kbd>⇧K</kbd> keep right, Trash left · drag the copy too · <kbd>Enter</kbd> compares closely · <kbd>⌫</kbd> undoes</p>`;
 
   box.innerHTML = `<div class="swipe-review">${pairHtml}</div>`;
   wireSwipeDom(g);
@@ -258,6 +285,7 @@ function wireSwipeDom(g) {
   });
   box.querySelector("#swipeSame")?.addEventListener("click", () => decideSwipe("same"));
   box.querySelector("#swipeDiff")?.addEventListener("click", () => decideSwipe("distinct"));
+  box.querySelector("#swipeKeepRight")?.addEventListener("click", keepRightTrashLeft);
   box.querySelector("#swipeSkip")?.addEventListener("click", skipSwipe);
   box.querySelector("#swipeUndo")?.addEventListener("click", undoSwipe);
   box.querySelector("#swipeUndoDone")?.addEventListener("click", undoSwipe);
@@ -294,7 +322,9 @@ function spring({ from, to, velocity = 0, stiffness = 230, damping = 20, onUpdat
   let x = from;
   let v = velocity;
   let last = null;
+  let cancelled = false;
   let raf = requestAnimationFrame(function step(t) {
+    if (cancelled) return;
     if (last == null) last = t;
     const dt = Math.min(0.032, (t - last) / 1000);
     last = t;
@@ -308,7 +338,10 @@ function spring({ from, to, velocity = 0, stiffness = 230, damping = 20, onUpdat
     }
     raf = requestAnimationFrame(step);
   });
-  return () => cancelAnimationFrame(raf);
+  return () => {
+    cancelled = true;
+    cancelAnimationFrame(raf);
+  };
 }
 
 function wireDrag(g, card) {
@@ -345,10 +378,23 @@ function wireDrag(g, card) {
   };
 
   const flyOff = (direction, dx, velocity) => {
+    if (state.swipeBusy || card.dataset.committing === "1" || state.scanning || state.actionBusy) {
+      snapBack(dx, velocity);
+      return;
+    }
+    const cardPath = card.dataset.path;
+    if (!cardPath) {
+      snapBack(dx, velocity);
+      return;
+    }
+    card.dataset.committing = "1";
+    state.swipeBusy = true;
+    activeFlyOff = true;
     const target = (direction === "same" ? -1 : 1) * Math.max(card.offsetWidth + 120, window.innerWidth * 0.55);
     if (reducedMotion()) {
       card.style.opacity = "0";
-      decideSwipe(direction);
+      activeFlyOff = false;
+      decideSwipe(direction, cardPath, { bypassBusyCheck: true });
       return;
     }
     cancelAnimation = spring({
@@ -362,12 +408,25 @@ function wireDrag(g, card) {
         card.style.opacity = String(Math.max(0.15, 1 - (Math.abs(x) / Math.abs(target)) * 0.85));
       },
       doneWhen: (x) => Math.abs(x) >= Math.abs(target) * 0.92,
-      onDone: () => decideSwipe(direction),
+      onDone: () => {
+        activeSpringCancel = null;
+        activeFlyOff = false;
+        cancelAnimation = null;
+        if (!card.isConnected) {
+          state.swipeBusy = false;
+          return;
+        }
+        decideSwipe(direction, cardPath, { bypassBusyCheck: true });
+      },
     });
+    activeSpringCancel = cancelAnimation;
   };
 
   media.addEventListener("pointerdown", (event) => {
     if (event.button !== undefined && event.button !== 0) return;
+    if (state.swipeBusy || card.dataset.committing === "1" || state.scanning || state.actionBusy) {
+      return;
+    }
     cancelAnimation?.();
     cancelAnimation = null;
     delete card.dataset.dragged;
@@ -441,12 +500,16 @@ function refreshAfterDecision(g) {
   const openPath = state.lightboxItems[state.lightboxIndex]?.path;
   const live = currentGroup();
   if (live && live.id === g.id) renderSwipeReview(live);
-  if (lightboxOpen() && state.lightboxItems.length) {
-    const idx = state.lightboxItems.findIndex((item) => item.path === openPath);
-    state.lightboxIndex = idx >= 0
-      ? idx
-      : Math.min(state.lightboxIndex, state.lightboxItems.length - 1);
-    updateLightbox();
+  if (lightboxOpen()) {
+    if (!state.lightboxItems.length) {
+      closeLightbox();
+    } else {
+      const idx = state.lightboxItems.findIndex((item) => item.path === openPath);
+      state.lightboxIndex = idx >= 0
+        ? idx
+        : Math.min(state.lightboxIndex, state.lightboxItems.length - 1);
+      updateLightbox();
+    }
   }
   if (selectionFiltersActive() || !updateGroupListItem(g)) {
     scheduleRender({ groupList: true });
@@ -459,20 +522,33 @@ function refreshAfterDecision(g) {
 // Decide one card — the deck's top card by default, or a specific member when
 // the lightbox is open on it. Only live deck members are decidable; the
 // reference and already-decided paths no-op.
-async function decideSwipe(direction, path = null) {
+async function decideSwipe(direction, path = null, { bypassBusyCheck = false } = {}) {
   const g = currentGroup();
-  if (!swipeActive() || !g) return;
+  if (!swipeActive() || !g) {
+    if (bypassBusyCheck) state.swipeBusy = false;
+    return;
+  }
+  if (state.scanning || state.actionBusy) {
+    if (bypassBusyCheck) state.swipeBusy = false;
+    toast("Decisions unlock when the scan or file action finishes", "error");
+    return;
+  }
+  if (!bypassBusyCheck && state.swipeBusy) {
+    // Held arrow keys repeat faster than the round-trip: keep the latest
+    // decision with its original path argument so null resolves the next card.
+    state.pendingSwipeDecision = { direction, path };
+    return;
+  }
   const deck = deckFor(g);
   const target = path || deck[0];
-  if (!target || !deck.includes(target)) return;
-  if (state.swipeBusy) {
-    // Held arrow keys repeat faster than the round-trip: keep the latest.
-    state.pendingSwipeDecision = { direction, path: target };
+  if (!target || !deck.includes(target)) {
+    if (bypassBusyCheck) state.swipeBusy = false;
     return;
   }
   state.swipeBusy = true;
   const anchor = anchorFor(g);
-  undoStackFor(g.id).push({ action: direction === "same" ? "trash" : "distinct", path: target, anchor });
+  const stack = undoStackFor(g.id);
+  stack.push({ action: direction === "same" ? "trash" : "distinct", path: target, anchor });
   try {
     if (direction === "same") {
       const updated = await api("/api/review-candidate/delete", {
@@ -504,7 +580,28 @@ async function decideSwipe(direction, path = null) {
       });
       recordReview(anchor, target, false);
       if (res.dissolved || !res.group) {
-        toast("Different — pair marked, group finished", "ok");
+        const idx = stack.findIndex((entry) => entry.path === target && entry.action === "distinct");
+        if (idx >= 0) stack.splice(idx, 1);
+        if (lightboxOpen()) closeLightbox();
+        toast("Different — pair marked, group finished", "ok", {
+          actionLabel: "Undo",
+          onAction: async () => {
+            try {
+              await api("/api/history/reconsider", {
+                method: "POST",
+                body: JSON.stringify({
+                  path_a: anchor,
+                  path_b: target,
+                  scan_id: state.scanId,
+                }),
+              });
+              undoReview(anchor, target);
+              toast("Decision reverted — the pair can match again on the next scan", "ok");
+            } catch (error) {
+              toast(error.message || "Could not undo that decision", "error");
+            }
+          },
+        });
         await loadGroups();
         return;
       }
@@ -516,8 +613,60 @@ async function decideSwipe(direction, path = null) {
       });
     }
   } catch (error) {
-    const stack = state.swipeUndo.get(g.id);
-    const index = stack ? stack.findIndex((entry) => entry.path === target) : -1;
+    const index = stack.findIndex((entry) => entry.path === target);
+    if (index >= 0) stack.splice(index, 1);
+    toast(error.message || "Could not apply that decision", "error");
+    const live = currentGroup();
+    if (live && live.id === g.id) renderSwipeReview(live);
+  } finally {
+    state.swipeBusy = false;
+    const pending = state.pendingSwipeDecision;
+    state.pendingSwipeDecision = null;
+    if (pending) await decideSwipe(pending.direction, pending.path);
+  }
+}
+
+async function keepRightTrashLeft() {
+  const g = currentGroup();
+  if (!swipeActive() || !g) return;
+  if (state.scanning || state.actionBusy) {
+    toast("Decisions unlock when the scan or file action finishes", "error");
+    return;
+  }
+  if (state.swipeBusy) return;
+  const oldAnchor = anchorFor(g);
+  const deck = deckFor(g);
+  const newAnchor = deck[0];
+  if (!oldAnchor || !newAnchor) return;
+  const oldAnchorMember = memberByPath(g, oldAnchor);
+  if (oldAnchorMember?.protected) {
+    toast("The left reference is in a protected library");
+    return;
+  }
+  state.swipeBusy = true;
+  const stack = undoStackFor(g.id);
+  const entry = { action: "trash", path: oldAnchor, anchor: newAnchor, prevAnchor: oldAnchor };
+  stack.push(entry);
+  try {
+    const updated = await api("/api/review-candidate/delete", {
+      method: "POST",
+      body: JSON.stringify({
+        group_id: g.id,
+        path: oldAnchor,
+        scan_id: state.scanId,
+        dry_run: false,
+      }),
+    });
+    state.swipeAnchors.set(g.id, newAnchor);
+    recordReview(newAnchor, oldAnchor, true);
+    patchGroup(updated);
+    refreshAfterDecision(updated);
+    toast(`Kept ${basename(newAnchor)} — moved ${basename(oldAnchor)} to Trash`, "ok", {
+      actionLabel: "Undo",
+      onAction: () => undoSwipe(),
+    });
+  } catch (error) {
+    const index = stack.lastIndexOf(entry);
     if (index >= 0) stack.splice(index, 1);
     toast(error.message || "Could not apply that decision", "error");
     const live = currentGroup();
@@ -533,6 +682,10 @@ async function decideSwipe(direction, path = null) {
 async function undoSwipe() {
   const g = currentGroup();
   if (!g || g.kind !== "similar") return;
+  if (state.scanning || state.actionBusy) {
+    toast("Undo unlocks when the scan or file action finishes", "error");
+    return;
+  }
   const stack = state.swipeUndo.get(g.id);
   const entry = stack ? stack[stack.length - 1] : null;
   if (!entry) return;
@@ -543,7 +696,12 @@ async function undoSwipe() {
         body: JSON.stringify({ group_id: g.id, path: entry.path, scan_id: state.scanId }),
       });
       patchGroup(updated);
-      restoreToDeck(g.id, entry.path);
+      if (entry.prevAnchor) {
+        state.swipeAnchors.set(g.id, entry.prevAnchor);
+        restoreToDeck(g.id, entry.anchor);
+      } else {
+        restoreToDeck(g.id, entry.path);
+      }
       undoReview(entry.anchor, entry.path);
       stack.pop();
       refreshAfterDecision(updated);
@@ -608,4 +766,19 @@ function advanceToNextGroup() {
   selectGroup(next.id).catch((e) => toast(e.message || String(e), "error"));
 }
 
-export { renderSwipeReview, decideSwipe, undoSwipe, skipSwipe, swipeActive };
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "K" || event.metaKey || event.ctrlKey || event.altKey) return;
+  const tag = event.target?.tagName || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || event.target?.isContentEditable) return;
+  if ($("results").hidden || !swipeActive() || lightboxOpen()) return;
+  if (
+    isOverlayOpen($("modalBackdrop"))
+    || isOverlayOpen($("helpBackdrop"))
+    || isOverlayOpen($("historyPanel"))
+    || isOverlayOpen($("cropEditor"))
+  ) return;
+  event.preventDefault();
+  keepRightTrashLeft();
+});
+
+export { renderSwipeReview, decideSwipe, undoSwipe, skipSwipe, swipeActive, keepRightTrashLeft };

@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 
 from dedupe.actions import collect_selected_paths
+from dedupe.cleanup import cleanup_opportunity
+from dedupe.face_detection import face_detection_signature
 from dedupe.grouping import (
     apply_smart_select,
     build_all_files_groups,
@@ -12,9 +14,13 @@ from dedupe.grouping import (
     build_groups,
     build_low_resolution_groups,
     build_no_human_groups,
+    build_one_group,
     build_random_review_groups,
+    cluster_around_best,
+    dominant_media_type,
     ensure_all_files_groups,
     pick_suggested_keep,
+    rank_keep_candidate,
 )
 from dedupe.human_detection import human_detection_signature
 from dedupe.models import (
@@ -284,14 +290,17 @@ def test_overlapping_no_human_selection_still_retains_a_duplicate() -> None:
 
 
 def test_no_human_groups_reject_counted_female_faces() -> None:
+    face_sig = face_detection_signature()
     safe = _mark_no_person(_rec("/landscape.jpg", 300, 1))
     woman = _mark_no_person(_rec("/portrait.jpg", 400, 2))
     woman.face_count = 1
     woman.female_face_count = 1
+    woman.face_detection_signature = face_sig
     man = _mark_no_person(_rec("/group.jpg", 500, 3))
     man.face_count = 2
     man.male_face_count = 2
     man.female_face_count = 0
+    man.face_detection_signature = face_sig
 
     groups = build_no_human_groups([safe, woman, man])
 
@@ -304,6 +313,7 @@ def test_loaded_no_human_group_drops_female_face_records() -> None:
     woman = _mark_no_person(_rec("/portrait.jpg", 400, 2))
     woman.face_count = 1
     woman.female_face_count = 1
+    woman.face_detection_signature = face_detection_signature()
     raw = ReviewGroup(
         id="no-human-female",
         kind=GroupKind.NO_HUMANS,
@@ -621,3 +631,234 @@ def test_all_files_group_survives_a_session_roundtrip() -> None:
     assert [group.kind for group in loaded.groups] == [GroupKind.ALL_FILES]
     assert loaded.groups[0].policy == ReviewPolicy.INDEPENDENT_CANDIDATES
     assert [member.path for member in loaded.groups[0].members] == ["/root/a.jpg"]
+
+
+def test_rank_keep_candidate_honors_cached_capture_metadata_without_opening_file(monkeypatch) -> None:
+    from PIL import Image
+
+    monkeypatch.setattr(
+        Image,
+        "open",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("should not reopen file")),
+    )
+    a = _rec("/a.jpg", 100, 1, w=1000, h=1000)
+    a.capture_metadata = True
+    b = _rec("/b.jpg", 100, 1, w=1000, h=1000)
+    b.capture_metadata = False
+    assert rank_keep_candidate(a) > rank_keep_candidate(b)
+
+
+def test_rank_keep_candidate_uses_effective_pixels_and_quality_tiers() -> None:
+    # Uncropped screenshot with chrome loses to clean original of same/more content.
+    screenshot = _rec("/Screenshot 2024.png", size=5000, mtime=1, w=1200, h=2000)
+    screenshot.extension = ".png"
+    screenshot.capture_metadata = False
+    screenshot.border_crop = "0,300,1200,1700,1200,2000,top+bottom"
+    clean = _rec("/clean.png", size=4000, mtime=1, w=1200, h=1500)
+    clean.extension = ".png"
+    clean.capture_metadata = False
+    assert pick_suggested_keep([screenshot, clean]) == clean.path
+
+    # Same effective pixels, clean beats substantially bordered copy.
+    bordered = _rec("/bordered.jpg", size=5000, mtime=1, w=1200, h=1200)
+    bordered.capture_metadata = False
+    bordered.border_crop = "100,100,1100,1100,1200,1200"
+    clean_same = _rec("/photo.jpg", size=4000, mtime=1, w=1000, h=1000)
+    clean_same.capture_metadata = False
+    assert pick_suggested_keep([bordered, clean_same]) == clean_same.path
+
+    # HEIC does not lose to bloated JPEG on raw byte size at equal resolution.
+    heic = _rec("/shot.heic", size=1_500_000, mtime=1, w=4000, h=3000)
+    heic.extension = ".heic"
+    heic.capture_metadata = True
+    jpg = _rec("/shot.jpg", size=4_500_000, mtime=1, w=4000, h=3000)
+    jpg.capture_metadata = True
+    assert pick_suggested_keep([jpg, heic]) == heic.path
+
+    # EXIF cannot override >2x effective-pixel deficit (640x480 EXIF vs 4000x3000 master).
+    thumb = _rec("/thumb.jpg", size=100_000, mtime=1, w=640, h=480)
+    thumb.capture_metadata = True
+    master = _rec("/master.png", size=5_000_000, mtime=1, w=4000, h=3000)
+    master.extension = ".png"
+    master.capture_metadata = False
+    assert pick_suggested_keep([thumb, master]) == master.path
+
+    # EXIF still wins on comparable resolutions (within 2x pixels).
+    comp_exif = _rec("/cam.jpg", size=500_000, mtime=1, w=1600, h=1200)
+    comp_exif.capture_metadata = True
+    comp_plain = _rec("/plain.jpg", size=600_000, mtime=2, w=2000, h=1500)
+    comp_plain.capture_metadata = False
+    assert pick_suggested_keep([comp_plain, comp_exif]) == comp_exif.path
+
+    # Format tier ordering: RAW > TIFF/PNG > HEIC/WebP > JPEG at equal resolution.
+    raw = _rec("/shot.dng", size=1000, mtime=1, w=2000, h=2000)
+    raw.extension = ".dng"
+    raw.capture_metadata = False
+    png = _rec("/shot.png", size=1000, mtime=1, w=2000, h=2000)
+    png.extension = ".png"
+    png.capture_metadata = False
+    webp = _rec("/shot.webp", size=1000, mtime=1, w=2000, h=2000)
+    webp.extension = ".webp"
+    webp.capture_metadata = False
+    jpeg = _rec("/shot.jpg", size=9000, mtime=1, w=2000, h=2000)
+    jpeg.capture_metadata = False
+    assert pick_suggested_keep([jpeg, webp]) == webp.path
+    assert pick_suggested_keep([webp, png]) == png.path
+    assert pick_suggested_keep([png, raw]) == raw.path
+
+
+def test_rank_keep_candidate_sharpness_video_and_export_names() -> None:
+    sharp = _rec("/a.jpg", 1000, 1, w=1000, h=1000)
+    sharp.capture_metadata = False
+    sharp.sharpness = 120.0
+    blurry = _rec("/b.jpg", 2000, 1, w=1000, h=1000)
+    blurry.capture_metadata = False
+    blurry.sharpness = 20.0
+    assert pick_suggested_keep([blurry, sharp]) == sharp.path
+
+    v_audio = FileRecord(
+        "/a.mp4", 1_000_000, 1.0, MediaType.VIDEO, ".mp4",
+        width=1920, height=1080, has_audio=True, video_bitrate=4_000_000, duration=10.0,
+    )
+    v_silent = FileRecord(
+        "/b.mp4", 2_000_000, 1.0, MediaType.VIDEO, ".mp4",
+        width=1920, height=1080, has_audio=False, video_bitrate=8_000_000, duration=10.0,
+    )
+    assert pick_suggested_keep([v_silent, v_audio]) == v_audio.path
+
+    for name in (
+        "/IMG-20240101-WA0002.jpg",
+        "/IMG_E1234.jpg",
+        "/Screenshot 2024.jpg",
+        "/photo (1).jpg",
+        "/photo_thumb.jpg",
+        "/photo_resized.jpg",
+    ):
+        orig = _rec("/photo.jpg", 1000, 1, w=1000, h=1000)
+        orig.capture_metadata = False
+        exp = _rec(name, 2000, 2, w=1000, h=1000)
+        exp.capture_metadata = False
+        assert pick_suggested_keep([exp, orig]) == orig.path
+
+
+def test_smart_select_fixes_kept_protection_recompute_smallest_and_alignment() -> None:
+    # SELECT_CANDIDATES never flips Kept files in LOW_RESOLUTION/FACES/RANDOM_REVIEW.
+    kept = _rec("/kept.jpg", 300, 1, w=100, h=100)
+    delete_me = _rec("/del.jpg", 300, 2, w=100, h=100)
+    low_res = build_low_resolution_groups([kept, delete_me])[0]
+    low_res.reviewed_paths = [kept.path, delete_me.path]
+    low_res.selected_for_removal = [delete_me.path]
+    apply_smart_select(low_res, SmartRule.SELECT_CANDIDATES)
+    assert low_res.selected_for_removal == [delete_me.path]
+
+    kept.face_count = 1
+    delete_me.face_count = 2
+    faces_group = build_faces_groups([kept, delete_me])[0]
+    faces_group.reviewed_paths = [kept.path]
+    apply_smart_select(faces_group, SmartRule.SELECT_CANDIDATES)
+    assert faces_group.selected_for_removal == []
+
+    rand_group = build_random_review_groups([kept, delete_me], count=2)[0]
+    rand_group.reviewed_paths = [kept.path]
+    apply_smart_select(rand_group, SmartRule.SELECT_CANDIDATES)
+    assert rand_group.selected_for_removal == []
+
+    # AUTOMATIC recomputes pick_suggested_keep after NEWEST mutated suggested_keep,
+    # while anchor_path stays preserved.
+    small_new = _rec("/new.jpg", size=500, mtime=100, w=200, h=200)
+    small_new.capture_metadata = False
+    big_old = _rec("/old.jpg", size=1000, mtime=10, w=2000, h=2000)
+    big_old.capture_metadata = False
+    group = build_one_group(GroupKind.SIMILAR, [small_new, big_old])
+    assert group.suggested_keep == big_old.path
+    assert group.anchor_path == big_old.path
+    apply_smart_select(group, SmartRule.NEWEST)
+    assert group.suggested_keep == small_new.path
+    assert group.anchor_path == big_old.path
+    apply_smart_select(group, SmartRule.AUTOMATIC)
+    assert group.suggested_keep == big_old.path
+
+    # Non-AUTOMATIC rules respect protected copies first.
+    big_old.protected = True
+    apply_smart_select(group, SmartRule.NEWEST)
+    assert group.suggested_keep == big_old.path
+    assert group.selected_for_removal == [small_new.path]
+
+    # SMALLEST does not mix unprobed byte size with pixel counts.
+    big_old.protected = False
+    unprobed = _rec("/unprobed.jpg", size=50_000_000, mtime=1, w=0, h=0)
+    tiny = _rec("/tiny.jpg", size=5000, mtime=2, w=100, h=100)
+    g_small = build_one_group(GroupKind.SIMILAR, [unprobed, tiny])
+    apply_smart_select(g_small, SmartRule.SMALLEST)
+    assert g_small.suggested_keep == tiny.path
+
+    # cluster_around_best and pick_suggested_keep agree on ties.
+    t1 = _rec("/a.jpg", 100, 1, w=100, h=100)
+    t2 = _rec("/b.jpg", 100, 1, w=100, h=100)
+    t1.capture_metadata = t2.capture_metadata = False
+    clustered = cluster_around_best([t1, t2], {t1.path: {t2.path}, t2.path: {t1.path}})
+    assert clustered[0][0].path == pick_suggested_keep([t1, t2])
+
+
+def test_build_groups_dedupes_exact_copies_in_similar_and_dominant_media_type() -> None:
+    a = _rec("/a.jpg", 100, 1, w=1000, h=1000)
+    b = _rec("/b.jpg", 100, 1, w=1000, h=1000)
+    c = _rec("/c.jpg", 50, 2, w=500, h=500)
+    a.capture_metadata = b.capture_metadata = c.capture_metadata = False
+    groups = build_groups([[a, b]], [[a, b, c]])
+    exact = next(g for g in groups if g.kind == GroupKind.EXACT)
+    similar = next(g for g in groups if g.kind == GroupKind.SIMILAR)
+    assert len(exact.members) == 2
+    assert len(similar.members) == 2
+    assert c in similar.members
+
+    video = FileRecord("/v.mp4", 100, 1.0, MediaType.VIDEO, ".mp4")
+    assert dominant_media_type([a, b, video]) == MediaType.MIXED
+    assert dominant_media_type([]) == MediaType.OTHER
+
+
+def test_cleanup_opportunity_curve_smoothness_and_exact_reasons() -> None:
+    # 1 GB semantic duplicate outranks 256-byte exact duplicate.
+    tiny_a = _rec("/t1.jpg", 256, 1)
+    tiny_b = _rec("/t2.jpg", 256, 2)
+    tiny_exact = build_one_group(GroupKind.EXACT, [tiny_a, tiny_b])
+
+    gb_a = _rec("/g1.jpg", 1_000_000_000, 1, w=4000, h=3000)
+    gb_b = _rec("/g2.jpg", 1_000_000_000, 2, w=2000, h=1500)
+    gb_sem = build_one_group(GroupKind.SIMILAR, [gb_a, gb_b], match_basis="semantic")
+    assert cleanup_opportunity(gb_sem)["score"] > cleanup_opportunity(tiny_exact)["score"]
+
+    # Smooth confidence weight around 95% without cliff, keeping clear labels.
+    sim_a = _rec("/s1.jpg", 100_000, 1, w=1000, h=1000)
+    sim_b = _rec("/s2.jpg", 100_000, 2, w=1000, h=1000)
+    sim_group = build_one_group(GroupKind.SIMILAR, [sim_a, sim_b])
+    below = cleanup_opportunity(sim_group, [94.9])
+    above = cleanup_opportunity(sim_group, [95.0])
+    assert below["label"] == "Compare copies"
+    assert above["label"] == "Strong match"
+    assert above["score"] - below["score"] < 0.05 * above["score"]
+
+    # EXACT groups do not cite identical EXIF or non-hash stage errors.
+    ex_a = _rec("/e1.jpg", 10_000, 1, w=1000, h=1000)
+    ex_b = _rec("/e2.jpg", 10_000, 2, w=1000, h=1000)
+    ex_a.capture_metadata = ex_b.capture_metadata = True
+    ex_a.sha256 = ex_b.sha256 = "abc"
+    ex_a.error = "face counting failed: timeout"
+    exact_group = build_one_group(GroupKind.EXACT, [ex_a, ex_b])
+    opp = cleanup_opportunity(exact_group)
+    assert "camera capture metadata" not in opp["keeper_reason"]
+    assert opp["label"] == "Identical files"
+
+    # Real sha256 error on EXACT still triggers Check file errors.
+    ex_a.error = "sha256 failed: PermissionError"
+    opp_err = cleanup_opportunity(exact_group)
+    assert opp_err["label"] == "Check file errors"
+    assert opp_err["score"] < opp["score"] * 0.2
+
+    # Resolution ties in multi-copy SIMILAR group report accurate tie reason.
+    t_hi1 = _rec("/hi1.jpg", 2000, 1, w=2000, h=2000)
+    t_hi2 = _rec("/hi2.jpg", 1500, 2, w=2000, h=2000)
+    t_lo = _rec("/lo.jpg", 500, 3, w=500, h=500)
+    t_hi1.capture_metadata = t_hi2.capture_metadata = t_lo.capture_metadata = False
+    tie_group = build_one_group(GroupKind.SIMILAR, [t_hi1, t_hi2, t_lo])
+    assert "matches highest resolution among copies" in cleanup_opportunity(tie_group)["keeper_reason"]

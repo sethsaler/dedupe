@@ -1,10 +1,21 @@
 // The group review list: fetch, filter, sort, windowed rendering.
 
 import { api } from "./api.js";
-import { renderBoard } from "./board.js";
-import { groupComplete, groupNeedsAttention, groupSelectedCount, isIndependentReview } from "./model.js";
+import { boardActive, renderBoard } from "./board.js";
+import {
+  groupComplete,
+  groupNeedsAttention,
+  groupReviewed,
+  groupSelectedCount,
+  isIndependentReview,
+} from "./model.js";
 import { scheduleRender } from "./render.js";
-import { selectGroup } from "./members.js";
+import {
+  getRenderedMemberFilterSignature,
+  renderMembers,
+  restartMemberList,
+  selectGroup,
+} from "./members.js";
 import { GROUP_RENDER_CHUNK, state } from "./state.js";
 import { $, basename, escapeHtml, formatBytes, toast } from "./util.js";
 
@@ -42,12 +53,12 @@ async function fetchAllGroups(token) {
       if (!batch.length || collected.length >= total) break;
     }
     if (!stale) {
-      return collected;
+      return { groups: collected, version };
     }
   }
   const fallback = await api(`/api/groups?kind=all`);
   if (token !== state.groupsLoadToken) return null;
-  return fallback.groups || [];
+  return { groups: fallback.groups || [], version: fallback.groups_version ?? null };
 }
 
 function renderTabCounts() {
@@ -97,10 +108,14 @@ function rememberFocusedGroup(id) {
 
 async function loadGroups({ preserveSelection = false } = {}) {
   const token = ++state.groupsLoadToken;
-  const all = await fetchAllGroups(token);
-  if (all === null) return;
-  state.allGroups = all;
-  applyResultControls();
+  const loaded = await fetchAllGroups(token);
+  if (loaded === null) return;
+  const loadedVersion = Number(loaded.version);
+  if (Number.isFinite(loadedVersion)) {
+    state.loadedGroupsVersion = loadedVersion;
+  }
+  state.allGroups = loaded.groups;
+  applyResultControls({ fromRender: true });
   renderTabCounts();
 
   scheduleRender({ groupList: true, selection: true });
@@ -170,14 +185,14 @@ function finishStreamedGroupRender() {
 }
 
 function numericFilter(id) {
-  const raw = ($(id).value || "").trim();
+  const raw = ($(id)?.value || "").trim();
   if (!raw) return null;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function pathMatcher() {
-  const raw = ($("filterPathPattern").value || "").trim();
+  const raw = ($("filterPathPattern")?.value || "").trim();
   if (!raw) return null;
   if (!/[*?]/.test(raw)) {
     const needle = raw.toLowerCase();
@@ -205,16 +220,38 @@ function advancedFilters() {
     minWidth: numericFilter("filterMinWidth"),
     minHeight: numericFilter("filterMinHeight"),
     matchPath: pathMatcher(),
-    faces: $("filterFaces").value === "any" ? null : $("filterFaces").value,
+    faces: $("filterFaces")?.value === "any" || !$("filterFaces") ? null : $("filterFaces").value,
   };
   filters.active =
-    filters.minSize != null ||
-    filters.maxSize != null ||
-    filters.minWidth != null ||
-    filters.minHeight != null ||
-    !!filters.matchPath ||
-    filters.faces != null;
+    filters.minSize != null
+    || filters.maxSize != null
+    || filters.minWidth != null
+    || filters.minHeight != null
+    || !!filters.matchPath
+    || filters.faces != null;
   return filters;
+}
+
+function activeMemberFilters() {
+  const query = ($("resultSearch")?.value || "").trim().toLowerCase();
+  const filters = advancedFilters();
+  return {
+    query,
+    ...filters,
+    anyActive: Boolean(query || filters.active),
+  };
+}
+
+function memberFilterSignature() {
+  return [
+    ($("resultSearch")?.value || "").trim().toLowerCase(),
+    ($("filterMinMb")?.value || "").trim(),
+    ($("filterMaxMb")?.value || "").trim(),
+    ($("filterMinWidth")?.value || "").trim(),
+    ($("filterMinHeight")?.value || "").trim(),
+    ($("filterPathPattern")?.value || "").trim(),
+    $("filterFaces")?.value || "any",
+  ].join("|");
 }
 
 function memberMatchesFilters(member, filters) {
@@ -236,24 +273,45 @@ function memberMatchesFilters(member, filters) {
   return true;
 }
 
-function applyResultControls() {
-  const query = ($("resultSearch").value || "").trim().toLowerCase();
+function memberMatchesSidebarFilters(member, filters = activeMemberFilters()) {
+  if (!filters.anyActive) return true;
+  if (filters.query && !(member.path || "").toLowerCase().includes(filters.query)) return false;
+  return memberMatchesFilters(member, filters);
+}
+
+function groupMatchesSidebarFilters(g) {
   const selection = $("selectionFilter").value;
   const issuesOnly = $("issuesOnly").checked;
   const hideCompleted = $("hideCompleted").checked;
-  const filters = advancedFilters();
+  const filters = activeMemberFilters();
+  const selected = groupSelectedCount(g) > 0;
+  if (selection === "selected" && !selected) return false;
+  if (selection === "unselected" && selected) return false;
+  if (issuesOnly && !groupNeedsAttention(g)) return false;
+  if (hideCompleted && groupComplete(g)) return false;
+  if (filters.anyActive && !(g.members || []).some((member) => memberMatchesSidebarFilters(member, filters))) {
+    return false;
+  }
+  return true;
+}
+
+function applyResultControls({ fromRender = false } = {}) {
+  const previousOrder = state.groups.map((g) => g.id);
+  const filters = activeMemberFilters();
+  const selection = $("selectionFilter").value;
+  const issuesOnly = $("issuesOnly").checked;
+  const hideCompleted = $("hideCompleted").checked;
   $("advancedFilterFlag").hidden = !filters.active;
   let groups = state.allGroups.filter((g) => state.kind === "all" || g.kind === state.kind);
   const categoryCount = groups.length;
   groups = groups.filter((g) => {
     const selected = groupSelectedCount(g) > 0;
-    if (query && !(g.members || []).some((member) => member.path.toLowerCase().includes(query))) return false;
     if (selection === "selected" && !selected) return false;
     if (selection === "unselected" && selected) return false;
     if (issuesOnly && !groupNeedsAttention(g)) return false;
     if (hideCompleted && groupComplete(g)) return false;
-    // Advanced filters keep a group when any one of its files qualifies.
-    if (filters.active && !(g.members || []).some((member) => memberMatchesFilters(member, filters))) {
+    // Search & advanced filters keep a group when any one of its files qualifies.
+    if (filters.anyActive && !(g.members || []).some((member) => memberMatchesSidebarFilters(member, filters))) {
       return false;
     }
     return true;
@@ -275,8 +333,14 @@ function applyResultControls() {
   state.groups = groups;
   $("filteredCount").textContent = `${groups.length} of ${categoryCount} groups shown`;
   // Clear filters only appears when there is something to clear.
-  $("btnClearFilters").hidden = !(query || selection !== "all" || filters.active
-    || $("issuesOnly").checked || $("hideCompleted").checked);
+  $("btnClearFilters").hidden = !(filters.anyActive || selection !== "all"
+    || issuesOnly || hideCompleted);
+
+  const orderChanged = previousOrder.length !== groups.length
+    || groups.some((g, index) => g.id !== previousOrder[index]);
+  if (!fromRender && orderChanged) {
+    scheduleRender({ groupList: true });
+  }
 }
 
 function groupItemHtml(g) {
@@ -295,15 +359,17 @@ function groupItemHtml(g) {
   const folderLabel = g.kind === "all_files" && g.root ? basename(g.root) : null;
   // The crop review is one list of unrelated images; its first file is not its name.
   const nameLabel = g.kind === "crop" ? "Crop suggestions" : g.members?.[0]?.path ? basename(g.members[0].path) : "";
-  const reviewed = (g.reviewed_paths || []).length;
+  const reviewed = g.kind === "crop"
+    ? new Set([...(g.reviewed_paths || []), ...(g.cropped_paths || [])]).size
+    : (g.reviewed_paths || []).length;
   const groupSummary = isIndependentReview(g)
     ? `${reviewed}/${g.member_count} reviewed${sel ? ` · ${sel} delete` : ""}`
     : `${formatBytes(g.reclaimable_bytes)} reclaimable`;
   // Status is never colour-only: the glyph and its label carry the same meaning.
   const attention = groupNeedsAttention(g);
   // Duplicate groups arrive with the suggested selection already complete;
-  // until the user changes it, say so rather than claim it was reviewed.
-  const suggestedOnly = !attention && !isIndependentReview(g) && !state.touchedGroups.has(g.id);
+  // until the user changes it or marks it reviewed, say so rather than claim it was reviewed.
+  const suggestedOnly = !attention && !isIndependentReview(g) && !groupReviewed(g);
   const stateLabel = attention ? "Needs review" : suggestedOnly ? "Suggested selection" : "Reviewed";
   const stateGlyph = attention ? "●" : suggestedOnly ? "◐" : "✔";
   return `
@@ -430,7 +496,7 @@ function shrinkGroupListWindow() {
 }
 
 function renderGroupList() {
-  applyResultControls();
+  applyResultControls({ fromRender: true });
   // On the Similar tab the board stands in for this list (board.js).
   renderBoard();
   const list = wireGroupList();
@@ -456,33 +522,50 @@ function renderGroupList() {
     </div>`;
     $("groupMore").innerHTML = "";
     syncEarlierSlot();
-    return;
+  } else {
+    // Only the window [groupListStart, groupListStart + groupListLimit) lives in
+    // the DOM; the rest streams in on scroll / slides via the window controls.
+    if (state.groupListStart >= state.groups.length) state.groupListStart = 0;
+    state.groupListLimit = Math.max(
+      GROUP_RENDER_CHUNK,
+      Math.min(
+        state.groupListLimit,
+        GROUP_WINDOW_MAX,
+        state.groups.length - state.groupListStart,
+      ),
+    );
+    const scrollTop = list.scrollTop;
+    // Replacing the rows would drop keyboard focus to <body>; hand it to the
+    // same group's fresh row (streamed groups and refetches re-render often).
+    const focusedId = document.activeElement?.closest?.("#groupList .group-item")?.dataset.id;
+    list.innerHTML = state.groups
+      .slice(state.groupListStart, state.groupListStart + state.groupListLimit)
+      .map(groupItemHtml)
+      .join("");
+    $("groupMore").innerHTML = groupMoreHtml();
+    syncEarlierSlot();
+    list.scrollTop = Math.min(scrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
+    if (focusedId) {
+      list.querySelector(`.group-item[data-id="${CSS.escape(focusedId)}"]`)
+        ?.focus({ preventScroll: true });
+    }
   }
-  // Only the window [groupListStart, groupListStart + groupListLimit) lives in
-  // the DOM; the rest streams in on scroll / slides via the window controls.
-  if (state.groupListStart >= state.groups.length) state.groupListStart = 0;
-  state.groupListLimit = Math.max(
-    GROUP_RENDER_CHUNK,
-    Math.min(
-      state.groupListLimit,
-      GROUP_WINDOW_MAX,
-      state.groups.length - state.groupListStart,
-    ),
-  );
-  const scrollTop = list.scrollTop;
-  // Replacing the rows would drop keyboard focus to <body>; hand it to the
-  // same group's fresh row (streamed groups and refetches re-render often).
-  const focusedId = document.activeElement?.closest?.("#groupList .group-item")?.dataset.id;
-  list.innerHTML = state.groups
-    .slice(state.groupListStart, state.groupListStart + state.groupListLimit)
-    .map(groupItemHtml)
-    .join("");
-  $("groupMore").innerHTML = groupMoreHtml();
-  syncEarlierSlot();
-  list.scrollTop = Math.min(scrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
-  if (focusedId) {
-    list.querySelector(`.group-item[data-id="${CSS.escape(focusedId)}"]`)
-      ?.focus({ preventScroll: true });
+
+  // Re-filter the currently open single-group / independent review in place
+  // whenever sidebar search or advanced filters change.
+  const filterSig = memberFilterSignature();
+  if (
+    !boardActive()
+    && !$("detailBody").hidden
+    && state.currentId
+    && filterSig !== getRenderedMemberFilterSignature()
+  ) {
+    const open = state.allGroups.find((g) => g.id === state.currentId)
+      || state.groups.find((g) => g.id === state.currentId);
+    if (open && isIndependentReview(open)) {
+      restartMemberList();
+      renderMembers(open);
+    }
   }
 }
 
@@ -501,9 +584,9 @@ function updateGroupListItem(g) {
 
 function selectionFiltersActive() {
   return (
-    $("selectionFilter").value !== "all" ||
-    $("issuesOnly").checked ||
-    $("hideCompleted").checked
+    $("selectionFilter").value !== "all"
+    || $("issuesOnly").checked
+    || $("hideCompleted").checked
   );
 }
 
@@ -541,4 +624,22 @@ function ensureGroupVisible(id) {
   renderGroupList();
 }
 
-export { loadGroups, addStreamedGroup, finishStreamedGroupRender, applyResultControls, renderGroupList, resetGroupListWindow, updateGroupListItem, selectionFiltersActive, markGroupListActive, ensureGroupVisible, renderTabCounts, markEmptyTabs, rememberFocusedGroup };
+export {
+  loadGroups,
+  addStreamedGroup,
+  finishStreamedGroupRender,
+  applyResultControls,
+  renderGroupList,
+  resetGroupListWindow,
+  updateGroupListItem,
+  selectionFiltersActive,
+  markGroupListActive,
+  ensureGroupVisible,
+  renderTabCounts,
+  markEmptyTabs,
+  rememberFocusedGroup,
+  activeMemberFilters,
+  memberMatchesSidebarFilters,
+  memberFilterSignature,
+  groupMatchesSidebarFilters,
+};

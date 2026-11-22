@@ -82,6 +82,80 @@ def test_file_record_serialization_preserves_fields_and_round_trips() -> None:
 
     del payload["non_person_coverage"]
     del payload["non_person_coverage_signature"]
+    del payload["sharpness"]
+    del payload["video_codec"]
+    del payload["video_bitrate"]
+    del payload["has_audio"]
     legacy = FileRecord.from_dict(payload)
     assert legacy.non_person_coverage is None
     assert legacy.non_person_coverage_signature is None
+    assert legacy.sharpness is None
+    assert legacy.video_codec is None
+    assert legacy.video_bitrate is None
+    assert legacy.has_audio is None
+
+
+def test_file_record_new_fields_and_effective_pixels() -> None:
+    from dedupe.models import FileRecord
+
+    rec = FileRecord(
+        path="/photos/shot.mp4",
+        size=1000,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        width=1920,
+        height=1080,
+        sharpness=42.5,
+        video_codec="h264",
+        video_bitrate=5_000_000,
+        has_audio=True,
+        capture_metadata=True,
+    )
+    restored = FileRecord.from_dict(rec.to_dict(compact=True))
+    assert restored == rec
+    assert rec.effective_pixels == 1920 * 1080
+
+    # 7-part border_crop with chrome flag and exact dimensions
+    rec.border_crop = "0,100,1920,980,1920,1080,top+bottom"
+    assert rec.effective_pixels == 1920 * 880
+
+    # Scaled border_crop measured at half-resolution
+    rec.border_crop = "0,50,960,490,960,540"
+    assert rec.effective_pixels == 1920 * 880
+
+    # Dismissed or invalid crops fall back to raw pixels
+    rec.border_crop = "dismissed"
+    assert rec.effective_pixels == 1920 * 1080
+    rec.border_crop = "invalid"
+    assert rec.effective_pixels == 1920 * 1080
+
+
+def test_review_group_new_fields_round_trip_and_legacy_defaults() -> None:
+    from dedupe.models import FileRecord, GroupKind, ReviewGroup
+
+    a = FileRecord("/a.jpg", 100, 1.0, MediaType.IMAGE, ".jpg")
+    b = FileRecord("/b.jpg", 100, 2.0, MediaType.IMAGE, ".jpg")
+    group = ReviewGroup(
+        id="grp1",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[a, b],
+        suggested_keep=a.path,
+        anchor_path=a.path,
+        reviewed=True,
+        match_explanations={b.path: "98% perceptual match"},
+    )
+    payload = group.to_dict()
+    loaded = ReviewGroup.from_dict(payload)
+    assert loaded.anchor_path == a.path
+    assert loaded.reviewed is True
+    assert loaded.match_explanations == {b.path: "98% perceptual match"}
+
+    del payload["anchor_path"]
+    del payload["reviewed"]
+    del payload["match_explanations"]
+    legacy = ReviewGroup.from_dict(payload)
+    assert legacy.anchor_path is None
+    assert legacy.reviewed is False
+    assert legacy.match_explanations == {}

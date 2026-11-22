@@ -16,11 +16,13 @@ from dedupe.cache import HashCache
 from dedupe.cli import main as cli_main
 from dedupe.decision_log import (
     append_decisions,
+    benchmark_crops,
     benchmark_manifest,
     crop_manifest,
     current_crop_labels,
     current_distinct_labels,
     file_snapshot,
+    log_crop_decision,
     make_crop_event,
     make_distinct_event,
     make_distinct_path_event,
@@ -446,3 +448,111 @@ def test_backfill_does_not_preserve_path_only_provenance() -> None:
     explicit = make_distinct_path_event("marked", "/a.png", "/b.png", label_scope="pair")
     inferred = make_distinct_path_event("marked", "/a.png", "/b.png", label_scope="backfill")
     assert current_distinct_labels([explicit, inferred]) == [inferred]
+
+
+def test_log_crop_decision_levels_provenance_source_and_adjustment_stats(tmp_path: Path) -> None:
+    log = tmp_path / "decisions.jsonl"
+    rec_a = _record(tmp_path / "a.png")
+    rec_b = _record(tmp_path / "b.png")
+    rec_m = _record(tmp_path / "m.png", border_crop="", border_levels_signature="crop-levels-v3")
+    sug_a = CropBox(left=0, top=40, right=320, bottom=200, width=320, height=240, provenance=("black_bar",))
+    adj_a = CropBox(left=0, top=30, right=320, bottom=210, width=320, height=240)
+    siblings = {
+        "conservative": CropBox(left=0, top=30, right=320, bottom=210, width=320, height=240),
+        "balanced": sug_a,
+        "aggressive": sug_a,
+    }
+    log_crop_decision(
+        "applied",
+        rec_a,
+        sug_a,
+        path=log,
+        source="single",
+        adjusted_box=adj_a,
+        level="balanced",
+        border_levels_signature="crop-levels-v3",
+        sibling_levels=siblings,
+        provenance=("black_bar",),
+    )
+    log_crop_decision("skipped", rec_b, sug_a, path=log, source="bulk", reason="cuts_content")
+    log_crop_decision("manual", rec_m, None, path=log, source="single", adjusted_box=adj_a)
+
+    events, _ = read_decisions(log)
+    assert events[0]["border_levels_signature"] == "crop-levels-v3"
+    assert events[0]["provenance"] == ["black_bar"]
+    assert events[0]["sibling_levels"]["conservative"]["top"] == 30
+
+    summary = summarize_decisions(events)["crop"]
+    assert summary["by_source"]["single"]["acceptance_rate"] == 1.0
+    assert summary["by_source"]["bulk"]["acceptance_rate"] == 0.0
+    assert summary["manual_recalls"] == 1
+    assert summary["adjustment_error"]["count"] == 1
+    # Suggested cut top=40, bottom=40 vs adjusted top=30, bottom=30 -> +10px bias on top & bottom.
+    assert summary["adjustment_error"]["bias_px"]["top"] == 10.0
+    assert summary["adjustment_error"]["mae_px"]["top"] == 10.0
+
+    manifest = crop_manifest(events)
+    assert {item["decision"] for item in manifest["items"]} == {"applied", "skipped", "manual"}
+    manual_item = next(item for item in manifest["items"] if item["decision"] == "manual")
+    assert manual_item["adjusted"]["top"] == 30
+
+
+def test_benchmark_crops_scores_suppression_recall_iou_and_monotonicity(tmp_path: Path) -> None:
+    import numpy as np
+
+    # Create 3 real images on disk:
+    # 1. boxed (applied via original backup in `after`),
+    # 2. clean photo (skipped negative),
+    # 3. missed bar manual entry (manual recall).
+    rng = np.random.default_rng(1)
+    pic = rng.integers(30, 220, size=(300, 400, 3), dtype=np.uint8)
+    boxed_arr = np.zeros((300, 400, 3), dtype=np.uint8)
+    boxed_arr[50:250] = pic[50:250]
+    trash_orig = tmp_path / "trash_boxed.png"
+    live_boxed = tmp_path / "boxed.png"
+    clean_img = tmp_path / "clean.png"
+    manual_img = tmp_path / "manual.png"
+    Image.fromarray(boxed_arr).save(trash_orig)
+    Image.fromarray(pic[50:250]).save(live_boxed)
+    Image.fromarray(pic).save(clean_img)
+    Image.fromarray(boxed_arr).save(manual_img)
+
+    sug = CropBox(left=0, top=50, right=400, bottom=250, width=400, height=300)
+    adj_gt = CropBox(left=0, top=48, right=400, bottom=252, width=400, height=300)
+    manifest = {
+        "items": [
+            {
+                "path": str(live_boxed),
+                "after": str(trash_orig),
+                "decision": "applied",
+                "suggestion": sug.to_dict(),
+                "adjusted": adj_gt.to_dict(),
+                "crop_level": "balanced",
+                "media_type": "image",
+            },
+            {
+                "path": str(clean_img),
+                "decision": "skipped",
+                "suggestion": sug.to_dict(),
+                "media_type": "image",
+            },
+            {
+                "path": str(manual_img),
+                "decision": "manual",
+                "suggestion": None,
+                "adjusted": sug.to_dict(),
+                "media_type": "image",
+            },
+        ]
+    }
+    mpath = tmp_path / "crop-manifest.json"
+    mpath.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = benchmark_crops(mpath, level="balanced")
+    assert report["evaluated"] == 3
+    assert report["negatives"]["suppression_rate"] == 1.0
+    assert report["positives"]["recall"] == 1.0
+    assert report["manual"]["recall"] == 1.0
+    assert report["adjusted_gt"]["mean_iou"] >= 0.95
+    assert report["adjusted_gt"]["mae_px"]["overall"] <= 2.0
+    assert report["level_agreement"]["monotonic_rate"] == 1.0

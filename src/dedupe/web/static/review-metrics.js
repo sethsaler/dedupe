@@ -14,17 +14,26 @@ function load() {
 }
 function save(labels) { try { localStorage.setItem(KEY, JSON.stringify(labels.slice(-5000))); } catch { /* quota/private mode */ } }
 export function noteReviewPair(a, b) {
+  if (!a || !b) return;
   const key = pairKey(a, b);
   if (active !== key) { active = key; started = performance.now(); }
 }
 export function recordReview(a, b, similar) {
-  const elapsed = active === pairKey(a, b) ? (performance.now() - started) / 1000 : null;
-  const labels = load().filter((p) => pairKey(p.path_a, p.path_b) !== pairKey(a, b));
+  if (!a || !b) return;
+  const key = pairKey(a, b);
+  const elapsed = active === key ? (performance.now() - started) / 1000 : null;
+  if (active === key) active = null;
+  const labels = load().filter((p) => pairKey(p.path_a, p.path_b) !== key);
   labels.push({ path_a: a, path_b: b, similar, category: "user-reviewed", review_seconds: elapsed, reviewed_at: new Date().toISOString() });
   save(labels);
 }
-export function undoReview(a, b) { save(load().filter((p) => pairKey(p.path_a, p.path_b) !== pairKey(a, b))); }
-$("exportReviewLabels").addEventListener("click", () => {
+export function undoReview(a, b) {
+  if (!a || !b) return;
+  const key = pairKey(a, b);
+  if (active === key) active = null;
+  save(load().filter((p) => pairKey(p.path_a, p.path_b) !== key));
+}
+$("exportReviewLabels")?.addEventListener("click", () => {
   const pairs = load();
   const timed = pairs.filter((p) => p.review_seconds > 0 && p.review_seconds < 300);
   const seconds = timed.reduce((n, p) => n + p.review_seconds, 0);

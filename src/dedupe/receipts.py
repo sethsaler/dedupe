@@ -19,7 +19,7 @@ from pathlib import Path
 
 EXECUTED_PREFIX = "action"
 PREVIEW_PREFIX = "preview"
-UNDOABLE_ACTIONS = frozenset({"quarantine", "trash"})
+UNDOABLE_ACTIONS = frozenset({"quarantine", "trash", "crop"})
 
 
 class ReceiptError(RuntimeError):
@@ -112,18 +112,20 @@ def receipt_id(path: str | Path) -> str:
     return Path(path).stem
 
 
-def iter_receipt_paths(log_dir: str | Path | None = None) -> list[Path]:
+def iter_receipt_paths(
+    log_dir: str | Path | None = None, *, include_previews: bool = True
+) -> list[Path]:
     base = resolve_log_dir(log_dir)
     try:
         entries = list(base.iterdir())
     except OSError:
         return []
-    return [
-        p
-        for p in entries
-        if p.suffix == ".json"
-        and (p.name.startswith(f"{EXECUTED_PREFIX}-") or p.name.startswith(f"{PREVIEW_PREFIX}-"))
-    ]
+    prefixes = (
+        (f"{EXECUTED_PREFIX}-", f"{PREVIEW_PREFIX}-")
+        if include_previews
+        else (f"{EXECUTED_PREFIX}-",)
+    )
+    return [p for p in entries if p.suffix == ".json" and p.name.startswith(prefixes)]
 
 
 def unreadable_receipt_paths(log_dir: str | Path | None = None) -> list[Path]:
@@ -135,6 +137,13 @@ def _sort_key(summary: ReceiptSummary) -> str:
     return summary.started_at or summary.id
 
 
+def _restorable_location(item: dict, action: str) -> str | None:
+    ref = item.get("original_in_trash") or item.get("destination") if action == "crop" else item.get("destination")
+    if not ref or ref == "Trash":
+        return None
+    return str(ref)
+
+
 def _undo_state(data: dict) -> tuple[bool, str | None]:
     action = str(data.get("action") or "")
     if data.get("status") == "running":
@@ -144,19 +153,19 @@ def _undo_state(data: dict) -> tuple[bool, str | None]:
     if action not in UNDOABLE_ACTIONS:
         return False, f"{action or 'unknown'} actions cannot be undone automatically"
     moved = [item for item in data.get("items") or [] if item.get("ok")]
-    # The undo restores from the recorded destination; a trash item recorded
-    # as the bare "Trash" marker has none, and one blocked item refuses the
-    # whole undo (all-or-nothing), so the receipt only counts as undoable
-    # when every moved item carries a real destination.
-    restorable = [
-        item
-        for item in moved
-        if item.get("destination") and item["destination"] != "Trash"
-    ]
+    # The undo restores from the recorded destination (or original_in_trash for
+    # crops); a trash item recorded as the bare "Trash" marker has none, and one
+    # blocked item refuses the whole undo (all-or-nothing), so the receipt only
+    # counts as undoable when every succeeded item carries a real backup path.
+    restorable = [item for item in moved if _restorable_location(item, action) is not None]
     if not restorable:
         return False, "receipt has no restorable items"
     if len(restorable) != len(moved):
-        return False, "some moved files have no recorded destination"
+        return False, (
+            "some cropped files have no recorded original in Trash"
+            if action == "crop"
+            else "some moved files have no recorded destination"
+        )
     return True, None
 
 
@@ -168,17 +177,16 @@ def _restorable_bytes(data: dict) -> int:
     return total
 
 
-def summarize_receipt(path: str | Path) -> ReceiptSummary | None:
-    """Parse one receipt file; returns ``None`` when it is missing or corrupt."""
+def summarize_receipt_data(
+    path: str | Path, data: dict, *, receipt_bytes: int | None = None
+) -> ReceiptSummary:
+    """Build a :class:`ReceiptSummary` from an already-parsed receipt dict."""
     log_path = Path(path)
-    try:
-        data = json.loads(log_path.read_text(encoding="utf-8"))
-        receipt_bytes = log_path.stat().st_size
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-
+    if receipt_bytes is None:
+        try:
+            receipt_bytes = log_path.stat().st_size
+        except OSError:
+            receipt_bytes = 0
     items = data.get("items") or []
     undoable, blocked = _undo_state(data)
     dry_run = bool(data.get("dry_run"))
@@ -202,6 +210,19 @@ def summarize_receipt(path: str | Path) -> ReceiptSummary | None:
     )
 
 
+def summarize_receipt(path: str | Path) -> ReceiptSummary | None:
+    """Parse one receipt file; returns ``None`` when it is missing or corrupt."""
+    log_path = Path(path)
+    try:
+        raw_bytes = log_path.read_bytes()
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return summarize_receipt_data(log_path, data, receipt_bytes=len(raw_bytes))
+
+
 def list_receipts(
     log_dir: str | Path | None = None,
     *,
@@ -217,7 +238,8 @@ def list_receipts(
     ``undo:quarantine``, ...).
     """
     summaries: list[ReceiptSummary] = []
-    for path in iter_receipt_paths(log_dir):
+    scan_previews = include_previews and not undoable_only
+    for path in iter_receipt_paths(log_dir, include_previews=scan_previews):
         summary = summarize_receipt(path)
         if summary is None:
             continue
@@ -357,6 +379,37 @@ def prune_receipts(
         freed_bytes=sum(r.receipt_bytes for r in removed),
         errors=errors,
     )
+
+
+def auto_prune_preview_receipts(
+    log_dir: str | Path | None = None, *, max_keep: int = 50
+) -> int:
+    """Unlink oldest ``preview-*.json`` files beyond ``max_keep`` safely."""
+    keep = max(0, int(max_keep))
+    base = resolve_log_dir(log_dir)
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return 0
+    previews: list[tuple[int, str, Path]] = []
+    for candidate in entries:
+        if candidate.suffix == ".json" and candidate.name.startswith(f"{PREVIEW_PREFIX}-"):
+            try:
+                mtime_ns = candidate.stat().st_mtime_ns
+            except OSError:
+                continue
+            previews.append((mtime_ns, candidate.name, candidate))
+    if len(previews) <= keep:
+        return 0
+    previews.sort()
+    removed = 0
+    for _, _, path in previews[: len(previews) - keep]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _started_at(summary: ReceiptSummary) -> datetime | None:

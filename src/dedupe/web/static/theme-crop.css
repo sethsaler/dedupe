@@ -1,4 +1,4 @@
-/* Scoped theme (crop): the Crop review's contact sheet.
+/* Scoped theme (crop): the Crop review's contact sheet and large editor.
    Loads inside @layer theme.
    Each print sits on a square loupe mat; the picture keeps its own aspect
    ratio inside it, so the suggested crop box can be drawn in image
@@ -6,8 +6,8 @@
 
 @layer theme {
 #members.crop-grid {
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--tile-size, 360px) * 0.75)), 1fr));
-  gap: 22px 16px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--tile-size, 360px) * 0.56)), 1fr));
+  gap: 14px 16px;
 }
 
 #members.crop-grid .crop-card {
@@ -23,9 +23,13 @@
   transform: none;
 }
 
+/* Padding reserves breathing room inside the loupe mat so flush 0%/100%
+   resize handles stay unclipped while the cut shade clips to .crop-frame. */
 #members.crop-grid .crop-thumb {
   aspect-ratio: 1 / 1;
   max-height: none;
+  padding: 12px;
+  box-sizing: border-box;
   background: var(--lt-loupe);
   border-radius: 4px;
   display: grid;
@@ -38,14 +42,17 @@
   outline-offset: 3px;
 }
 
-/* The picture at its own aspect ratio, contained in the square mat. */
+/* The picture at its own aspect ratio, contained in the square mat.
+   overflow: visible lets flush corner/edge handles extend past the edge;
+   ::after masks the 100vmax cut shade cleanly back to the frame bounds. */
 #members.crop-grid .crop-frame {
   position: relative;
   display: block;
   width: 100%;
   height: auto;
   aspect-ratio: var(--crop-aspect, 4 / 3);
-  overflow: hidden;
+  overflow: visible;
+  isolation: isolate;
 }
 
 #members.crop-grid .crop-frame.portrait {
@@ -59,11 +66,24 @@
   width: 100%;
   height: 100%;
   object-fit: fill;
+  border-radius: 2px;
+  overflow: hidden;
 }
 
-/* Everything outside the box is shaded; the box itself is the new frame. */
+#members.crop-grid .crop-frame:has(.crop-box)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  box-shadow: 0 0 0 100vmax var(--lt-loupe);
+}
+
+/* Everything outside the box is shaded; z-index: auto keeps .crop-handle
+   children in .crop-frame's stacking context above the ::after mat mask. */
 #members.crop-grid .crop-box {
   position: absolute;
+  z-index: auto;
   box-sizing: border-box;
   border: 2px dashed var(--lt-pencil);
   box-shadow: 0 0 0 100vmax rgba(232, 54, 31, 0.32);
@@ -86,43 +106,113 @@
 }
 
 #members.crop-grid .crop-box.editable:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 2px;
 }
 
-#members.crop-grid .crop-handle {
+#members.crop-grid .crop-handle,
+#members.crop-grid .ce-handle {
   position: absolute;
+  box-sizing: border-box;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+#members.crop-grid .crop-handle:is(.nw, .ne, .se, .sw),
+#members.crop-grid .ce-handle:is(.nw, .ne, .se, .sw) {
   width: 12px;
   height: 12px;
-  box-sizing: border-box;
+  z-index: 3;
   background: var(--lt-table, #fff);
   border: 2px solid var(--lt-pencil);
   border-radius: 2px;
-  opacity: 0;
-  transition: opacity 120ms ease;
+}
+
+#members.crop-grid .crop-handle:is(.nw, .ne, .se, .sw)::after,
+#members.crop-grid .ce-handle:is(.nw, .ne, .se, .sw)::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+}
+
+/* Invisible full-edge resize strips (18px hit target) with centered visual grip. */
+#members.crop-grid .crop-handle:is(.n, .s, .e, .w),
+#members.crop-grid .ce-handle:is(.n, .s, .e, .w) {
+  z-index: 2;
+  background: transparent;
+  border: 0;
+}
+
+#members.crop-grid .crop-handle:is(.n, .s, .e, .w)::after,
+#members.crop-grid .ce-handle:is(.n, .s, .e, .w)::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  box-sizing: border-box;
+  background: var(--lt-table, #fff);
+  border: 2px solid var(--lt-pencil);
+  border-radius: 999px;
+}
+
+#members.crop-grid .crop-handle:is(.n, .s)::after,
+#members.crop-grid .ce-handle:is(.n, .s)::after {
+  width: 24px;
+  height: 6px;
+}
+
+#members.crop-grid .crop-handle:is(.e, .w)::after,
+#members.crop-grid .ce-handle:is(.e, .w)::after {
+  width: 6px;
+  height: 24px;
 }
 
 #members.crop-grid .crop-card:hover .crop-handle,
 #members.crop-grid .crop-card.focused .crop-handle,
 #members.crop-grid .crop-box.editable:focus .crop-handle,
-#members.crop-grid .crop-card.crop-dragging .crop-handle {
+#members.crop-grid .crop-card.crop-dragging .crop-handle,
+#members.crop-grid .crop-card:hover .ce-handle,
+#members.crop-grid .crop-card.focused .ce-handle,
+#members.crop-grid .crop-box.editable:focus .ce-handle,
+#members.crop-grid .crop-card.crop-dragging .ce-handle {
   opacity: 1;
 }
 
+@media (hover: none) {
+  #members.crop-grid .crop-handle,
+  #members.crop-grid .ce-handle {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  #members.crop-grid .crop-handle {
+  #members.crop-grid .crop-handle,
+  #members.crop-grid .ce-handle {
     transition: none;
   }
 }
 
-#members.crop-grid .crop-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
-#members.crop-grid .crop-handle.n { left: 50%; top: 0; transform: translate(-50%, -50%); cursor: ns-resize; }
-#members.crop-grid .crop-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
-#members.crop-grid .crop-handle.e { right: 0; top: 50%; transform: translate(50%, -50%); cursor: ew-resize; }
-#members.crop-grid .crop-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
-#members.crop-grid .crop-handle.s { left: 50%; bottom: 0; transform: translate(-50%, 50%); cursor: ns-resize; }
-#members.crop-grid .crop-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
-#members.crop-grid .crop-handle.w { left: 0; top: 50%; transform: translate(-50%, -50%); cursor: ew-resize; }
+#members.crop-grid .crop-handle.nw,
+#members.crop-grid .ce-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+#members.crop-grid .crop-handle.n,
+#members.crop-grid .ce-handle.n { left: 0; right: 0; top: 0; width: auto; height: 18px; transform: translateY(-50%); cursor: ns-resize; }
+#members.crop-grid .crop-handle.ne,
+#members.crop-grid .ce-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+#members.crop-grid .crop-handle.e,
+#members.crop-grid .ce-handle.e { top: 0; bottom: 0; right: 0; width: 18px; height: auto; transform: translateX(50%); cursor: ew-resize; }
+#members.crop-grid .crop-handle.se,
+#members.crop-grid .ce-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+#members.crop-grid .crop-handle.s,
+#members.crop-grid .ce-handle.s { left: 0; right: 0; bottom: 0; width: auto; height: 18px; transform: translateY(50%); cursor: ns-resize; }
+#members.crop-grid .crop-handle.sw,
+#members.crop-grid .ce-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+#members.crop-grid .crop-handle.w,
+#members.crop-grid .ce-handle.w { top: 0; bottom: 0; left: 0; width: 18px; height: auto; transform: translateX(-50%); cursor: ew-resize; }
 
 /* While a zone is dragged, its handles match the gesture and the picture
    under the pointer cannot be selected or scrolled away. */
@@ -152,7 +242,8 @@
   box-shadow: 0 0 0 100vmax rgba(120, 120, 120, 0.25);
 }
 
-#members.crop-grid .crop-card.skipped .crop-handle {
+#members.crop-grid .crop-card.skipped .crop-handle:is(.nw, .ne, .se, .sw),
+#members.crop-grid .crop-card.skipped .crop-handle:is(.n, .s, .e, .w)::after {
   border-color: var(--lt-faint);
 }
 
@@ -165,13 +256,18 @@
   position: absolute;
   top: 8px;
   left: 8px;
-  z-index: 2;
+  z-index: 3;
   padding: 3px 8px;
   border-radius: 4px;
   font-family: var(--lt-mono);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
   background: var(--lt-ink);
+  color: var(--lt-table);
+}
+
+#members.crop-grid .crop-badge.done {
+  background: var(--lt-keep);
   color: var(--lt-table);
 }
 
@@ -181,7 +277,7 @@
 }
 
 #members.crop-grid .crop-card .card-body {
-  padding: 8px 0 0;
+  padding: 6px 0 0;
 }
 
 #members.crop-grid .crop-card .name {
@@ -201,24 +297,21 @@
   color: var(--lt-graphite);
 }
 
+/* Always show crop evidence even when File details is off, clamped to a fixed
+   2-line height so pending, cropped, and skipped states keep the grid still. */
+.detail-body #members.crop-grid .crop-card .evidence,
 #members.crop-grid .crop-card .evidence {
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: 11px;
+  line-height: 1.35;
   color: var(--lt-graphite);
   background: none;
   border: 0;
   padding: 2px 0 0;
-}
-
-/* With file details showing, evidence keeps at least two lines (at most
-   three) so the shorter text after a crop, skip or undo does not shrink the
-   card and shift the rows below it. */
-.detail-body.show-file-details #members.crop-grid .crop-card .evidence {
-  min-height: calc(1.4em * 2);
+  min-height: calc(1.35em * 2);
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
 }
 
@@ -226,12 +319,51 @@
   color: var(--lt-ink);
 }
 
+/* Extreme-crop amber warning badge, provenance & duplicate membership pills. */
+.crop-warn-badge,
+#members.crop-grid .crop-warn-badge,
+.crop-editor .crop-warn-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  background: var(--lt-warn-soft) !important;
+  color: var(--lt-warn) !important;
+  border: 1px solid color-mix(in srgb, var(--lt-warn) 45%, transparent) !important;
+}
+
+.crop-provenance-pill,
+.crop-dup-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+  border: 1px solid var(--lt-sleeve);
+}
+
+.crop-dup-pill {
+  color: var(--lt-ink);
+}
+
 #members.crop-grid .crop-actions {
   display: flex;
   justify-content: flex-start;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 6px;
   padding: 0;
   border: 0;
 }
@@ -241,6 +373,19 @@
   padding: 0 14px;
 }
 
+#members.crop-grid .crop-actions .btn.danger-soft,
+.crop-editor .ce-actions .btn.danger-soft {
+  color: var(--lt-graphite);
+  border-color: var(--lt-sleeve);
+}
+
+#members.crop-grid .crop-actions .btn.danger-soft:hover:not(:disabled),
+.crop-editor .ce-actions .btn.danger-soft:hover:not(:disabled) {
+  color: var(--lt-pencil);
+  border-color: var(--lt-pencil);
+  background: var(--lt-pencil-soft);
+}
+
 /* The zone's tools sit on a line of their own under the decision buttons.
    The line is there in every state, at one height, so a crop, a skip or a
    moved zone never changes how tall the card is. */
@@ -248,8 +393,8 @@
   display: flex;
   align-items: center;
   gap: 14px;
-  min-height: 24px;
-  margin-top: 8px;
+  min-height: 22px;
+  margin-top: 6px;
   overflow: hidden;
   white-space: nowrap;
   font-size: 12px;
@@ -268,7 +413,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  margin-top: 6px;
+  margin-top: 4px;
 }
 
 #members.crop-grid .crop-level-btn {
@@ -288,12 +433,25 @@
   color: var(--lt-table);
 }
 
+#members.crop-grid .crop-level-btn.unavailable:not(.chosen),
+.crop-editor .crop-level-btn.unavailable:not(.chosen) {
+  opacity: 0.48;
+  border-style: dashed;
+}
+
+#members.crop-grid .crop-level-btn.unavailable:not(.chosen):hover,
+.crop-editor .crop-level-btn.unavailable:not(.chosen):hover {
+  opacity: 0.78;
+  border-color: var(--lt-ink);
+  color: var(--lt-ink);
+}
+
 #members.crop-grid .crop-level-btn:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 1px;
 }
 
-/* The review header's whole-pile level select. */
+/* The review header's whole-pile level select and crop filter chip bar. */
 .crop-level-all {
   display: inline-flex;
   align-items: center;
@@ -303,6 +461,63 @@
 
 .crop-level-all[hidden] {
   display: none;
+}
+
+.crop-filters,
+#cropFilters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.crop-filters[hidden],
+#cropFilters[hidden],
+#btnSkipAllCrops[hidden] {
+  display: none !important;
+}
+
+#cropFilters .crop-filter-chip {
+  min-height: 28px;
+  min-block-size: 28px;
+  padding: 3px 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--lt-graphite);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+#cropFilters .crop-filter-chip:hover {
+  border-color: var(--lt-ink);
+  color: var(--lt-ink);
+}
+
+#cropFilters .crop-filter-chip[aria-pressed="true"],
+#cropFilters .crop-filter-chip.active,
+#cropFilters .crop-filter-chip.chosen {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
+}
+
+#cropFilters #btnSkipAllCrops {
+  margin-left: auto;
+  min-height: 28px;
+  min-block-size: 28px;
+  padding: 3px 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--lt-ink);
+}
+
+#cropFilters #btnSkipAllCrops:hover:not(:disabled) {
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
 }
 
 /* Optional "why was this skipped?" annotation on a skipped card. */
@@ -356,6 +571,7 @@
   inset: 0;
   z-index: 38;
   grid-template-columns: minmax(0, 1fr) 320px;
+  overflow: hidden;
   background: var(--lt-table);
   color: var(--lt-ink);
 }
@@ -371,27 +587,65 @@
   margin: 28px;
   display: grid;
   place-items: center;
+  overflow: visible;
 }
 
 .crop-editor .ce-frame {
   position: relative;
-  overflow: hidden;
+  overflow: visible;
+  isolation: isolate;
   background: var(--lt-loupe);
+}
+
+/* Clip the 100vmax cut mask / cropped-preview veil cleanly to .ce-frame bounds
+   without clipping flush resize handles (which sit at z-index 2/3). */
+.crop-editor .ce-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  box-shadow: 0 0 0 100vmax var(--lt-table);
   outline: 1px solid var(--lt-sleeve);
 }
 
-.crop-editor .ce-image {
+.crop-editor .ce-image,
+.crop-editor .ce-video {
   position: absolute;
   inset: 0;
+  z-index: auto !important;
   width: 100%;
   height: 100%;
   object-fit: fill;
+  border-radius: 2px;
+  overflow: hidden;
   user-select: none;
   pointer-events: none;
 }
 
+.crop-editor .ce-image[hidden],
+.crop-editor .ce-video[hidden] {
+  display: none;
+}
+
+.crop-editor .ce-guides {
+  position: absolute;
+  inset: 0;
+  z-index: auto !important;
+  pointer-events: none;
+}
+
+.crop-editor .ce-guides[hidden] {
+  display: none;
+}
+
+.crop-editor .ce-guides > span {
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.75));
+}
+
 .crop-editor .ce-box {
   position: absolute;
+  z-index: auto !important;
   box-sizing: border-box;
   border: 2px solid var(--lt-pencil);
   box-shadow: 0 0 0 100vmax rgba(232, 54, 31, 0.38);
@@ -399,46 +653,172 @@
   touch-action: none;
 }
 
+.crop-editor .ce-box:is([data-preview-mode="cropped"], [data-preview="cropped"]) {
+  box-shadow: 0 0 0 100vmax var(--lt-table, #111);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
 .crop-editor .ce-box:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 2px;
 }
 
-.crop-editor .crop-handle {
+.crop-editor .crop-handle,
+.crop-editor .ce-handle {
   position: absolute;
-  width: 16px;
-  height: 16px;
   box-sizing: border-box;
+}
+
+.crop-editor .crop-handle:is(.nw, .ne, .se, .sw),
+.crop-editor .ce-handle:is(.nw, .ne, .se, .sw) {
+  width: 14px;
+  height: 14px;
+  z-index: 3;
   background: var(--lt-table);
   border: 2px solid var(--lt-pencil);
   border-radius: 3px;
 }
 
-/* Edge grips run long, so an edge can be caught anywhere near its middle. */
-.crop-editor .crop-handle.n,
-.crop-editor .crop-handle.s { width: 44px; height: 12px; }
-.crop-editor .crop-handle.e,
-.crop-editor .crop-handle.w { width: 12px; height: 44px; }
+.crop-editor .crop-handle:is(.nw, .ne, .se, .sw)::after,
+.crop-editor .ce-handle:is(.nw, .ne, .se, .sw)::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+}
 
-.crop-editor .crop-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
-.crop-editor .crop-handle.n { left: 50%; top: 0; transform: translate(-50%, -50%); cursor: ns-resize; }
-.crop-editor .crop-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
-.crop-editor .crop-handle.e { right: 0; top: 50%; transform: translate(50%, -50%); cursor: ew-resize; }
-.crop-editor .crop-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
-.crop-editor .crop-handle.s { left: 50%; bottom: 0; transform: translate(-50%, 50%); cursor: ns-resize; }
-.crop-editor .crop-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
-.crop-editor .crop-handle.w { left: 0; top: 50%; transform: translate(-50%, -50%); cursor: ew-resize; }
+/* Full-edge invisible resize strips (20px hit target) with centered visual grip. */
+.crop-editor .crop-handle:is(.n, .s, .e, .w),
+.crop-editor .ce-handle:is(.n, .s, .e, .w) {
+  z-index: 2;
+  background: transparent;
+  border: 0;
+}
+
+.crop-editor .crop-handle:is(.n, .s, .e, .w)::after,
+.crop-editor .ce-handle:is(.n, .s, .e, .w)::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  box-sizing: border-box;
+  background: var(--lt-table);
+  border: 2px solid var(--lt-pencil);
+  border-radius: 999px;
+}
+
+.crop-editor .crop-handle:is(.n, .s)::after,
+.crop-editor .ce-handle:is(.n, .s)::after {
+  width: 44px;
+  height: 8px;
+}
+
+.crop-editor .crop-handle:is(.e, .w)::after,
+.crop-editor .ce-handle:is(.e, .w)::after {
+  width: 8px;
+  height: 44px;
+}
+
+.crop-editor .crop-handle.nw,
+.crop-editor .ce-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+.crop-editor .crop-handle.n,
+.crop-editor .ce-handle.n { left: 0; right: 0; top: 0; width: auto; height: 20px; transform: translateY(-50%); cursor: ns-resize; }
+.crop-editor .crop-handle.ne,
+.crop-editor .ce-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+.crop-editor .crop-handle.e,
+.crop-editor .ce-handle.e { top: 0; bottom: 0; right: 0; width: 20px; height: auto; transform: translateX(50%); cursor: ew-resize; }
+.crop-editor .crop-handle.se,
+.crop-editor .ce-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+.crop-editor .crop-handle.s,
+.crop-editor .ce-handle.s { left: 0; right: 0; bottom: 0; width: auto; height: 20px; transform: translateY(50%); cursor: ns-resize; }
+.crop-editor .crop-handle.sw,
+.crop-editor .ce-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+.crop-editor .crop-handle.w,
+.crop-editor .ce-handle.w { top: 0; bottom: 0; left: 0; width: 20px; height: auto; transform: translateX(-50%); cursor: ew-resize; }
 
 .crop-editor.crop-dragging {
   user-select: none;
 }
 
+/* Video sample jump strip below .ce-frame. */
+.crop-editor .ce-video-strip {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.crop-editor .ce-video-strip[hidden] {
+  display: none !important;
+}
+
+.crop-editor .ce-video-play {
+  min-height: 28px;
+  min-block-size: 28px;
+  padding: 3px 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 999px;
+  background: var(--lt-table);
+  color: var(--lt-ink);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.crop-editor .ce-video-play:hover {
+  border-color: var(--lt-ink);
+}
+
+.crop-editor .ce-video-play[aria-pressed="true"] {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
+}
+
+.crop-editor .ce-sample-chip {
+  min-height: 28px;
+  padding: 3px 10px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 999px;
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.crop-editor .ce-sample-chip:hover {
+  border-color: var(--lt-ink);
+  color: var(--lt-ink);
+}
+
+.crop-editor .ce-sample-chip.chosen,
+.crop-editor .ce-sample-chip[aria-pressed="true"] {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
+}
+
 .crop-editor .ce-panel {
+  position: relative;
+  z-index: 3;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
   padding: 28px 24px;
   overflow-y: auto;
+  background: var(--lt-table);
   border-left: 1px solid var(--lt-sleeve);
   font-size: 13px;
 }
@@ -462,6 +842,25 @@
   margin: 0;
   line-height: 1.45;
   min-height: calc(1.45em * 3);
+}
+
+.crop-editor .ce-aspect {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.crop-editor .ce-aspect[hidden] {
+  display: none;
 }
 
 .crop-editor .ce-sides {
@@ -501,7 +900,7 @@
 }
 
 .crop-editor .ce-side input:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 1px;
 }
 
@@ -538,8 +937,24 @@
 }
 
 .crop-editor .crop-level-btn:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 1px;
+}
+
+.crop-editor #cePreviewToggle {
+  align-self: flex-start;
+  min-height: 32px;
+  padding: 4px 12px;
+  border-color: var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-size: 12px;
+}
+
+.crop-editor #cePreviewToggle[aria-pressed="true"] {
+  background: var(--lt-ink);
+  border-color: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
 }
 
 .crop-editor .ce-actions,

@@ -12,7 +12,7 @@ import "./modal.js";
 import "./scan.js";
 import "./jobs.js";
 import { initHistory } from "./history.js";
-import { collapseScanPanel, renderRecent, scanGoalShortLabel } from "./settings.js";
+import { applySettingsToForm, collapseScanPanel, renderRecent, scanGoalShortLabel } from "./settings.js";
 import { CSRF_TOKEN } from "./state.js";
 import { openEventStream, refreshStatus } from "./status.js";
 import { initModernUI } from "./theme.js";
@@ -25,6 +25,9 @@ initHistory();
 openEventStream();
 refreshStatus()
   .then((s) => {
+    if ((s?.scanning || s?.has_result || s?.summary?.group_count > 0) && s?.scan_settings && Object.keys(s.scan_settings).length) {
+      applySettingsToForm(s.scan_settings);
+    }
     // With a scan running or results already loaded, the setup form folds
     // away so the results get the screen; fresh pages keep it prominent.
     if (s?.scanning || s?.summary?.group_count > 0 || !$("results").hidden) {

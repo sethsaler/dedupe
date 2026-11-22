@@ -781,13 +781,13 @@ def test_undo_rejects_previews_and_unsupported_actions(
         roots=[str(tmp_path)],
         log_dir=tmp_path / "logs",
     )
-    with pytest.raises(ValueError, match="executed trash or quarantine"):
+    with pytest.raises(ValueError, match="executed trash, quarantine, or crop"):
         undo_action(preview.log_path or "", dry_run=False)
 
     receipt = json.loads(Path(action.log_path).read_text(encoding="utf-8"))
     receipt["action"] = "isolate"
     Path(action.log_path).write_text(json.dumps(receipt), encoding="utf-8")
-    with pytest.raises(ValueError, match="executed trash or quarantine"):
+    with pytest.raises(ValueError, match="executed trash, quarantine, or crop"):
         undo_action(action.log_path, dry_run=False)
 
 
@@ -986,3 +986,203 @@ def test_gif_keeper_drift_rechecks_later_frames(tmp_path: Path, change_animation
     valid, error = actions_module._revalidate_keeper(keeper, group)
     assert valid is not change_animation
     assert (error is not None) is change_animation
+
+
+def test_non_exact_actions_and_undo_avoid_redundant_full_sha256_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.action_journal as journal_mod
+
+    src = tmp_path / "src"
+    quarantine = tmp_path / "quarantine"
+    logs = tmp_path / "logs"
+    src.mkdir()
+    keep = _rec(src / "keep.jpg", b"A" * 100_000)
+    sim = _rec(src / "sim.jpg", b"B" * 100_000)
+    group = DuplicateGroup(
+        id="sim-1",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[keep, sim],
+        suggested_keep=keep.path,
+        selected_for_removal=[sim.path],
+    )
+
+    def _forbid_full_sha(*_args, **_kwargs):
+        raise AssertionError("full sha256 should not run for large non-exact files")
+
+    monkeypatch.setattr(journal_mod, "file_sha256", _forbid_full_sha)
+    monkeypatch.setattr(actions_module, "file_sha256", _forbid_full_sha)
+
+    moved = apply_actions(
+        [group],
+        action="quarantine",
+        quarantine_dir=quarantine,
+        dry_run=False,
+        roots=[str(src)],
+        log_dir=logs,
+    )
+    assert moved.success_count == 1
+    receipt = json.loads(Path(moved.log_path).read_text(encoding="utf-8"))
+    identity = receipt["journal"][0]["identity"]
+    assert "sha256" not in identity
+    assert identity["partial_hash"]
+    assert identity["mtime_ns"] is not None
+
+    undone = undo_action(moved.log_path, dry_run=False, log_dir=logs)
+    assert undone.success_count == 1
+    assert Path(sim.path).read_bytes() == b"B" * 100_000
+
+
+def test_linux_trash_dirs_and_inode_location(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    mnt = tmp_path / "mnt"
+    uid = os.getuid()
+    files_dir = mnt / f".Trash-{uid}" / "files"
+    files_dir.mkdir(parents=True)
+    src_dir = mnt / "photos"
+    src_dir.mkdir(parents=True)
+    sample = src_dir / "dup.jpg"
+    sample.write_bytes(b"same-size-data")
+    decoy = files_dir / "dup.jpg"
+    decoy.write_bytes(b"same-size-data")
+    real_in_trash = files_dir / "dup 2.jpg"
+    real_in_trash.write_bytes(b"same-size-data")
+    orig_stat = real_in_trash.lstat()
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    real_stat = Path.stat
+
+    def _fake_stat(self: Path, *args, **kwargs):
+        st = real_stat(self, *args, **kwargs)
+        if self == sample:
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev + 99, st.st_nlink, st.st_uid, st.st_gid,
+                 st.st_size, st.st_atime, st.st_mtime, st.st_ctime)
+            )
+        return st
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    monkeypatch.setattr(Path, "stat", _fake_stat)
+    monkeypatch.setattr(actions_module, "_volume_root", lambda _p: mnt)
+
+    dirs = actions_module._trash_dirs_for(sample)
+    assert files_dir in dirs
+
+    batch = actions_module.TrashBatch()
+    located = batch._locate(
+        [files_dir],
+        sample.name,
+        sample.stem,
+        orig_stat.st_size,
+        (orig_stat.st_dev, orig_stat.st_ino),
+    )
+    assert located == real_in_trash
+
+
+def test_undo_action_restores_crop_receipt_via_restore_original(
+    tmp_path: Path, monkeypatch
+) -> None:
+    logs = tmp_path / "logs"
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+    cropped_file = tmp_path / "photo.png"
+    cropped_file.write_bytes(b"cropped-bytes")
+    original_backup = trash / "photo.png"
+    original_backup.write_bytes(b"original-bytes-full")
+
+    monkeypatch.setattr(actions_module.TrashBatch, "send", lambda self, p: shutil.move(str(p), str(trash / f"{Path(p).stem}_trashed{Path(p).suffix}")))
+    receipt_data = {
+        "action": "crop",
+        "dry_run": False,
+        "status": "complete",
+        "session_id": "crop-sess",
+        "items": [
+            {
+                "path": str(cropped_file),
+                "ok": True,
+                "action": "crop",
+                "destination": str(original_backup),
+                "size": len(b"original-bytes-full"),
+            }
+        ],
+    }
+    receipt_path = logs / "receipt-20261121T000000.000000Z-cropsess.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt_data), encoding="utf-8")
+
+    restored = undo_action(receipt_path, dry_run=False, log_dir=logs)
+    assert restored.success_count == 1
+    assert restored.action == "undo:crop"
+    assert cropped_file.read_bytes() == b"original-bytes-full"
+
+    # Unlocated bare "Trash" marker must block undo cleanly.
+    receipt_data["items"][0]["destination"] = "Trash"
+    receipt_path.write_text(json.dumps(receipt_data), encoding="utf-8")
+    blocked = undo_action(receipt_path, dry_run=True, log_dir=logs)
+    assert blocked.fail_count == 1
+
+
+def test_preview_auto_prunes_and_recovery_skips_previews(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dedupe.action_journal import recover_interrupted_actions
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for index in range(60):
+        (logs / f"preview-20260101T0000{index:02d}.000000Z-aaaa{index:04d}.json").write_text(
+            "{corrupt-not-parsed", encoding="utf-8"
+        )
+    # Recovery must ignore preview-* files completely without failing.
+    assert recover_interrupted_actions(logs) == []
+
+    # Writing a new dry-run preview auto-prunes older previews down to 50.
+    keep = _rec(tmp_path / "k.jpg", b"1")
+    rem = _rec(tmp_path / "r.jpg", b"1")
+    apply_actions(
+        build_groups([[keep, rem]], []),
+        action="trash",
+        dry_run=True,
+        roots=[str(tmp_path)],
+        log_dir=logs,
+    )
+    remaining_previews = list(logs.glob("preview-*.json"))
+    assert len(remaining_previews) == 50
+
+
+def test_action_journal_batches_fsync_calls(tmp_path: Path, monkeypatch) -> None:
+    import dedupe.action_journal as journal_mod
+
+    logs = tmp_path / "logs"
+    files = []
+    plans = []
+    for i in range(40):
+        p = tmp_path / f"f{i}.txt"
+        p.write_bytes(f"data-{i}".encode())
+        files.append(p)
+        plans.append({"path": str(p), "size": p.stat().st_size, "destination": "Trash"})
+
+    fsync_calls = []
+    real_fsync = journal_mod.os.fsync
+
+    def count_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(journal_mod.os, "fsync", count_fsync)
+    journal = journal_mod.ActionJournal(
+        {"action": "trash", "dry_run": False, "session_id": "batch1"},
+        plans,
+        log_dir=logs,
+    )
+    for i, p in enumerate(files):
+        journal.begin(i, require_full_hash=False)
+        journal.record(i, {"path": str(p), "ok": True, "action": "trash", "destination": "Trash"})
+    journal.finalize({"action": "trash", "dry_run": False, "items": []})
+    # 40 files = 80 append events -> far fewer than 80 fsyncs (interval=32 + atomic saves).
+    assert len(fsync_calls) < 15
+    assert not journal.events_path.exists()

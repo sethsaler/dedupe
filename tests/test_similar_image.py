@@ -96,15 +96,14 @@ def test_grouping_reuses_tile_hashes_without_reopening_files(tmp_path: Path, mon
     _make_image(a, (40, 80, 120), quality=95)
     _make_image(b, (40, 80, 120), quality=60)
 
-    module._tile_phashes_for_path.cache_clear()
+    module.clear_image_comparison_cache()
     lazy_calls: list[str] = []
-    original = module._tile_phashes_for_path.__wrapped__
+    original = module._tile_phashes_for_path
 
-    def counted(path: str):
+    def counted(path: str, *args, **kwargs):
         lazy_calls.append(path)
-        return original(path)
+        return original(path, *args, **kwargs)
 
-    counted.cache_clear = lambda: None
     monkeypatch.setattr(module, "_tile_phashes_for_path", counted)
 
     records = [_rec_for(a), _rec_for(b)]
@@ -119,17 +118,19 @@ def test_grouping_reuses_tile_hashes_without_reopening_files(tmp_path: Path, mon
 
 
 def test_lazy_tiles_match_tiles_from_hashing_pass(tmp_path: Path) -> None:
-    """Both tile paths must agree or mixed records would score as different."""
+    """Both tile paths stay closely aligned (768px verification vs 512px hash draft)."""
     import dedupe.similar_image as module
 
     p = tmp_path / "photo.jpg"
     _soft_photo(p, size=(900, 700))
-    module._tile_phashes_for_path.cache_clear()
+    module.clear_image_comparison_cache()
 
     lazy = module._tile_phashes_for_path(str(p))
     _ph, _dh, _w, _h, eager = compute_image_hashes_with_tiles(p)
 
-    assert lazy == eager
+    assert lazy is not None and eager is not None and len(lazy) == len(eager)
+    diffs = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(lazy, eager, strict=True)]
+    assert max(diffs) <= 3
 
 
 def test_legacy_tile_hashes_are_recomputed(tmp_path: Path) -> None:
@@ -920,7 +921,7 @@ def test_verification_decodes_each_file_once_for_every_orientation(tmp_path: Pat
         module._tile_phashes_for_path(str(a), module.TILE_NORMALIZE, orientation)
         module._dense_thumbs_for_path(str(a), orientation)
     module.is_dense_match(str(a), str(b))
-    info = module._hash_samples_for_path.cache_info()
+    info = module._verification_frames_cached.cache_info()
     assert info.misses == 2  # one decode per file serves tiles and dense thumbnails
     module.clear_image_comparison_cache()
 
@@ -1070,3 +1071,276 @@ def test_hashes_from_an_older_decode_are_computed_again(tmp_path: Path, monkeypa
     assert all(
         record.tile_phashes.startswith(f"{module.TILE_HASH_VERSION}:") for record in records
     )
+
+
+def test_ensure_heif_registered_is_thread_safe(monkeypatch) -> None:
+    """Concurrent worker threads register pillow-heif once behind the module lock."""
+    import concurrent.futures
+    import types
+
+    import dedupe.similar_image as module
+
+    calls = 0
+
+    def register_heif_opener() -> None:
+        nonlocal calls
+        calls += 1
+
+    fake_heif = types.SimpleNamespace(register_heif_opener=register_heif_opener)
+    monkeypatch.setitem(__import__("sys").modules, "pillow_heif", fake_heif)
+    monkeypatch.setattr(module, "_HEIF_REGISTERED", False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _i: module.ensure_heif_registered(), range(24)))
+
+    assert calls == 1
+    assert module._HEIF_REGISTERED is True
+
+
+def test_isoluminant_localized_patch_rejected_in_dense_and_grouping(tmp_path: Path) -> None:
+    """Localized red-to-green patch with identical BT.601 luminance must not match."""
+    a_img = Image.open(ASTRONAUT).convert("RGB")
+    b_img = a_img.copy()
+    px = b_img.load()
+    # Apply an isoluminant green->red/red->green shift inside a textured 56x56 patch.
+    for y in range(210, 266):
+        for x in range(210, 266):
+            r, g, b = px[x, y]
+            # Swap R/G with luma compensation (0.299*R + 0.587*G preserved).
+            g2 = max(0, min(255, g - 60))
+            r2 = max(0, min(255, round(r + (0.587 / 0.299) * (g - g2))))
+            actual_dg = (0.299 * (r - r2)) / 0.587
+            g2 = max(0, min(255, round(g + actual_dg)))
+            px[x, y] = (r2, g2, b)
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    a_img.save(a)
+    b_img.save(b)
+
+    assert not is_dense_match(str(a), str(b))
+    records = [_rec_for(a), _rec_for(b)]
+    assert find_similar_image_groups(records, workers=1) == []
+
+
+def test_rgba_transparent_matte_and_icc_srgb_normalization(tmp_path: Path) -> None:
+    """Zero-alpha garbage pixels do not skew hashes; embedded ICC normalizes to sRGB."""
+    icon_a = Image.new("RGBA", (128, 128), (255, 0, 0, 0))
+    icon_b = Image.new("RGBA", (128, 128), (0, 0, 255, 0))
+    for img in (icon_a, icon_b):
+        draw = ImageDraw.Draw(img)
+        draw.ellipse((24, 24, 104, 104), fill=(60, 140, 220, 255))
+        draw.rectangle((48, 48, 80, 80), fill=(240, 220, 80, 255))
+    pa, pb = tmp_path / "alpha_a.png", tmp_path / "alpha_b.png"
+    icon_a.save(pa)
+    icon_b.save(pb)
+
+    ph_a, dh_a, _, _ = compute_image_hashes(pa)
+    ph_b, dh_b, _, _ = compute_image_hashes(pb)
+    assert ph_a == ph_b
+    assert dh_a == dh_b
+
+    from PIL import ImageCms
+
+    srgb_bytes = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    icc_path = tmp_path / "icc.png"
+    Image.open(ASTRONAUT).convert("RGB").save(icc_path, icc_profile=srgb_bytes)
+    ph_icc, dh_icc, _, _ = compute_image_hashes(icc_path)
+    ph_raw, dh_raw, _, _ = compute_image_hashes(ASTRONAUT)
+    assert (int(ph_icc, 16) ^ int(ph_raw, 16)).bit_count() <= 1
+    assert (int(dh_icc, 16) ^ int(dh_raw, 16)).bit_count() <= 1
+
+
+def test_border_crop_virtual_secondary_hash_groups_bordered_screenshot(tmp_path: Path) -> None:
+    """A bordered phone screenshot matches the uncropped source via virtual-crop hashing."""
+    base_img = Image.open(ASTRONAUT).convert("RGB")
+    base_path = tmp_path / "orig.png"
+    base_img.save(base_path)
+
+    shot_path = tmp_path / "phone_screenshot.png"
+    inner = base_img.resize((384, 384), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (600, 1000), (16, 18, 22))
+    canvas.paste(inner, (108, 308))
+    canvas.save(shot_path)
+
+    rec_base = _rec_for(base_path)
+    rec_shot = _rec_for(shot_path)
+    rec_shot.border_crop = "108,308,492,692,600,1000"
+
+    groups = find_similar_image_groups([rec_base, rec_shot], threshold=6, workers=1)
+    assert len(groups) == 1
+    assert {r.path for r in groups[0]} == {str(base_path), str(shot_path)}
+
+
+def test_hamming_index_mih_indexed_up_to_radius_11_and_high_chunk_65535() -> None:
+    """4x16-bit MIH stays indexed through r=11, drops buckets, handles 0xFFFF chunks."""
+    import dedupe.similar_image as module
+
+    keys = [
+        0xFFFFFFFFFFFFFFFF,
+        0xFFFF00000000FFFF,
+        0xFFFF00000000FF00,  # dist 8 from 0xFFFF00000000FFFF
+        0xFFFF00000000F800,  # dist 11 from 0xFFFF00000000FFFF
+        0x0000000000000000,
+    ]
+    index = module.HammingIndex(keys, radius=11)
+    assert not hasattr(index, "buckets")
+    assert index.MAX_INDEXED_RADIUS == 11
+
+    for radius in (8, 11):
+        for query in keys:
+            got = sorted(index.find(query, radius=radius))
+            expected = sorted(
+                ((query ^ k).bit_count(), k)
+                for k in keys
+                if (query ^ k).bit_count() <= radius
+            )
+            assert got == expected
+
+        many = index.find_many(keys, radius=radius)
+        got_many = sorted(many)
+        expected_many = sorted(
+            (i, (keys[i] ^ k).bit_count(), k)
+            for i in range(len(keys))
+            for k in keys
+            if (keys[i] ^ k).bit_count() <= radius
+        )
+        assert got_many == expected_many
+
+
+def test_near_misses_skips_edited_copy_for_burst_shots(tmp_path: Path, monkeypatch) -> None:
+    """Already-aligned burst shots rejected only by fine detail skip verify_edited_copy."""
+    from dedupe import edited_copy
+
+    a_img = Image.open(ASTRONAUT).convert("RGB")
+    b_img = a_img.copy()
+    draw = ImageDraw.Draw(b_img)
+    draw.arc((215, 225, 265, 255), 10, 170, fill=(210, 130, 110), width=2)
+    pa, pb = tmp_path / "burst_a.png", tmp_path / "burst_b.png"
+    a_img.save(pa)
+    b_img.save(pb)
+
+    calls: list[tuple[str, str]] = []
+
+    def spy_verify(left: str, right: str, **_kwargs) -> bool:
+        calls.append((left, right))
+        return False
+
+    monkeypatch.setattr(edited_copy, "verify_edited_copy", spy_verify)
+    records = [_rec_for(pa), _rec_for(pb)]
+    groups = find_similar_image_groups(records, workers=1)
+    assert groups == []
+    # Verify aligned_local_reject avoided unnecessary edited-copy invocation in near_misses.
+    assert calls == []
+
+
+def test_still_multi_image_formats_and_animation_sentinel_and_fps_decimation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """TIFF/DNG stay still; animated WebP uses sentinel without backfill; GIF +-1 frame matches."""
+    import dedupe.image_frames as frames_mod
+    import dedupe.similar_image as module
+
+    assert {"MPO", "TIFF", "DNG"} <= frames_mod.STILL_MULTI_IMAGE_FORMATS
+
+    frames_a = [
+        Image.new("RGB", (96, 96), (30 + i * 25, 80, 200 - i * 20))
+        for i in range(8)
+    ]
+    for i, fr in enumerate(frames_a):
+        draw = ImageDraw.Draw(fr)
+        draw.rectangle((10 + i * 5, 20, 40 + i * 5, 60), fill=(240, 220, 60))
+    gif_a = tmp_path / "anim_a.gif"
+    gif_b = tmp_path / "anim_b.gif"
+    frames_a[0].save(gif_a, save_all=True, append_images=frames_a[1:], duration=80, loop=0)
+    # Shift frames by 1 index (simulates FPS-decimated re-encode within +-1 frame tolerance).
+    frames_b = [frames_a[0], *frames_a[1:], frames_a[-1]][:8]
+    frames_b[0].save(gif_b, save_all=True, append_images=frames_b[1:], duration=100, loop=0)
+
+    _path_a, ph, dh, w, h, tiles, ori, err_a = module._image_hash_job(str(gif_a))
+    assert err_a is None
+    assert module.is_animation_orientation_sentinel(ori)
+    assert module.decode_animation_midpoint_phash(ori) is not None
+
+    rec_a = _rec_for(gif_a)
+    rec_a.media_type = MediaType.GIF
+    rec_a.phash, rec_a.dhash, rec_a.width, rec_a.height = ph, dh, w, h
+    rec_a.tile_phashes = module.encode_tile_phashes(tiles)
+    rec_a.orientation_phashes = ori
+
+    _path_b, ph_b, dh_b, w_b, h_b, tiles_b, ori_b, err_b = module._image_hash_job(str(gif_b))
+    assert err_b is None
+    rec_b = _rec_for(gif_b)
+    rec_b.media_type = MediaType.GIF
+    rec_b.phash, rec_b.dhash, rec_b.width, rec_b.height = ph_b, dh_b, w_b, h_b
+    rec_b.tile_phashes = module.encode_tile_phashes(tiles_b)
+    rec_b.orientation_phashes = ori_b
+
+    # Animated record marked with sentinel must NOT trigger hash backfill on cached scans.
+    rec_as_img = _rec_for(gif_a)
+    rec_as_img.media_type = MediaType.IMAGE
+    rec_as_img.phash, rec_as_img.dhash, rec_as_img.width, rec_as_img.height = ph, dh, w, h
+    rec_as_img.tile_phashes = rec_a.tile_phashes
+    rec_as_img.orientation_phashes = ori
+    rec_as_img_b = _rec_for(gif_b)
+    rec_as_img_b.media_type = MediaType.IMAGE
+    rec_as_img_b.phash, rec_as_img_b.dhash, rec_as_img_b.width, rec_as_img_b.height = (
+        ph_b,
+        dh_b,
+        w_b,
+        h_b,
+    )
+    rec_as_img_b.tile_phashes = rec_b.tile_phashes
+    rec_as_img_b.orientation_phashes = ori_b
+
+    hash_calls: list[str] = []
+    real_map_parallel = module.map_parallel
+
+    def intercept_map_parallel(fn, items, **kwargs):
+        if fn is module._image_hash_job:
+            hash_calls.extend(items)
+            return []
+        return real_map_parallel(fn, items, **kwargs)
+
+    monkeypatch.setattr(module, "map_parallel", intercept_map_parallel)
+    groups = find_similar_image_groups([rec_as_img, rec_as_img_b], workers=1)
+    assert hash_calls == []
+    assert len(groups) == 1
+
+
+def test_jpeg_bitstream_and_canonical_pixel_sha256(tmp_path: Path) -> None:
+    """Bitstream SHA-256 strips APP/COM metadata; pixel SHA-256 normalizes EXIF rotation."""
+    import dedupe.similar_image as module
+
+    src = Image.open(ASTRONAUT).convert("RGB")
+    jpg1 = tmp_path / "one.jpg"
+    jpg2 = tmp_path / "two.jpg"
+    src.save(jpg1, quality=90)
+    # Build a second JPEG identical except for inserted COM/APP1 metadata before SOS.
+    raw = jpg1.read_bytes()
+    com_seg = b"\xff\xfe" + (10).to_bytes(2, "big") + b"extra-cm"
+    jpg2.write_bytes(raw[:2] + com_seg + raw[2:] + b"trailing-bytes")
+
+    h1 = module.jpeg_bitstream_sha256(jpg1)
+    h2 = module.jpeg_bitstream_sha256(jpg2)
+    assert h1 is not None and h1 == h2
+
+    # Non-JPEG and truncated JPEG return None.
+    png_path = tmp_path / "img.png"
+    src.save(png_path)
+    assert module.jpeg_bitstream_sha256(png_path) is None
+    trunc = tmp_path / "trunc.jpg"
+    trunc.write_bytes(raw[:20])
+    assert module.jpeg_bitstream_sha256(trunc) is None
+
+    # Canonical pixel SHA-256 matches across unrotated PNG and EXIF-rotated lossless PNG/TIFF.
+    rotated = src.rotate(90, expand=True)
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Rotate 90 CW (= undo 90 CCW above)
+    rot_png = tmp_path / "rot.png"
+    rotated.save(rot_png, exif=exif)
+    assert module.canonical_pixel_sha256(png_path) == module.canonical_pixel_sha256(rot_png)
+
+    # Animated image returns None for canonical_pixel_sha256.
+    gif = tmp_path / "a.gif"
+    second_frame = Image.new("RGB", src.size, (10, 20, 30))
+    src.save(gif, save_all=True, append_images=[second_frame], duration=100, loop=0)
+    assert module.canonical_pixel_sha256(gif) is None

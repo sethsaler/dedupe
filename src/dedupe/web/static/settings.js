@@ -2,25 +2,47 @@
 
 import { api } from "./api.js";
 import { state } from "./state.js";
-import { $, escapeHtml, toast } from "./util.js";
+import { syncRangeInput } from "./theme.js";
+import { $, basename, escapeHtml, toast } from "./util.js";
 
 const RECENT_KEY = "dedupe.recentPaths";
 const WORKERS_KEY = "dedupe.workers";
 const SETTINGS_KEY = "dedupe.scanSettings.v1";
 
-const thresh = $("threshold");
-const threshVal = $("threshVal");
-thresh.addEventListener("input", () => {
+/** Parse scan paths without splitting single folder names that contain commas. */
+function parsePathsInput(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  const seen = new Set();
+  const parsed = [];
+  for (const part of text.split(/\r?\n|,\s*(?=[/~]|[A-Za-z]:[\\/])/)) {
+    const cleaned = part.trim();
+    if (cleaned && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      parsed.push(cleaned);
+    }
+  }
+  return parsed;
+}
+
+function syncThresholdUI() {
   threshVal.textContent = thresh.value;
   const preset = $("similarityPreset");
-  preset.value = [...preset.options].some((option) => option.value === thresh.value) ? thresh.value : "";
-});
+  if (preset) {
+    preset.value = [...preset.options].some((option) => option.value === thresh.value) ? thresh.value : "";
+  }
+  syncRangeInput(thresh);
+}
+
+const thresh = $("threshold");
+const threshVal = $("threshVal");
+thresh.addEventListener("input", syncThresholdUI);
 $("similarityPreset").addEventListener("change", () => {
   // "" is the disabled "Custom (raw slider)" marker shown when the slider
   // sits between presets; choosing nothing keeps the slider value.
   if ($("similarityPreset").value === "") return;
   thresh.value = $("similarityPreset").value;
-  threshVal.textContent = thresh.value;
+  syncThresholdUI();
   saveScanSettings();
 });
 
@@ -48,6 +70,7 @@ function updateWorkersUI() {
   } else {
     workersHint.textContent = "parallel hashing";
   }
+  syncRangeInput(workersEl);
 }
 
 workersEl.addEventListener("input", () => {
@@ -159,6 +182,8 @@ function saveScanSettings() {
 function syncSemanticLabels() {
   $("semanticDuplicateVal").textContent = `${Number($("semanticDuplicateThreshold").value).toFixed(1).replace(/\.0$/, "")}%`;
   $("semanticSetVal").textContent = `${$("semanticSetThreshold").value}%`;
+  syncRangeInput($("semanticDuplicateThreshold"));
+  syncRangeInput($("semanticSetThreshold"));
 }
 $("semanticDuplicateThreshold").addEventListener("input", syncSemanticLabels);
 $("semanticSetThreshold").addEventListener("input", syncSemanticLabels);
@@ -172,7 +197,7 @@ function restoreScanSettings() {
       if (element.type === "checkbox") element.checked = !!settings[id];
       else element.value = settings[id];
     }
-    threshVal.textContent = thresh.value;
+    syncThresholdUI();
     syncSemanticLabels();
   } catch {
     /* ignore */
@@ -203,6 +228,20 @@ function syncSemanticVisibility() {
 }
 $("optSemantic").addEventListener("change", syncSemanticVisibility);
 syncSemanticVisibility();
+
+function syncLowResolutionVisibility() {
+  const field = $("lowResFields");
+  if (field) field.hidden = !$("optLowResolution").checked;
+}
+$("optLowResolution").addEventListener("change", syncLowResolutionVisibility);
+syncLowResolutionVisibility();
+
+function syncSimilarityVisibility() {
+  const field = $("similarityFields");
+  if (field) field.hidden = !$("optSimilar").checked;
+}
+$("optSimilar").addEventListener("change", syncSimilarityVisibility);
+syncSimilarityVisibility();
 
 // —— Scan goals ——
 // Each goal is a starting point: it sets which detectors run and which tab
@@ -305,14 +344,30 @@ function settingsDetectorFlag(settings, detectorId) {
     case "optSemantic": return Boolean(settings.semantic);
     case "optVideoVersions": return Boolean(settings.video_versions);
     case "optDecider": return Boolean(settings.decider);
-    case "optNoHumans": return Boolean(settings.find_no_humans);
+    case "optNoHumans": return Boolean(settings.find_no_humans ?? settings.no_humans);
     case "optCountFaces": return Boolean(settings.count_faces);
     case "optBlackBorders": return Boolean(settings.find_black_borders);
-    case "optLowResolution": return Boolean(settings.find_low_resolution);
-    case "optRandomReview": return Number(settings.random_review_count || 0) > 0;
+    case "optLowResolution": return Boolean(settings.find_low_resolution ?? settings.low_resolution);
+    case "optRandomReview": return Number(settings.random_review_count || 0) > 0 || Boolean(settings.random_review);
     case "optParallel": return Boolean(settings.parallel_streams);
     default: return false;
   }
+}
+
+function currentDetectorSettings() {
+  return {
+    exact: $("optExact")?.checked,
+    similar: $("optSimilar")?.checked,
+    semantic: $("optSemantic")?.checked,
+    video_versions: $("optVideoVersions")?.checked,
+    decider: $("optDecider")?.checked,
+    find_no_humans: $("optNoHumans")?.checked,
+    count_faces: $("optCountFaces")?.checked,
+    find_black_borders: $("optBlackBorders")?.checked,
+    find_low_resolution: $("optLowResolution")?.checked,
+    random_review_count: $("optRandomReview")?.checked ? 50 : 0,
+    parallel_streams: $("optParallel")?.checked,
+  };
 }
 
 function inferScanPreset(settings) {
@@ -372,7 +427,10 @@ function applyScanPreset(preset) {
   syncSemanticVisibility();
   syncHumanBackendVisibility();
   syncCropLevelVisibility();
+  syncLowResolutionVisibility();
+  syncSimilarityVisibility();
   syncCrossFolderHint();
+  syncSetupConflictHint();
   saveScanSettings();
 }
 
@@ -398,8 +456,10 @@ $("scanPreset").value = "cleanup";
 applyScanPreset("cleanup");
 for (const id of GOAL_DETECTORS) {
   $(id).addEventListener("change", () => {
-    $("scanPreset").value = "custom";
-    syncCustomPresetHint();
+    const inferred = inferScanPreset(currentDetectorSettings());
+    $("scanPreset").value = inferred;
+    if (inferred === "custom") syncCustomPresetHint();
+    else $("presetHint").textContent = SCAN_PRESETS[inferred]?.hint || "";
   });
 }
 
@@ -439,26 +499,71 @@ function renderRecent() {
     btn.addEventListener("click", () => {
       // Append like the native picker does; replacing wiped typed paths.
       appendPickedPaths([btn.dataset.path]);
-      syncCrossFolderHint();
     });
   });
 }
 
-// —— Native folder/file pick (the local server can return absolute paths) ——
-function appendPickedPaths(paths) {
+// —— Path chips & native folder/file pick ——
+function syncPathChips() {
+  const box = $("pathChips");
   const input = $("paths");
-  const existing = input.value
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  for (const path of paths) {
-    if (path && !existing.includes(path)) existing.push(path);
+  if (!box || !input) return;
+  const paths = parsePathsInput(input.value);
+  if (!paths.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
   }
-  input.value = existing.join(", ");
-  input.focus();
+  box.hidden = false;
+  box.innerHTML = paths
+    .map(
+      (p) =>
+        `<span class="path-chip" title="${escapeHtml(p)}">`
+        + `<button type="button" class="path-chip-label" data-focus-path="${escapeHtml(p)}">${escapeHtml(basename(p) || p)}</button>`
+        + `<button type="button" class="path-chip-remove" data-remove-path="${escapeHtml(p)}" aria-label="Remove ${escapeHtml(p)}">✕</button>`
+        + `</span>`,
+    )
+    .join("");
 }
 
-async function pickPaths(kind, button) {
+$("pathChips")?.addEventListener("click", (event) => {
+  const removeBtn = event.target.closest("[data-remove-path]");
+  if (removeBtn) {
+    const target = removeBtn.dataset.removePath;
+    const remaining = parsePathsInput($("paths").value).filter((p) => p !== target);
+    $("paths").value = remaining.join(", ");
+    syncPathChips();
+    syncCrossFolderHint();
+    syncSetupConflictHint();
+    $("paths").dispatchEvent(new Event("input", { bubbles: true }));
+    $("paths").focus();
+    return;
+  }
+  if (event.target.closest("[data-focus-path]")) {
+    $("paths").focus();
+  }
+});
+
+function appendPickedPaths(paths, targetEl = $("paths"), { multiline = false } = {}) {
+  if (!targetEl) return;
+  const existing = multiline
+    ? targetEl.value.split("\n").map((value) => value.trim()).filter(Boolean)
+    : parsePathsInput(targetEl.value);
+  for (const path of paths) {
+    const cleaned = String(path || "").trim();
+    if (cleaned && !existing.includes(cleaned)) existing.push(cleaned);
+  }
+  targetEl.value = existing.join(multiline ? "\n" : ", ");
+  if (targetEl === $("paths")) {
+    syncPathChips();
+    syncCrossFolderHint();
+  }
+  syncSetupConflictHint();
+  targetEl.dispatchEvent(new Event(multiline ? "change" : "input", { bubbles: true }));
+  targetEl.focus();
+}
+
+async function pickPaths(kind, button, targetEl = $("paths"), { multiline = false } = {}) {
   const originalLabel = button.textContent;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
@@ -470,7 +575,7 @@ async function pickPaths(kind, button) {
     });
     const paths = data.paths || (data.path ? [data.path] : []);
     if (paths.length) {
-      appendPickedPaths(paths);
+      appendPickedPaths(paths, targetEl, { multiline });
       toast(`${paths.length} ${kind === "folder" ? "folder" : "file"}${paths.length === 1 ? "" : "s"} added`, "ok");
     } else if (data.cancelled) {
       /* user cancelled */
@@ -492,6 +597,63 @@ $("btnPickFolder").addEventListener("click", (event) => {
 $("btnPickFiles").addEventListener("click", (event) => {
   pickPaths("files", event.currentTarget);
 });
+$("btnPickProtected")?.addEventListener("click", (event) => {
+  pickPaths("folder", event.currentTarget, $("protectedFolders"), { multiline: true });
+});
+$("btnPickPreferred")?.addEventListener("click", (event) => {
+  pickPaths("folder", event.currentTarget, $("preferredFolders"), { multiline: true });
+});
+
+function decodeFileUrl(raw) {
+  let path = raw.replace(/^file:\/\/(?:localhost)?/i, "");
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    /* keep raw percent sequences if malformed */
+  }
+  if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+  return path.trim();
+}
+
+function unquoteShellLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return [];
+  const multiQuoted = trimmed.match(/^(?:'[^']+'|"[^"]+")(?:\s+(?:'[^']+'|"[^"]+"))+$/);
+  if (multiQuoted) {
+    return [...trimmed.matchAll(/'([^']+)'|"([^"]+)"/g)].map((m) => (m[1] ?? m[2]).trim()).filter(Boolean);
+  }
+  if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    const inner = trimmed.slice(1, -1).trim();
+    return inner ? [inner] : [];
+  }
+  // Unescape POSIX backslash-escaped spaces when not a Windows drive path.
+  const normalized = /^[A-Za-z]:\\/.test(trimmed) ? trimmed : trimmed.replace(/\\ /g, " ");
+  return parsePathsInput(normalized);
+}
+
+function parseDroppedPaths(dataTransfer) {
+  const uriList = dataTransfer.getData("text/uri-list") || "";
+  const plain = dataTransfer.getData("text/plain") || "";
+  const raw = uriList.trim() ? uriList : plain;
+  if (!raw.trim()) return [];
+  const seen = new Set();
+  const out = [];
+  const isUriList = Boolean(uriList.trim());
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || (isUriList && trimmed.startsWith("#"))) continue;
+    const candidates = /^file:\/\//i.test(trimmed)
+      ? [decodeFileUrl(trimmed)]
+      : unquoteShellLine(trimmed);
+    for (const candidate of candidates) {
+      if (candidate && !seen.has(candidate)) {
+        seen.add(candidate);
+        out.push(candidate);
+      }
+    }
+  }
+  return out;
+}
 
 // Drag path text onto input
 const pathWrap = document.querySelector(".path-input-wrap");
@@ -508,15 +670,9 @@ const pathWrap = document.querySelector(".path-input-wrap");
   });
 });
 pathWrap.addEventListener("drop", (e) => {
-  const text =
-    e.dataTransfer.getData("text/plain") ||
-    e.dataTransfer.getData("text/uri-list") ||
-    "";
-  if (text.trim()) {
-    const cleaned = text.trim().replace(/^file:\/\//, "");
-    const cur = $("paths").value.trim();
-    $("paths").value = cur ? `${cur}, ${cleaned}` : cleaned;
-    syncCrossFolderHint();
+  const dropped = parseDroppedPaths(e.dataTransfer);
+  if (dropped.length) {
+    appendPickedPaths(dropped);
   } else if (e.dataTransfer.files?.length) {
     // Browsers never expose a dropped item's absolute path; say so instead of
     // silently ignoring the drop.
@@ -524,21 +680,64 @@ pathWrap.addEventListener("drop", (e) => {
   }
 });
 
-// —— Cross-folder duplicate hint ——
+function normalizeFolderCompare(p) {
+  const trimmed = String(p || "").trim();
+  return trimmed.length > 1 ? trimmed.replace(/[\\/]+$/, "") : trimmed;
+}
+
+// —— Cross-folder duplicate & setup conflict hints ——
 // Opt-in independent streams never match files across
 // folders; say so next to the path field, where the user actually looks.
 function syncCrossFolderHint() {
   const hint = $("crossFolderHint");
   if (!hint) return;
-  const pathCount = $("paths")
-    .value.split(",")
-    .map((value) => value.trim())
-    .filter(Boolean).length;
+  const pathCount = parsePathsInput($("paths")?.value).length;
   hint.hidden = !(pathCount > 1 && $("optParallel").checked);
 }
-$("paths").addEventListener("input", syncCrossFolderHint);
-$("optParallel").addEventListener("change", syncCrossFolderHint);
+
+function syncSetupConflictHint() {
+  const hint = $("setupConflictHint");
+  if (!hint) return;
+  const scanPaths = parsePathsInput($("paths")?.value);
+  const protectedPaths = ($("protectedFolders")?.value || "")
+    .split("\n")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const messages = [];
+  if (protectedPaths.length > 0 && $("optParallel")?.checked) {
+    messages.push(
+      "Protected libraries require comparing folders together — turn off “Scan folders separately” before scanning.",
+    );
+  }
+  if (scanPaths.length > 0 && protectedPaths.length > 0) {
+    const protectedSet = new Set(protectedPaths.map(normalizeFolderCompare));
+    const overlap = scanPaths.filter((p) => protectedSet.has(normalizeFolderCompare(p)));
+    if (overlap.length > 0) {
+      messages.push(
+        `Listed in both Scan folders and Protected library (${overlap.map((p) => basename(p) || p).join(", ")}): protected folders stay read-only.`,
+      );
+    }
+  }
+  hint.hidden = messages.length === 0;
+  hint.textContent = messages.join(" ");
+}
+
+function onPathsFieldChanged() {
+  syncPathChips();
+  syncCrossFolderHint();
+  syncSetupConflictHint();
+}
+$("paths").addEventListener("input", onPathsFieldChanged);
+$("paths").addEventListener("change", onPathsFieldChanged);
+$("protectedFolders")?.addEventListener("input", syncSetupConflictHint);
+$("protectedFolders")?.addEventListener("change", syncSetupConflictHint);
+$("optParallel").addEventListener("change", () => {
+  syncCrossFolderHint();
+  syncSetupConflictHint();
+});
+syncPathChips();
 syncCrossFolderHint();
+syncSetupConflictHint();
 
 // —— Dependency-gated options ——
 // The server probes optional dependencies once at startup; options that need a
@@ -551,12 +750,18 @@ function applyCapabilities(caps) {
     const input = $(inputId);
     const wrap = wrapId ? $(wrapId) : null;
     if (!input) return;
+    const target = wrap || input;
+    if (target.dataset.defaultTitle === undefined) {
+      target.dataset.defaultTitle = target.getAttribute("title") || "";
+    }
     input.disabled = !ready;
     if (!ready) {
       input.checked = false;
-      (wrap || input).title = reason;
+      target.title = reason;
+    } else if (target.dataset.defaultTitle) {
+      target.title = target.dataset.defaultTitle;
     } else {
-      (wrap || input).removeAttribute("title");
+      target.removeAttribute("title");
     }
   };
   gate("optVideoVersions", "optVideoVersionsWrap", Boolean(caps.ffmpeg && caps.ffprobe),
@@ -619,12 +824,142 @@ function applyCapabilities(caps) {
       : "";
   }
   syncHumanBackendVisibility();
+  syncSemanticVisibility();
+  syncCropLevelVisibility();
+  syncLowResolutionVisibility();
+  syncSimilarityVisibility();
+}
+
+function setCheckboxFromSetting(id, value) {
+  const el = $(id);
+  if (!el) return;
+  el.checked = !el.disabled && Boolean(value);
+}
+
+function formatMegapixels(pixelsValue, mpValue) {
+  if (mpValue != null && Number.isFinite(Number(mpValue))) return String(mpValue);
+  if (pixelsValue == null || !Number.isFinite(Number(pixelsValue))) return null;
+  return String(Number((Number(pixelsValue) / 1_000_000).toFixed(4)));
+}
+
+/** Hydrate the scan setup form from a saved or active scan_settings object. */
+function applySettingsToForm(settings) {
+  if (!settings || typeof settings !== "object") return;
+  if ("paths" in settings) {
+    const paths = Array.isArray(settings.paths)
+      ? settings.paths.map((s) => String(s).trim()).filter(Boolean)
+      : parsePathsInput(settings.paths);
+    if ($("paths")) $("paths").value = paths.join(", ");
+    syncPathChips();
+  }
+  if ("protected_folders" in settings && $("protectedFolders")) {
+    $("protectedFolders").value = Array.isArray(settings.protected_folders)
+      ? settings.protected_folders.join("\n")
+      : (settings.protected_folders || "");
+  }
+  if ("preferred_folders" in settings && $("preferredFolders")) {
+    $("preferredFolders").value = Array.isArray(settings.preferred_folders)
+      ? settings.preferred_folders.join("\n")
+      : (settings.preferred_folders || "");
+  }
+  const boolMappings = [
+    ["exact", "optExact"],
+    ["similar", "optSimilar"],
+    ["video_versions", "optVideoVersions"],
+    ["semantic", "optSemantic"],
+    ["decider", "optDecider"],
+    ["count_faces", "optCountFaces"],
+    ["find_black_borders", "optBlackBorders"],
+    ["low_resolution_images", "optLowResolutionImages"],
+    ["low_resolution_gifs", "optLowResolutionGifs"],
+    ["low_resolution_videos", "optLowResolutionVideos"],
+    ["include_images", "optImages"],
+    ["include_gifs", "optGifs"],
+    ["include_videos", "optVideos"],
+    ["parallel_streams", "optParallel"],
+  ];
+  for (const [key, id] of boolMappings) {
+    if (key in settings) setCheckboxFromSetting(id, settings[key]);
+  }
+  if ("semantic_full_speed" in settings || "semantic_fast" in settings) {
+    setCheckboxFromSetting("optSemanticFast", settings.semantic_full_speed ?? settings.semantic_fast);
+  }
+  if ("find_no_humans" in settings || "no_humans" in settings) {
+    setCheckboxFromSetting("optNoHumans", settings.find_no_humans ?? settings.no_humans);
+  }
+  if ("find_low_resolution" in settings || "low_resolution" in settings) {
+    setCheckboxFromSetting("optLowResolution", settings.find_low_resolution ?? settings.low_resolution);
+  }
+  if ("random_review_count" in settings || "random_review" in settings) {
+    const active = settings.random_review_count != null
+      ? Number(settings.random_review_count) > 0
+      : Boolean(settings.random_review);
+    setCheckboxFromSetting("optRandomReview", active);
+  }
+  if ("human_backend" in settings && $("humanBackend")) {
+    const val = String(settings.human_backend || "opencv");
+    const opt = [...$("humanBackend").options].find((o) => o.value === val && !o.disabled);
+    if (opt) $("humanBackend").value = val;
+  }
+  if ("crop_aggressiveness" in settings && $("optCropAggressiveness")) {
+    $("optCropAggressiveness").value = String(settings.crop_aggressiveness || "balanced");
+  }
+  if (settings.semantic_duplicate_threshold != null && $("semanticDuplicateThreshold")) {
+    const raw = Number(settings.semantic_duplicate_threshold);
+    if (Number.isFinite(raw)) {
+      $("semanticDuplicateThreshold").value = String(raw <= 1 ? raw * 100 : raw);
+    }
+  }
+  const semSetRaw = settings.semantic_threshold ?? settings.semantic_set_threshold;
+  if (semSetRaw != null && $("semanticSetThreshold")) {
+    const raw = Number(semSetRaw);
+    if (Number.isFinite(raw)) {
+      $("semanticSetThreshold").value = String(raw <= 1 ? raw * 100 : raw);
+    }
+  }
+  for (const [pixelsKey, mpKey, id] of [
+    ["low_resolution_image_max_pixels", "low_resolution_image_max_mp", "lowResolutionImageMaxMp"],
+    ["low_resolution_gif_max_pixels", "low_resolution_gif_max_mp", "lowResolutionGifMaxMp"],
+    ["low_resolution_video_max_pixels", "low_resolution_video_max_mp", "lowResolutionVideoMaxMp"],
+  ]) {
+    const formatted = formatMegapixels(settings[pixelsKey], settings[mpKey]);
+    if (formatted !== null && $(id)) $(id).value = formatted;
+  }
+  const simThresh = settings.threshold ?? settings.similarity_threshold;
+  if (simThresh != null && Number.isFinite(Number(simThresh))) {
+    thresh.value = String(simThresh);
+  }
+  if ("workers" in settings && workersEl) {
+    const maxW = Number(workersEl.max || 32);
+    workersEl.value = settings.workers == null
+      ? "0"
+      : String(Math.max(0, Math.min(maxW, Number(settings.workers) || 0)));
+  }
+  if ("exclusions" in settings && $("exclusions")) {
+    $("exclusions").value = Array.isArray(settings.exclusions)
+      ? settings.exclusions.join(", ")
+      : (settings.exclusions || "");
+  }
+  syncThresholdUI();
+  syncSemanticLabels();
+  updateWorkersUI();
+  syncSemanticVisibility();
+  syncHumanBackendVisibility();
+  syncCropLevelVisibility();
+  syncLowResolutionVisibility();
+  syncSimilarityVisibility();
+  syncCrossFolderHint();
+  syncSetupConflictHint();
+  const inferredPreset = inferScanPreset(settings);
+  $("scanPreset").value = inferredPreset;
+  if (inferredPreset === "custom") syncCustomPresetHint();
+  else $("presetHint").textContent = SCAN_PRESETS[inferredPreset]?.hint || "";
 }
 
 // —— Exclusion check ——
 $("btnCheckExclusions").addEventListener("click", async () => {
   const result = $("exclusionsCheckResult");
-  const paths = $("paths").value.split(",").map((value) => value.trim()).filter(Boolean);
+  const paths = parsePathsInput($("paths").value);
   const exclusions = $("exclusions").value.split(",").map((value) => value.trim()).filter(Boolean);
   if (!paths.length) {
     toast("Enter the scan folders first, then check exclusions");
@@ -666,6 +1001,8 @@ function lowResolutionMaxPixels(id) {
 
 export {
   SCAN_PRESETS,
+  parsePathsInput,
+  applySettingsToForm,
   updateWorkersUI,
   workersEl,
   saveRecent,
@@ -675,6 +1012,7 @@ export {
   expandScanPanel,
   applyCapabilities,
   syncCrossFolderHint,
+  syncSetupConflictHint,
   syncCollapseButtonVisibility,
   syncCustomPresetHint,
   inferScanPreset,

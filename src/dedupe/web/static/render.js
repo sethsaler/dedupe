@@ -7,21 +7,37 @@ import { renderMembers } from "./members.js";
 // —— Batched rendering ——
 const pendingRender = { groupList: false, streamedGroups: false, selection: false, members: null };
 let renderHandle = null;
+let flushing = false;
+
+function hasPendingWork() {
+  return Boolean(
+    pendingRender.groupList
+      || pendingRender.streamedGroups
+      || pendingRender.selection
+      || pendingRender.members,
+  );
+}
 
 function flushRenders() {
   renderHandle = null;
-  const members = pendingRender.members;
-  const list = pendingRender.groupList;
-  const streamedGroups = pendingRender.streamedGroups;
-  const selection = pendingRender.selection;
-  pendingRender.members = null;
-  pendingRender.groupList = false;
-  pendingRender.streamedGroups = false;
-  pendingRender.selection = false;
-  if (members) renderMembers(members);
-  if (list) renderGroupList();
-  if (streamedGroups) finishStreamedGroupRender();
-  if (selection) updateSelectionSummary();
+  flushing = true;
+  try {
+    const members = pendingRender.members;
+    const list = pendingRender.groupList;
+    const streamedGroups = pendingRender.streamedGroups;
+    pendingRender.members = null;
+    pendingRender.groupList = false;
+    pendingRender.streamedGroups = false;
+    if (members) renderMembers(members);
+    if (list) renderGroupList();
+    if (streamedGroups) finishStreamedGroupRender();
+    const selection = pendingRender.selection;
+    pendingRender.selection = false;
+    if (selection) updateSelectionSummary();
+  } finally {
+    flushing = false;
+    if (hasPendingWork()) scheduleRender();
+  }
 }
 
 function scheduleRender({ groupList = false, streamedGroups = false, selection = false, members = null } = {}) {
@@ -29,7 +45,7 @@ function scheduleRender({ groupList = false, streamedGroups = false, selection =
   if (streamedGroups) pendingRender.streamedGroups = true;
   if (selection) pendingRender.selection = true;
   if (members) pendingRender.members = members;
-  if (renderHandle !== null) return;
+  if (!hasPendingWork() || flushing || renderHandle !== null) return;
   renderHandle =
     typeof requestAnimationFrame === "function"
       ? requestAnimationFrame(flushRenders)

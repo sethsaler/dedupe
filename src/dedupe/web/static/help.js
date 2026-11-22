@@ -7,19 +7,26 @@ let previousFocus = null;
 
 function openHelp() {
   const dialog = $("helpBackdrop");
-  previousFocus = document.activeElement;
-  if (!dialog.open) dialog.showModal();
-  $("helpClose").focus();
+  if (!dialog) return;
+  if (!dialog.open) {
+    previousFocus = document.activeElement;
+    dialog.showModal();
+  }
+  $("helpClose")?.focus();
   promoteToastTopLayer();
 }
 function closeHelp() {
   const dialog = $("helpBackdrop");
-  if (dialog.open) dialog.close();
+  if (dialog?.open) dialog.close();
 }
-$("btnHelp").addEventListener("click", openHelp);
-$("helpClose").addEventListener("click", closeHelp);
-$("helpBackdrop").addEventListener("close", () => {
-  if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
+$("btnHelp")?.addEventListener("click", openHelp);
+$("helpClose")?.addEventListener("click", closeHelp);
+$("helpBackdrop")?.addEventListener("close", () => {
+  if (previousFocus && previousFocus.isConnected && typeof previousFocus.focus === "function") {
+    previousFocus.focus();
+  } else {
+    $("btnHelp")?.focus();
+  }
   previousFocus = null;
 });
 

@@ -1,47 +1,29 @@
 /* Workspace design system. Structural and media behavior stays in app.css. */
 @layer workspace {
-:root:not([data-theme="light"]) {
-  color-scheme: dark;
-  --bg: #111216;
-  --bg-elev: #1b1d24;
-  --panel: #191b21;
-  --panel-2: #22252e;
-  --panel-hover: #2b2e39;
-  --border: #353945;
-  --border-soft: #2a2d37;
-  --text: #eeeef3;
-  --muted: #a6aabb;
-  --faint: #898fa2;
-  --accent: #a5a0ff;
-  --accent-2: #8078ef;
-  --accent-soft: #2c2946;
-  --brand: #635bdf;
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#f7f8fa, #111216);
+  --bg-elev: light-dark(#ffffff, #1b1d24);
+  --panel: light-dark(#ffffff, #191b21);
+  --panel-2: light-dark(#f4f5f8, #22252e);
+  --panel-hover: light-dark(#edeef3, #2b2e39);
+  --border: light-dark(#dcdfe7, #353945);
+  --border-soft: light-dark(#eceef3, #2a2d37);
+  --text: light-dark(#20232e, #eeeef3);
+  --muted: light-dark(#626a7c, #a6aabb);
+  --faint: light-dark(#747d8e, #898fa2);
+  --accent: light-dark(#4f46e5, #a5a0ff);
+  --accent-2: light-dark(#4338ca, #8078ef);
+  --accent-soft: light-dark(#eeedff, #2c2946);
+  --brand: light-dark(#4f46e5, #635bdf);
   --radius: 10px;
   --radius-sm: 7px;
   --shadow-panel: none;
-  --media-mat: #121419;
+  --media-mat: light-dark(#f0f1f5, #121419);
 }
 
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    color-scheme: light;
-    --bg: #f7f8fa;
-    --bg-elev: #ffffff;
-    --panel: #ffffff;
-    --panel-2: #f4f5f8;
-    --panel-hover: #edeef3;
-    --border: #dcdfe7;
-    --border-soft: #eceef3;
-    --text: #20232e;
-    --muted: #626a7c;
-    --faint: #747d8e;
-    --accent: #4f46e5;
-    --accent-2: #4338ca;
-    --accent-soft: #eeedff;
-    --brand: #4f46e5;
-    --media-mat: #f0f1f5;
-  }
-}
+:root[data-theme="light"] { color-scheme: only light; }
+:root[data-theme="dark"] { color-scheme: only dark; }
 
 body { background: var(--bg); }
 .app { padding: 20px 24px calc(var(--actionbar-h) + 24px); gap: 12px; }
@@ -62,8 +44,6 @@ body { background: var(--bg); }
 .scan-collapse { font-size: 13px; }
 .scan-panel.collapsed .session-status { border: 0; background: transparent; }
 .session-status-main { flex-wrap: wrap; }
-.exact-recovery { background: var(--panel); font-size: 13px; padding: 11px 14px; }
-.exact-recovery > summary { font-weight: 550; }
 
 .results { grid-template-columns: 272px minmax(0, 1fr); gap: 12px; animation: none; }
 .filter-tabs { padding: 4px; border-radius: var(--radius); background: var(--panel); }
@@ -76,7 +56,6 @@ body { background: var(--bg); }
 .result-controls-heading .text-button { background: transparent; border: 0; color: var(--muted); padding: 4px 0; font-size: 11px; }
 .result-controls-heading .text-button:hover { color: var(--accent); }
 .search-field input { min-height: 38px; font-size: 13px; background: var(--bg); border-radius: 7px; }
-.review-filters summary { font-size: 13px; padding: 5px 0; }
 .result-control-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
 .control-field select { font-size: 13px; padding: 8px; background: var(--panel); }
 .sidebar-panel { border-color: var(--border-soft); padding: 7px 9px; }
@@ -113,7 +92,6 @@ body { background: var(--bg); }
 .detail-tools > .btn { color: var(--muted); border-color: var(--border); background: var(--panel); }
 .detail-tools > .btn:hover { background: var(--panel-2); border-color: var(--muted); }
 .candidate-review-banner { background: var(--panel); border-color: var(--border); }
-.candidate-review-banner summary { font-size: 12px; }
 
 /* Media stays unfiltered. The neutral mat avoids a noisy checkerboard. */
 .swipe-pair { gap: 16px; }
@@ -148,6 +126,9 @@ body { background: var(--bg); }
   .results { grid-template-columns: 244px minmax(0, 1fr); }
   .detail { padding: 16px; }
   .swipe-pair, .swipe-vs { gap: 10px; }
+}
+@media (max-width: 900px) {
+  .app { padding: 14px 14px 24px; }
 }
 @media (max-width: 760px) {
   .app { padding: 14px 14px 24px; }

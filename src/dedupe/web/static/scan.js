@@ -3,14 +3,22 @@
 import { api } from "./api.js";
 import { updateSelectionSummary } from "./actions.js";
 import { renderBoard } from "./board.js";
-import { loadGroups, renderGroupList, rememberFocusedGroup, resetGroupListWindow } from "./groups.js";
+import {
+  loadGroups,
+  renderGroupList,
+  renderTabCounts,
+  rememberFocusedGroup,
+  resetGroupListWindow,
+} from "./groups.js";
 import { selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
 import { groupNeedsAttention } from "./model.js";
 import {
+  applySettingsToForm,
   collapseScanPanel,
   expandScanPanel,
   lowResolutionMaxPixels,
+  parsePathsInput,
   presetResultsTab,
   saveRecent,
   scanGoalShortLabel,
@@ -26,15 +34,25 @@ $("btnRetryAnalysis").addEventListener("click", () => {
   if (state.lastScanSettings) startScan({ ...state.lastScanSettings, new_only: false });
 });
 async function cancelScan() {
+  const btn1 = $("btnCancelScan");
+  const btn2 = $("btnCancelScanProgress");
+  const prev1 = btn1.textContent;
+  const prev2 = btn2.textContent;
+  btn1.disabled = true;
+  btn2.disabled = true;
+  btn1.textContent = "Cancelling…";
+  btn2.textContent = "Cancelling…";
   try {
     await api("/api/scan/cancel", {
       method: "POST",
       body: JSON.stringify({ scan_id: state.scanId }),
     });
-    $("btnCancelScan").disabled = true;
-    $("btnCancelScanProgress").disabled = true;
     toast("Cancelling scan after the current work item…");
   } catch (error) {
+    btn1.disabled = false;
+    btn2.disabled = false;
+    btn1.textContent = prev1;
+    btn2.textContent = prev2;
     toast(error.message, "error");
   }
 }
@@ -54,7 +72,7 @@ export function collectScanSettings() {
     videos: lowResolutionMaxPixels("lowResolutionVideoMaxMp"),
   };
   return {
-        paths: $("paths").value.split(",").map((s) => s.trim()).filter(Boolean),
+        paths: parsePathsInput($("paths").value),
         preferred_folders: $("preferredFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
         protected_folders: $("protectedFolders").value.split("\n").map((s) => s.trim()).filter(Boolean),
         video_versions: $("optVideoVersions").checked,
@@ -139,13 +157,15 @@ export async function startScan(overrides = {}) {
   if (overrides instanceof Event) overrides = {};
   const hasOverrides = Object.keys(overrides).length > 0;
   const settings = { ...collectScanSettings(), job_id: state.selectedJobId || null, ...overrides };
-  const raw = (settings.paths || []).join(", ");
-  if (!raw) {
+  const paths = Array.isArray(settings.paths)
+    ? settings.paths.map((s) => String(s).trim()).filter(Boolean)
+    : parsePathsInput(settings.paths);
+  if (!paths.length) {
     toast("Enter at least one folder path");
     $("paths").focus();
     return;
   }
-  const paths = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  settings.paths = paths;
   const lowResolutionBounds = {
     images: lowResolutionMaxPixels("lowResolutionImageMaxMp"),
     gifs: lowResolutionMaxPixels("lowResolutionGifMaxMp"),
@@ -160,81 +180,161 @@ export async function startScan(overrides = {}) {
     toast(`Set a positive megapixel bound for ${invalidLowResolutionBound[2]}`);
     return;
   }
-  paths.forEach(saveRecent);
+  const scanBtn = $("btnScan");
+  scanBtn.disabled = true;
+  const tabBeforeScan = state.kind;
+  const previous = {
+    groups: state.groups,
+    allGroups: state.allGroups,
+    currentId: state.currentId,
+    groupsVersion: state.groupsVersion,
+    loadedGroupsVersion: state.loadedGroupsVersion,
+    lastScanSettings: state.lastScanSettings,
+    emptyHidden: $("emptyState").hidden,
+    resultsHidden: $("results").hidden,
+    actionBarHidden: $("actionBar").hidden,
+    detailBodyHidden: $("detailBody").hidden,
+    detailEmptyHidden: $("detailEmpty").hidden,
+    progressHidden: $("progressWrap").hidden,
+    progressMsg: $("progressMsg").textContent,
+    scanStatus: $("scanStatus").textContent,
+    scanStatusError: $("scanStatus").classList.contains("error"),
+  };
+  state.groups = [];
+  state.allGroups = [];
+  state.currentId = null;
+  state.groupsVersion = -1;
+  state.loadedGroupsVersion = -1;
+  state.touchedGroups.clear();
+  state.swipeAnchors.clear();
+  state.swipeDeckOrder.clear();
+  state.swipeUndo.clear();
+  state.trashedInPlace.clear();
+  state.showDeleted = false;
+  state.boardLimit = 30;
+  state.boardFocus = { id: null, index: 0 };
+  state.memberPage = 0;
+  state.memberFocus = 0;
+  rememberFocusedGroup(null);
+  resetGroupListWindow();
+  $("btnCancelScan").disabled = false;
+  $("btnCancelScan").hidden = false;
+  $("btnCancelScan").textContent = "Cancel";
+  $("btnCancelScanProgress").disabled = false;
+  $("btnCancelScanProgress").hidden = false;
+  $("btnCancelScanProgress").textContent = "Cancel scan";
+  $("progressWrap").hidden = false;
+  $("progressBar").removeAttribute("value");
+  $("progressMsg").textContent = settings.new_only
+    ? "Checking new arrivals against baseline…"
+    : "Starting…";
+  $("scanStatus").textContent = "Scanning…";
+  $("scanStatus").classList.remove("error");
+  $("scanQuality").hidden = true;
+  $("scanQuality").open = false;
+  delete $("scanQuality").dataset.autoOpened;
+  $("exclusionsCheckResult").hidden = true;
+  $("streamProgress").hidden = true;
+  $("streamProgress").innerHTML = "";
+  $("btnCollapseScan").hidden = true;
+  $("emptyState").hidden = true;
+  $("results").hidden = false;
+  $("actionBar").hidden = true;
+  $("detailBody").hidden = true;
+  $("detailEmpty").hidden = false;
+  $("groupList").innerHTML =
+    `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
+  $("groupMore").innerHTML = "";
+  $("countAll").textContent = "0";
+  $("countExact").textContent = "0";
+  $("countSimilar").textContent = "0";
+  $("countSets").textContent = "0";
+  $("countLowResolution").textContent = "0";
+  $("countRandomReview").textContent = "0";
+  $("countNoHumans").textContent = "0";
+  $("countFaces").textContent = "0";
+  $("countCrop").textContent = "0";
+  $("countAllFiles").textContent = "0";
+  state.pendingScanPriorId = state.scanId;
+  state.pendingScanStart = true;
   try {
-    $("progressWrap").hidden = false;
-    $("progressBar").removeAttribute("value");
-    $("progressMsg").textContent = "Starting…";
-    $("scanStatus").textContent = "Scanning…";
-    $("scanStatus").classList.remove("error");
-    $("scanQuality").hidden = true;
-    $("scanQuality").open = false;
-    $("exclusionsCheckResult").hidden = true;
-    $("streamProgress").hidden = true;
-    $("streamProgress").innerHTML = "";
-    $("btnCollapseScan").hidden = true;
-    $("emptyState").hidden = true;
-    $("results").hidden = false;
-    $("actionBar").hidden = true;
-    $("detailBody").hidden = true;
-    $("detailEmpty").hidden = false;
-    $("groupList").innerHTML =
-      `<div class="group-empty">Scanning — matches will appear here as they are found…</div>`;
-    $("groupMore").innerHTML = "";
-    $("countAll").textContent = "0";
-    $("countExact").textContent = "0";
-    $("countSimilar").textContent = "0";
-    $("countSets").textContent = "0";
-    $("countLowResolution").textContent = "0";
-    $("countRandomReview").textContent = "0";
-    $("countNoHumans").textContent = "0";
-    $("countFaces").textContent = "0";
-    $("countCrop").textContent = "0";
-    $("countAllFiles").textContent = "0";
-    state.groups = [];
-    state.allGroups = [];
-    state.currentId = null;
-    state.groupsVersion = -1;
-    state.touchedGroups.clear();
-    rememberFocusedGroup(null);
-    resetGroupListWindow();
-    state.lastScanSettings = settings;
     const started = await api("/api/scan", {
       method: "POST",
       body: JSON.stringify({
         ...settings,
       }),
     });
-    state.scanId = started.scan_id || state.scanId;
-    state.scanning = true;
+    paths.forEach(saveRecent);
+    state.lastScanSettings = settings;
+    const startedScanId = started.scan_id || null;
+    const alreadyCompleted = Boolean(startedScanId && state.completedScanId === startedScanId);
+    state.scanId = startedScanId || state.scanId;
+    if (!alreadyCompleted) {
+      state.scanning = true;
+    }
     // Fold the setup form into its slim bar so the streaming results get
     // the screen; the bar shows the active goal + scanned paths and re-opens on click.
-    collapseScanPanel(raw, scanGoalShortLabel(hasOverrides ? settings : null));
+    collapseScanPanel(paths.join(", "), scanGoalShortLabel(hasOverrides ? settings : null));
     syncCollapseButtonVisibility();
     // Route to the goal's results tab (or recover from an inactive category)
     // rather than leaving the user stranded on the previous scan's tab.
-    const nextKind = targetTabForScan(settings, hasOverrides);
-    const goalTab = tabButtons.find((tab) => tab.dataset.kind === nextKind);
-    if (goalTab && !goalTab.classList.contains("active")) {
-      activateTab(goalTab);
-    } else {
-      renderBoard();
+    if (!alreadyCompleted || state.kind === tabBeforeScan) {
+      const nextKind = targetTabForScan(settings, hasOverrides);
+      const goalTab = tabButtons.find((tab) => tab.dataset.kind === nextKind);
+      if (goalTab && !goalTab.classList.contains("active")) {
+        activateTab(goalTab);
+      } else {
+        renderBoard();
+      }
     }
     // SSE status/group events drive the UI from here; polling is the
     // fallback and stands down as soon as the stream delivers.
-    startStatusPolling();
+    if (!alreadyCompleted) {
+      startStatusPolling();
+    }
   } catch (e) {
+    if (!state.scanning) {
+      state.groups = previous.groups;
+      state.allGroups = previous.allGroups;
+      state.currentId = previous.currentId;
+      state.groupsVersion = previous.groupsVersion;
+      state.loadedGroupsVersion = previous.loadedGroupsVersion;
+      state.lastScanSettings = previous.lastScanSettings;
+      $("emptyState").hidden = previous.emptyHidden;
+      $("results").hidden = previous.resultsHidden;
+      $("actionBar").hidden = previous.actionBarHidden;
+      $("detailBody").hidden = previous.detailBodyHidden;
+      $("detailEmpty").hidden = previous.detailEmptyHidden;
+      $("progressWrap").hidden = previous.progressHidden;
+      $("progressMsg").textContent = previous.progressMsg;
+      $("btnCancelScan").hidden = true;
+      $("btnCancelScan").disabled = false;
+      $("btnCancelScan").textContent = "Cancel";
+      $("btnCancelScanProgress").hidden = true;
+      $("btnCancelScanProgress").disabled = false;
+      $("btnCancelScanProgress").textContent = "Cancel scan";
+      scanBtn.disabled = false;
+      scanBtn.querySelector(".btn-label").textContent = "Scan";
+      renderTabCounts();
+      renderGroupList();
+      updateSelectionSummary();
+    }
     $("scanStatus").textContent = "Error";
     $("scanStatus").classList.add("error");
     syncCollapseButtonVisibility();
     toast(e.message, "error");
   } finally {
-    $("btnCancelScan").disabled = false;
-    $("btnCancelScanProgress").disabled = false;
+    state.pendingScanStart = false;
   }
 }
 
 const tabButtons = [...document.querySelectorAll(".tab")];
+
+export function switchTab(kind) {
+  const tab = tabButtons.find((item) => item.dataset.kind === kind);
+  if (tab) return activateTab(tab);
+  return Promise.resolve();
+}
 
 async function activateTab(tab) {
   tabButtons.forEach((t) => {
@@ -245,15 +345,31 @@ async function activateTab(tab) {
     t.tabIndex = active ? 0 : -1;
   });
   state.kind = tab.dataset.kind;
-  updateSelectionSummary();
   resetGroupListWindow();
   // Switch layouts now (the Similar board or the sidebar) rather than after
-  // the refetch below.
+  // any refetch.
   renderGroupList();
+  updateSelectionSummary();
   try {
     tab.scrollIntoView({ block: "nearest", inline: "nearest", container: "nearest" });
   } catch {
     tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+  if (state.allGroups.length > 0 && state.groupsVersion >= 0) {
+    if (state.currentId && !state.groups.some((g) => g.id === state.currentId)) {
+      $("members").querySelectorAll("video").forEach((video) => video.pause());
+      state.currentId = null;
+      $("detailBody").hidden = true;
+      $("detailEmpty").hidden = false;
+    }
+    if (!state.currentId && state.groups.length && !$("results").hidden && !$("detailEmpty").hidden) {
+      try {
+        await selectGroup(state.groups[0].id, { silent: true });
+      } catch (e) {
+        toast(e.message || String(e), "error");
+      }
+    }
+    return;
   }
   try {
     await loadGroups();
@@ -353,14 +469,17 @@ $("btnNextReview").addEventListener("click", () => {
 $("btnRescanSession").addEventListener("click", () => {
   const roots = state.reviewSession?.roots || [];
   if (!roots.length) return toast("No saved folders to rescan", "error");
-  $("paths").value = roots.join(", ");
-  $("scanPanel").classList.remove("collapsed");
-  $("scanCollapse").setAttribute("aria-expanded", "true");
   const saved = state.reviewSession.scan_settings || {};
-  startScan({
+  const hydrated = {
     ...saved,
     paths: saved.paths?.length ? saved.paths : roots,
-    protected_folders: state.reviewSession.protected_folders || [],
+    protected_folders: state.reviewSession.protected_folders || saved.protected_folders || [],
+  };
+  applySettingsToForm(hydrated);
+  $("scanPanel").classList.remove("collapsed");
+  $("scanCollapse").setAttribute("aria-expanded", "true");
+  startScan({
+    ...hydrated,
     job_id: state.reviewSession.job_id || null,
     new_only: false,
   });
@@ -368,23 +487,33 @@ $("btnRescanSession").addEventListener("click", () => {
 
 $("btnResumeSession").addEventListener("click", async () => {
   const button = $("btnResumeSession");
+  const originalLabel = button.textContent;
   button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.textContent = "Resuming…";
   try {
     const resumed = await api("/api/review-session/resume", { method: "POST", body: "{}" });
     state.scanId = resumed.scan_id || state.scanId;
-    await refreshStatus();
-    const roots = (
-      state.lastScanSettings?.paths
-      || state.reviewSession?.roots
-      || []
-    ).join(", ");
-    collapseScanPanel(roots, scanGoalShortLabel(state.lastScanSettings));
+    const status = await refreshStatus();
+    const saved = status?.scan_settings || state.lastScanSettings || {};
+    const hydrated = {
+      ...saved,
+      paths: saved.paths?.length ? saved.paths : (state.reviewSession?.roots || []),
+      protected_folders: saved.protected_folders || state.reviewSession?.protected_folders || [],
+    };
+    if (hydrated.paths?.length || Object.keys(saved).length) {
+      applySettingsToForm(hydrated);
+    }
+    const roots = (hydrated.paths || []).join(", ");
+    collapseScanPanel(roots, scanGoalShortLabel(state.lastScanSettings || hydrated));
     toast("Saved review resumed", "ok");
   } catch (error) {
     toast(error.message || String(error), "error");
     refreshStatus().catch(() => {});
   } finally {
     button.disabled = false;
+    button.removeAttribute("aria-busy");
+    button.textContent = originalLabel;
   }
 });
 

@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dedupe.grouping import build_groups
-from dedupe.models import FileRecord, MediaType, ScanResult
+from dedupe.models import DuplicateGroup, FileRecord, MediaType, ScanResult
 from dedupe.review_session import (
     MAX_PRUNE_SAMPLES,
     PRUNE_REASON_LABELS,
@@ -69,8 +69,14 @@ def test_saved_records_omit_only_unset_optional_values(tmp_path: Path) -> None:
     record.capture_metadata = False
 
     save_review_session(result, session_path)
-    saved = json.loads(session_path.read_bytes())["result"]
-    for row in (saved["files"][0], saved["groups"][0]["members"][0]):
+    envelope = json.loads(session_path.read_bytes())
+    saved = envelope["result"]
+    table = envelope["file_table"]
+    assert isinstance(saved["files"][0], int)
+    assert isinstance(saved["groups"][0]["members"][0], int)
+    assert saved["files"][0] == saved["groups"][0]["members"][0]
+    for idx in (saved["files"][0], saved["groups"][0]["members"][0]):
+        row = table[idx]
         assert "phash" not in row
         assert row["border_crop"] == ""
         assert row["face_count"] == 0
@@ -230,13 +236,17 @@ def test_deleted_files_round_trip_survives_resume(tmp_path: Path) -> None:
     session_path = tmp_path / "state" / "review.json"
     result = _result(tmp_path)
     trashed = result.groups[0].members[0].path
-    Path(trashed).unlink()  # simulate the move to the Trash
-    deleted = {trashed: str(tmp_path / "Trash" / "a.jpg")}
+    trash_dir = tmp_path / "Trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    trash_copy = trash_dir / "a.jpg"
+    Path(trashed).replace(trash_copy)
+    deleted = {trashed: str(trash_copy)}
 
     save_review_session(result, session_path, deleted_files=deleted)
     loaded = load_review_session(session_path)
 
     assert loaded.deleted_files == deleted
+    assert loaded.unlocatable_deleted_files == {}
     assert loaded.pruned_files == 0
     member_paths = {member.path for member in loaded.result.groups[0].members}
     assert trashed in member_paths  # kept for the undo control, not pruned
@@ -249,3 +259,104 @@ def test_session_without_deleted_files_loads_an_empty_map(tmp_path: Path) -> Non
     loaded = load_review_session(session_path)
 
     assert loaded.deleted_files == {}
+
+
+def test_file_table_deduplicates_records_and_supports_legacy_v1(tmp_path: Path) -> None:
+    from dedupe.models import GroupKind, MediaType
+
+    session_path = tmp_path / "review.json"
+    result = _result(tmp_path)
+    result.job_id = "job-42"
+    # Mirror the same FileRecord across an additional ALL_FILES/CROP-style group.
+    extra = DuplicateGroup(
+        id="all-1",
+        kind=GroupKind.ALL_FILES,
+        media_type=MediaType.IMAGE,
+        members=list(result.files),
+        suggested_keep=None,
+    )
+    result.groups.append(extra)
+    save_review_session(result, session_path, job_name="Weekly Cleanup")
+
+    raw = json.loads(session_path.read_bytes())
+    assert raw["version"] == 2
+    assert len(raw["file_table"]) == len(result.files)
+    assert raw["roots"] == result.roots
+    assert raw["job_id"] == "job-42"
+    assert raw["job_name"] == "Weekly Cleanup"
+    assert raw["group_count"] == 2
+    assert load_review_session(session_path).result.to_dict() == result.to_dict()
+
+    # Legacy v1 envelope without file_table loads cleanly.
+    v1_path = tmp_path / "legacy-v1.json"
+    v1_path.write_text(
+        json.dumps({"version": 1, "saved_at": "2025-01-01T00:00:00Z", "result": result.to_dict()})
+    )
+    v1_loaded = load_review_session(v1_path)
+    assert v1_loaded.error is None
+    assert v1_loaded.result.to_dict() == result.to_dict()
+
+
+def test_peek_review_session_header_fast_path_and_oversized_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.review_session as rs_mod
+    from dedupe.review_session import peek_review_session
+
+    session_path = tmp_path / "large.json"
+    result = _result(tmp_path)
+    result.job_id = "job-fast"
+    save_review_session(result, session_path, job_name="Fast Peek")
+
+    # Force header-prefix path without needing a 64 MB disk fixture.
+    monkeypatch.setattr(rs_mod, "FAST_FULL_PEEK_MAX_BYTES", 64)
+    monkeypatch.setattr(rs_mod, "PEEK_HEADER_BYTES", 512)
+
+    def _forbid_full_loads(*_args, **_kwargs):
+        raise AssertionError("full json.loads must not run for large header peeks")
+
+    monkeypatch.setattr(rs_mod.json, "loads", _forbid_full_loads)
+
+    peeked = peek_review_session(session_path)
+    assert peeked.available is True
+    assert peeked.peeked is True
+    assert peeked.roots == result.roots
+    assert peeked.job_id == "job-fast"
+    assert peeked.job_name == "Fast Peek"
+    assert peeked.group_count == 1
+    meta = peeked.metadata()
+    assert meta["job_name"] == "Fast Peek"
+    assert meta["group_count"] == 1
+    assert meta["roots"] == result.roots
+
+    # Oversized files above MAX_REVIEW_SESSION_BYTES fail cleanly without reading body.
+    monkeypatch.setattr(rs_mod, "MAX_REVIEW_SESSION_BYTES", 10)
+    oversized = peek_review_session(session_path)
+    assert oversized.corrupt is True
+    assert "exceeds" in (oversized.error or "")
+
+
+def test_unlocatable_and_vanished_deleted_files_are_flagged_not_silently_kept(
+    tmp_path: Path,
+) -> None:
+    session_path = tmp_path / "review.json"
+    result = _result(tmp_path)
+    a_path = result.groups[0].members[0].path
+    b_path = result.groups[0].members[1].path
+    Path(a_path).unlink()
+    Path(b_path).unlink()
+    deleted = {
+        a_path: str(tmp_path / "Trash" / "missing.jpg"),
+        b_path: "Trash",
+    }
+    save_review_session(result, session_path, deleted_files=deleted)
+
+    loaded = load_review_session(session_path)
+    assert loaded.deleted_files == {}
+    assert loaded.unlocatable_deleted_files == deleted
+    meta = loaded.metadata()
+    assert meta["unlocatable_deleted_count"] == 2
+    # Dead entries are persisted out cleanly on load.
+    reloaded = load_review_session(session_path)
+    assert reloaded.unlocatable_deleted_files == {}
+    assert reloaded.deleted_files == {}

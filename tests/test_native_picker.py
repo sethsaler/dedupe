@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 from dedupe.web import native_picker
@@ -103,3 +104,59 @@ def test_picker_process_error_surfaces_stderr(monkeypatch) -> None:
     payload, status = native_picker.pick_native_paths("folder")
     assert status == 500
     assert payload["error"] == "osascript exploded"
+
+
+def test_picker_single_flight_rejects_concurrent_dialog_cleanly(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(native_picker.platform, "system", lambda: "Darwin")
+    target = tmp_path / "media"
+    target.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def slow_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        release.wait(timeout=5)
+        return _FakeProc(stdout=f"{target}\n")
+
+    monkeypatch.setattr(native_picker.subprocess, "run", slow_run)
+
+    first_result: list[tuple[dict, int]] = []
+    thread = threading.Thread(
+        target=lambda: first_result.append(native_picker.pick_native_paths("folder"))
+    )
+    thread.start()
+    assert entered.wait(timeout=2)
+
+    second_payload, second_status = native_picker.pick_native_paths("folder")
+    assert second_status == 200
+    assert second_payload == {"cancelled": True, "path": None, "paths": [], "busy": True}
+    assert calls == 1
+
+    release.set()
+    thread.join(timeout=2)
+    assert len(first_result) == 1
+    assert first_result[0][1] == 200
+    assert first_result[0][0]["paths"] == [str(target)]
+
+    # Lock is released so a subsequent call invokes the picker normally.
+    third_payload, third_status = native_picker.pick_native_paths("folder")
+    assert third_status == 200
+    assert third_payload["paths"] == [str(target)]
+    assert calls == 2
+
+
+def test_picker_releases_lock_after_exception(monkeypatch) -> None:
+    monkeypatch.setattr(native_picker.platform, "system", lambda: "Darwin")
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(native_picker.subprocess, "run", explode)
+    payload, status = native_picker.pick_native_paths("folder")
+    assert status == 500
+    assert payload["error"] == "boom"
+    assert native_picker._picker_lock.acquire(blocking=False)
+    native_picker._picker_lock.release()

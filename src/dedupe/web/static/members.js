@@ -2,19 +2,55 @@
 
 import { api } from "./api.js";
 import { renderCropReview } from "./crop.js";
-import { renderExactReview } from "./exact.js";
-import { applyResultControls, ensureGroupVisible, markGroupListActive, rememberFocusedGroup, selectionFiltersActive, updateGroupListItem } from "./groups.js";
+import { renderExactReview, syncCopyRow, syncExactSelectionState } from "./exact.js";
+import {
+  activeMemberFilters,
+  applyResultControls,
+  ensureGroupVisible,
+  markGroupListActive,
+  memberFilterSignature,
+  memberMatchesSidebarFilters,
+  rememberFocusedGroup,
+  selectionFiltersActive,
+  updateGroupListItem,
+} from "./groups.js";
 import { closeLightbox, lightboxOpen, openLightbox, updateLightbox } from "./lightbox.js";
-import { currentGroup, isDecisionReview, isIndependentReview, isPagedIndependentReview, isGridPagedGroup, markGroupTouched, patchGroup } from "./model.js";
+import {
+  currentGroup,
+  isDecisionReview,
+  isGridPagedGroup,
+  isIndependentReview,
+  isPagedIndependentReview,
+  lightboxItemFor,
+  markGroupTouched,
+  memberDiffPills,
+  patchGroup,
+} from "./model.js";
 import { boardActive, refreshBoardRow } from "./board.js";
 import { renderSwipeReview, swipeActive } from "./swipe.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
-import { $, basename, escapeHtml, formatBytes, formatMtime, isOverlayOpen, setPreviewAspectRatio, sleep, toast, withMediaVersion } from "./util.js";
+import {
+  $,
+  basename,
+  escapeHtml,
+  formatBytes,
+  formatMtime,
+  isOverlayOpen,
+  setPreviewAspectRatio,
+  sleep,
+  toast,
+  withMediaVersion,
+} from "./util.js";
 
 const MEMBER_PAGE_SIZE = 50;
 let renderedGroupSnapshot = "";
 let renderedGroupId = null;
+let renderedMemberFilterSig = "";
+
+function getRenderedMemberFilterSignature() {
+  return renderedMemberFilterSig;
+}
 
 // Fit the stage and its actual controls above the action bar. This responds to
 // open guides, wrapped captions, and short laptop screens, not a guessed vh.
@@ -170,7 +206,7 @@ async function ensurePeopleScores(g) {
     peopleJob = null;
   }
   if (peopleJob?.groupId === g.id) return;
-  const keyFor = (groupId, metric) => JSON.stringify([groupId, metric]);
+  const keyFor = (groupId, metric) => `${groupId}\0${metric}`;
   const deleted = new Set(g.deleted_paths || []);
   const metric = peopleMetricsFor(g.kind).find((field) =>
     !peopleScoreRequested.has(keyFor(g.id, field))
@@ -275,6 +311,30 @@ function applyModifiedFilter(members) {
   );
 }
 
+function ensureMemberFilterNote() {
+  let note = $("memberFilterNote");
+  if (!note) {
+    note = document.createElement("p");
+    note.id = "memberFilterNote";
+    note.className = "member-filter-note muted small";
+    note.setAttribute("role", "status");
+    note.hidden = true;
+    const anchor = $("scanPreviewNote") || $("memberPagination");
+    if (anchor) anchor.after(note);
+    else $("members")?.before(note);
+  }
+  return note;
+}
+
+function updateMemberFilterNote(active, shown, total) {
+  const note = ensureMemberFilterNote();
+  if (!note) return;
+  note.hidden = !active;
+  if (active) {
+    note.textContent = `Showing ${shown} of ${total} matching filter`;
+  }
+}
+
 function syncMemberPagination(pageCount, summaryText, decisionReview) {
   const bars = [
     $("memberPagination"),
@@ -306,12 +366,49 @@ function syncDeletedToggle(g) {
   }
 }
 
+function syncMarkReviewedButton(g) {
+  const btn = $("btnMarkGroupReviewed");
+  if (!btn) return;
+  btn.hidden = !g;
+  if (!g) return;
+  const reviewed = Boolean(g.reviewed);
+  btn.setAttribute("aria-pressed", reviewed ? "true" : "false");
+  btn.textContent = reviewed ? "Reviewed" : "Mark reviewed";
+  btn.disabled = Boolean(state.scanning);
+}
+
+function syncScanningLock(g) {
+  const note = $("scanPreviewNote");
+  if (note) note.hidden = !state.scanning;
+  const lock = Boolean(state.scanning);
+  for (const id of [
+    "btnSelectSuggested",
+    "btnClearGroup",
+    "btnSmartGroup",
+    "btnSmartAll",
+    "smartRule",
+    "btnMarkDistinct",
+    "btnMarkRemainingHuman",
+    "btnCropAll",
+    "cropLevelAll",
+    "btnSkipAllCrops",
+  ]) {
+    const el = $(id);
+    if (el) el.disabled = lock;
+  }
+  syncMarkReviewedButton(g);
+}
+
 function prefetchThumbnails(members) {
   for (const member of (members || []).slice(0, 8)) {
     if (!member?.path) continue;
     const image = new Image();
     image.decoding = "async";
-    image.src = `/api/thumbnail?path=${encodeURIComponent(member.path)}`;
+    image.src = withMediaVersion(
+      `/api/thumbnail?path=${encodeURIComponent(member.path)}`,
+      member.path,
+      member.media_version,
+    );
   }
 }
 
@@ -335,26 +432,13 @@ function updateGroupSelectionText(g) {
       : base;
 }
 
-// Full lightbox item for one member: the lightbox shows metadata and selection
-// state, so it needs more than the path.
-function lightboxItemFor(member, group) {
-  return {
-    path: member.path,
-    mediaType: member.media_type,
-    keeper: group.suggested_keep,
-    kind: group.kind,
-    size: member.size,
-    width: member.width,
-    height: member.height,
-    mtime: member.mtime,
-    similarityPercent: member.similarity_percent,
-    orientationLabel: member.orientation_label,
-  };
-}
-
 // Sync one card's selection affordances (badge, classes, copy, checkbox) after
 // a selection toggle, leaving the rest of the grid — and keyboard focus — intact.
 function syncCardSelection(card, g, path) {
+  if (card.classList.contains("copy-row")) {
+    syncCopyRow(card, g, path);
+    return;
+  }
   const isSel = (g.selected_for_removal || []).includes(path);
   const reviewed = new Set(g.reviewed_paths || []).has(path);
   const isKeep = (path === g.suggested_keep || (isDecisionReview(g) && reviewed)) && !isSel;
@@ -374,7 +458,10 @@ function syncCardSelection(card, g, path) {
   if (title) title.textContent = isSel ? "Selected for removal" : "Not selected";
   if (hint) hint.textContent = isSel ? "Click to keep this file" : "Click to remove this file";
   const checkbox = card.querySelector(".sel-cb");
-  if (checkbox) checkbox.checked = isSel;
+  if (checkbox) {
+    checkbox.checked = isSel;
+    checkbox.disabled = Boolean(state.scanning);
+  }
 }
 
 function updateDetailMeta(g) {
@@ -416,6 +503,34 @@ function updateDetailMeta(g) {
     `${formatBytes(g.reclaimable_bytes)} reclaimable · ${g.match_basis === "video_version" ? "matching video sections; inspect audio and edits" : "every member was directly verified against the suggested keeper"}.${keeperWhy}`;
 }
 
+function groupRenderSignature(g) {
+  if (!g) return "";
+  const memberPart = (g.members || [])
+    .map((m) => `${m.path}:${m.media_version || ""}:${m.error || ""}:${m.people_score ?? ""}:${m.non_person_coverage ?? ""}:${m.face_count ?? ""}:${m.crop_state || ""}`)
+    .join("\n");
+  return [
+    g.id,
+    g.kind,
+    Boolean(g.reviewed),
+    g.suggested_keep || "",
+    g.member_count || 0,
+    g.reclaimable_bytes || 0,
+    g.match_basis || "",
+    state.scanning,
+    state.reviewView,
+    state.similarView,
+    state.showDeleted,
+    state.memberModified,
+    state.memberPeople,
+    memberSortFor(g.kind) || "",
+    memberFilterSignature(),
+    (g.selected_for_removal || []).join("\n"),
+    (g.reviewed_paths || []).join("\n"),
+    (g.deleted_paths || []).join("\n"),
+    memberPart,
+  ].join("\0");
+}
+
 // A fresh member list (another group, sort, or filter) starts on its first
 // page with the detail pane scrolled to the top. In the app-shell layout the
 // pane keeps its scroll offset across re-renders, so a restarted list would
@@ -442,10 +557,11 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
   if (state.selectToken !== myToken || g.id !== state.currentId) return;
-  // Preserve unchanged media on passive refreshes: rebuilding loses video
-  // playback, image scroll position, and the identity of appended gallery cards.
-  // Changed data and explicit view changes still repaint.
-  if (preservePlayback && preserveMemberFocus && JSON.stringify(g) === renderedGroupSnapshot
+  syncScanningLock(g);
+  // Preserve unchanged media during silent background refreshes of the same group
+  // so video playback, image scroll position, and appended gallery cards survive.
+  // Explicit clicks (`silent === false`) always re-render from page 1 as expected.
+  if (preservePlayback && preserveMemberFocus && groupRenderSignature(g) === renderedGroupSnapshot
     && $("members").querySelector(".card, .swipe-review")) {
     applyPendingGroupFocus(id);
     return;
@@ -481,10 +597,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
       state.memberFocus = firstUnreviewed >= 0 ? firstUnreviewed : 0;
     }
   }
-  const idx = state.groups.findIndex((group) => group.id === g.id);
-  if (idx >= 0) state.groups[idx] = g;
-  const allIdx = state.allGroups.findIndex((group) => group.id === g.id);
-  if (allIdx >= 0) state.allGroups[allIdx] = g;
+  patchGroup(g);
   updateGroupListItem(g);
   scheduleRender({ selection: true });
   $("detailEmpty").hidden = true;
@@ -512,6 +625,7 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   $("btnCropAll").hidden = g.kind !== "crop";
   $("cropLevelAllWrap").hidden = g.kind !== "crop";
   $("btnToggleCropZones").hidden = g.kind !== "crop";
+  syncMarkReviewedButton(g);
   updateSimilarViewToggle(g);
   $("nonHumanBanner").hidden = g.kind !== "no_humans";
   syncDeletedToggle(g);
@@ -576,12 +690,229 @@ function applyPendingGroupFocus(id) {
   active.focus({ preventScroll: true });
 }
 
+function cardPreviewHtml(g, m, lightboxIndex, { singleReview, isKeep, isSel, deleted, dims, previewDimensions, clickTrash }) {
+  const fileName = basename(m.path);
+  const thumb = withMediaVersion(
+    `/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`,
+    m.path,
+    m.media_version,
+  );
+  const badge = m.protected
+    ? '<span class="thumb-badge keep">Protected library</span>'
+    : isSel
+      ? '<span class="thumb-badge remove">Remove</span>'
+      : isKeep
+        ? '<span class="thumb-badge keep">Keep</span>'
+        : "";
+  const mediaPreview = m.media_type === "video"
+    ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${escapeHtml(thumb)}" ${singleReview ? "controls src" : "data-src"}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
+    : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${escapeHtml(m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb)}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${escapeHtml(thumb)}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
+  const overlayEnlarge = clickTrash
+    ? `<button class="thumb-enlarge inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button>`
+    : "";
+  if (deleted) {
+    return `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`;
+  }
+  return `<div class="thumb-stack">
+    <${singleReview && m.media_type === "video" ? "div" : 'button type="button"'} class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${clickTrash ? ' data-click-trash="1" title="Move to Trash — one click, undo from the toast"' : ""}${previewDimensions} aria-label="${clickTrash ? `Move ${escapeHtml(fileName)} to Trash` : `Open preview for ${escapeHtml(fileName)}`}">
+      ${badge}
+      ${mediaPreview}
+      ${["video", "gif"].includes(m.media_type) && !singleReview ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
+    </${singleReview && m.media_type === "video" ? "div" : "button"}>
+    ${singleReview ? "" : overlayEnlarge}
+  </div>`;
+}
+
+function cardActionsHtml(g, m, lightboxIndex, { singleReview, decisionReview, deleted, isSel, reviewed, clickTrash }) {
+  const fileName = basename(m.path);
+  const lock = Boolean(state.scanning);
+  if (m.protected) {
+    return `<span class="protected-label">Protected library</span><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
+  }
+  if (decisionReview && !deleted) {
+    return `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
+      <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"${lock ? " disabled" : ""}><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
+      <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"${lock ? " disabled" : ""}><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
+    </div><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button><button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>`;
+  }
+  if (isPagedIndependentReview(g)) {
+    const base = deleted
+      ? `<button class="btn ghost undo-delete" data-path="${escapeHtml(m.path)}" type="button" title="Restore from Trash"${lock ? " disabled" : ""}>Undo</button>`
+      : clickTrash
+        ? `<button class="btn ghost enlarge-candidate inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
+        : `<button class="btn danger delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click"${lock ? " disabled" : ""}>Trash</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
+    return `${base}${singleReview && !deleted && !clickTrash ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}`;
+  }
+  const selectionTitle = isSel ? "Selected for removal" : "Not selected";
+  const selectionHint = isSel ? "Click to keep this file" : "Click to remove this file";
+  return `<label class="selection-control">
+    <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} ${lock ? "disabled" : ""} />
+    <span class="selection-copy">
+      <strong>${selectionTitle}</strong>
+      <small>${selectionHint}</small>
+    </span>
+  </label>
+  <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
+}
+
+function cardOptionsFor(g, m, { selected, reviewedPaths, deletedPaths, singleReview, decisionReview }) {
+  const isSel = selected.has(m.path);
+  const reviewed = reviewedPaths.has(m.path);
+  const isKeep = (m.path === g.suggested_keep || (decisionReview && reviewed)) && !isSel;
+  const deleted = deletedPaths.has(m.path);
+  const mediaWidth = Number(m.width);
+  const mediaHeight = Number(m.height);
+  const hasDimensions = Number.isFinite(mediaWidth) && Number.isFinite(mediaHeight)
+    && mediaWidth > 0 && mediaHeight > 0;
+  const dims = hasDimensions ? `${mediaWidth}×${mediaHeight}` : "—";
+  const previewDimensions = hasDimensions
+    ? ` data-preview-width="${mediaWidth}" data-preview-height="${mediaHeight}"`
+    : "";
+  const clickTrash = isPagedIndependentReview(g) && !deleted && !m.protected
+    && !(singleReview && m.media_type === "video");
+  return {
+    singleReview,
+    decisionReview,
+    isSel,
+    reviewed,
+    isKeep,
+    deleted,
+    dims,
+    previewDimensions,
+    clickTrash,
+  };
+}
+
+function currentLightboxSource(g) {
+  const deletedPaths = new Set(g.deleted_paths || []);
+  const focusReview = isPagedIndependentReview(g) && state.reviewView === "focus";
+  const singleReview = isDecisionReview(g) || focusReview;
+  let allMembers = g.members || [];
+  const memberSort = memberSortFor(g.kind);
+  const peopleMax = peopleFilterFor(g.kind);
+  if (peopleMax != null) {
+    allMembers = allMembers.filter((m) => m.people_score != null && m.people_score <= peopleMax);
+  }
+  if (memberSort === COVERAGE_SORT) allMembers = [...allMembers].sort(byNonPersonCoverage);
+  else if (memberSort === PEOPLE_SORT) allMembers = [...allMembers].sort(byPeopleScore);
+  else if (g.kind === "faces" && memberSort !== "faces-desc") {
+    allMembers = [...allMembers].sort(
+      memberSort === "newest"
+        ? (a, b) => (b.mtime || 0) - (a.mtime || 0)
+        : (a, b) => (a.face_count || 0) - (b.face_count || 0),
+    );
+  } else if (g.kind === "all_files" && memberSort !== "path") {
+    const byPath = (a, b) => a.path.localeCompare(b.path);
+    allMembers = [...allMembers].sort(
+      memberSort === "largest"
+        ? (a, b) => (b.size || 0) - (a.size || 0) || byPath(a, b)
+        : memberSort === "oldest"
+          ? (a, b) => (a.mtime || 0) - (b.mtime || 0) || byPath(a, b)
+          : (a, b) => (b.mtime || 0) - (a.mtime || 0) || byPath(a, b),
+    );
+  }
+  if (g.kind === "all_files") allMembers = applyModifiedFilter(allMembers);
+  const triage = isPagedIndependentReview(g);
+  if (triage && !state.showDeleted) {
+    allMembers = allMembers.filter(
+      (member) => !deletedPaths.has(member.path) || (!focusReview && state.trashedInPlace.has(member.path)),
+    );
+  }
+  const sidebarFilters = isIndependentReview(g) ? activeMemberFilters() : null;
+  if (sidebarFilters?.anyActive) {
+    allMembers = allMembers.filter((member) => memberMatchesSidebarFilters(member, sidebarFilters));
+  }
+  const gridPaged = isGridPagedGroup(g);
+  const members = singleReview
+    ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
+    : gridPaged
+      ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
+      : allMembers;
+  return (gridPaged ? allMembers : members).filter((member) => !deletedPaths.has(member.path));
+}
+
+function syncLightboxItemsAndIndices(g) {
+  state.lightboxItems = currentLightboxSource(g).map((member) => lightboxItemFor(member, g));
+  const indexByPath = new Map(state.lightboxItems.map((item, idx) => [item.path, idx]));
+  $("members").querySelectorAll(":scope > .card[data-path]").forEach((card) => {
+    const idx = indexByPath.get(card.dataset.path);
+    if (idx == null) return;
+    card.querySelectorAll(".thumb-wrap, .inspect-media").forEach((el) => {
+      el.dataset.index = String(idx);
+    });
+  });
+  return indexByPath;
+}
+
+function patchTriageCardDeleted(card, g, path, isDeleted) {
+  const member = (g.members || []).find((item) => item.path === path);
+  if (!card || !member) return false;
+  const focusReview = isPagedIndependentReview(g) && state.reviewView === "focus";
+  if (focusReview) return false;
+  const hadFocus = card.contains(document.activeElement);
+  const indexByPath = syncLightboxItemsAndIndices(g);
+  const lightboxIndex = indexByPath.get(path) ?? -1;
+  const selected = new Set(g.selected_for_removal || []);
+  const reviewedPaths = new Set(g.reviewed_paths || []);
+  const deletedPaths = new Set(g.deleted_paths || []);
+  const opts = cardOptionsFor(g, member, {
+    selected,
+    reviewedPaths,
+    deletedPaths,
+    singleReview: false,
+    decisionReview: isDecisionReview(g),
+  });
+
+  card.classList.toggle("deleted", isDeleted);
+  syncCardSelection(card, g, path);
+
+  const oldPreview = card.querySelector(":scope > .thumb-stack, :scope > .deleted-preview");
+  if (oldPreview) {
+    const temp = document.createElement("div");
+    temp.innerHTML = cardPreviewHtml(g, member, lightboxIndex, opts).trim();
+    const freshPreview = temp.firstElementChild;
+    if (freshPreview) {
+      oldPreview.replaceWith(freshPreview);
+      const wrap = freshPreview.classList.contains("thumb-wrap")
+        ? freshPreview
+        : freshPreview.querySelector(".thumb-wrap");
+      if (wrap) {
+        setPreviewAspectRatio(wrap, wrap.dataset.previewWidth, wrap.dataset.previewHeight);
+      }
+      const img = freshPreview.querySelector(".thumb-image");
+      if (img?.complete && img.naturalWidth > 0) {
+        setPreviewAspectRatio(wrap, img.naturalWidth, img.naturalHeight);
+      }
+    }
+  }
+
+  const actionsEl = card.querySelector(".card-actions");
+  if (actionsEl) {
+    actionsEl.innerHTML = cardActionsHtml(g, member, lightboxIndex, opts);
+  }
+
+  if (hadFocus) {
+    if (isDeleted) {
+      card.querySelector(".undo-delete")?.focus({ preventScroll: true });
+    } else {
+      (card.querySelector("button.thumb-wrap") || card.querySelector(".enlarge-candidate"))
+        ?.focus({ preventScroll: true });
+    }
+  }
+  return true;
+}
+
 function renderMembers(g, { append = false } = {}) {
   memberObserver.disconnect();
   // The Similar board owns the screen; the hidden detail pane stays as is.
-  if (boardActive()) return;
-  renderedGroupSnapshot = JSON.stringify(g);
+  if (boardActive()) {
+    renderedGroupSnapshot = "";
+    return;
+  }
+  renderedGroupSnapshot = groupRenderSignature(g);
   renderedGroupId = g.id;
+  renderedMemberFilterSig = memberFilterSignature();
+  syncScanningLock(g);
   const box = $("members");
   if (!append) {
     stopInlineVideo();
@@ -606,16 +937,27 @@ function renderMembers(g, { append = false } = {}) {
   // Custom review layouts own the member area entirely (their own pagination
   // model, lightbox list, and detail meta).
   if (g.kind === "similar" && state.similarView !== "grid") {
+    updateMemberFilterNote(false, 0, 0);
     renderSwipeReview(g);
     requestAnimationFrame(fitReviewStage);
     return;
   }
   if (g.kind === "exact") {
+    updateMemberFilterNote(false, 0, 0);
     renderExactReview(g);
     return;
   }
   if (g.kind === "crop") {
-    renderCropReview(g);
+    const filters = activeMemberFilters();
+    if (filters.anyActive) {
+      const total = (g.members || []).length;
+      const filteredMembers = (g.members || []).filter((m) => memberMatchesSidebarFilters(m, filters));
+      updateMemberFilterNote(true, filteredMembers.length, total);
+      renderCropReview({ ...g, members: filteredMembers, member_count: filteredMembers.length });
+    } else {
+      updateMemberFilterNote(false, 0, 0);
+      renderCropReview(g);
+    }
     return;
   }
   const selected = new Set(g.selected_for_removal || []);
@@ -660,6 +1002,14 @@ function renderMembers(g, { append = false } = {}) {
       (member) => !deletedPaths.has(member.path) || (!focusReview && state.trashedInPlace.has(member.path)),
     );
   }
+  const totalBeforeSidebarFilter = allMembers.length;
+  const sidebarFilters = isIndependentReview(g) ? activeMemberFilters() : null;
+  if (sidebarFilters?.anyActive) {
+    allMembers = allMembers.filter((member) => memberMatchesSidebarFilters(member, sidebarFilters));
+    updateMemberFilterNote(true, allMembers.length, totalBeforeSidebarFilter);
+  } else {
+    updateMemberFilterNote(false, 0, 0);
+  }
   syncDeletedToggle(g);
   const decisionReview = isDecisionReview(g);
   const gridPaged = isGridPagedGroup(g);
@@ -677,8 +1027,8 @@ function renderMembers(g, { append = false } = {}) {
   const members = singleReview
     ? allMembers.slice(state.memberFocus, state.memberFocus + 1)
     : gridPaged
-    ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
-    : allMembers;
+      ? allMembers.slice(0, (state.memberPage + 1) * MEMBER_PAGE_SIZE)
+      : allMembers;
   const resultCount = allMembers.length
     ? singleReview
       ? `${pageStart + 1} of ${allMembers.length}`
@@ -737,73 +1087,67 @@ function renderMembers(g, { append = false } = {}) {
   state.lightboxItems = lightboxSource
     .filter((member) => !deletedPaths.has(member.path))
     .map((member) => lightboxItemFor(member, g));
+  const lightboxIndexByPath = new Map(
+    state.lightboxItems.map((item, lightboxIndex) => [item.path, lightboxIndex]),
+  );
   updateDetailMeta(g);
   updateGroupSelectionText(g);
-  if (triage && !members.length) {
+  if ((triage || decisionReview) && !members.length) {
     const hiddenDeleted = !state.showDeleted && deletedPaths.size;
     const modifiedWindow = g.kind === "all_files" ? MODIFIED_LABELS[state.memberModified] : null;
     const peopleLabel = peopleMax != null ? PEOPLE_FILTER_LABELS[state.memberPeople] : null;
-    // The request for this folder may still be on its way to the server.
     const scoringNow = peopleJob?.groupId === g.id;
     box.innerHTML = `<div class="triage-empty">${
-      hiddenDeleted
-        ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`
-        : peopleLabel && scoringNow
-          ? "Ranking by people likelihood…"
-        : peopleLabel
-          ? `No ${modifiedWindow ? `files modified in ${modifiedWindow}` : "files"} here ${peopleLabel}.`
-        : modifiedWindow
-          ? `No files in this folder were modified in ${modifiedWindow}.`
-          : "Nothing left in this review pile."
+      sidebarFilters?.anyActive
+        ? "No files here match the active search or filters."
+        : hiddenDeleted
+          ? `Every remaining file is in Trash. Use <strong>${deletedPaths.size} in Trash · Show</strong> to restore one.`
+          : peopleLabel && scoringNow
+            ? "Ranking by people likelihood…"
+            : peopleLabel
+              ? `No ${modifiedWindow ? `files modified in ${modifiedWindow}` : "files"} here ${peopleLabel}.`
+              : modifiedWindow
+                ? `No files in this folder were modified in ${modifiedWindow}.`
+                : "Nothing left in this review pile."
     }</div>`;
     return;
   }
 
+  const keeperMember = g.kind === "similar"
+    ? (g.members || []).find((item) => item.path === g.suggested_keep) || g.members?.[0]
+    : null;
   const offset = append ? box.querySelectorAll(".card").length : 0;
   const rendered = document.createElement("div");
   rendered.innerHTML = members.slice(offset)
     .map((m, i) => {
       i += offset;
-      const isSel = selected.has(m.path);
-      const reviewed = reviewedPaths.has(m.path);
-      const isKeep = (m.path === g.suggested_keep || (decisionReview && reviewed)) && !isSel;
-      const deleted = deletedPaths.has(m.path);
-      const mediaWidth = Number(m.width);
-      const mediaHeight = Number(m.height);
-      const hasDimensions = Number.isFinite(mediaWidth) && Number.isFinite(mediaHeight)
-        && mediaWidth > 0 && mediaHeight > 0;
-      const dims = hasDimensions ? `${mediaWidth}×${mediaHeight}` : "—";
-      const previewDimensions = hasDimensions
-        ? ` data-preview-width="${mediaWidth}" data-preview-height="${mediaHeight}"`
-        : "";
-      const thumb = withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`, m.path);
+      const opts = cardOptionsFor(g, m, {
+        selected,
+        reviewedPaths,
+        deletedPaths,
+        singleReview,
+        decisionReview,
+      });
       const memberIndex = singleReview ? state.memberFocus : i;
       const focused = singleReview || i === state.memberFocus ? "focused" : "";
-      const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === m.path);
+      const lightboxIndex = lightboxIndexByPath.get(m.path) ?? -1;
       const fileName = basename(m.path);
-      const badge = m.protected
-        ? `<span class="thumb-badge keep">Protected library</span>`
-        : isSel
-        ? `<span class="thumb-badge remove">Remove</span>`
-        : isKeep
-          ? `<span class="thumb-badge keep">Keep</span>`
-          : "";
       const similarity = m.similarity_percent == null ? null : Number(m.similarity_percent);
       // A rotated or mirrored copy is named so the turned thumbnail reads as intended.
       const turnedEvidence = m.orientation_label ? ` · ${m.orientation_label} copy` : "";
       const similarityEvidence = g.match_basis === "video_version"
         ? "Matching video section; review the time ranges and audio before removing a version"
         : m.match_label
-        ? `${m.match_label} of suggested keeper · EmbeddingGemma meaning match, not a pixel match`
-        : Number.isFinite(similarity)
-          ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
-          : `Perceptual match to suggested keeper${turnedEvidence} · similarity score unavailable`;
+          ? `${m.match_label} of suggested keeper · EmbeddingGemma meaning match, not a pixel match`
+          : Number.isFinite(similarity)
+            ? `${similarity.toFixed(1).replace(/\.0$/, "")}% Similar to suggested keeper${turnedEvidence} · fingerprint agreement, not a probability`
+            : `Perceptual match to suggested keeper${turnedEvidence} · similarity score unavailable`;
       const evidence = g.kind === "exact"
         ? "Byte-identical SHA-256 match"
         : g.kind === "similar"
           ? similarityEvidence
           : g.kind === "low_resolution"
-            ? `${dims} · ${((m.width || 0) * (m.height || 0) / 1_000_000).toFixed(2)} megapixels · below the 1 MP review threshold`
+            ? `${opts.dims} · ${((m.width || 0) * (m.height || 0) / 1_000_000).toFixed(2)} megapixels · below the 1 MP review threshold`
             : g.kind === "random_review"
               ? "Randomly selected from this scan for a quick keep-or-delete check"
               : g.kind === "faces"
@@ -814,65 +1158,29 @@ function renderMembers(g, { append = false } = {}) {
                     ? (m.match_label
                       ? `${m.match_label} · EmbeddingGemma meaning match, not a duplicate check`
                       : "First image of this set · the others are measured against it")
-                  : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
-      const selectionTitle = isSel
-        ? (isPagedIndependentReview(g) ? "Reviewed · selected" : "Selected for removal")
-        : (isPagedIndependentReview(g) && reviewed ? "Reviewed · not selected" : "Not selected");
-      const selectionHint = isSel
-        ? "Click to keep this file"
-        : (isPagedIndependentReview(g) ? "Click to review and remove" : "Click to remove this file");
-      const mediaPreview = m.media_type === "video"
-        ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${thumb}" ${singleReview ? 'controls src' : 'data-src'}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
-        : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
-      // In the triage grids the picture itself is the one-click Trash, and
-      // the buttons that used to say Trash enlarge it instead. A focus-view
-      // video is the exception: its click belongs to the playback controls,
-      // so its card keeps an explicit Trash button below.
-      const clickTrash = isPagedIndependentReview(g) && !deleted && !m.protected
-        && !(singleReview && m.media_type === "video");
-      const overlayEnlarge = clickTrash
-        ? `<button class="thumb-enlarge inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button>`
-        : "";
-      const preview = deleted
-        ? `<div class="thumb-wrap deleted-preview"${previewDimensions}><div class="thumb-fallback">Moved to Trash — undo available</div></div>`
-        : `<div class="thumb-stack">
-            <${singleReview && m.media_type === "video" ? "div" : 'button type="button"'} class="thumb-wrap" data-path="${escapeHtml(m.path)}" data-index="${lightboxIndex}"${clickTrash ? ' data-click-trash="1" title="Move to Trash — one click, undo from the toast"' : ""}${previewDimensions} aria-label="${clickTrash ? `Move ${escapeHtml(fileName)} to Trash` : `Open preview for ${escapeHtml(fileName)}`}">
-              ${badge}
-              ${mediaPreview}
-              ${["video", "gif"].includes(m.media_type) && !singleReview ? '<span class="video-preview-badge" aria-hidden="true">▶ Hover to play</span>' : ""}
-            </${singleReview && m.media_type === "video" ? "div" : "button"}>
-            ${singleReview ? "" : overlayEnlarge}
-          </div>`;
-      const actions = m.protected
-        ? `<span class="protected-label">Protected library</span><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
-        : decisionReview
-        ? `<div class="candidate-actions" role="group" aria-label="Keep or delete ${escapeHtml(fileName)}">
-              <button class="candidate-decision candidate-delete" data-path="${escapeHtml(m.path)}" type="button"><kbd>←</kbd><span><strong>Delete</strong><small>Stage for removal</small></span></button>
-              <button class="candidate-decision candidate-keep" data-path="${escapeHtml(m.path)}" type="button"><span><strong>Keep</strong><small>Leave untouched</small></span><kbd>→</kbd></button>
-            </div>`
-        : isPagedIndependentReview(g)
-        ? (deleted
-          ? `<button class="btn ghost undo-delete" data-path="${escapeHtml(m.path)}" type="button" title="Restore from Trash">Undo</button>`
-          : clickTrash
-            ? `<button class="btn ghost enlarge-candidate inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`
-            : `<button class="btn danger delete-candidate" data-path="${escapeHtml(m.path)}" type="button" title="Move to Trash — one click">Trash</button><button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`)
-        : `<label class="selection-control">
-                <input type="checkbox" class="sel-cb" data-path="${escapeHtml(m.path)}" ${isSel ? "checked" : ""} />
-                <span class="selection-copy">
-                  <strong>${selectionTitle}</strong>
-                  <small>${selectionHint}</small>
-                </span>
-              </label>
-              <button class="linkish reveal" data-path="${escapeHtml(m.path)}" type="button">Reveal</button>`;
+                    : `OpenCV person detection analyzed ${m.human_frames_analyzed || 0} frame(s); no person detected — likely non-human`;
+      let similarExtras = "";
+      if (g.kind === "similar") {
+        if (m.path === g.suggested_keep && g.cleanup?.keeper_reason) {
+          similarExtras = `<div class="keeper-reason">Suggested keeper: ${escapeHtml(g.cleanup.keeper_reason)}</div>`;
+        } else if (keeperMember && m.path !== keeperMember.path) {
+          const pills = memberDiffPills(m, keeperMember);
+          if (pills.length) {
+            similarExtras = `<div class="diff-pills">${pills.map((p) => `<span class="diff-pill ${escapeHtml(p.kind || "")}"${p.title ? ` title="${escapeHtml(p.title)}"` : ""}>${escapeHtml(p.label)}</span>`).join("")}</div>`;
+          }
+        }
+      }
+      const preview = cardPreviewHtml(g, m, lightboxIndex, opts);
+      const actions = cardActionsHtml(g, m, lightboxIndex, opts);
       return `
-        <article class="card ${singleReview ? "focus-card" : ""} ${decisionReview ? "decision-card" : ""} ${isPagedIndependentReview(g) ? "triage-card" : ""} ${isKeep ? "keep" : ""} ${isSel ? "selected" : ""} ${deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
+        <article class="card ${singleReview ? "focus-card" : ""} ${decisionReview ? "decision-card" : ""} ${triage ? "triage-card" : ""} ${opts.isKeep ? "keep" : ""} ${opts.isSel ? "selected" : ""} ${opts.deleted ? "deleted" : ""} ${focused}" data-path="${escapeHtml(m.path)}" data-index="${memberIndex}">
           ${preview}
           <div class="card-body">
             <div class="name" title="${escapeHtml(m.path)}">${escapeHtml(fileName)}</div>
             <div class="path" title="${escapeHtml(m.path)}">${escapeHtml(m.path)}</div>
             <div class="card-meta">
               <span>${formatBytes(m.size)}</span>
-              <span>${dims}</span>
+              <span>${opts.dims}</span>
               <span class="file-extra" title="Modified">${escapeHtml(formatMtime(m.mtime))}</span>
               <span class="media-kind">${escapeHtml(m.media_type)}</span>
               ${m.face_count != null ? `<span class="face-count ${m.face_count > 1 ? "multi" : ""}" title="Faces detected by OpenCV (heuristic)">${m.face_count === 0 ? "No faces" : `${m.face_count} face${m.face_count === 1 ? "" : "s"}`}</span>` : ""}
@@ -880,10 +1188,10 @@ function renderMembers(g, { append = false } = {}) {
               ${(m.male_face_count || 0) > 0 ? `<span class="face-count multi" title="Male faces estimated by InsightFace genderage (heuristic)">${m.male_face_count} male${m.male_face_count === 1 ? "" : "s"}</span>` : ""}
             </div>
             <div class="evidence">${escapeHtml(evidence)}</div>
+            ${similarExtras}
             ${m.non_person_coverage != null || memberSort === COVERAGE_SORT ? `<div class="non-person-coverage" title="${COVERAGE_HINT}">Non-person coverage: ${m.non_person_coverage == null ? "Unknown" : `${coveragePercent.format(m.non_person_coverage)}%`}</div>` : ""}
             <div class="card-actions">
               ${actions}
-              ${singleReview && !deleted && !clickTrash ? `<button class="linkish inspect-media" data-index="${lightboxIndex}" type="button">Expand ↗</button>` : ""}
             </div>
           </div>
         </article>
@@ -898,27 +1206,206 @@ function renderMembers(g, { append = false } = {}) {
       preview.dataset.previewHeight,
     );
   });
-
   rendered.querySelectorAll(".thumb-image").forEach((image) => {
-    const syncAspectRatio = () => {
+    if (image.complete && image.naturalWidth > 0) {
       setPreviewAspectRatio(image.closest(".thumb-wrap"), image.naturalWidth, image.naturalHeight);
-    };
-    image.addEventListener("load", syncAspectRatio);
-    image.addEventListener("error", () => {
-      const fallback = document.createElement("div");
-      fallback.className = "thumb-fallback";
-      fallback.textContent = "No preview";
-      image.replaceWith(fallback);
-    });
-    if (image.complete) syncAspectRatio();
+    }
   });
 
-  rendered.querySelectorAll(".hover-video").forEach((video) => {
-    const wrap = video.closest(".thumb-wrap");
-    video.addEventListener("loadedmetadata", () => {
-      setPreviewAspectRatio(wrap, video.videoWidth, video.videoHeight);
-    });
-    wrap.addEventListener("pointerenter", () => {
+  if (!append) box.replaceChildren(...rendered.childNodes);
+  else box.append(...rendered.childNodes);
+
+  // The single-file stage has a stable height; decisions never move the page.
+  requestAnimationFrame(fitReviewStage);
+}
+
+// —— Serialized checkbox queue for Similar / duplicate list view ——
+const pendingListSelection = new Map(); // group id → ordered selected paths
+const listSelectionInFlight = new Map(); // group id → Promise
+
+function flushListSelection(id) {
+  if (listSelectionInFlight.has(id)) return listSelectionInFlight.get(id);
+  const promise = (async () => {
+    try {
+      while (pendingListSelection.has(id)) {
+        const selectedPaths = pendingListSelection.get(id);
+        pendingListSelection.delete(id);
+        const updated = await api("/api/selection", {
+          method: "POST",
+          body: JSON.stringify({
+            group_id: id,
+            selected: selectedPaths,
+            scan_id: state.scanId,
+          }),
+        });
+        if (!pendingListSelection.has(id)) {
+          patchGroup(updated);
+          if (currentGroup()?.id === id) {
+            const box = $("members");
+            box.querySelectorAll(":scope > .card[data-path]").forEach((card) => {
+              syncCardSelection(card, updated, card.dataset.path);
+            });
+            updateGroupSelectionText(updated);
+            updateDetailMeta(updated);
+            renderedGroupSnapshot = groupRenderSignature(updated);
+          }
+          if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+            scheduleRender({ groupList: true });
+          } else {
+            applyResultControls();
+          }
+          scheduleRender({ selection: true });
+        }
+      }
+    } catch (error) {
+      pendingListSelection.delete(id);
+      toast(error.message || "Could not update selection", "error");
+      const open = currentGroup();
+      if (open && open.id === id) selectGroup(id, { silent: true }).catch(() => {});
+    } finally {
+      listSelectionInFlight.delete(id);
+    }
+  })();
+  listSelectionInFlight.set(id, promise);
+  return promise;
+}
+
+// —— Event delegation on #members (standard member & triage cards) ——
+(function wireMembersDelegation() {
+  const box = $("members");
+  if (!box || box.dataset.membersDelegated === "1") return;
+  box.dataset.membersDelegated = "1";
+
+  box.addEventListener("click", async (event) => {
+    const card = event.target.closest("#members > .card:not(.copy-row):not(.crop-card)");
+    if (!card) return;
+    const g = currentGroup();
+    if (!g) return;
+
+    const candDelete = event.target.closest(".candidate-delete");
+    if (candDelete) {
+      reviewCandidate(g, candDelete.dataset.path, true);
+      return;
+    }
+    const candKeep = event.target.closest(".candidate-keep");
+    if (candKeep) {
+      reviewCandidate(g, candKeep.dataset.path, false);
+      return;
+    }
+    const revealBtn = event.target.closest(".reveal");
+    if (revealBtn) {
+      event.stopPropagation();
+      try {
+        await api(`/api/reveal?path=${encodeURIComponent(revealBtn.dataset.path)}&open=1`);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+      return;
+    }
+    const delBtn = event.target.closest(".delete-candidate");
+    if (delBtn) {
+      event.stopPropagation();
+      trashReviewCandidate(g, delBtn.dataset.path);
+      return;
+    }
+    const undoBtn = event.target.closest(".undo-delete");
+    if (undoBtn) {
+      event.stopPropagation();
+      undoReviewCandidate(g, undoBtn.dataset.path);
+      return;
+    }
+    const thumbBtn = event.target.closest("button.thumb-wrap");
+    if (thumbBtn) {
+      state.memberFocus = Number(card.dataset.index || 0);
+      if (thumbBtn.dataset.clickTrash) {
+        trashReviewCandidate(g, thumbBtn.dataset.path);
+        return;
+      }
+      const path = card.dataset.path;
+      const idx = path ? state.lightboxItems.findIndex((item) => item.path === path) : -1;
+      openLightbox(idx >= 0 ? idx : Number(thumbBtn.dataset.index));
+      return;
+    }
+    const inspectBtn = event.target.closest(".inspect-media");
+    if (inspectBtn) {
+      event.stopPropagation();
+      const cardIndex = Number(card.dataset.index);
+      if (Number.isFinite(cardIndex)) state.memberFocus = cardIndex;
+      const path = card.dataset.path;
+      const idx = path ? state.lightboxItems.findIndex((item) => item.path === path) : -1;
+      openLightbox(idx >= 0 ? idx : Number(inspectBtn.dataset.index));
+      return;
+    }
+    if (!event.target.closest("input, button, label, a")) {
+      state.memberFocus = Number(card.dataset.index);
+      box.querySelectorAll(".card").forEach((c) => c.classList.remove("focused"));
+      card.classList.add("focused");
+    }
+  });
+
+  // Capturing listener so Space's non-bubbling synthetic change event from
+  // keyboard.js also reaches the delegated handler.
+  box.addEventListener("change", (event) => {
+    const cb = event.target.closest?.("#members > .card:not(.copy-row):not(.crop-card) .sel-cb");
+    if (!cb) return;
+    if (state.scanning || state.actionBusy) {
+      cb.checked = !cb.checked;
+      toast("Selections are locked while a scan or file action runs", "error");
+      return;
+    }
+    const g = currentGroup();
+    if (!g) return;
+    const changedPath = cb.dataset.path;
+    const next = new Set(g.selected_for_removal || []);
+    if (cb.checked) next.add(changedPath);
+    else next.delete(changedPath);
+    const ordered = (g.members || []).map((m) => m.path).filter((p) => next.has(p));
+    const optimistic = { ...g, selected_for_removal: ordered };
+    state.selectToken += 1;
+    markGroupTouched(g.id);
+    patchGroup(optimistic);
+    const card = cb.closest(".card");
+    if (card) syncCardSelection(card, optimistic, changedPath);
+    updateGroupSelectionText(optimistic);
+    if (selectionFiltersActive() || !updateGroupListItem(optimistic)) {
+      scheduleRender({ groupList: true });
+    } else {
+      applyResultControls();
+    }
+    scheduleRender({ selection: true });
+    pendingListSelection.set(g.id, ordered);
+    flushListSelection(g.id);
+  }, true);
+
+  box.addEventListener("load", (event) => {
+    const img = event.target;
+    if (!img?.classList?.contains("thumb-image")) return;
+    if (!img.closest("#members > .card:not(.copy-row):not(.crop-card)")) return;
+    setPreviewAspectRatio(img.closest(".thumb-wrap"), img.naturalWidth, img.naturalHeight);
+  }, true);
+
+  box.addEventListener("error", (event) => {
+    const img = event.target;
+    if (!img?.classList?.contains("thumb-image")) return;
+    if (!img.closest("#members > .card:not(.copy-row):not(.crop-card)")) return;
+    const fallback = document.createElement("div");
+    fallback.className = "thumb-fallback";
+    fallback.textContent = "No preview";
+    img.replaceWith(fallback);
+  }, true);
+
+  box.addEventListener("loadedmetadata", (event) => {
+    const video = event.target;
+    if (!video?.classList?.contains("hover-video")) return;
+    if (!video.closest("#members > .card:not(.copy-row):not(.crop-card)")) return;
+    setPreviewAspectRatio(video.closest(".thumb-wrap"), video.videoWidth, video.videoHeight);
+  }, true);
+
+  box.addEventListener("pointerover", (event) => {
+    const wrap = event.target.closest?.("#members > .card:not(.copy-row):not(.crop-card) .thumb-wrap");
+    if (!wrap || wrap.contains(event.relatedTarget)) return;
+    const video = wrap.querySelector(".hover-video");
+    if (video) {
       stopInlineVideo();
       activeVideo = video;
       video.muted = true;
@@ -926,151 +1413,26 @@ function renderMembers(g, { append = false } = {}) {
       video.play().catch(() => {
         /* The static poster remains when the browser cannot play this codec. */
       });
-    });
-    wrap.addEventListener("pointerleave", () => {
-      if (activeVideo === video) stopInlineVideo();
-    });
+    }
+    const gif = wrap.querySelector(".hover-gif");
+    if (gif?.dataset.src) gif.src = gif.dataset.src;
   });
 
-  rendered.querySelectorAll(".hover-gif").forEach((image) => {
-    const wrap = image.closest(".thumb-wrap");
-    wrap.addEventListener("pointerenter", () => {
-      image.src = image.dataset.src;
-    });
-    wrap.addEventListener("pointerleave", () => {
-      image.src = image.dataset.thumbnail;
-    });
+  box.addEventListener("pointerout", (event) => {
+    const wrap = event.target.closest?.("#members > .card:not(.copy-row):not(.crop-card) .thumb-wrap");
+    if (!wrap || wrap.contains(event.relatedTarget)) return;
+    const video = wrap.querySelector(".hover-video");
+    if (video && activeVideo === video) stopInlineVideo();
+    const gif = wrap.querySelector(".hover-gif");
+    if (gif?.dataset.thumbnail) gif.src = gif.dataset.thumbnail;
   });
-
-  rendered.querySelectorAll(".sel-cb").forEach((cb) => {
-    cb.addEventListener("change", async () => {
-      g = currentGroup();
-      const changedPath = cb.dataset.path;
-      const checks = [...box.querySelectorAll(".sel-cb")];
-      const pagePaths = new Set(checks.map((c) => c.dataset.path));
-      // Preserve picks in unloaded batches while updating loaded checkboxes.
-      const offPageKept = (g.selected_for_removal || []).filter((path) => !pagePaths.has(path));
-      const selectedPaths = [
-        ...offPageKept,
-        ...checks.filter((c) => c.checked).map((c) => c.dataset.path),
-      ];
-      const previousSelected = new Set(g.selected_for_removal || []);
-      try {
-        const updated = await api("/api/selection", {
-          method: "POST",
-          body: JSON.stringify({
-            group_id: g.id,
-            selected: selectedPaths,
-            scan_id: state.scanId,
-          }),
-        });
-        markGroupTouched(g.id);
-        const idx = state.groups.findIndex((x) => x.id === g.id);
-        if (idx >= 0) state.groups[idx] = updated;
-        const aidx = state.allGroups.findIndex((x) => x.id === g.id);
-        if (aidx >= 0) state.allGroups[aidx] = updated;
-        // Patch only the cards whose selection flipped (keeper retention can
-        // flip one other card) instead of rebuilding all cards — the rebuild
-        // churned DOM and focus on every toggle.
-        const nowSelected = new Set(updated.selected_for_removal || []);
-        const flipped = new Set(
-          [...previousSelected, ...nowSelected]
-            .filter((path) => previousSelected.has(path) !== nowSelected.has(path)),
-        );
-        for (const path of flipped) {
-          const card = box.querySelector(`.card[data-path="${CSS.escape(path)}"]`);
-          if (card) syncCardSelection(card, updated, path);
-          else if (path === changedPath) {
-            // The card is gone (page changed under us); fall back to a render.
-            renderMembers(updated);
-            break;
-          }
-        }
-        updateGroupSelectionText(updated);
-        // Patch the single sidebar row unless a filter depends on selection.
-        if (selectionFiltersActive() || !updateGroupListItem(updated)) {
-          scheduleRender({ groupList: true });
-        } else {
-          applyResultControls();
-        }
-        scheduleRender({ selection: true });
-      } catch (e) {
-        toast(e.message, "error");
-        cb.checked = !cb.checked;
-      }
-    });
-  });
-
-  rendered.querySelectorAll(".candidate-delete").forEach((btn) => {
-    btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, true));
-  });
-  rendered.querySelectorAll(".candidate-keep").forEach((btn) => {
-    btn.addEventListener("click", () => reviewCandidate(g, btn.dataset.path, false));
-  });
-
-  rendered.querySelectorAll(".reveal").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try {
-        await api(`/api/reveal?path=${encodeURIComponent(btn.dataset.path)}&open=1`);
-      } catch (err) {
-        toast(err.message, "error");
-      }
-    });
-  });
-
-  rendered.querySelectorAll(".delete-candidate").forEach((btn) => {
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      trashReviewCandidate(g, btn.dataset.path);
-    });
-  });
-
-  rendered.querySelectorAll(".undo-delete").forEach((btn) => {
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      undoReviewCandidate(g, btn.dataset.path);
-    });
-  });
-
-  rendered.querySelectorAll("button.thumb-wrap").forEach((el) => {
-    el.addEventListener("click", () => {
-      state.memberFocus = Number(el.closest(".card")?.dataset.index || 0);
-      // Triage pictures trash on click; enlarging lives on their Enlarge
-      // button. Every other card's picture still opens the lightbox.
-      if (el.dataset.clickTrash) {
-        trashReviewCandidate(g, el.dataset.path);
-        return;
-      }
-      openLightbox(Number(el.dataset.index));
-    });
-  });
-  rendered.querySelectorAll(".inspect-media").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      const cardIndex = Number(button.closest(".card")?.dataset.index);
-      if (Number.isFinite(cardIndex)) state.memberFocus = cardIndex;
-      openLightbox(Number(button.dataset.index));
-    });
-  });
-
-  rendered.querySelectorAll(".card").forEach((card) => {
-    card.addEventListener("click", (e) => {
-      if (e.target.closest("input, button, label, a")) return;
-      state.memberFocus = Number(card.dataset.index);
-      box.querySelectorAll(".card").forEach((c) => c.classList.remove("focused"));
-      card.classList.add("focused");
-    });
-  });
-
-  if (!append) box.replaceChildren();
-  box.append(...rendered.childNodes);
-
-  // The single-file stage has a stable height; decisions never move the page.
-  requestAnimationFrame(fitReviewStage);
-}
+})();
 
 async function reviewCandidate(group, path, remove) {
+  if (state.scanning) {
+    toast("Selections unlock when the scan finishes", "error");
+    return;
+  }
   if (remove && group.members.some((m) => m.path === path && m.protected)) return toast("This file is in a protected library");
   if (!isDecisionReview(group)) return;
   if (state.reviewingCandidate) {
@@ -1101,10 +1463,7 @@ async function reviewCandidate(group, path, remove) {
         scan_id: state.scanId,
       }),
     });
-    const idx = state.groups.findIndex((candidate) => candidate.id === updated.id);
-    if (idx >= 0) state.groups[idx] = updated;
-    const allIdx = state.allGroups.findIndex((candidate) => candidate.id === updated.id);
-    if (allIdx >= 0) state.allGroups[allIdx] = updated;
+    patchGroup(updated);
     for (const groups of [state.groups, state.allGroups]) {
       for (const candidate of groups) {
         if (!(candidate.members || []).some((member) => member.path === path)) continue;
@@ -1139,6 +1498,9 @@ async function reviewCandidate(group, path, remove) {
     }
     state.memberFocus = nextIndex;
     renderMembers(updated);
+    // Unlock lightbox decision buttons before refreshing unless another held-key
+    // decision is already queued to run next in finally.
+    state.reviewingCandidate = Boolean(state.pendingReviewDecision);
     if (lightboxOpen()) {
       state.lightboxIndex = 0;
       updateLightbox();
@@ -1155,15 +1517,19 @@ async function reviewCandidate(group, path, remove) {
   } catch (error) {
     toast(error.message, "error");
   } finally {
-    state.reviewingCandidate = false;
     const pending = state.pendingReviewDecision;
     state.pendingReviewDecision = null;
     if (pending) {
+      state.reviewingCandidate = false;
       const current = currentGroup();
       const member = isDecisionReview(current)
         ? (current.members || [])[state.memberFocus]
         : null;
       if (member) await reviewCandidate(current, member.path, pending.direction);
+      else if (lightboxOpen()) updateLightbox();
+    } else if (state.reviewingCandidate) {
+      state.reviewingCandidate = false;
+      if (lightboxOpen()) updateLightbox();
     }
   }
 }
@@ -1174,6 +1540,37 @@ function optimisticTrashGroup(group, path) {
     deleted_paths: [...new Set([...(group.deleted_paths || []), path])],
     selected_for_removal: (group.selected_for_removal || []).filter((item) => item !== path),
     reviewed_paths: [...new Set([...(group.reviewed_paths || []), path])],
+  };
+}
+
+function mergeInFlightDeletes(group, finishedPath) {
+  const stillBusy = new Set(
+    [...state.deleteBusy].filter((item) => item !== finishedPath),
+  );
+  if (!stillBusy.size) return group;
+  const memberPaths = new Set((group.members || []).map((m) => m.path));
+  const extraDeletes = [...stillBusy].filter((item) => memberPaths.has(item));
+  if (!extraDeletes.length) return group;
+  return {
+    ...group,
+    deleted_paths: [...new Set([...(group.deleted_paths || []), ...extraDeletes])],
+    selected_for_removal: (group.selected_for_removal || []).filter((item) => !stillBusy.has(item)),
+    reviewed_paths: [...new Set([...(group.reviewed_paths || []), ...extraDeletes])],
+  };
+}
+
+function revertSingleOptimisticTrash(group, path, { wasSelected, wasReviewed }) {
+  const deleted = (group.deleted_paths || []).filter((item) => item !== path);
+  const selectedSet = new Set(group.selected_for_removal || []);
+  if (wasSelected) selectedSet.add(path);
+  else selectedSet.delete(path);
+  const reviewedSet = new Set(group.reviewed_paths || []);
+  if (!wasReviewed) reviewedSet.delete(path);
+  return {
+    ...group,
+    deleted_paths: deleted,
+    selected_for_removal: (group.members || []).map((m) => m.path).filter((p) => selectedSet.has(p)),
+    reviewed_paths: (group.members || []).map((m) => m.path).filter((p) => reviewedSet.has(p)),
   };
 }
 
@@ -1193,17 +1590,47 @@ async function requestWithLockRetry(path, body) {
   throw lastError;
 }
 
+function refreshSidebarAndFooter(updated) {
+  if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+    scheduleRender({ groupList: true });
+  } else {
+    applyResultControls();
+  }
+  scheduleRender({ selection: true });
+}
+
 async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) {
-  if (!group || !path || (group.deleted_paths || []).includes(path) || state.deleteBusy.has(path)) {
+  const liveGroup = state.allGroups.find((item) => item.id === group?.id) || group;
+  if (!liveGroup || !path || (liveGroup.deleted_paths || []).includes(path) || state.deleteBusy.has(path)) {
     return;
   }
+  if (state.scanning) {
+    toast("Selections unlock when the scan finishes", "error");
+    return;
+  }
+  const wasSelected = (liveGroup.selected_for_removal || []).includes(path);
+  const wasReviewed = (liveGroup.reviewed_paths || []).includes(path);
+
   state.deleteBusy.add(path);
   state.trashedInPlace.add(path);
-  const previous = group;
-  const optimistic = optimisticTrashGroup(group, path);
+  state.selectToken += 1;
+  const optimistic = optimisticTrashGroup(liveGroup, path);
   patchGroup(optimistic);
-  renderMembers(optimistic);
-  scheduleRender({ groupList: true, selection: true });
+
+  const box = $("members");
+  const card = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+  const inPlace = !boardActive() && renderedGroupId === optimistic.id
+    && card && patchTriageCardDeleted(card, optimistic, path, true);
+  if (inPlace) {
+    updateDetailMeta(optimistic);
+    updateGroupSelectionText(optimistic);
+    syncDeletedToggle(optimistic);
+    renderedGroupSnapshot = groupRenderSignature(optimistic);
+  } else if (currentGroup()?.id === optimistic.id) {
+    renderMembers(optimistic);
+  }
+  refreshSidebarAndFooter(optimistic);
+
   if (fromLightbox) {
     state.lightboxItems = state.lightboxItems.filter((item) => item.path !== path);
     if (!state.lightboxItems.length) closeLightbox();
@@ -1214,29 +1641,52 @@ async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) 
   }
   try {
     const updated = await requestWithLockRetry("/api/review-candidate/delete", {
-      group_id: group.id,
+      group_id: liveGroup.id,
       path,
       scan_id: state.scanId,
       dry_run: false,
     });
-    patchGroup(updated);
-    renderMembers(updated);
-    scheduleRender({ groupList: true, selection: true });
+    const merged = mergeInFlightDeletes(updated, path);
+    patchGroup(merged);
+    if (currentGroup()?.id === merged.id) {
+      if (inPlace && box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`)) {
+        updateDetailMeta(merged);
+        updateGroupSelectionText(merged);
+        syncDeletedToggle(merged);
+        syncLightboxItemsAndIndices(merged);
+        renderedGroupSnapshot = groupRenderSignature(merged);
+      } else {
+        renderMembers(merged);
+      }
+    }
+    refreshSidebarAndFooter(merged);
     toast(`Moved ${basename(path)} to Trash`, "ok", {
       actionLabel: "Undo",
-      onAction: () => undoReviewCandidate(updated, path, { fromLightbox }),
+      onAction: () => undoReviewCandidate(merged, path, { fromLightbox }),
     });
   } catch (error) {
     state.trashedInPlace.delete(path);
-    patchGroup(previous);
-    renderMembers(previous);
-    scheduleRender({ groupList: true, selection: true });
+    const latest = state.allGroups.find((item) => item.id === liveGroup.id) || liveGroup;
+    const reverted = revertSingleOptimisticTrash(latest, path, { wasSelected, wasReviewed });
+    patchGroup(reverted);
+    if (currentGroup()?.id === reverted.id) {
+      const currentCard = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+      if (currentCard && patchTriageCardDeleted(currentCard, reverted, path, false)) {
+        updateDetailMeta(reverted);
+        updateGroupSelectionText(reverted);
+        syncDeletedToggle(reverted);
+        renderedGroupSnapshot = groupRenderSignature(reverted);
+      } else {
+        renderMembers(reverted);
+      }
+    }
+    refreshSidebarAndFooter(reverted);
     if (fromLightbox && lightboxOpen()) {
-      const failedMember = (previous.members || []).find((member) => member.path === path);
+      const failedMember = (reverted.members || []).find((member) => member.path === path);
       state.lightboxItems = [
         failedMember
-          ? lightboxItemFor(failedMember, previous)
-          : { path, mediaType: undefined, keeper: previous.suggested_keep, kind: previous.kind },
+          ? lightboxItemFor(failedMember, reverted)
+          : { path, mediaType: undefined, keeper: reverted.suggested_keep, kind: reverted.kind },
         ...state.lightboxItems,
       ];
       updateLightbox();
@@ -1249,6 +1699,10 @@ async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) 
 
 async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
   if (!group || !path) return;
+  if (state.scanning) {
+    toast("Undo unlocks when the scan finishes", "error");
+    return;
+  }
   while (state.deleteBusy.has(path)) await sleep(40);
   const live = currentGroup()?.id === group.id ? currentGroup() : group;
   try {
@@ -1257,12 +1711,24 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
       path,
       scan_id: state.scanId,
     });
-    patchGroup(updated);
+    const merged = mergeInFlightDeletes(updated, null);
+    patchGroup(merged);
     state.trashedInPlace.delete(path);
-    renderMembers(updated);
-    scheduleRender({ groupList: true, selection: true });
-    // renderMembers rebuilt the lightbox list with the restored file back at
-    // its sorted position; when the overlay is open, jump back to it.
+    const box = $("members");
+    const card = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+    if (currentGroup()?.id === merged.id) {
+      if (!boardActive() && renderedGroupId === merged.id && card && patchTriageCardDeleted(card, merged, path, false)) {
+        updateDetailMeta(merged);
+        updateGroupSelectionText(merged);
+        syncDeletedToggle(merged);
+        renderedGroupSnapshot = groupRenderSignature(merged);
+      } else {
+        renderMembers(merged);
+      }
+    }
+    refreshSidebarAndFooter(merged);
+    // Lightbox list now includes the restored file at its sorted position;
+    // when the overlay is open, jump back to it.
     if (fromLightbox && lightboxOpen()) {
       const restoredIndex = state.lightboxItems.findIndex((item) => item.path === path);
       if (restoredIndex >= 0) {
@@ -1281,31 +1747,42 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
 // every visible card resyncs from the response.
 async function setMemberSelected(group, path, wantSelected) {
   if (!group || isIndependentReview(group)) return null;
-  const selected = new Set(group.selected_for_removal || []);
+  if (state.scanning || state.actionBusy) {
+    toast("Selections are locked while a scan or file action runs", "error");
+    return null;
+  }
+  if (listSelectionInFlight.has(group.id)) {
+    await Promise.allSettled([listSelectionInFlight.get(group.id)]);
+  }
+  const latest = state.allGroups.find((item) => item.id === group.id) || group;
+  const selected = new Set(latest.selected_for_removal || []);
   if (wantSelected) selected.add(path);
   else selected.delete(path);
   const updated = await api("/api/selection", {
     method: "POST",
     body: JSON.stringify({
-      group_id: group.id,
+      group_id: latest.id,
       selected: [...selected],
       scan_id: state.scanId,
     }),
   });
-  markGroupTouched(group.id);
+  markGroupTouched(latest.id);
   patchGroup(updated);
   const box = $("members");
   box.querySelectorAll(".card[data-path]").forEach((card) => {
     syncCardSelection(card, updated, card.dataset.path);
   });
-  updateGroupSelectionText(updated);
-  refreshBoardRow(updated);
-  if (selectionFiltersActive() || !updateGroupListItem(updated)) {
-    scheduleRender({ groupList: true });
+  if (updated.kind === "exact") {
+    syncExactSelectionState(updated);
   } else {
-    applyResultControls();
+    updateGroupSelectionText(updated);
+    updateDetailMeta(updated);
   }
-  scheduleRender({ selection: true });
+  if (currentGroup()?.id === updated.id) {
+    renderedGroupSnapshot = groupRenderSignature(updated);
+  }
+  refreshBoardRow(updated);
+  refreshSidebarAndFooter(updated);
   return updated;
 }
 
@@ -1355,8 +1832,11 @@ function updateSimilarViewToggle(g) {
   $("btnSimilarBoard").hidden = !show;
   if (!show) return;
   const swipe = state.similarView !== "grid";
-  btn.setAttribute("aria-pressed", swipe ? "true" : "false");
+  btn.setAttribute("aria-pressed", swipe ? "false" : "true");
   btn.textContent = swipe ? "☰ List view" : "⇄ Swipe review";
+  btn.title = swipe
+    ? "Switch to classic card list view"
+    : "List view active — click to switch to Swipe review";
 }
 
 $("btnSimilarView")?.addEventListener("click", () => {
@@ -1368,6 +1848,47 @@ $("btnSimilarView")?.addEventListener("click", () => {
   }
   const g = currentGroup();
   if (g) selectGroup(g.id, { silent: true }).catch((e) => toast(e.message, "error"));
+});
+
+$("btnMarkGroupReviewed")?.addEventListener("click", async () => {
+  const g = currentGroup();
+  if (!g || state.scanning) return;
+  const nextReviewed = !g.reviewed;
+  const btn = $("btnMarkGroupReviewed");
+  btn.disabled = true;
+  try {
+    const updated = await api("/api/group/reviewed", {
+      method: "POST",
+      body: JSON.stringify({
+        group_id: g.id,
+        reviewed: nextReviewed,
+        scan_id: state.scanId,
+      }),
+    });
+    patchGroup(updated);
+    syncMarkReviewedButton(updated);
+    refreshSidebarAndFooter(updated);
+    toast(nextReviewed ? "Group marked reviewed" : "Group unmarked as reviewed", "ok");
+  } catch (error) {
+    toast(error.message || "Could not update reviewed status", "error");
+  } finally {
+    syncMarkReviewedButton(currentGroup());
+  }
+});
+
+window.addEventListener("dedupe:work-state", () => {
+  const open = currentGroup();
+  syncScanningLock(open);
+  const lock = Boolean(state.scanning);
+  $("members").querySelectorAll(".sel-cb, .candidate-decision, .delete-candidate, .undo-delete, .copy-keep").forEach((el) => {
+    if (el.classList.contains("sel-cb")) {
+      const row = el.closest(".card");
+      const member = open?.members?.find((m) => m.path === row?.dataset.path);
+      el.disabled = Boolean(lock || member?.protected || row?.classList.contains("deleted"));
+    } else {
+      el.disabled = lock;
+    }
+  });
 });
 
 document.querySelectorAll(".member-prev").forEach((btn) => {
@@ -1404,12 +1925,17 @@ $("memberModified")?.addEventListener("change", (event) => {
 
 const REVIEW_VIEW_KEY = "dedupe.reviewView";
 const PREVIEW_SIZE_KEY = "dedupe.previewSize";
+const MEDIA_DETAILS_KEY = "dedupe.showFileDetails";
 try {
   if (localStorage.getItem(REVIEW_VIEW_KEY) === "focus") state.reviewView = "focus";
   const size = Number(localStorage.getItem(PREVIEW_SIZE_KEY));
   if (size >= 240 && size <= 520 && (size - 240) % 40 === 0) {
     $("previewSize").value = String(size);
     $("members").style.setProperty("--tile-size", `${size}px`);
+  }
+  if (localStorage.getItem(MEDIA_DETAILS_KEY) === "1") {
+    $("detailBody").classList.add("show-file-details");
+    $("btnMediaDetails").setAttribute("aria-pressed", "true");
   }
 } catch { /* Storage may be unavailable in private browsing. */ }
 
@@ -1429,6 +1955,17 @@ $("previewSize").addEventListener("input", (event) => {
 $("btnMediaDetails").addEventListener("click", () => {
   const show = $("detailBody").classList.toggle("show-file-details");
   $("btnMediaDetails").setAttribute("aria-pressed", String(show));
+  try { localStorage.setItem(MEDIA_DETAILS_KEY, show ? "1" : "0"); } catch { /* ignore */ }
 });
 
-export { selectGroup, renderMembers, restartMemberList, reviewCandidate, trashReviewCandidate, undoReviewCandidate, changeMemberPage, setMemberSelected };
+export {
+  selectGroup,
+  renderMembers,
+  restartMemberList,
+  reviewCandidate,
+  trashReviewCandidate,
+  undoReviewCandidate,
+  changeMemberPage,
+  setMemberSelected,
+  getRenderedMemberFilterSignature,
+};

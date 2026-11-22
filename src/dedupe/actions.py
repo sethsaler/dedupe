@@ -13,8 +13,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 
+from . import receipts as receipts_module
 from .action_journal import ActionJournal, atomic_json, recover_interrupted_actions
-from .exact import file_sha256
+from .exact import file_partial_hash, file_sha256
 from .models import (
     DuplicateGroup,
     FileRecord,
@@ -25,7 +26,13 @@ from .models import (
     effective_selected_paths,
 )
 from .parallel import map_parallel, resolve_workers
-from .receipts import receipt_filename, resolve_log_dir, resolve_receipt_path
+from .receipts import (
+    PREVIEW_PREFIX,
+    iter_receipt_paths,
+    receipt_filename,
+    resolve_log_dir,
+    resolve_receipt_path,
+)
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
 from .similar_image import (
     compute_image_hashes,
@@ -44,6 +51,43 @@ from .similar_video import (
 # Destructive file work is I/O bound; a small pool hides move/copy latency
 # without saturating the disk or the system Trash service.
 DEFAULT_ACTION_WORKERS_CAP = 4
+MAX_AUTO_PREVIEW_RECEIPTS = 50
+
+
+def auto_prune_old_previews(
+    log_dir: str | Path | None = None,
+    *,
+    keep: int = MAX_AUTO_PREVIEW_RECEIPTS,
+) -> int:
+    """Keep at most the ``keep`` newest preview-*.json receipts so History stays fast."""
+    w2c_prune = getattr(receipts_module, "auto_prune_preview_receipts", None)
+    if callable(w2c_prune):
+        try:
+            return int(w2c_prune(log_dir, keep=keep))
+        except TypeError:
+            try:
+                return int(w2c_prune(log_dir))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    previews = [
+        path
+        for path in iter_receipt_paths(log_dir)
+        if path.name.startswith(f"{PREVIEW_PREFIX}-")
+    ]
+    if len(previews) <= keep:
+        return 0
+    # Receipt names carry UTC ISO-8601 timestamps down to microseconds.
+    previews.sort(key=lambda p: p.name, reverse=True)
+    removed = 0
+    for stale in previews[max(0, int(keep)) :]:
+        try:
+            stale.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 class CrossDeviceError(OSError):
@@ -140,6 +184,11 @@ def _write_action_log(
         )
         result.log_path = str(log_path)
         atomic_json(log_path, result.to_dict())
+        if result.dry_run:
+            try:
+                auto_prune_old_previews(log_base)
+            except OSError:
+                pass
     except OSError as exc:
         if result._journal is None:
             result.log_path = None
@@ -285,9 +334,15 @@ def _trash_dirs_for(path: Path) -> list[Path]:
         except OSError:
             return dirs
         if dev != home_dev:
-            mount_trash = _volume_root(path) / f".Trash-{os.getuid()}"
-            if mount_trash.exists():
-                dirs.append(mount_trash)
+            vol_root = _volume_root(path)
+            uid = os.getuid()
+            for mount_trash in (
+                vol_root / f".Trash-{uid}" / "files",
+                vol_root / ".Trash" / str(uid) / "files",
+                vol_root / f".Trash-{uid}",
+            ):
+                if mount_trash.exists():
+                    dirs.append(mount_trash)
     return dirs
 
 
@@ -300,6 +355,26 @@ def _list_names(directory: Path) -> set[str]:
 
 def _snapshot_trash(dirs: list[Path]) -> dict[Path, set[str]]:
     return {d: _list_names(d) for d in dirs}
+
+
+def _trashed_entry_matches(
+    candidate: Path,
+    size: int,
+    dev_ino: tuple[int, int] | None,
+) -> tuple[bool, bool, float]:
+    """Return ``(matches, exact_inode, mtime)`` for a candidate entry in Trash."""
+    try:
+        st = candidate.lstat()
+    except OSError:
+        return False, False, 0.0
+    if not S_ISREG(st.st_mode) or st.st_size != size:
+        return False, False, 0.0
+    if dev_ino is not None:
+        if (st.st_dev, st.st_ino) == dev_ino:
+            return True, True, st.st_mtime
+        if st.st_dev == dev_ino[0]:
+            return False, False, 0.0
+    return True, False, st.st_mtime
 
 
 class TrashBatch:
@@ -337,54 +412,70 @@ class TrashBatch:
 
         if not src.exists():
             raise FileNotFoundError(str(src))
-        size = src.stat().st_size
+        st = src.lstat()
+        size = st.st_size
+        dev_ino = (st.st_dev, st.st_ino)
         with self._lock:
             dirs = self._dirs_for(src)
             send2trash(str(src))
-            return self._locate(dirs, src.name, src.stem, size)
+            return self._locate(dirs, src.name, src.stem, size, dev_ino)
 
-    def _locate(self, dirs: list[Path], name: str, stem: str, size: int) -> Path | None:
+    def _locate(
+        self,
+        dirs: list[Path],
+        name: str,
+        stem: str,
+        size: int,
+        dev_ino: tuple[int, int] | None = None,
+    ) -> Path | None:
         for directory in dirs:
             known = self._known.setdefault(directory, set())
             if name in known:
                 continue
             candidate = directory / name
-            try:
-                if candidate.stat().st_size == size:
-                    known.add(name)
-                    return candidate
-            except OSError:
-                continue
+            matched, _exact_inode, _mtime = _trashed_entry_matches(candidate, size, dev_ino)
+            if matched:
+                known.add(name)
+                return candidate
 
+        fallback_added: Path | None = None
         for directory in dirs:
             current = _list_names(directory)
             added = current - self._known.get(directory, set())
             self._known[directory] = current
             for entry in sorted(added):
                 candidate = directory / entry
-                try:
-                    if candidate.stat().st_size == size:
+                matched, exact_inode, _mtime = _trashed_entry_matches(candidate, size, dev_ino)
+                if matched:
+                    if exact_inode:
                         return candidate
-                except OSError:
-                    continue
+                    if fallback_added is None:
+                        fallback_added = candidate
+        if fallback_added is not None:
+            return fallback_added
 
-        # Last resort: newest entry whose name matches, in case send2trash chose a
-        # Trash directory we never enumerated.
-        best: tuple[float, Path] | None = None
+        # Last resort: newest matching entry whose name matches, in case send2trash
+        # reused a name or picked a Trash directory with pre-existing entries.
+        best_exact: tuple[float, Path] | None = None
+        best_size: tuple[float, Path] | None = None
         for directory in dirs:
             try:
                 entries = list(directory.iterdir())
             except OSError:
                 continue
             for p in entries:
-                if p.name == name or p.name.startswith(f"{stem} "):
-                    try:
-                        mtime = p.stat().st_mtime
-                    except OSError:
+                if p.name == name or p.name.startswith(f"{stem} ") or p.name.startswith(f"{stem}_"):
+                    matched, exact_inode, mtime = _trashed_entry_matches(p, size, dev_ino)
+                    if not matched:
                         continue
-                    if best is None or mtime > best[0]:
-                        best = (mtime, p)
-        return best[1] if best else None
+                    if exact_inode:
+                        if best_exact is None or mtime > best_exact[0]:
+                            best_exact = (mtime, p)
+                    elif best_size is None or mtime > best_size[0]:
+                        best_size = (mtime, p)
+        if best_exact is not None:
+            return best_exact[1]
+        return best_size[1] if best_size else None
 
 
 def _send_to_trash(src: Path, batch: TrashBatch | None = None) -> Path | None:
@@ -574,6 +665,16 @@ def _plan_keeper_checks(
     return batch
 
 
+def _stat_identity(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(st.st_dev),
+        int(st.st_ino),
+        int(st.st_size),
+        int(st.st_mtime_ns),
+        int(st.st_ctime_ns),
+    )
+
+
 def _preflight_action(
     records: dict[str, FileRecord],
     paths: list[str],
@@ -582,7 +683,10 @@ def _preflight_action(
     *,
     dest_dir: Path | None = None,
     device_cache: dict[str, int | None] | None = None,
-    verified_hashes: dict[str, tuple[str, os.stat_result]] | None = None,
+    verified_hashes: dict[str, tuple[str, os.stat_result, str]] | None = None,
+    verify_exact_hashes: bool = True,
+    keeper_hash_cache: dict[str, tuple[str, os.stat_result]] | None = None,
+    keeper_hash_lock: threading.Lock | None = None,
 ) -> dict[str, str]:
     """Return path -> error for stale, out-of-scope, or no-longer-exact selections.
 
@@ -600,6 +704,20 @@ def _preflight_action(
             error = cross_device_error(Path(path), dest_dir, device_cache)
         if error:
             errors[path] = error
+
+    def _hash_with_stat(path_str: str, *, is_keeper: bool) -> tuple[str, os.stat_result]:
+        if is_keeper and keeper_hash_cache is not None and keeper_hash_lock is not None:
+            cur_stat = Path(path_str).lstat()
+            with keeper_hash_lock:
+                cached = keeper_hash_cache.get(path_str)
+            if cached is not None and _stat_identity(cur_stat) == _stat_identity(cached[1]):
+                return cached[0], cur_stat
+        digest = file_sha256(path_str)
+        cur_stat = Path(path_str).lstat()
+        if is_keeper and keeper_hash_cache is not None and keeper_hash_lock is not None:
+            with keeper_hash_lock:
+                keeper_hash_cache[path_str] = (digest, cur_stat)
+        return digest, cur_stat
 
     for check in keeper_checks:
         keep = check.keep
@@ -623,7 +741,7 @@ def _preflight_action(
                 for member in check.candidates:
                     errors[member.path] = f"retained member is stale: {keep_error}"
                 continue
-        if check.group.kind != GroupKind.EXACT:
+        if check.group.kind != GroupKind.EXACT or not verify_exact_hashes:
             continue
         current_hashes: dict[str, str] = {}
         members_to_verify = [*check.candidates, keep]
@@ -632,14 +750,18 @@ def _preflight_action(
                 if member.path in errors:
                     continue
                 if member.path not in current_hashes:
-                    current_hashes[member.path] = file_sha256(member.path)
+                    digest, stat_after = _hash_with_stat(
+                        member.path, is_keeper=(member.path == keep.path)
+                    )
+                    current_hashes[member.path] = digest
+                    if verified_hashes is not None:
+                        verified_hashes[member.path] = (digest, stat_after, "sha256")
                 current = current_hashes[member.path]
-                if verified_hashes is not None:
-                    verified_hashes[member.path] = (current, Path(member.path).stat())
                 if member.sha256 and current != member.sha256:
                     errors[member.path] = "file content no longer matches its scan hash"
             if keep.path not in current_hashes:
-                current_hashes[keep.path] = file_sha256(keep.path)
+                digest, _ = _hash_with_stat(keep.path, is_keeper=True)
+                current_hashes[keep.path] = digest
             keep_hash = current_hashes[keep.path]
             for member in members_to_verify:
                 if member.path == keep.path or member.path in errors:
@@ -664,6 +786,7 @@ def apply_actions(
     safety_groups: list[DuplicateGroup] | None = None,
     allow_cross_device: bool = False,
     workers: int | None = None,
+    verify_hashes: bool = True,
 ) -> ActionResult:
     """
     action: 'trash' | 'quarantine'
@@ -715,6 +838,8 @@ def apply_actions(
     guarded_dest = qdir if (qdir is not None and not allow_cross_device) else None
     records = {member.path: member for group in all_safety_groups for member in group.members}
     batch_checks = _plan_keeper_checks(all_safety_groups, selected)
+    keeper_hash_cache: dict[str, tuple[str, os.stat_result]] = {}
+    keeper_hash_lock = threading.Lock()
     preflight_errors = _preflight_action(
         records,
         paths,
@@ -722,6 +847,11 @@ def apply_actions(
         roots,
         dest_dir=guarded_dest,
         device_cache=device_cache,
+        # When executing, each file is immediately re-verified right before its
+        # move; skip redundant full-file hashing in the batch pre-pass.
+        verify_exact_hashes=verify_hashes if dry_run else False,
+        keeper_hash_cache=keeper_hash_cache,
+        keeper_hash_lock=keeper_hash_lock,
     )
 
     # Names are reserved up front so concurrent workers never pick the same
@@ -767,15 +897,20 @@ def apply_actions(
                 path=path_str, ok=True, action=action, destination=destination, size=size
             )
         # Revalidate immediately before this file's destructive operation.
-        verified_hashes = {}
+        verified_hashes: dict[str, tuple[str, os.stat_result, str]] = {}
+        path_checks = checks_by_path.get(path_str, [])
+        is_exact_member = any(check.group.kind == GroupKind.EXACT for check in path_checks)
         immediate_errors = _preflight_action(
             records,
             [path_str],
-            checks_by_path.get(path_str, []),
+            path_checks,
             roots,
             dest_dir=guarded_dest,
             device_cache=device_cache,
             verified_hashes=verified_hashes,
+            verify_exact_hashes=verify_hashes,
+            keeper_hash_cache=keeper_hash_cache,
+            keeper_hash_lock=keeper_hash_lock,
         )
         if path_str in immediate_errors:
             return ActionItem(
@@ -791,6 +926,7 @@ def apply_actions(
                     journal_indexes[path_str],
                     search_dirs=_trash_dirs_for(src) if action == "trash" else (),
                     verified_hash=verified_hashes.get(path_str),
+                    require_full_hash=is_exact_member,
                 )
             if action == "trash":
                 trashed = _send_to_trash(src, trash_batch)
@@ -840,8 +976,10 @@ def undo_action(
     dry_run: bool = True,
     log_dir: str | Path | None = None,
     receipt_dir: str | Path | None = None,
+    verify_hashes: bool = True,
+    allow_partial: bool = False,
 ) -> ActionResult:
-    """Restore a completed trash or quarantine action from its receipt.
+    """Restore a completed trash, quarantine, or crop action from its receipt.
 
     ``action_log`` may be a path to a receipt or a receipt id (see
     :mod:`dedupe.receipts`); ids are resolved against ``receipt_dir`` (default:
@@ -852,7 +990,8 @@ def undo_action(
     resolved. A trash item recorded without a resolved destination (the bare
     ``"Trash"`` marker) cannot be restored programmatically — it fails
     preflight like any other blocker, and any preflight failure refuses the
-    whole undo, so a bulk restore never half-applies.
+    whole undo unless ``allow_partial`` is True, so a bulk restore never
+    half-applies unexpectedly.
     """
     log_path = resolve_receipt_path(action_log, receipt_dir)
     recover_interrupted_actions(log_path.parent)
@@ -860,8 +999,8 @@ def undo_action(
     if data.get("status") == "running":
         raise ValueError("this action is still running; wait before restoring its files")
     action = str(data.get("action") or "")
-    if data.get("dry_run") or action not in ("trash", "quarantine"):
-        raise ValueError("only executed trash or quarantine receipts can be undone")
+    if data.get("dry_run") or action not in ("trash", "quarantine", "crop"):
+        raise ValueError("only executed trash, quarantine, or crop receipts can be undone")
     undo_kind = f"undo:{action}"
 
     result = ActionResult(dry_run=dry_run, action=undo_kind)
@@ -869,6 +1008,7 @@ def undo_action(
         entry["path"]: entry.get("identity")
         for entry in data.get("journal", []) if isinstance(entry, dict) and entry.get("path")
     }
+    verified_hashes: dict[str, tuple[str, os.stat_result, str]] = {}
     planned: list[tuple[Path, Path, int | None]] = []
     for item in reversed(data.get("items") or []):
         if not item.get("ok") or not item.get("destination"):
@@ -877,21 +1017,68 @@ def undo_action(
         original = Path(item["path"])
         size = item.get("size")
         error = None
-        if action == "trash" and item["destination"] == "Trash":
-            error = "trash destination was not recorded; restore this one in Finder"
-        elif moved.is_symlink():
-            error = "moved file became a symbolic link"
-        elif not moved.is_file():
-            error = "moved file no longer exists at its recorded destination"
-        elif original.exists() or original.is_symlink():
-            error = "original path is already occupied"
-        elif (identity := recorded_identities.get(str(original))):
-            try:
-                if (moved.stat().st_size != identity["size"]
-                        or file_sha256(moved) != identity["sha256"]):
-                    error = "moved file changed since the cleanup"
-            except OSError as exc:
-                error = f"moved file could not be verified: {exc}"
+        if action == "crop":
+            if item["destination"] == "Trash":
+                error = "original backup in Trash was not recorded; restore this one in Finder"
+            elif moved.is_symlink():
+                error = "original backup in Trash became a symbolic link"
+            elif not moved.is_file():
+                error = "original backup no longer exists in Trash"
+            elif original.is_symlink():
+                error = "cropped file became a symbolic link"
+            elif not original.is_file():
+                error = "cropped file no longer exists at its original path"
+            else:
+                try:
+                    moved_stat = moved.stat()
+                    if size is not None and moved_stat.st_size != int(size):
+                        error = "original backup in Trash changed size since cropping"
+                    elif verify_hashes and (identity := recorded_identities.get(str(original))):
+                        if moved_stat.st_size != identity["size"]:
+                            error = "original backup changed since cropping"
+                        elif identity.get("sha256"):
+                            digest = file_sha256(moved)
+                            if digest != identity["sha256"]:
+                                error = "original backup changed since cropping"
+                            else:
+                                verified_hashes[str(moved)] = (digest, moved_stat, "sha256")
+                        elif identity.get("partial_hash"):
+                            digest = file_partial_hash(moved)
+                            if digest != identity["partial_hash"]:
+                                error = "original backup changed since cropping"
+                            else:
+                                verified_hashes[str(moved)] = (digest, moved_stat, "partial")
+                except OSError as exc:
+                    error = f"original backup could not be verified: {exc}"
+        else:
+            if action == "trash" and item["destination"] == "Trash":
+                error = "trash destination was not recorded; restore this one in Finder"
+            elif moved.is_symlink():
+                error = "moved file became a symbolic link"
+            elif not moved.is_file():
+                error = "moved file no longer exists at its recorded destination"
+            elif original.exists() or original.is_symlink():
+                error = "original path is already occupied"
+            elif (identity := recorded_identities.get(str(original))):
+                try:
+                    moved_stat = moved.stat()
+                    if moved_stat.st_size != identity["size"]:
+                        error = "moved file changed since the cleanup"
+                    elif verify_hashes:
+                        if identity.get("sha256"):
+                            digest = file_sha256(moved)
+                            if digest != identity["sha256"]:
+                                error = "moved file changed since the cleanup"
+                            else:
+                                verified_hashes[str(moved)] = (digest, moved_stat, "sha256")
+                        elif identity.get("partial_hash"):
+                            digest = file_partial_hash(moved)
+                            if digest != identity["partial_hash"]:
+                                error = "moved file changed since the cleanup"
+                            else:
+                                verified_hashes[str(moved)] = (digest, moved_stat, "partial")
+                except OSError as exc:
+                    error = f"moved file could not be verified: {exc}"
         if error:
             result.items.append(
                 ActionItem(
@@ -906,7 +1093,7 @@ def undo_action(
         else:
             planned.append((moved, original, size))
 
-    if result.fail_count and not dry_run:
+    if result.fail_count and not dry_run and not allow_partial:
         for moved, original, size in planned:
             result.items.append(
                 ActionItem(
@@ -925,18 +1112,34 @@ def undo_action(
                 for moved, original, size in planned
             ], log_dir or log_path.parent)
             result.log_path = str(result._journal.path)
+        trash_batch = TrashBatch() if action == "crop" and not dry_run else None
         for index, (moved, original, size) in enumerate(planned):
             try:
                 if not dry_run:
-                    if original.exists() or original.is_symlink():
-                        raise OSError("original path became occupied before restore")
                     if moved.is_symlink():
                         raise OSError("moved file became a symbolic link")
-                    result._journal.begin(index)
-                    original.parent.mkdir(parents=True, exist_ok=True)
-                    # Restores are always allowed to cross volumes: the
-                    # quarantine folder or Trash may live on another disk.
-                    _move_file(moved, original, allow_cross_device=True)
+                    if action == "crop":
+                        if original.is_symlink() or not original.is_file():
+                            raise OSError("cropped file is no longer at its original path")
+                    elif original.exists() or original.is_symlink():
+                        raise OSError("original path became occupied before restore")
+                    result._journal.begin(
+                        index,
+                        verified_hash=verified_hashes.get(str(moved)),
+                        require_full_hash=False,
+                    )
+                    if action == "crop":
+                        from .borders import restore_original_in_place
+
+                        assert trash_batch is not None
+                        restore_original_in_place(
+                            original, moved, send_to_trash=trash_batch.send
+                        )
+                    else:
+                        original.parent.mkdir(parents=True, exist_ok=True)
+                        # Restores are always allowed to cross volumes: the
+                        # quarantine folder or Trash may live on another disk.
+                        _move_file(moved, original, allow_cross_device=True)
                 result.items.append(
                     ActionItem(
                         path=str(moved),
@@ -1205,7 +1408,10 @@ def isolate_groups(
             if not src.exists():
                 raise FileNotFoundError(member.path)
             if result._journal is not None:
-                result._journal.begin(journal_indexes[(group.id, member.path, str(dest))])
+                result._journal.begin(
+                    journal_indexes[(group.id, member.path, str(dest))],
+                    require_full_hash=(group.kind == GroupKind.EXACT),
+                )
             _link_or_copy(src, dest, mode, allow_cross_device=allow_cross_device)
             return ActionItem(
                 path=member.path,

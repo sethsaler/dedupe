@@ -50,10 +50,6 @@
     font-size: 1.375rem;
   }
 
-  .detail-header h2 {
-    font-size: 1.875rem;
-  }
-
   p,
   .thresh-hint,
   #presetHint,
@@ -85,20 +81,16 @@
   }
 
   /* ---------- Hit targets & keyboard focus visibility ---------- */
-  .btn,
-  .tab,
   .guide-trigger,
   .toast-action,
   .toast-dismiss,
   .lb-close,
-  .lb-nav,
-  #btnHelp,
-  #btnHistory {
+  .lb-nav {
     min-block-size: 36px;
   }
 
   @media (pointer: coarse) {
-    .btn,
+    .btn:not(#btnScan, .path-pick, #modalConfirm, #modalCancel),
     .tab,
     .guide-trigger,
     .toast-action,
@@ -119,9 +111,14 @@
     textarea,
     summary,
     [tabindex]
-  ):focus-visible {
+  ):not(.board-thumb):focus-visible {
     outline: 2px solid var(--lt-focus);
     outline-offset: 2px;
+  }
+
+  .board-thumb:focus-visible {
+    outline: 2px solid var(--lt-focus);
+    outline-offset: 8px;
   }
 
   @media (forced-colors: active) {
@@ -685,7 +682,8 @@
     transition-behavior: allow-discrete;
   }
 
-  .app:has(> .actionbar:not([hidden])) ~ .toast-region #toast:is(:popover-open, .\:popover-open) {
+  .app:has(> .actionbar:not([hidden]):not(.no-actions), > .actionbar[aria-busy="true"]:not([hidden]))
+    ~ .toast-region #toast:is(:popover-open, .\:popover-open) {
     inset-block-end: calc(var(--actionbar-h) + 12px);
   }
 
@@ -1001,6 +999,96 @@
     }
     .board-controls {
       width: 100%;
+    }
+  }
+
+  /* ---------- Modal, Crop Editor & Help section refinements ---------- */
+  #modalBackdrop .modal .modal-actions #modalConfirm.btn.danger {
+    background: var(--lt-danger-fill);
+    border-color: var(--lt-danger-fill);
+    color: #FFFFFF;
+  }
+
+  #modalBackdrop .modal .modal-actions #modalConfirm.btn.danger:hover {
+    filter: brightness(0.92);
+  }
+
+  #modalBackdrop .modal .modal-actions #modalCancel.btn,
+  .crop-editor .ce-side input {
+    border-color: var(--lt-control-border);
+  }
+
+  .detail-body:not(.show-file-details) #members.crop-grid .crop-card .evidence {
+    min-height: 1.4em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #helpBackdrop .help-section {
+    margin: 18px 0 6px;
+    font-family: var(--lt-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--lt-graphite);
+  }
+
+  #helpBackdrop .help-section:first-child {
+    margin-top: 8px;
+  }
+
+  #helpBackdrop .shortcut-list {
+    margin: 0;
+    border-top: 1px solid var(--lt-sleeve);
+  }
+
+  #helpBackdrop .shortcut-list > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--lt-sleeve);
+  }
+
+  #helpBackdrop .shortcut-list dt {
+    flex: 0 0 168px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--lt-ink);
+  }
+
+  #helpBackdrop .shortcut-list dt kbd {
+    font-family: var(--lt-mono);
+    font-size: 12px;
+    line-height: 18px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--lt-loupe);
+    border: 1px solid var(--lt-sleeve);
+    color: var(--lt-ink);
+  }
+
+  #helpBackdrop .shortcut-list dd {
+    margin: 0;
+    flex: 1 1 auto;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--lt-graphite);
+  }
+
+  @media (max-width: 560px) {
+    #helpBackdrop .shortcut-list > div {
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    #helpBackdrop .shortcut-list dt {
+      flex: 0 0 auto;
     }
   }
 

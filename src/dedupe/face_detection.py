@@ -6,7 +6,6 @@ model so files can be filtered by male/female face counts.
 
 from __future__ import annotations
 
-import hashlib
 import math
 import tempfile
 import threading
@@ -26,6 +25,7 @@ from .human_detection import (
 )
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
+from .people_score import verify_model_sha256
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
@@ -37,9 +37,8 @@ from .similar_video import (
 
 ProgressCb = Callable[[str, int, int], None]
 
-# v3: sampled frames come from one batched multi-seek ffmpeg pass, whose
-# decode-order output can differ subtly from per-frame exact seeks.
-FACE_COUNT_CACHE_VERSION = "face-count-v3"
+# v4: fix second-pass max-side check and derive gender counts from busiest frame.
+FACE_COUNT_CACHE_VERSION = "face-count-v4"
 # Face counting has no early exit (the count is the busiest sampled frame), so
 # videos get a bounded sample of frames rather than a full decode.
 FACE_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
@@ -79,7 +78,7 @@ class _YuNetFaceCounter:
 
     backend = "opencv_yunet"
 
-    def __init__(self) -> None:
+    def __init__(self, load_genderage: bool = True) -> None:
         try:
             import cv2
         except ImportError as exc:
@@ -87,30 +86,33 @@ class _YuNetFaceCounter:
                 "face counting requires OpenCV; install with `pip install -e '.[human]'`"
             ) from exc
 
+        if hasattr(cv2, "setNumThreads"):
+            cv2.setNumThreads(1)
         self.cv2 = cv2
-        if not YUNET_MODEL_PATH.is_file():
-            raise RuntimeError(
+        verify_model_sha256(
+            YUNET_MODEL_PATH,
+            YUNET_MODEL_SHA256,
+            missing_error=(
                 "the bundled OpenCV YuNet face model is missing; "
                 "refusing to count faces without it"
-            )
-        with YUNET_MODEL_PATH.open("rb") as model_file:
-            model_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
-        if model_sha256 != YUNET_MODEL_SHA256:
-            raise RuntimeError(
+            ),
+            integrity_error=(
                 "the bundled OpenCV YuNet face model failed its integrity check; "
                 "refusing to count faces"
-            )
-        if not GENDERAGE_MODEL_PATH.is_file():
-            raise RuntimeError(
-                "the bundled InsightFace genderage model is missing; "
-                "refusing to count faces without it"
-            )
-        with GENDERAGE_MODEL_PATH.open("rb") as model_file:
-            gender_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
-        if gender_sha256 != GENDERAGE_MODEL_SHA256:
-            raise RuntimeError(
-                "the bundled InsightFace genderage model failed its integrity check; "
-                "refusing to count faces"
+            ),
+        )
+        if load_genderage:
+            verify_model_sha256(
+                GENDERAGE_MODEL_PATH,
+                GENDERAGE_MODEL_SHA256,
+                missing_error=(
+                    "the bundled InsightFace genderage model is missing; "
+                    "refusing to count faces without it"
+                ),
+                integrity_error=(
+                    "the bundled InsightFace genderage model failed its integrity check; "
+                    "refusing to count faces"
+                ),
             )
         try:
             self.face = cv2.FaceDetectorYN.create(
@@ -121,7 +123,11 @@ class _YuNetFaceCounter:
                 YUNET_NMS_THRESHOLD,
                 YUNET_TOP_K,
             )
-            self.gender = cv2.dnn.readNetFromONNX(str(GENDERAGE_MODEL_PATH))
+            self.gender = (
+                cv2.dnn.readNetFromONNX(str(GENDERAGE_MODEL_PATH))
+                if load_genderage
+                else None
+            )
         except (AttributeError, cv2.error) as exc:
             raise RuntimeError(
                 "OpenCV YuNet face detection could not start; "
@@ -138,11 +144,9 @@ class _YuNetFaceCounter:
         best_faces = None
         best_candidate = bgr_frame
         height, width = bgr_frame.shape[:2]
-        # The 480px pass exists for close-up faces. When the short side is
-        # already ≤480, that pass only upscales and re-detects the same
-        # faces, so skip it. (Deferred: also skipping it when the first pass
-        # found faces would need a benchmark corpus we do not have here.)
-        skip_second_pass = min(width, height) <= YUNET_SECOND_PASS_MAX_SIDE
+        # The 480px pass exists for close-up faces. When the long side is
+        # already <=480, that pass does not downscale and repeats the same size.
+        skip_second_pass = max(width, height) <= YUNET_SECOND_PASS_MAX_SIDE
         checked_sizes: set[tuple[int, int]] = set()
         for max_side in (DETECT_MAX_SIDE, YUNET_SECOND_PASS_MAX_SIDE):
             if max_side == YUNET_SECOND_PASS_MAX_SIDE and skip_second_pass:
@@ -172,6 +176,8 @@ class _YuNetFaceCounter:
 
     def _classify_faces(self, bgr_image, faces) -> tuple[int, int]:
         """Classify each detected face; return (male_count, female_count)."""
+        if getattr(self, "gender", None) is None:
+            return (0, 0)
         import numpy as np
 
         males = 0
@@ -179,6 +185,12 @@ class _YuNetFaceCounter:
         size = GENDERAGE_INPUT_SIZE
         for face in faces:
             x, y, face_width, face_height = (float(value) for value in face[:4])
+            if (
+                not (math.isfinite(face_width) and math.isfinite(face_height))
+                or face_width <= 0.0
+                or face_height <= 0.0
+            ):
+                continue
             center_x = x + face_width / 2
             center_y = y + face_height / 2
             scale = size / (max(face_width, face_height) * GENDERAGE_CROP_SCALE)
@@ -323,9 +335,12 @@ def analyze_face_count(
     if not frames:
         record.error = "face counting failed: no frames decoded"
         return None
-    record.face_count = max(total for total, _males, _females in frames)
-    record.male_face_count = max(males for _total, males, _females in frames)
-    record.female_face_count = max(females for _total, _males, females in frames)
+    best_total, best_males, best_females = max(
+        frames, key=lambda frame: (frame[0], frame[2], frame[1])
+    )
+    record.face_count = best_total
+    record.male_face_count = best_males
+    record.female_face_count = best_females
     record.face_detection_signature = cache_signature
     return record.face_count
 
@@ -396,7 +411,13 @@ def count_faces_in_files(
     return candidates
 
 
-def protect_no_person_candidates(records: list[FileRecord]) -> None:
+def protect_no_person_candidates(
+    records: list[FileRecord],
+    *,
+    workers: int | None = None,
+    progress: Callable | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> None:
     """Keep any file whose YuNet pass finds a face, especially a female face.
 
     Used as a second opinion on Photon / ensemble no-person decisions. A
@@ -412,7 +433,12 @@ def protect_no_person_candidates(records: list[FileRecord]) -> None:
     if not pending:
         return
     try:
-        count_faces_in_files(pending)
+        count_faces_in_files(
+            pending,
+            workers=workers,
+            progress=progress,
+            cancelled=cancelled,
+        )
     except RuntimeError:
         return
     for record in pending:

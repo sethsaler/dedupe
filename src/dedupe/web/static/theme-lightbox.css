@@ -1,9 +1,11 @@
 /* Scoped theme (lightbox): the one dark surface, in both schemes, like a loupe.
    Loads inside @layer theme. Re-declares inherited custom properties under
-   color-scheme: dark so light-dark() tokens resolve for this surface. */
+   color-scheme: dark so light-dark() tokens resolve for this surface.
+   Also styles the shared video comparison controls (.video-compare-bar etc.). */
 
 @layer theme {
-/* ---------- Ground and text ---------- */
+/* ---------- Ground, text, and high-contrast focus token ---------- */
+#lightbox,
 .lightbox {
   color-scheme: dark;
   --lt-table: #0E0E0E;
@@ -15,6 +17,7 @@
   --lt-pencil: #FF5A43;
   --lt-pencil-soft: #3A1712;
   --lt-keep: #3ECF8E;
+  --lt-focus: #93C5FD;
   --text: #F2F2F0;
   --muted: #A0A0A0;
   --bg: #0E0E0E;
@@ -32,30 +35,142 @@
   border: 1px solid #333333;
   border-radius: 4px;
   background: transparent;
-  color: #8A8A8A;
+  color: #A0A0A0;
 }
 
-/* Focus rings inherit the light-table ink, which vanishes on this ground. */
-.lightbox button:focus-visible,
-.lightbox input:focus-visible,
-.lightbox select:focus-visible {
-  outline: 2px solid #F2F2F0;
+.lightbox :is(button, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--lt-focus, #93C5FD);
   outline-offset: 2px;
 }
 
-/* ---------- Media: centered, no frame; a pencil outline when marked ---------- */
-/* Padding keeps the 6px-offset outline inside the grid cell (it still
-   constrains the media size via the container query units). */
+/* ---------- Media stage, aspect-safe plane & pointer pass-through ---------- */
+.lightbox .lb-stage {
+  gap: 5px;
+}
+
 .lightbox .lb-media {
   padding: 10px;
 }
 
-/* While a keeper overlay is showing, the keeper sits above the copy and is the
-   visible frame, so the ring goes on the keeper instead of the copy under it. */
+.lightbox .lb-image-plane > img {
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* Keeper overlay must never intercept double-click zoom or pan gestures. */
+.lightbox #lbKeeperImage,
+.lightbox .lb-keeper-image {
+  pointer-events: none;
+  object-fit: contain;
+  animation: none;
+}
+
+/* Override app.css object-fit: fill on zoomed keeper so mismatched aspects
+   keep their natural proportions without distortion. */
+.lightbox .lb-image-stack.zoomed #lbKeeperImage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+}
+
+.lightbox .lb-image-plane.side-by-side {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  justify-items: center;
+}
+
+.lightbox .lb-image-plane.side-by-side > img {
+  object-fit: contain;
+}
+
+/* Overlay badges: Candidate/Reference mode & status pill (no clipped outline on keeper). */
+.lightbox .lb-stage-badge,
+.lightbox .lb-status-pill {
+  position: absolute;
+  top: 10px;
+  z-index: 5;
+  pointer-events: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  background: rgba(14, 14, 14, 0.86);
+  color: #F2F2F0;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+}
+
+.lightbox .lb-stage-badge {
+  left: 10px;
+}
+
+.lightbox .lb-status-pill {
+  right: 10px;
+}
+
+.lightbox .lb-stage-badge[hidden],
+.lightbox .lb-status-pill[hidden] {
+  display: none !important;
+}
+
+/* Removal indicator: crisp pill + unclipped candidate frame border (never on #lbKeeperImage). */
+.lightbox:has(#lbSelectWrap:not([hidden]) #lbSelect[aria-pressed="true"]) .lb-status-pill {
+  background: #C92A14;
+  border-color: #FF8A75;
+  color: #FFFFFF;
+}
+
 .lightbox:has(#lbSelectWrap:not([hidden]) #lbSelect[aria-pressed="true"])
-  :is(#lbVideo, #lbKeeperImage:not([hidden]), #lbImage:not(:has(~ #lbKeeperImage:not([hidden])))) {
-  outline: 2px solid #E8361F;
-  outline-offset: 6px;
+  :is(#lbVideo, .lb-image-stack:not(.zoomed) .lb-image-plane:not(.side-by-side), .lb-image-plane.side-by-side #lbImage) {
+  outline: 2px solid #FF5A43;
+  outline-offset: 2px;
+}
+
+/* Split-curtain handle & draggable knob */
+.lightbox .lb-split-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 24px;
+  z-index: 6;
+  cursor: ew-resize;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+
+.lightbox .lb-split-handle[hidden] {
+  display: none !important;
+}
+
+.lightbox .lb-split-knob {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(14, 14, 14, 0.9);
+  color: #F2F2F0;
+  border: 1px solid rgba(255, 255, 255, 0.48);
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
+.lightbox .lb-split-handle:hover .lb-split-knob,
+.lightbox .lb-split-handle:focus-visible .lb-split-knob {
+  border-color: var(--lt-focus, #93C5FD);
+  box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.35);
 }
 
 /* ---------- Top: counter centered, close at the right ---------- */
@@ -87,11 +202,12 @@
 }
 
 .lightbox .lb-close:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.06);
   border-color: #CFCFCF;
+  color: #F2F2F0;
 }
 
-/* ---------- Prev / next: 48px outlined circles (grid columns stay in app.css) ---------- */
+/* ---------- Prev / next: 48px outlined circles ---------- */
 .lightbox .lb-nav {
   width: 48px;
   height: 48px;
@@ -102,149 +218,116 @@
 }
 
 .lightbox .lb-nav:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.06);
   border-color: #CFCFCF;
+  color: #F2F2F0;
 }
 
 .lightbox .lb-nav:disabled {
   opacity: 0.3;
 }
 
-/* ---------- Bottom: path, details, then tools ---------- */
+/* ---------- Bottom compact HUD: tools, path, diff chips, details, actions ---------- */
+.lightbox .lb-stage-tools,
+.lightbox .lb-compare-tools,
+.lightbox .lb-video-tools,
+.lightbox .lb-actions,
+.lightbox .lb-select {
+  gap: 6px 8px;
+}
+
+.lightbox .lb-stage-tools[hidden],
+.lightbox .lb-compare-tools[hidden],
+.lightbox .lb-video-tools[hidden],
+.lightbox .lb-actions[hidden],
+.lightbox .lb-select[hidden] {
+  display: none !important;
+}
+
 .lightbox .lb-meta {
   font-family: var(--lt-mono);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 400;
+  line-height: 1.3;
   color: #F2F2F0;
   max-width: 90%;
 }
 
 .lightbox .lb-details {
   font-family: var(--lt-mono);
-  font-size: 12px;
-  color: #9A9A9A;
+  font-size: 11px;
+  line-height: 1.3;
+  color: #A0A0A0;
 }
 
-/* Tool buttons: outlined, quiet. */
-.lightbox .btn {
-  font-family: var(--lt-ui);
-  font-size: 13px;
-  font-weight: 500;
-  min-height: 34px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  background: transparent;
+/* Diff strip & winner pills */
+.lightbox .lb-diff-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  max-width: 92%;
+}
+
+.lightbox .lb-diff-strip[hidden] {
+  display: none !important;
+}
+
+.lightbox .lb-diff-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
   border: 1px solid #333333;
-  color: #E6E6E6;
-  box-shadow: none;
-}
-
-.lightbox .btn:hover {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: #CFCFCF;
-  color: #F2F2F0;
-}
-
-.lightbox .btn:disabled {
-  opacity: 0.4;
-}
-
-.lightbox .btn.ghost {
-  background: transparent;
-  border-color: #333333;
-  color: #E6E6E6;
-  font-weight: 500;
-}
-
-.lightbox .btn.ghost:hover {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: #CFCFCF;
-  color: #F2F2F0;
-}
-
-/* Mark for removal: unpressed is outlined; pressed is the pencil fill. */
-.lightbox #lbSelect[aria-pressed="true"],
-.lightbox #lbSelect.danger,
-.lightbox #lbDelete,
-.lightbox #lbDelete.danger {
-  background: #E8361F;
-  border-color: #E8361F;
-  color: #FFFFFF;
-  font-weight: 600;
-}
-
-.lightbox #lbSelect[aria-pressed="true"]:hover,
-.lightbox #lbSelect.danger:hover,
-.lightbox #lbDelete:hover {
-  background: #E8361F;
-  border-color: #E8361F;
-  color: #FFFFFF;
-  opacity: 0.9;
-}
-
-/* Decisions (low-res and random): Delete is pencil-outlined, Keep is quiet. */
-.lightbox #lbStageDelete {
-  background: transparent;
-  border-color: #E8361F;
-  color: #E8361F;
-  font-weight: 600;
-}
-
-.lightbox #lbStageDelete:hover {
-  background: rgba(232, 54, 31, 0.12);
-  border-color: #E8361F;
-  color: #E8361F;
-}
-
-.lightbox #lbKeep {
-  background: transparent;
-  border-color: #333333;
-  color: #CFCFCF;
-  font-weight: 500;
-}
-
-.lightbox #lbKeep:hover {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: #CFCFCF;
-  color: #F2F2F0;
-}
-
-.lightbox .lb-action-hint {
+  background: rgba(255, 255, 255, 0.04);
   font-family: var(--lt-mono);
   font-size: 11px;
-  color: #8A8A8A;
+  line-height: 1.3;
+  color: #D6D6D2;
+  font-variant-numeric: tabular-nums;
 }
 
-.lightbox .lb-action-hint kbd {
-  font-size: 11px;
+.lightbox .lb-diff-pill {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #B8B8B4;
+  background: rgba(255, 255, 255, 0.08);
 }
 
-/* Video: native controls stay; the custom hint text is quiet mono. */
-.lightbox .lb-video-tools {
-  color: rgba(255, 255, 255, 0.75);
-  font-size: 12px;
-  font-family: var(--lt-mono);
+.lightbox .lb-diff-pill.winner {
+  color: #3ECF8E;
+  background: rgba(62, 207, 142, 0.16);
+  border: 1px solid rgba(62, 207, 142, 0.45);
 }
 
-.lightbox .lb-video-tools label {
-  color: #CFCFCF;
-  font-family: var(--lt-ui);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.lightbox .lb-video-tools select {
-  background: #0E0E0E;
+/* Controls & selects on dark ground */
+.lightbox select,
+.lightbox #lbCompareMode,
+.lightbox #lbZoomLevel,
+.lightbox #lbDiffGain,
+.lightbox #lbSpeed {
+  color-scheme: dark;
+  background: #141414;
   border: 1px solid #333333;
   border-radius: 6px;
-  color: #E6E6E6;
+  color: #F2F2F0;
   min-height: 32px;
+  padding: 4px 10px;
   font-family: var(--lt-mono);
-  font-size: 13px;
+  font-size: 12px;
+  cursor: pointer;
 }
 
-.lightbox .lb-video-tools > span {
-  color: rgba(255, 255, 255, 0.75);
+.lightbox select:hover,
+.lightbox #lbCompareMode:hover,
+.lightbox #lbZoomLevel:hover,
+.lightbox #lbDiffGain:hover,
+.lightbox #lbSpeed:hover {
+  border-color: #CFCFCF;
 }
 
 .lightbox .lb-compare-tools {
@@ -254,15 +337,274 @@
 
 .lightbox .lb-compare-tools label {
   font-family: var(--lt-ui);
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 500;
   color: #CFCFCF;
+}
+
+.lightbox .lb-diff-gain-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #CFCFCF;
+}
+
+.lightbox .lb-diff-gain-wrap[hidden] {
+  display: none !important;
 }
 
 .lightbox .lb-compare-tools input[type="range"] {
   accent-color: #E6E6E6;
 }
 
-.lightbox select {
-  color-scheme: dark;
+.lightbox #lbOpacity:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Tool buttons: compact, outlined, quiet. */
+.lightbox .btn {
+  font-family: var(--lt-ui);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  min-height: 32px;
+  padding: 5px 11px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid #333333;
+  color: #E6E6E6;
+  box-shadow: none;
+}
+
+.lightbox .btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #CFCFCF;
+  color: #F2F2F0;
+}
+
+.lightbox .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.lightbox .btn.ghost {
+  background: transparent;
+  border-color: #333333;
+  color: #E6E6E6;
+  font-weight: 500;
+}
+
+.lightbox .btn.ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #CFCFCF;
+  color: #F2F2F0;
+}
+
+.lightbox .btn.primary {
+  background: #F2F2F0;
+  border-color: #F2F2F0;
+  color: #0E0E0E;
+  font-weight: 600;
+}
+
+.lightbox .btn.primary:hover:not(:disabled) {
+  background: #FFFFFF;
+  border-color: #FFFFFF;
+  color: #0E0E0E;
+}
+
+.lightbox .btn.primary-soft {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: #4A4A4A;
+  color: #F2F2F0;
+  font-weight: 600;
+}
+
+.lightbox .btn.primary-soft:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: #CFCFCF;
+  color: #FFFFFF;
+}
+
+.lightbox #lbZoom[aria-pressed="true"],
+.lightbox #lbFlicker[aria-pressed="true"] {
+  background: #F2F2F0;
+  border-color: #F2F2F0;
+  color: #0E0E0E;
+  font-weight: 600;
+}
+
+/* Destructive buttons inside #lightbox: >=4.5:1 contrast (#C92A14 + #FFFFFF = 5.75:1). */
+.lightbox .btn.danger,
+.lightbox #lbSelect[aria-pressed="true"],
+.lightbox #lbSelect.danger,
+.lightbox #lbDelete,
+.lightbox #lbDelete.danger,
+.lightbox #lbStageDelete {
+  background: #C92A14;
+  border-color: #C92A14;
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+.lightbox .btn.danger:hover:not(:disabled),
+.lightbox #lbSelect[aria-pressed="true"]:hover:not(:disabled),
+.lightbox #lbSelect.danger:hover:not(:disabled),
+.lightbox #lbDelete:hover:not(:disabled),
+.lightbox #lbStageDelete:hover:not(:disabled) {
+  background: #B32310;
+  border-color: #E04A35;
+  color: #FFFFFF;
+}
+
+.lightbox #lbKeep {
+  background: rgba(62, 207, 142, 0.14);
+  border-color: rgba(62, 207, 142, 0.55);
+  color: #6EE7B7;
+  font-weight: 600;
+}
+
+.lightbox #lbKeep:hover:not(:disabled) {
+  background: rgba(62, 207, 142, 0.24);
+  border-color: #3ECF8E;
+  color: #A7F3D0;
+}
+
+.lightbox .lb-action-hint {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: #9A9A9A;
+}
+
+.lightbox .lb-action-hint kbd {
+  font-size: 11px;
+}
+
+/* Video tools inside Lightbox */
+.lightbox .lb-video-tools {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  font-family: var(--lt-mono);
+}
+
+.lightbox .lb-video-tools label {
+  color: #CFCFCF;
+  font-family: var(--lt-ui);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.lightbox .lb-video-tools > span {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+@media (max-height: 760px) {
+  .lightbox .lb-stage {
+    gap: 3px;
+  }
+
+  .lightbox .lb-media {
+    padding: 6px;
+  }
+}
+
+/* ---------- Video version comparison bar & alignment readouts (Swipe & Lightbox) ---------- */
+.video-match-ranges {
+  display: block;
+  padding: 6px 10px;
+  border-left: 2px solid var(--lt-ink);
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+  font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+.video-meta-diffs {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--lt-graphite);
+}
+
+.video-compare-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 6px 0 2px;
+}
+
+.video-compare-bar .btn {
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+  font-size: 12px;
+}
+
+.video-compare-bar .btn:hover:not(:disabled) {
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
+}
+
+.video-compare-bar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-graphite);
+}
+
+.video-compare-bar select {
+  min-height: 30px;
+  padding: 3px 8px;
+  font-family: var(--lt-mono);
+  font-size: 12px;
+}
+
+.video-audio-solo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.video-audio-solo .btn {
+  border: 0;
+  border-radius: 0;
+  min-height: 28px;
+  padding: 3px 10px;
+  color: var(--lt-graphite);
+}
+
+.video-audio-solo .btn + .btn {
+  border-left: 1px solid var(--lt-sleeve);
+}
+
+.video-audio-solo .btn[aria-pressed="true"] {
+  background: var(--lt-ink);
+  color: var(--lt-table);
+  font-weight: 600;
+}
+
+.video-offset-nudge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.video-offset-nudge .btn {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  padding: 3px 8px;
 }
 }

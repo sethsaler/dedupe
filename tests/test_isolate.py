@@ -10,7 +10,7 @@ import pytest
 import dedupe.actions as actions_module
 from dedupe.actions import isolate_groups
 from dedupe.grouping import build_groups
-from dedupe.models import FileRecord, MediaType
+from dedupe.models import DuplicateGroup, FileRecord, GroupKind, MediaType
 
 
 def _rec(path: Path, data: bytes) -> FileRecord:
@@ -251,3 +251,43 @@ def test_isolate_records_sizes_and_orders_items(tmp_path: Path) -> None:
     expected = [member.path for group in groups for member in group.members]
     assert [item.path for item in result.items] == expected
     assert all(item.size for item in result.items)
+
+
+def test_isolate_move_distinguishes_exact_vs_non_exact_journal_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import json
+
+    import dedupe.action_journal as journal_mod
+
+    src = tmp_path / "src"
+    src.mkdir()
+    a = _rec(src / "a.jpg", b"A" * 100_000)
+    b = _rec(src / "b.jpg", b"B" * 100_000)
+    sim_group = DuplicateGroup(
+        id="sim-iso",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[a, b],
+        suggested_keep=a.path,
+        selected_for_removal=[b.path],
+    )
+
+    def _forbid_full_sha(*_args, **_kwargs):
+        raise AssertionError("full sha256 should not run for large non-exact isolate moves")
+
+    monkeypatch.setattr(journal_mod, "file_sha256", _forbid_full_sha)
+    logs = tmp_path / "logs"
+    result = isolate_groups(
+        [sim_group],
+        tmp_path / "review",
+        mode="move",
+        dry_run=False,
+        roots=[str(src)],
+        log_dir=logs,
+    )
+    assert result.success_count == 2
+    receipt = json.loads(Path(result.log_path).read_text(encoding="utf-8"))
+    for entry in receipt["journal"]:
+        assert "sha256" not in entry["identity"]
+        assert entry["identity"]["partial_hash"]

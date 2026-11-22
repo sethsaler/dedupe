@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import tempfile
 import threading
@@ -20,6 +19,7 @@ from .human_policy import (
 from .image_frames import animation_frame_count
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
+from .people_score import PEOPLE_MODEL_SHA256, PeopleScorer, verify_model_sha256
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
@@ -109,7 +109,7 @@ class PersonDetector(Protocol):
 
 
 class _OpenCVPersonDetector:
-    """CPU-only detector combining YuNet faces with HOG full-body detection."""
+    """CPU-only detector combining YuNet faces with YOLOX-tiny person detection."""
 
     def __init__(self, confidence: float) -> None:
         try:
@@ -120,20 +120,22 @@ class _OpenCVPersonDetector:
                 "install with `pip install -e '.[human]'`"
             ) from exc
 
+        if hasattr(cv2, "setNumThreads"):
+            cv2.setNumThreads(1)
         self.cv2 = cv2
         self.confidence = max(0.0, float(confidence))
-        if not YUNET_MODEL_PATH.is_file():
-            raise RuntimeError(
+        verify_model_sha256(
+            YUNET_MODEL_PATH,
+            YUNET_MODEL_SHA256,
+            missing_error=(
                 "the bundled OpenCV YuNet face model is missing; refusing to "
                 "classify files as non-human with full-body detection alone"
-            )
-        with YUNET_MODEL_PATH.open("rb") as model_file:
-            model_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
-        if model_sha256 != YUNET_MODEL_SHA256:
-            raise RuntimeError(
+            ),
+            integrity_error=(
                 "the bundled OpenCV YuNet face model failed its integrity check; "
                 "refusing to classify files as non-human"
-            )
+            ),
+        )
         try:
             self.face = cv2.FaceDetectorYN.create(
                 str(YUNET_MODEL_PATH),
@@ -148,21 +150,8 @@ class _OpenCVPersonDetector:
                 "OpenCV YuNet face detection could not start; install OpenCV 4.5.4 "
                 "or newer. No media was classified as non-human."
             ) from exc
-        # OpenCV 5 keeps HOGDescriptor only in the contrib builds, which is
-        # why the extras depend on opencv-contrib-python-headless. YuNet remains
-        # required; body detectors are extra recall when the build ships them.
-        self.hog = None
-        self.hog_daimler = None
-        if hasattr(cv2, "HOGDescriptor"):
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            try:
-                daimler = cv2.HOGDescriptor((48, 96), (16, 16), (8, 8), (8, 8), 9)
-                daimler.setSVMDetector(cv2.HOGDescriptor_getDaimlerPeopleDetector())
-                self.hog_daimler = daimler
-            except cv2.error:
-                self.hog_daimler = None
-        self.backend = "opencv_yunet_hog"
+        self.people: PeopleScorer | None = PeopleScorer()
+        self.backend = "opencv_yunet_yolox"
 
     def _yunet_best(self, bgr_frame) -> float:
         """Score faces at several scales; any presence-threshold hit is enough."""
@@ -225,25 +214,13 @@ class _OpenCVPersonDetector:
             return best
         return max(best, self._yunet_tiles(frame))
 
-    def _hog_weights(self, hog, frame) -> float:
-        _boxes, weights = hog.detectMultiScale(
-            frame,
-            winStride=(8, 8),
-            padding=(8, 8),
-            scale=1.05,
-        )
-        if weights is None or len(weights) == 0:
+    def _body_score(self, rgb_frame) -> float:
+        """YOLOX-tiny full-body person confidence."""
+        people = getattr(self, "people", None)
+        if people is None or rgb_frame.shape[0] == 0 or rgb_frame.shape[1] == 0:
             return 0.0
-        return max(float(weight) for weight in weights)
-
-    def _body_score(self, frame) -> float:
-        """INRIA HOG plus Daimler, which catches a different set of poses."""
-        if self.hog is None or frame.shape[0] < 128 or frame.shape[1] < 64:
-            return 0.0
-        best = self._hog_weights(self.hog, frame)
-        if self.hog_daimler is not None:
-            best = max(best, self._hog_weights(self.hog_daimler, frame))
-        return best if best >= self.confidence else 0.0
+        score = people.score_rgb(rgb_frame)
+        return score if score >= self.confidence else 0.0
 
     def score(self, rgb_frame) -> float:
         import numpy as np
@@ -254,22 +231,7 @@ class _OpenCVPersonDetector:
         face_score = self._face_score(frame)
         if face_score > 0:
             return face_score
-
-        height, width = frame.shape[:2]
-        longest = max(width, height)
-        if longest > DETECT_MAX_SIDE:
-            scale = DETECT_MAX_SIDE / longest
-            frame = self.cv2.resize(
-                frame,
-                (max(1, round(width * scale)), max(1, round(height * scale))),
-                interpolation=self.cv2.INTER_AREA,
-            )
-
-        # HOG needs a moderately sized frame and targets upright people.
-        body_score = self._body_score(frame)
-        if body_score > 0:
-            return body_score
-        return self._body_score(self.cv2.flip(frame, 1))
+        return self._body_score(frame)
 
     def close(self) -> None:
         return None
@@ -379,6 +341,7 @@ def human_detection_signature(
     if normalized in {"opencv", "ensemble"}:
         parts.append(f"confidence={max(0.0, float(confidence)):g}")
         parts.append(f"yunet={YUNET_MODEL_SHA256[:12]}")
+        parts.append(f"yolox={PEOPLE_MODEL_SHA256[:12]}")
         parts.append(f"face-confidence={YUNET_PRESENCE_SCORE_THRESHOLD:g}")
         parts.append("face-flip=1")
         parts.append("face-tiles=2x2")
@@ -611,51 +574,134 @@ def find_no_human_files(
     normalized_backend = backend.strip().lower()
     human_workers = resolve_workers(workers, cap=DEFAULT_HUMAN_WORKERS_CAP)
 
-    if pending and normalized_backend == "opencv" and human_workers > 1 and len(pending) > 1:
-        # OpenCV detector objects mutate their input size and cannot be shared
-        # across threads. Keep one detector per worker thread instead.
+    def _run_opencv_stage(
+        items: list[FileRecord],
+        *,
+        for_ensemble: bool,
+        on_done: Callable[[int, int], None] | None = None,
+    ) -> list[FileRecord]:
+        """Run OpenCV presence detection (threaded when beneficial) and return uncertain items."""
         local = threading.local()
         detectors: list[PersonDetector] = []
         detectors_lock = threading.Lock()
+        uncertain: list[FileRecord] = []
+        uncertain_lock = threading.Lock()
 
-        def analyze(record: FileRecord) -> None:
+        def get_detector() -> PersonDetector:
             detector = getattr(local, "detector", None)
             if detector is None:
                 detector = create_person_detector(
-                    backend,
+                    "opencv",
                     confidence=confidence,
                     photon_model=photon_model,
                 )
                 local.detector = detector
                 with detectors_lock:
                     detectors.append(detector)
-            analyze_person_presence(
+            return detector
+
+        def analyze(record: FileRecord) -> None:
+            detector = get_detector()
+            has_person = analyze_person_presence(
                 record,
                 detector,
-                cache_signature=signature,
+                cache_signature=None if for_ensemble else signature,
             )
-
-        def parallel_progress(done: int, _total: int) -> None:
-            if progress:
-                progress("human-detection", len(cached) + done, len(candidates))
+            if for_ensemble:
+                if has_person is True:
+                    record.human_detector = f"ensemble:{detector.backend}"
+                    record.human_detection_signature = signature
+                elif has_person is False:
+                    # Leave status/signature unset until Photon confirms no person.
+                    record.human_detection_status = None
+                    record.human_detection_signature = None
+                    with uncertain_lock:
+                        uncertain.append(record)
 
         try:
             map_parallel(
                 analyze,
-                pending,
+                items,
                 workers=human_workers,
                 backend="thread",
-                progress=parallel_progress,
+                progress=on_done,
                 progress_every=1,
                 cancelled=cancelled,
             )
         finally:
             for detector in detectors:
                 detector.close()
+        return uncertain
+
+    if pending and normalized_backend == "opencv":
+        # OpenCV detector objects mutate their input size and cannot be shared
+        # across threads. Keep one detector per worker thread instead.
+        def opencv_progress(done: int, _total: int) -> None:
+            if progress:
+                progress("human-detection", len(cached) + done, len(candidates))
+
+        _run_opencv_stage(pending, for_ensemble=False, on_done=opencv_progress)
+    elif pending and normalized_backend == "ensemble":
+        half_budget = len(pending) // 2
+
+        def prepass_progress(done: int, _total: int) -> None:
+            if progress:
+                progress(
+                    "human-detection",
+                    len(cached) + (done // 2),
+                    len(candidates),
+                )
+
+        uncertain = _run_opencv_stage(
+            pending, for_ensemble=True, on_done=prepass_progress
+        )
+        if not uncertain:
+            if progress:
+                progress("human-detection", len(candidates), len(candidates))
+        else:
+            effective_model = photon_model.strip() or DEFAULT_PHOTON_MODEL
+            if progress and not photon_model_ready(effective_model):
+                progress(
+                    "human-detection",
+                    len(cached) + half_budget,
+                    len(candidates),
+                    "Preparing the Photon model — first use downloads ~10 GB, "
+                    "which can take a long time…",
+                )
+            photon_detector = create_person_detector(
+                "photon",
+                confidence=confidence,
+                photon_model=photon_model,
+            )
+            mark_photon_model_ready(effective_model)
+            try:
+                remaining_budget = len(pending) - half_budget
+                total_uncertain = len(uncertain)
+                for idx, record in enumerate(uncertain, start=1):
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
+                    cv_backend = record.human_detector or "opencv"
+                    analyze_person_presence(
+                        record,
+                        photon_detector,
+                        cache_signature=signature,
+                    )
+                    record.human_detector = f"ensemble:{cv_backend}+{photon_detector.backend}"
+                    if progress:
+                        scaled = half_budget + round(
+                            (idx / total_uncertain) * remaining_budget
+                        )
+                        progress(
+                            "human-detection",
+                            len(cached) + scaled,
+                            len(candidates),
+                        )
+            finally:
+                photon_detector.close()
     elif pending:
         effective_model = photon_model.strip() or DEFAULT_PHOTON_MODEL
         if (
-            normalized_backend in ("photon", "ensemble")
+            normalized_backend == "photon"
             and progress
             and not photon_model_ready(effective_model)
         ):
@@ -673,7 +719,7 @@ def find_no_human_files(
             confidence=confidence,
             photon_model=photon_model,
         )
-        if normalized_backend in ("photon", "ensemble"):
+        if normalized_backend == "photon":
             mark_photon_model_ready(effective_model)
         try:
             for index, record in enumerate(pending, start=len(cached) + 1):
@@ -694,6 +740,11 @@ def find_no_human_files(
         # pile: any counted face, especially a female face, is kept.
         from .face_detection import protect_no_person_candidates
 
-        protect_no_person_candidates(candidates)
+        protect_no_person_candidates(
+            candidates,
+            workers=workers,
+            progress=progress,
+            cancelled=cancelled,
+        )
 
     return [record for record in candidates if may_enter_no_person_review(record)]

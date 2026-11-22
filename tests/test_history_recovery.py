@@ -238,3 +238,57 @@ def test_isolate_move_refuses_protected_library(tmp_path):
     assert result.success_count == 0
     assert any("protected" in item.error for item in result.items)
     assert all(Path(record.path).exists() for record in records)
+
+
+def test_history_blocks_crop_with_unrecorded_or_symlink_trash_backup(tmp_path):
+    cropped = tmp_path / "cropped.jpg"
+    cropped.write_bytes(b"cropped")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    # Bare "Trash" marker has no recoverable path.
+    (logs / "action-20261101T000000Z-aaaa1111.json").write_text(
+        json.dumps(
+            {
+                "action": "crop",
+                "dry_run": False,
+                "started_at": "2026-11-01T00:00:00+00:00",
+                "success_count": 1,
+                "fail_count": 0,
+                "items": [{"path": str(cropped), "ok": True, "destination": "Trash"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Symlink backup in Trash must also be refused.
+    real_target = tmp_path / "real.jpg"
+    real_target.write_bytes(b"real")
+    symlink_backup = tmp_path / "trash_link.jpg"
+    symlink_backup.symlink_to(real_target)
+    (logs / "action-20261102T000000Z-bbbb2222.json").write_text(
+        json.dumps(
+            {
+                "action": "crop",
+                "dry_run": False,
+                "started_at": "2026-11-02T00:00:00+00:00",
+                "success_count": 1,
+                "fail_count": 0,
+                "items": [
+                    {
+                        "path": str(cropped),
+                        "ok": True,
+                        "original_in_trash": str(symlink_backup),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = history(tmp_path)["actions"]
+    assert len(rows) == 2
+    assert all(row["action_label"] == "Cropped Borders" for row in rows)
+    assert all(row["undoable"] is False for row in rows)
+    assert "Trash" in (rows[0]["undo_blocked_reason"] or "")
+    assert rows[1]["undo_blocked_reason"] == "receipt has no restorable items"

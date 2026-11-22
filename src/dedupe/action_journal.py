@@ -17,18 +17,21 @@ from os import replace as atomic_replace
 from pathlib import Path
 from stat import S_ISREG
 
-from .exact import file_sha256
-from .receipts import iter_receipt_paths, receipt_filename, resolve_log_dir
+from .exact import PARTIAL_SIZE, file_partial_hash, file_sha256
+from .receipts import PREVIEW_PREFIX, iter_receipt_paths, receipt_filename, resolve_log_dir
 
 _active: set[str] = set()
 _active_lock = threading.Lock()
+JOURNAL_FSYNC_INTERVAL = 32
 
 
 def atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with stream:
             json.dump(data, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -39,6 +42,11 @@ def atomic_json(path: Path, data: dict) -> None:
         finally:
             os.close(directory)
     finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         Path(temporary).unlink(missing_ok=True)
 
 
@@ -46,23 +54,55 @@ def _stamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _identity(path: Path, verified_hash=None) -> dict:
+def _unpack_verified_hash(verified_hash) -> tuple[str, os.stat_result, str]:
+    if len(verified_hash) == 3:
+        digest, verified_stat, kind = verified_hash
+        return digest, verified_stat, kind
+    digest, verified_stat = verified_hash
+    return digest, verified_stat, "sha256"
+
+
+def _identity(
+    path: Path, verified_hash=None, *, require_full_hash: bool = True
+) -> dict:
     before = path.lstat()
     if not S_ISREG(before.st_mode):
         raise OSError("move journal requires a regular file")
+    digest: str | None = None
+    partial: str | None = None
     if verified_hash is not None:
-        digest, verified_stat = verified_hash
+        hash_value, verified_stat, kind = _unpack_verified_hash(verified_hash)
         if any(getattr(before, key) != getattr(verified_stat, key)
                for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
             raise OSError("file changed after its immediate content check")
-    else:
+        if kind == "partial":
+            partial = hash_value
+            if before.st_size <= PARTIAL_SIZE:
+                digest = hash_value
+        else:
+            digest = hash_value
+    elif require_full_hash or before.st_size <= PARTIAL_SIZE:
         digest = file_sha256(path)
+        if before.st_size <= PARTIAL_SIZE:
+            partial = digest
+    else:
+        partial = file_partial_hash(path)
     after = path.lstat()
     keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
     if any(getattr(before, key) != getattr(after, key) for key in keys):
         raise OSError("file changed while preparing its move journal")
-    return {"size": after.st_size, "sha256": digest,
-            "device": after.st_dev, "inode": after.st_ino}
+    identity: dict = {
+        "size": after.st_size,
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+    }
+    if digest is not None:
+        identity["sha256"] = digest
+    if partial is not None:
+        identity["partial_hash"] = partial
+    return identity
 
 
 class ActionJournal:
@@ -74,6 +114,9 @@ class ActionJournal:
         self.lock = threading.Lock()
         self.failed = False
         self.events_path = self.path.with_suffix(".journal")
+        self._events_stream = None
+        self._unflushed_events = 0
+        self._fsync_interval = JOURNAL_FSYNC_INTERVAL
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock_fd = os.open(self.events_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
@@ -98,19 +141,40 @@ class ActionJournal:
             self.failed = True
             raise
 
+    def _flush_events(self, *, force_fsync: bool = False) -> None:
+        if self._events_stream is None:
+            return
+        self._events_stream.flush()
+        if force_fsync and self._unflushed_events > 0:
+            os.fsync(self._events_stream.fileno())
+            self._unflushed_events = 0
+
     def _append(self, index: int, entry: dict):
         try:
-            with self.events_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"index": index, "entry": entry}) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
+            if self._events_stream is None:
+                self._events_stream = self.events_path.open("a", encoding="utf-8")
+            self._events_stream.write(json.dumps({"index": index, "entry": entry}) + "\n")
+            self._events_stream.flush()
+            self._unflushed_events += 1
+            if self._unflushed_events >= self._fsync_interval:
+                os.fsync(self._events_stream.fileno())
+                self._unflushed_events = 0
         except OSError:
             self.failed = True
             raise
 
-    def begin(self, index: int, *, search_dirs=(), verified_hash=None):
+    def begin(
+        self,
+        index: int,
+        *,
+        search_dirs=(),
+        verified_hash=None,
+        require_full_hash: bool = True,
+    ):
         entry = self.data["journal"][index]
-        identity = _identity(Path(entry["path"]), verified_hash)
+        identity = _identity(
+            Path(entry["path"]), verified_hash, require_full_hash=require_full_hash
+        )
         with self.lock:
             if self.failed:
                 raise OSError("move journal unavailable; remaining moves stopped")
@@ -129,6 +193,15 @@ class ActionJournal:
 
     def finalize(self, result: dict):
         with self.lock:
+            try:
+                self._flush_events(force_fsync=True)
+            except OSError:
+                self.failed = True
+                raise
+            finally:
+                if self._events_stream is not None:
+                    self._events_stream.close()
+                    self._events_stream = None
             unfinished = any(entry["state"] == "moving" for entry in self.data["journal"])
             self.data.update(result, status="running" if unfinished else "complete",
                              log_path=str(self.path))
@@ -139,6 +212,17 @@ class ActionJournal:
     def close(self):
         with _active_lock:
             _active.discard(str(self.path))
+        with self.lock:
+            if self._events_stream is not None:
+                try:
+                    self._flush_events(force_fsync=True)
+                except OSError:
+                    pass
+                try:
+                    self._events_stream.close()
+                except OSError:
+                    pass
+                self._events_stream = None
         if self._lock_fd is not None:
             os.close(self._lock_fd)
             self._lock_fd = None
@@ -147,11 +231,18 @@ class ActionJournal:
 def _matches(path: Path, identity: dict) -> bool:
     try:
         stat = path.lstat()
-        return (
-            S_ISREG(stat.st_mode)
-            and stat.st_size == identity.get("size")
-            and file_sha256(path) == identity.get("sha256")
-        )
+        if not S_ISREG(stat.st_mode) or stat.st_size != identity.get("size"):
+            return False
+        if identity.get("sha256"):
+            return file_sha256(path) == identity["sha256"]
+        if identity.get("partial_hash"):
+            if (
+                identity.get("mtime_ns") is not None
+                and stat.st_mtime_ns != identity.get("mtime_ns")
+            ):
+                return False
+            return file_partial_hash(path) == identity["partial_hash"]
+        return False
     except OSError:
         return False
 
@@ -229,6 +320,8 @@ def recover_interrupted_actions(log_dir=None) -> list[dict]:
     """Reconcile abandoned receipts without moving files; leave live workers alone."""
     recovered = []
     for path in iter_receipt_paths(log_dir):
+        if path.name.startswith(f"{PREVIEW_PREFIX}-"):
+            continue
         lock_stream = None
         try:
             if path.stat().st_size > 64 * 1024 * 1024:

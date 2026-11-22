@@ -31,46 +31,130 @@ FACE_COUNTED_MEDIA_TYPES = (MediaType.IMAGE, MediaType.GIF, MediaType.VIDEO)
 
 _keeper_metadata_lock = threading.Lock()
 
+_RAW_IMAGE_EXTS = frozenset({".raw", ".dng", ".cr2", ".nef", ".arw"})
+_LOSSLESS_IMAGE_EXTS = frozenset({".tif", ".tiff", ".png", ".bmp"})
+_MODERN_IMAGE_EXTS = frozenset({".heic", ".heif", ".avif", ".webp"})
+_JPEG_IMAGE_EXTS = frozenset({".jpg", ".jpeg"})
+
+_EXPORT_NAME_RE = re.compile(
+    r"(?:^|[ _-])(?:copy|edited|export|compressed|whatsapp|thumb|thumbnail|resized)(?:[ _.-]|\d|$)"
+    r"|(?:^|[ _-])(?:IMG-\d+-WA\d+|IMG_E\d+)(?:[ _.-]|$)"
+    r"|(?:^|[ _-])screenshot"
+    r"|\(\d+\)",
+    re.IGNORECASE,
+)
+
+
+def _has_capture_metadata(rec: FileRecord) -> bool:
+    """Read and cache EXIF camera capture metadata without holding the lock on I/O."""
+    if rec.capture_metadata is not None:
+        return bool(rec.capture_metadata)
+    has_meta = False
+    if rec.media_type == MediaType.IMAGE:
+        try:
+            from PIL import Image
+
+            try:
+                from pillow_heif import register_heif_opener
+
+                register_heif_opener()
+            except Exception:
+                pass
+            with Image.open(rec.path) as image:
+                exif = image.getexif()
+                capture = exif.get(36867)
+                if not capture and exif.get(34665):
+                    capture = exif.get_ifd(34665).get(36867)
+                has_meta = bool(capture and (exif.get(271) or exif.get(272)))
+        except Exception:
+            pass
+    with _keeper_metadata_lock:
+        if rec.capture_metadata is None:
+            rec.capture_metadata = has_meta
+        return bool(rec.capture_metadata)
+
+
+def _format_quality_tier(rec: FileRecord) -> int:
+    if rec.media_type != MediaType.IMAGE:
+        return 0
+    ext = (rec.extension or Path(rec.path).suffix).lower()
+    if ext in _RAW_IMAGE_EXTS:
+        return 4
+    if ext in _LOSSLESS_IMAGE_EXTS:
+        return 3
+    if ext in _MODERN_IMAGE_EXTS:
+        return 2
+    if ext in _JPEG_IMAGE_EXTS:
+        return 1
+    return 0
+
+
+def _border_stats(rec: FileRecord) -> tuple[bool, bool, float]:
+    """Higher is cleaner: (no_chrome, under_5pct_removed, -removed_fraction)."""
+    crop = rec.border_crop
+    if not crop or crop == "dismissed":
+        return (True, True, 0.0)
+    parts = crop.split(",")
+    if len(parts) not in (6, 7):
+        return (True, True, 0.0)
+    has_chrome = len(parts) == 7 and bool(parts[6])
+    raw = rec.pixels
+    eff = rec.effective_pixels
+    if raw <= 0 or eff >= raw:
+        return (not has_chrome, True, 0.0)
+    removed = 1.0 - (eff / raw)
+    return (not has_chrome, removed < 0.05, round(-removed, 4))
+
 
 def rank_keep_candidate(rec: FileRecord) -> tuple:
     """
     Higher is better for 'automatic' keep.
-    Folder preferences and capture metadata precede dimensions. Size alone
-    cannot measure quality; recognizable export names lose otherwise equal ties.
+    Protection, folder preferences, effective resolution (with bounded EXIF/export
+    weighting), format tier, sharpness, video audio/duration/bitrate, and clean
+    borders precede size, date, and path tie-breakers.
     These hints never establish whether files are duplicates.
     """
-    with _keeper_metadata_lock:
-        if rec.capture_metadata is None:
-            rec.capture_metadata = False
-            if rec.media_type == MediaType.IMAGE:
-                try:
-                    from PIL import Image
-
-                    with Image.open(rec.path) as image:
-                        exif = image.getexif()
-                        capture = exif.get(36867)
-                        if not capture and exif.get(34665):
-                            capture = exif.get_ifd(34665).get(36867)
-                        rec.capture_metadata = bool(capture and (exif.get(271) or exif.get(272)))
-                except Exception:
-                    pass
+    capture_meta = _has_capture_metadata(rec)
+    ext = (rec.extension or Path(rec.path).suffix).lower()
+    is_raw = rec.media_type == MediaType.IMAGE and ext in _RAW_IMAGE_EXTS
+    camera_origin = capture_meta or is_raw
+    export_name = bool(_EXPORT_NAME_RE.search(Path(rec.path).name))
+    eff_px = rec.effective_pixels
+    resolution_score = eff_px * (2.0 if camera_origin else 1.0) * (0.25 if export_name else 1.0)
+    format_tier = _format_quality_tier(rec)
+    has_sharpness = rec.sharpness is not None
+    sharpness_score = round(float(rec.sharpness), 2) if has_sharpness else 0.0
+    if rec.media_type == MediaType.VIDEO:
+        audio_tier = 2 if rec.has_audio is True else (1 if rec.has_audio is None else 0)
+        video_duration = round(float(rec.duration or 0.0), 1)
+        video_bitrate = int(rec.video_bitrate or 0)
+    else:
+        audio_tier = 0
+        video_duration = 0.0
+        video_bitrate = 0
     path_depth = len(Path(rec.path).parts)
     name_len = len(Path(rec.path).name)
-    export_name = bool(re.search(
-        r"(?:^|[ _-])(copy|edited|export|compressed|whatsapp)(?:[ _.-]|$)",
-        Path(rec.path).name, re.IGNORECASE,
-    ))
     return (
         rec.protected,
         rec.keeper_preference,
-        bool(rec.capture_metadata),
-        rec.pixels,
+        resolution_score,
+        camera_origin,
+        format_tier,
         not export_name,
+        _border_stats(rec),
+        (has_sharpness, sharpness_score),
+        (audio_tier, video_bitrate),
         rec.size,
+        video_duration,
         rec.mtime,
         -path_depth,
         -name_len,
     )
+
+
+def _keep_sort_key(rec: FileRecord) -> tuple:
+    """Total order shared by clustering and suggested-keeper selection."""
+    return (rank_keep_candidate(rec), rec.path)
 
 
 def cluster_around_best(
@@ -92,7 +176,7 @@ def cluster_around_best(
     linked.update(path for matches in adjacency.values() for path in matches)
     ordered = sorted(
         (record for record in records if record.path in linked),
-        key=lambda record: (rank_keep_candidate(record), record.path),
+        key=_keep_sort_key,
         reverse=True,
     )
     by_path = {record.path: record for record in records}
@@ -111,7 +195,7 @@ def cluster_around_best(
             remaining.remove(keeper.path)
             continue
         matches.sort(
-            key=lambda record: (rank_keep_candidate(record), record.path),
+            key=_keep_sort_key,
             reverse=True,
         )
         members = [keeper]
@@ -130,7 +214,7 @@ def cluster_around_best(
 
 
 def pick_suggested_keep(members: list[FileRecord]) -> str:
-    best = max(members, key=rank_keep_candidate)
+    best = max(members, key=_keep_sort_key)
     return best.path
 
 
@@ -141,10 +225,12 @@ def make_group_id(kind: GroupKind, members: list[FileRecord]) -> str:
 
 
 def dominant_media_type(members: list[FileRecord]) -> MediaType:
-    counts: dict[MediaType, int] = {}
-    for m in members:
-        counts[m.media_type] = counts.get(m.media_type, 0) + 1
-    return max(counts, key=counts.get)  # type: ignore[arg-type]
+    if not members:
+        return MediaType.OTHER
+    media_types = {m.media_type for m in members}
+    if len(media_types) == 1:
+        return next(iter(media_types))
+    return MediaType.MIXED
 
 
 def build_one_group(
@@ -172,6 +258,7 @@ def build_one_group(
         media_type=dominant_media_type(members),
         members=sorted(members, key=lambda m: m.path),
         suggested_keep=keep,
+        anchor_path=keep,
         match_basis=match_basis,
         match_scores=dict(match_scores or {}),
     )
@@ -184,26 +271,51 @@ def build_one_group(
     return g
 
 
+def _dedupe_exact_copies_in_similar(
+    members: list[FileRecord],
+    exact_path_to_group: dict[str, int],
+) -> list[FileRecord]:
+    """Keep at most one best-ranked representative per exact-identical cluster."""
+    by_path = {m.path: m for m in members}
+    buckets: dict[tuple, list[FileRecord]] = {}
+    for member in by_path.values():
+        exact_idx = exact_path_to_group.get(member.path)
+        if exact_idx is not None:
+            key: tuple = ("exact", exact_idx)
+        elif member.sha256:
+            key = ("sha256", member.sha256)
+        else:
+            key = ("path", member.path)
+        buckets.setdefault(key, []).append(member)
+    return [max(bucket, key=_keep_sort_key) for bucket in buckets.values()]
+
+
 def build_groups(
     exact_member_lists: list[list[FileRecord]],
     similar_member_lists: list[list[FileRecord]],
 ) -> list[DuplicateGroup]:
-    """Build DuplicateGroups. Similar groups exclude pure-subsets of exact groups."""
+    """Build DuplicateGroups. Similar groups deduplicate redundant exact copies."""
     groups: list[DuplicateGroup] = []
     exact_path_sets: list[set[str]] = []
+    exact_path_to_group: dict[str, int] = {}
 
     for members in exact_member_lists:
         g = build_one_group(GroupKind.EXACT, members)
         if g is None:
             continue
+        group_idx = len(exact_path_sets)
         groups.append(g)
-        exact_path_sets.append({m.path for m in g.members})
+        path_set = {m.path for m in g.members}
+        exact_path_sets.append(path_set)
+        for path in path_set:
+            exact_path_to_group[path] = group_idx
 
     for members in similar_member_lists:
-        # Drop members that are exact-duplicates of each other but keep cross-quality
-        # similars (an exact set linked to a re-encoded copy still forms a similar group).
+        # Drop redundant exact-duplicate copies from the similar group while
+        # keeping cross-quality matches (one representative per exact set).
+        deduped = _dedupe_exact_copies_in_similar(members, exact_path_to_group)
         g = build_one_group(
-            GroupKind.SIMILAR, members, exact_path_sets=exact_path_sets
+            GroupKind.SIMILAR, deduped, exact_path_sets=exact_path_sets
         )
         if g is None:
             continue
@@ -232,13 +344,11 @@ def build_no_human_groups(members: list[FileRecord]) -> list[DuplicateGroup]:
     if not matching:
         return []
 
-    media_types = {member.media_type for member in matching}
-    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
     return [
         DuplicateGroup(
             id=make_group_id(GroupKind.NO_HUMANS, matching),
             kind=GroupKind.NO_HUMANS,
-            media_type=media_type,
+            media_type=dominant_media_type(matching),
             members=matching,
             selected_for_removal=[],
             reviewed_paths=[],
@@ -394,13 +504,11 @@ def build_all_files_groups(
         bucket = sorted(buckets[key], key=lambda member: member.path)
         if not bucket:
             continue
-        media_types = {member.media_type for member in bucket}
-        media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
         groups.append(
             DuplicateGroup(
                 id=make_group_id(GroupKind.ALL_FILES, bucket),
                 kind=GroupKind.ALL_FILES,
-                media_type=media_type,
+                media_type=dominant_media_type(bucket),
                 members=bucket,
                 selected_for_removal=[],
                 reviewed_paths=[],
@@ -423,15 +531,13 @@ def build_set_group(
     members = list({member.path: member for member in members}.values())
     if len(members) < 2:
         return None
-    media_types = {member.media_type for member in members}
-    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
     anchor, rest = members[0], members[1:]
     rest.sort(key=lambda member: (-scores.get(member.path, 0.0), member.path))
     ordered = [anchor, *rest]
     return DuplicateGroup(
         id=make_group_id(GroupKind.SETS, ordered),
         kind=GroupKind.SETS,
-        media_type=media_type,
+        media_type=dominant_media_type(ordered),
         members=ordered,
         selected_for_removal=[],
         reviewed_paths=[],
@@ -518,13 +624,11 @@ def _build_independent_group(
     members = list({member.path: member for member in members}.values())
     if not members:
         return []
-    media_types = {member.media_type for member in members}
-    media_type = next(iter(media_types)) if len(media_types) == 1 else MediaType.MIXED
     return [
         DuplicateGroup(
             id=make_group_id(kind, members),
             kind=kind,
-            media_type=media_type,
+            media_type=dominant_media_type(members),
             members=members,
             selected_for_removal=[],
             reviewed_paths=[],
@@ -553,34 +657,64 @@ def apply_smart_select(group: DuplicateGroup, rule: SmartRule) -> None:
         group.suggested_keep = None
         if rule == SmartRule.SELECT_CANDIDATES:
             reviewed = set(group.reviewed_paths)
-            group.selected_for_removal = [
-                m.path for m in members if m.path in reviewed and not m.protected
-            ]
+            if group.kind == GroupKind.NO_HUMANS:
+                group.selected_for_removal = [
+                    m.path
+                    for m in members
+                    if m.path in reviewed
+                    and not m.protected
+                    and may_enter_no_person_review(m)
+                ]
+            else:
+                # In Low-Res, Faces, and Random Review, reviewed & unselected
+                # means an explicit Keep decision — never flip Kept files
+                # into deletion selections.
+                existing_selected = set(group.selected_for_removal)
+                group.selected_for_removal = [
+                    m.path
+                    for m in members
+                    if m.path in reviewed
+                    and m.path in existing_selected
+                    and not m.protected
+                ]
         return
 
     if rule == SmartRule.SELECT_CANDIDATES:
         return
 
+    if group.anchor_path is None:
+        group.anchor_path = group.suggested_keep or pick_suggested_keep(members)
+
     if rule == SmartRule.AUTOMATIC:
-        keep = group.suggested_keep or pick_suggested_keep(members)
+        keep = pick_suggested_keep(members)
         group.suggested_keep = keep
         group.selected_for_removal = [
             m.path for m in members if m.path != keep and not m.protected
         ]
         return
 
+    # Protected reference-library copies can never be removed, so prefer them
+    # before applying user rules.
+    pool = [m for m in members if m.protected] or members
+
     if rule == SmartRule.NEWEST:
-        keep = max(members, key=lambda m: m.mtime).path
+        keep = max(pool, key=lambda m: (m.mtime_sort_stamp, m.path)).path
     elif rule == SmartRule.OLDEST:
-        keep = min(members, key=lambda m: m.mtime).path
+        keep = min(pool, key=lambda m: (m.mtime_sort_stamp, m.path)).path
     elif rule == SmartRule.LARGEST:
-        keep = max(members, key=lambda m: (m.pixels, m.size)).path
+        keep = max(pool, key=lambda m: (m.effective_pixels, m.size, m.path)).path
     elif rule == SmartRule.SMALLEST:
-        keep = min(members, key=lambda m: (m.pixels if m.pixels else m.size, m.size)).path
+        keep = min(
+            pool,
+            key=lambda m: (m.effective_pixels == 0, m.effective_pixels, m.size, m.path),
+        ).path
     elif rule == SmartRule.SHORTEST_PATH:
-        keep = min(members, key=lambda m: (len(Path(m.path).parts), len(m.path))).path
+        keep = min(
+            pool,
+            key=lambda m: (len(Path(m.path).parts), len(m.path), m.path),
+        ).path
     else:
-        keep = group.suggested_keep or pick_suggested_keep(members)
+        keep = pick_suggested_keep(members)
 
     group.suggested_keep = keep
     group.selected_for_removal = [

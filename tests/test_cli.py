@@ -540,3 +540,61 @@ def test_semantic_full_speed_flag_reaches_the_engine(tmp_path: Path, monkeypatch
     assert captured["semantic_full_speed"] is False
     assert cli.main([str(tmp_path), "--semantic", "--semantic-full-speed"]) == 0
     assert captured["semantic_full_speed"] is True
+
+
+def test_semantic_duplicate_threshold_default_is_0_92(tmp_path: Path) -> None:
+    parsed = cli.build_parser().parse_args(["scan", str(tmp_path), "--semantic"])
+    assert parsed.semantic_duplicate_threshold == pytest.approx(0.92)
+
+
+def test_doctor_does_not_require_unused_pybktree(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_pybktree(name, *args, **kwargs):
+        if name == "pybktree":
+            raise ImportError("No module named 'pybktree'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pybktree)
+    report = cli.collect_doctor_report()
+    assert "pybktree" not in report["imports"]
+    assert report["core_ready"] is True
+
+
+def test_benchmark_crops_cli_human_and_json(tmp_path: Path, capsys) -> None:
+    from PIL import Image
+
+    img_path = tmp_path / "clean.png"
+    Image.new("RGB", (120, 120), (30, 100, 180)).save(img_path)
+    manifest = tmp_path / "crops.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "path": str(img_path),
+                        "decision": "skipped",
+                        "crop_level": "balanced",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["benchmark-crops", str(manifest), "--level", "balanced"]) == 0
+    human_out = capsys.readouterr().out
+    assert "Crop benchmark (balanced): 1/1 evaluated" in human_out
+
+    assert cli.main(["benchmark-crops", str(manifest), "--json"]) == 0
+    stdout_json = json.loads(capsys.readouterr().out)
+    assert stdout_json["evaluated"] == 1
+    assert stdout_json["negatives"]["suppressed"] == 1
+
+    json_file = tmp_path / "report.json"
+    assert cli.main(["benchmark-crops", str(manifest), "--json", str(json_file)]) == 0
+    file_json = json.loads(json_file.read_text(encoding="utf-8"))
+    assert file_json["level"] == "balanced"
+    assert file_json["evaluated"] == 1

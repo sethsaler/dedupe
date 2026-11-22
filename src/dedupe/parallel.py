@@ -85,6 +85,19 @@ def split_cpu_budget(total: int, stages: int) -> int:
     return max(2, int(total) // stages)
 
 
+def _run_chunk(
+    fn: Callable[[T], R],
+    chunk: Sequence[T],
+    cancelled: Callable[[], bool] | None = None,
+) -> list[R]:
+    out: list[R] = []
+    for item in chunk:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        out.append(fn(item))
+    return out
+
+
 def map_parallel(
     fn: Callable[[T], R],
     items: Sequence[T],
@@ -94,24 +107,26 @@ def map_parallel(
     progress: Callable[[int, int], None] | None = None,
     progress_every: int = 1,
     cancelled: Callable[[], bool] | None = None,
+    chunk_size: int = 1,
 ) -> list[R]:
     """
     Map ``fn`` over ``items``, preserving order.
 
-    When ``workers <= 1`` or there is only one item, runs sequentially
+    When ``workers <= 1`` or there is only one task, runs sequentially
     (no pool overhead). Progress is ``progress(done, total)``.
 
     For large item lists, only keeps ~2×workers futures in flight so we
     do not allocate tens of thousands of Future objects or queue unbounded
-    disk/CPU work.
+    disk/CPU work. Passing ``chunk_size > 1`` batches small jobs per future.
     """
     if not items:
         return []
 
     n = len(items)
     every = max(1, progress_every)
+    step = max(1, int(chunk_size))
 
-    if workers <= 1 or n == 1:
+    if workers <= 1 or n == 1 or n <= step:
         results: list[R] = []
         for i, item in enumerate(items):
             if cancelled and cancelled():
@@ -125,18 +140,32 @@ def map_parallel(
     Executor = ThreadPoolExecutor if backend == "thread" else ProcessPoolExecutor
     ordered: list[R | None] = [None] * n
     done = 0
+    chunk_cancelled = cancelled if backend == "thread" else None
+    if step > 1:
+        tasks: list[tuple[int, Sequence[T]]] = [
+            (start, items[start : start + step]) for start in range(0, n, step)
+        ]
+    else:
+        tasks = []
+    task_count = len(tasks) if step > 1 else n
+    pool_workers = max(1, min(workers, task_count))
     # Bound in-flight work: enough to keep cores busy, not enough to thrash.
-    window = max(workers * 2, workers)
+    window = max(pool_workers * 2, pool_workers)
     next_i = 0
     inflight: dict = {}
 
-    ex = Executor(max_workers=workers)
+    ex = Executor(max_workers=pool_workers)
 
     def _submit_more() -> None:
         nonlocal next_i
-        while next_i < n and len(inflight) < window:
-            fut = ex.submit(fn, items[next_i])
-            inflight[fut] = next_i
+        while next_i < task_count and len(inflight) < window:
+            if step > 1:
+                start, chunk = tasks[next_i]
+                fut = ex.submit(_run_chunk, fn, chunk, chunk_cancelled)
+                inflight[fut] = (start, len(chunk))
+            else:
+                fut = ex.submit(fn, items[next_i])
+                inflight[fut] = (next_i, 1)
             next_i += 1
 
     try:
@@ -152,19 +181,39 @@ def map_parallel(
                 return_when=FIRST_COMPLETED,
             )
             for fut in finished:
-                idx = inflight.pop(fut)
-                ordered[idx] = fut.result()
-                done += 1
-                if progress and (done % every == 0 or done == n):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                start, count = inflight.pop(fut)
+                res = fut.result()
+                if step > 1:
+                    chunk_out = res  # type: ignore[assignment]
+                    ordered[start : start + count] = chunk_out
+                else:
+                    ordered[start] = res  # type: ignore[assignment]
+                prev_bucket = done // every
+                done += count
+                if progress and (done // every > prev_bucket or done == n):
                     progress(done, n)
             _submit_more()
     except BaseException:
         # Cancel/error path: drop queued work and return promptly instead of
         # blocking on shutdown(wait=True) — a running work item (e.g. an
         # ffmpeg extract with a 60–180s timeout) would otherwise make cancel
-        # hang. Running items finish (or time out) in the background; their
-        # subprocesses carry their own timeouts so none are orphaned forever.
+        # hang. For process pools, terminate lingering worker processes too.
+        for fut in list(inflight):
+            fut.cancel()
+        procs = (
+            list((getattr(ex, "_processes", None) or {}).values())
+            if backend == "process"
+            else []
+        )
         ex.shutdown(wait=False, cancel_futures=True)
+        for proc in procs:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
         raise
     else:
         ex.shutdown(wait=True)

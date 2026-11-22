@@ -10,6 +10,7 @@ from typing import Any
 
 from .models import FileRecord, MediaType
 from .scanner import inventory
+from .semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 from .similar_image import DEFAULT_THRESHOLD as IMAGE_THRESHOLD
 from .similar_image import find_similar_image_groups
 from .similar_video import DEFAULT_THRESHOLD as VIDEO_THRESHOLD
@@ -109,6 +110,15 @@ def summarize_similarity_predictions(predictions: list[dict[str, Any]]) -> dict[
     }
 
 
+def _cosine_similarity(vec_a: bytes, vec_b: bytes) -> float:
+    import numpy as np
+
+    a = np.frombuffer(vec_a, dtype="<f4")
+    b = np.frombuffer(vec_b, dtype="<f4")
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
 def run_similarity_benchmark(
     manifest: str | Path,
     *,
@@ -116,7 +126,7 @@ def run_similarity_benchmark(
     video_threshold: int = VIDEO_THRESHOLD,
     workers: int | None = None,
     semantic: bool = False,
-    semantic_duplicate_threshold: float = 0.94,
+    semantic_duplicate_threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
     decider: bool = False,
 ) -> dict[str, Any]:
     """Run existing similarity detectors against labeled pairs."""
@@ -130,64 +140,168 @@ def run_similarity_benchmark(
 
         judge = DeciderJudge(use_cache=False)
 
-    for pair in pairs:
-        pair_started = time.perf_counter()
-        records: list[FileRecord] = inventory([pair.path_a, pair.path_b])
-        error: str | None = None
-        predicted: bool | None
-        try:
-            if pair.media_type == MediaType.VIDEO:
-                if not ffmpeg_available():
-                    groups = []
-                    error = "ffmpeg and ffprobe are required to benchmark video similarity"
-                else:
-                    groups = find_similar_video_groups(
-                        records, threshold=video_threshold, workers=workers
-                    )
-            else:
-                groups = find_similar_image_groups(
-                    records, threshold=image_threshold, workers=workers
-                )
-            if semantic and pair.media_type == MediaType.IMAGE and not groups:
-                from .semantic import find_semantic_groups
+    perceptual_seconds_total = 0.0
+    video_seconds_total = 0.0
+    semantic_embed_seconds = 0.0
+    semantic_verify_seconds = 0.0
+    pending_semantic: list[tuple[int, list[FileRecord]]] = []
 
-                _sets, groups, semantic_errors = find_semantic_groups(
-                    records, duplicate_threshold=semantic_duplicate_threshold,
-                    workers=workers or 1, use_cache=False, judge=judge,
-                )
-                if semantic_errors:
-                    error = "; ".join(semantic_errors)
-            record_error = next((record.error for record in records if record.error), None)
-            if error or record_error:
-                error = error or record_error
+    try:
+        for idx, pair in enumerate(pairs):
+            pair_started = time.perf_counter()
+            records: list[FileRecord] = inventory([pair.path_a, pair.path_b])
+            error: str | None = None
+            predicted: bool | None = None
+            matched_stage = "none"
+            perceptual_secs = 0.0
+            try:
+                if pair.media_type == MediaType.VIDEO:
+                    if not ffmpeg_available():
+                        groups = []
+                        error = "ffmpeg and ffprobe are required to benchmark video similarity"
+                    else:
+                        groups = find_similar_video_groups(
+                            records, threshold=video_threshold, workers=workers
+                        )
+                    perceptual_secs = time.perf_counter() - pair_started
+                    video_seconds_total += perceptual_secs
+                    if groups:
+                        matched_stage = "video"
+                else:
+                    groups = find_similar_image_groups(
+                        records, threshold=image_threshold, workers=workers
+                    )
+                    perceptual_secs = time.perf_counter() - pair_started
+                    perceptual_seconds_total += perceptual_secs
+                    if groups:
+                        matched_stage = "perceptual"
+                record_error = next((record.error for record in records if record.error), None)
+                if error or record_error:
+                    error = error or record_error
+                    predicted = None
+                    matched_stage = "error"
+                else:
+                    predicted = bool(groups)
+                    if semantic and pair.media_type == MediaType.IMAGE and not groups:
+                        pending_semantic.append((idx, records))
+            except Exception as exc:
+                error = str(exc)
                 predicted = None
-            else:
-                predicted = bool(groups)
-        except Exception as exc:
-            error = str(exc)
-            predicted = None
-        predictions.append(
-            {
-                "path_a": str(pair.path_a),
-                "path_b": str(pair.path_b),
-                "media_type": pair.media_type.value,
-                "category": pair.category,
-                "similar": pair.similar,
-                "predicted_similar": predicted,
-                "latency_seconds": time.perf_counter() - pair_started,
-                "error": error,
-            }
-        )
+                matched_stage = "error"
+            predictions.append(
+                {
+                    "path_a": str(pair.path_a),
+                    "path_b": str(pair.path_b),
+                    "media_type": pair.media_type.value,
+                    "category": pair.category,
+                    "similar": pair.similar,
+                    "predicted_similar": predicted,
+                    "matched_stage": matched_stage,
+                    "perceptual_seconds": perceptual_secs,
+                    "semantic_seconds": 0.0,
+                    "semantic_score": None,
+                    "latency_seconds": time.perf_counter() - pair_started,
+                    "error": error,
+                }
+            )
+
+        unique_semantic_paths = 0
+        if semantic and pending_semantic:
+            from .semantic import embed_records, group_semantic_vectors
+
+            unique_by_path: dict[str, FileRecord] = {}
+            for _idx, pair_records in pending_semantic:
+                for rec in pair_records:
+                    unique_by_path.setdefault(rec.path, rec)
+            unique_records = list(unique_by_path.values())
+            unique_semantic_paths = len(unique_records)
+
+            embed_started = time.perf_counter()
+            vectors: dict[str, bytes] = {}
+            global_error: str | None = None
+            per_path_errors: dict[str, str] = {}
+            try:
+                vectors, embed_errors = embed_records(
+                    unique_records,
+                    workers=workers or 1,
+                    use_cache=False,
+                )
+                for msg in embed_errors:
+                    # Format: "semantic embedding failed: <path>: <reason>"
+                    parts = msg.split(": ", 2)
+                    if len(parts) >= 2:
+                        per_path_errors.setdefault(parts[1], msg)
+            except Exception as exc:
+                global_error = str(exc)
+            semantic_embed_seconds = time.perf_counter() - embed_started
+
+            for idx, pair_records in pending_semantic:
+                pred = predictions[idx]
+                verify_started = time.perf_counter()
+                path_a, path_b = pair_records[0].path, pair_records[1].path
+                if global_error is not None:
+                    pred["error"] = global_error
+                    pred["predicted_similar"] = None
+                    pred["matched_stage"] = "error"
+                elif path_a not in vectors or path_b not in vectors:
+                    err_parts = [
+                        per_path_errors[p]
+                        for p in (path_a, path_b)
+                        if p in per_path_errors
+                    ]
+                    pred["error"] = "; ".join(err_parts) or "semantic embedding missing"
+                    pred["predicted_similar"] = None
+                    pred["matched_stage"] = "error"
+                else:
+                    pair_vectors = {path_a: vectors[path_a], path_b: vectors[path_b]}
+                    pred["semantic_score"] = _cosine_similarity(vectors[path_a], vectors[path_b])
+                    try:
+                        _sets, sem_groups = group_semantic_vectors(
+                            pair_records,
+                            pair_vectors,
+                            duplicate_threshold=semantic_duplicate_threshold,
+                            workers=workers or 1,
+                            use_cache=False,
+                            judge=judge,
+                        )
+                        if sem_groups:
+                            pred["predicted_similar"] = True
+                            pred["matched_stage"] = "semantic"
+                        else:
+                            pred["predicted_similar"] = False
+                            pred["matched_stage"] = "none"
+                    except Exception as exc:
+                        pred["error"] = str(exc)
+                        pred["predicted_similar"] = None
+                        pred["matched_stage"] = "error"
+                sem_secs = time.perf_counter() - verify_started
+                semantic_verify_seconds += sem_secs
+                pred["semantic_seconds"] = sem_secs
+                pred["latency_seconds"] += sem_secs
+    finally:
+        if judge is not None:
+            judge.close()
 
     elapsed = time.perf_counter() - started
     report = summarize_similarity_predictions(predictions)
     report["categories"] = {
         category: summarize_similarity_predictions(
             [p for p in predictions if p["category"] == category]
-        ) for category in sorted({p["category"] for p in predictions})
+        )
+        for category in sorted({p["category"] for p in predictions})
     }
-    if judge is not None:
-        judge.close()
+    stage_counts: dict[str, int] = {}
+    for pred in predictions:
+        stage = str(pred["matched_stage"])
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    report["diagnostics"] = {
+        "stage_counts": stage_counts,
+        "perceptual_seconds": perceptual_seconds_total,
+        "video_seconds": video_seconds_total,
+        "semantic_embed_seconds": semantic_embed_seconds,
+        "semantic_verify_seconds": semantic_verify_seconds,
+        "semantic_unique_paths": unique_semantic_paths if semantic else 0,
+    }
     report["semantic"] = semantic
     report["decider"] = decider
     report.update(

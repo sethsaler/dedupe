@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from dedupe.engine import run_scan
 
 
-@pytest.mark.parametrize("rename_after_edit", [False, True])
-def test_cached_scan_rehashes_same_size_edit_with_preserved_mtime(tmp_path, rename_after_edit):
+def test_cached_scan_rehashes_same_path_edit_with_preserved_mtime_and_reuses_pure_rename(tmp_path):
     left, right = tmp_path / "left", tmp_path / "right"
     left.mkdir()
     right.mkdir()
@@ -32,11 +29,10 @@ def test_cached_scan_rehashes_same_size_edit_with_preserved_mtime(tmp_path, rena
     assert cold.diagnostics.cache_hits == 0
     assert warm.diagnostics.cache_hits == 2
 
+    # Same-path byte replacement preserving mtime updates ctime_ns -> must invalidate cache.
     previous = copy.stat()
     copy.write_bytes(prefix + b"modified")
     os.utime(copy, ns=(previous.st_atime_ns, previous.st_mtime_ns))
-    if rename_after_edit:
-        copy = copy.rename(right / "renamed.jpg")
     current = copy.stat()
     assert current.st_size == previous.st_size
     assert current.st_mtime_ns == previous.st_mtime_ns
@@ -53,3 +49,12 @@ def test_cached_scan_rehashes_same_size_edit_with_preserved_mtime(tmp_path, rena
     refreshed = run_scan([left, right], **options)
     assert refreshed.diagnostics.cache_hits == 2
     assert refreshed.exact_groups == 0
+
+    # Pure POSIX rename updates ctime_ns while keeping (dev, ino, size, mtime_ns) intact ->
+    # inode fallback must reuse the cached hashes instead of re-reading from disk.
+    renamed = copy.rename(right / "renamed.jpg")
+    renamed_stat = renamed.stat()
+    assert renamed_stat.st_ctime_ns != current.st_ctime_ns
+    after_rename = run_scan([left, right], **options)
+    assert after_rename.diagnostics.cache_hits == 2
+    assert after_rename.exact_groups == 0

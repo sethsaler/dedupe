@@ -120,8 +120,33 @@
 
 /* Only the size stays on the caption line; dimensions, modified time and media
    kind move to File details. Face counts stay, they are the point of Faces. */
-#members.triage-grid .triage-card .card-meta > span:nth-child(n+2):not(.face-count) {
+.detail-body:not(.show-file-details) #members.triage-grid .triage-card .card-meta > span:nth-child(n+2):not(.face-count) {
   display: none;
+}
+
+.detail-body.show-file-details #members.triage-grid .triage-card:not(.focus-card) .name {
+  grid-column: 1 / -1;
+}
+
+.detail-body.show-file-details #members.triage-grid .triage-card:not(.focus-card) .card-meta {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  white-space: normal;
+  margin-top: 2px;
+}
+
+.detail-body.show-file-details #members.triage-grid .triage-card:not(.focus-card) .path {
+  grid-row: 4;
+}
+
+.detail-body.show-file-details #members.triage-grid .triage-card:not(.focus-card) .evidence {
+  grid-row: 5;
+}
+
+.detail-body.show-file-details #members.triage-grid .triage-card:not(.focus-card) .non-person-coverage {
+  grid-row: 6;
 }
 
 #members.triage-grid .triage-card .path {
@@ -146,8 +171,7 @@
 /* ---------- Focus ring on the print ----------
    The focused card outlines its print, not the caption: 2px ink, 3px offset. */
 #members.triage-grid .triage-card.focused {
-  outline: 2px solid var(--lt-ink);
-  outline-offset: 3px;
+  outline: none;
 }
 
 #members.triage-grid .triage-card.focused > .thumb-stack,
@@ -226,7 +250,7 @@
 
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate:hover,
 #members.triage-grid .triage-card:not(.focus-card) .card-actions > .delete-candidate:focus-visible {
-  background: var(--lt-pencil);
+  background: var(--lt-danger-fill);
   color: #FFFFFF;
   box-shadow: none;
 }
@@ -353,7 +377,7 @@
 .results .detail-body:has(> #members.triage-grid) #memberPeople {
   min-height: 36px;
   padding: 5px 30px 5px 10px;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 8px;
   background-color: var(--lt-table);
   color: var(--lt-ink);
@@ -381,7 +405,7 @@
 .results .detail-body:has(> #members.triage-grid) .member-pagination .btn {
   min-height: 36px;
   padding: 6px 12px;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 6px;
   background: transparent;
   box-shadow: none;
@@ -393,8 +417,8 @@
 
 .results .detail-body:has(> #members.triage-grid) .member-pagination .btn:hover:not(:disabled) {
   color: var(--lt-ink);
-  border-color: transparent;
-  background: transparent;
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
   text-decoration: none;
 }
 
@@ -421,23 +445,7 @@
 }
 
 /* ---------- Guide banner: quiet, graphite, no tinted chips ---------- */
-.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > summary {
-  min-height: 36px;
-  padding: 10px 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  color: var(--lt-graphite);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > summary:hover {
-  color: var(--lt-ink);
-  border-color: transparent;
-}
-
-.results .detail-body:has(> #members.triage-grid) #nonHumanBanner > .popover-body {
+.results .detail-body:has(> #members.triage-grid) #nonHumanBanner .popover-body {
   background: var(--lt-table);
   border: 1px solid var(--lt-sleeve);
   border-radius: 8px;
@@ -499,19 +507,21 @@
 .toast.error {
   background: var(--toast-bg);
   border-color: var(--toast-line);
-  box-shadow: inset 3px 0 0 var(--lt-pencil);
-  padding-left: 14px;
+  box-shadow: inset 4px 0 0 #FF5A43;
+  padding-left: 16px;
 }
 
 .toast.ok {
   background: var(--toast-bg);
   border-color: var(--toast-line);
+  box-shadow: inset 4px 0 0 #3ECF8E;
+  padding-left: 16px;
 }
 
 .toast .toast-action {
   min-height: 36px;
   padding: 4px 12px;
-  border: 1px solid #444444;
+  border: 1px solid light-dark(rgba(255, 255, 255, 0.35), var(--lt-control-border));
   border-radius: 6px;
   background: transparent;
   color: var(--toast-fg);
@@ -523,13 +533,13 @@
 
 .toast .toast-action:hover {
   background: rgba(128, 128, 128, 0.18);
-  border-color: #666666;
+  border-color: var(--toast-fg);
   color: var(--toast-fg);
 }
 
 .toast .toast-dismiss {
-  opacity: 1;
-  color: var(--lt-graphite);
+  opacity: 0.85;
+  color: var(--toast-fg);
   font-size: 13px;
   min-width: 36px;
   min-height: 36px;
@@ -538,8 +548,9 @@
 }
 
 .toast .toast-dismiss:hover {
+  opacity: 1;
   color: var(--toast-fg);
-  background: rgba(128, 128, 128, 0.18);
+  background: rgba(128, 128, 128, 0.22);
 }
 
 /* ---------- Narrow windows ---------- */

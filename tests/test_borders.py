@@ -708,12 +708,16 @@ def test_web_crop_adjust_moves_the_zone_and_apply_uses_it(
     assert event["suggestion"]["left"] == suggested["left"]
     assert {k: event["adjusted"][k] for k in edges} == edges
 
-    # Undo brings the file back with the applied (adjusted) zone as its suggestion.
+    # Undo restores the file with the adjusted zone preserved and the
+    # detector's original suggestion still intact for Reset.
     undone = client.post("/api/crop/undo", json=base, headers=headers)
     assert undone.status_code == 200, undone.get_json()
     member = _member_of(undone.get_json(), target)
     assert member["crop_state"] == "pending"
-    assert member["crop_adjusted"] is False
+    assert member["crop_adjusted"] is True
+    assert {k: member["crop_suggested"][k] for k in edges} == {
+        k: suggested[k] for k in edges
+    }
     assert {k: member["crop"][k] for k in edges} == edges
 
 
@@ -3467,19 +3471,29 @@ def test_web_video_crop_apply_and_undo(tmp_path: Path, monkeypatch) -> None:
 
 @requires_ffmpeg
 def test_video_boxed_in_most_segments_is_cropped(tmp_path: Path) -> None:
-    """Majority rule: boxed segments outvote a full-frame tail. (The
-    minority case above stays uncropped.)"""
-    path = _make_video(
+    """Strict majority (>70%): 80% boxed is cropped, while 60% boxed (40% full-frame) is left alone."""
+    boxed_80 = _make_video(
         tmp_path / "mostly_boxed.mp4",
+        "color=c=black:size=640x360:rate=15:duration=3.2[bg];"
+        "testsrc=size=202x360:rate=15:duration=3.2[fg];"
+        "[bg][fg]overlay=219:0[boxed];"
+        "color=c=0x7f7f7f:size=640x360:rate=15:duration=0.8[full];"
+        "[boxed][full]concat=n=2:v=1:a=0",
+    )
+    box = borders.detect_video_borders(boxed_80)
+    assert box is not None
+    assert box.left >= 214 and box.right <= 426
+
+    # Substantial full-frame segment (40%) is never permanently cropped.
+    mixed_60_40 = _make_video(
+        tmp_path / "mixed_60_40.mp4",
         "color=c=black:size=640x360:rate=15:duration=2.4[bg];"
         "testsrc=size=202x360:rate=15:duration=2.4[fg];"
         "[bg][fg]overlay=219:0[boxed];"
         "color=c=0x7f7f7f:size=640x360:rate=15:duration=1.6[full];"
         "[boxed][full]concat=n=2:v=1:a=0",
     )
-    box = borders.detect_video_borders(path)
-    assert box is not None
-    assert box.left >= 214 and box.right <= 426
+    assert borders.detect_video_borders(mixed_60_40) is None
 
 
 def _mock_guarded_video(monkeypatch, frames, guard_results, *, rgb_failures=()):
@@ -3509,7 +3523,7 @@ def test_video_guard_overrides_majority_strict_bars(monkeypatch, horizontal, edg
     if horizontal:
         boxed = boxed.T
         person = (edge, 0.3, 1 - edge, 0.7)
-    _mock_guarded_video(monkeypatch, [boxed] * 3 + [full] * 2, [[], [], [], [person], []])
+    _mock_guarded_video(monkeypatch, [boxed] * 4 + [full], [[], [], [], [person], []])
 
     box = borders.detect_video_borders("mixed.mp4")
 
@@ -3590,7 +3604,7 @@ def test_video_strict_fallback_still_honors_people_from_successful_frames(monkey
     boxed = borders._luma(Image.fromarray(_framed(1000, 1000, top=200, bottom=200)))
     full = borders._luma(Image.fromarray(_picture(1000, 1000)))
     person = (0.3, 0.05, 0.7, 0.95)
-    _mock_guarded_video(monkeypatch, [boxed] * 3 + [full] * 2, [None, [], [], [person], []])
+    _mock_guarded_video(monkeypatch, [boxed] * 4 + [full], [None, [], [], [person], []])
 
     box = borders.detect_video_borders("partial-guard.mp4")
 
@@ -3668,10 +3682,432 @@ def test_only_mp4_family_videos_are_croppable(tmp_path: Path) -> None:
             media_type=media_type, extension=Path(name).suffix.lower(),
         )
 
-    assert borders.is_croppable(record("clip.mp4", MediaType.VIDEO))
-    assert borders.is_croppable(record("clip.mov", MediaType.VIDEO))
-    assert borders.is_croppable(record("clip.m4v", MediaType.VIDEO))
-    assert not borders.is_croppable(record("clip.mkv", MediaType.VIDEO))
-    assert not borders.is_croppable(record("clip.webm", MediaType.VIDEO))
+    for ext in ("mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "ts"):
+        assert borders.is_croppable(record(f"clip.{ext}", MediaType.VIDEO))
+    assert not borders.is_croppable(record("clip.wmv", MediaType.VIDEO))
     assert borders.is_croppable(record("photo.jpg", MediaType.IMAGE))
+    assert borders.is_croppable(record("photo.avif", MediaType.IMAGE))
     assert not borders.is_croppable(record("clip.mp4", MediaType.IMAGE))
+
+
+# --- new bugfixes, detectors, optimization & metadata tests -------------------
+
+
+def test_jpeg_ringing_black_bar_cleanly_peeled(tmp_path: Path) -> None:
+    # Black bar ending inside an 8x8 DCT block rings a few luma rows at the seam.
+    canvas = np.zeros((600, 800, 3), dtype=np.uint8)
+    canvas[101:500] = _picture(800, 399)
+    path = tmp_path / "ringing_bar.jpg"
+    Image.fromarray(canvas).save(path, quality=75)
+    box = detect_black_borders(path)
+    assert box is not None
+    assert 96 <= box.top <= 105 and 495 <= box.bottom <= 504
+
+
+def test_screenshot_evidence_broadened_devices_ratios_and_names(tmp_path: Path) -> None:
+    # Resized mobile aspect (~2.16:1 not in hardcoded width set), Pixel Pro (1344), iPad, CleanShot
+    cases = [
+        ("resized.png", (760, 1646), "shape"),
+        ("pixel.png", (1344, 2992), "shape"),
+        ("ipad.png", (1668, 2388), "shape"),
+        ("landscape_phone.png", (2532, 1170), "shape"),
+        ("CleanShot 2024-05-01.png", (900, 700), "name"),
+        ("Shottr_shot.png", (900, 700), "name"),
+        ("IMG_9012.PNG", (1024, 2000), "name"),
+    ]
+    for name, size, expected in cases:
+        im = Image.new("RGB", size, (255, 255, 255))
+        p = tmp_path / name
+        im.save(p)
+        with Image.open(p) as opened:
+            assert borders.screenshot_evidence(p, opened) == expected, name
+
+    tag_im = Image.new("RGB", (900, 700), (255, 255, 255))
+    tag_ex = tag_im.getexif()
+    tag_ex.get_ifd(0x8769)[0x9286] = b"ASCII\0\0\0Screenshot"
+    tag_p = tmp_path / "tagged.png"
+    tag_im.save(tag_p, exif=tag_ex.tobytes())
+    with Image.open(tag_p) as opened:
+        assert borders.screenshot_evidence(tag_p, opened) == "metadata"
+
+    # Camera EXIF Make disqualifies IMG_*.PNG shape/name inference.
+    cam_im = Image.new("RGB", (1170, 2532), (255, 255, 255))
+    ex = cam_im.getexif()
+    ex[0x010F] = "Apple"
+    ex[0x0110] = "iPhone 15"
+    cam_p = tmp_path / "IMG_1234.PNG"
+    cam_im.save(cam_p, exif=ex.tobytes())
+    with Image.open(cam_p) as opened:
+        assert borders.screenshot_evidence(cam_p, opened) is None
+
+
+def test_dynamic_island_and_centered_clock_status_bars(tmp_path: Path) -> None:
+    from PIL import ImageDraw
+
+    # Dynamic Island: centered black pill flanked by status icons on light status bar.
+    w, h = 1179, 2556
+    im1 = Image.new("RGB", (w, h), (255, 255, 255))
+    d1 = ImageDraw.Draw(im1)
+    d1.rounded_rectangle([w // 2 - 140, 32, w // 2 + 140, 86], radius=24, fill=(10, 10, 10))
+    for x in (90, 140, w - 210, w - 150, w - 100):
+        d1.rectangle([x, 48, x + 28, 72], fill=(20, 20, 20))
+    im1.paste(Image.fromarray(_picture(w, 1600)), (0, 260))
+    d1.rounded_rectangle([w // 2 - 180, h - 42, w // 2 + 180, h - 26], radius=8, fill=(20, 20, 20))
+    p1 = tmp_path / "Screenshot_island.png"
+    im1.save(p1)
+    box1 = detect_black_borders(p1)
+    assert box1 is not None and "top" in box1.chrome and 86 <= box1.top <= 260
+
+    # Centered clock block (Android/lock-style) with side icons, empty flanking background.
+    w2, h2 = 1080, 2340
+    im2 = Image.new("RGB", (w2, h2), (255, 255, 255))
+    d2 = ImageDraw.Draw(im2)
+    for x in range(w2 // 2 - 42, w2 // 2 + 42, 18):
+        d2.rectangle([x, 42, x + 11, 68], fill=(20, 20, 20))
+    for x in (60, 100, w2 - 170, w2 - 120):
+        d2.rectangle([x, 46, x + 24, 66], fill=(20, 20, 20))
+    im2.paste(Image.fromarray(_picture(w2, 1500)), (0, 240))
+    p2 = tmp_path / "Screenshot_clock.png"
+    im2.save(p2)
+    box2 = detect_black_borders(p2)
+    assert box2 is not None and "top" in box2.chrome and 68 < box2.top <= 240
+
+
+def test_landscape_side_chrome_dock_detected(tmp_path: Path) -> None:
+    from PIL import ImageDraw
+
+    w, h = 1920, 1080
+    im = Image.new("RGB", (w, h), (242, 244, 248))
+    draw = ImageDraw.Draw(im)
+    # Left desktop dock/sidebar (width 180) with vertically spaced flat icon squares
+    for y in range(180, 900, 110):
+        draw.rectangle([50, y, 130, y + 52], fill=(60, 95, 160))
+    im.paste(Image.fromarray(_picture(w - 180, h)), (180, 0))
+    p = tmp_path / "Screenshot_desktop.png"
+    im.save(p)
+    box = detect_black_borders(p)
+    assert box is not None and "left" in box.chrome and 130 <= box.left <= 184
+
+
+def test_human_guard_protects_false_chrome_and_allows_post_chrome(tmp_path: Path, monkeypatch) -> None:
+    # 1. Person's face enters chrome zone -> guard pulls chrome back safely.
+    im = Image.new("RGB", (1000, 1400), (255, 255, 255))
+    im.paste(Image.fromarray(_picture(1000, 1000)), (0, 300))
+    monkeypatch.setattr(borders, "_human_guard_available", lambda: True)
+    # Simulate detailed raw face overlapping top=180..300
+    monkeypatch.setattr(
+        borders,
+        "_human_guard_boxes_pair",
+        lambda _rgb: ([((0.40, 0.14, 0.60, 0.35), True, (0.33, 0.02, 0.67, 0.42))],
+                      [(0.33, 0.02, 0.67, 0.42)]),
+    )
+    boxes = borders._boxes_for(im, chrome=(220, 0, 0, 0), speck=True, evidence="name")
+    bal = boxes["balanced"]
+    assert bal is None or bal.top <= 28
+
+    # 2. Chrome ends at top=240 above a person framed INSIDE the post (raw y0=0.20*1400=280 > 240,
+    # even though expanded face head padding reached above y=240!). Chrome cuts cleanly to 240!
+    monkeypatch.setattr(
+        borders,
+        "_human_guard_boxes_pair",
+        lambda _rgb: ([((0.40, 0.20, 0.60, 0.40), True, (0.33, 0.08, 0.67, 0.47))],
+                      [(0.33, 0.08, 0.67, 0.47)]),
+    )
+    boxes_post = borders._boxes_for(im, chrome=(240, 0, 0, 0), speck=True, evidence="name")
+    assert boxes_post["balanced"] is not None
+    assert boxes_post["balanced"].top == 240
+    assert "chrome" in boxes_post["balanced"].to_dict()["provenance"]
+
+
+def test_lazy_guard_skips_clean_photos_and_cancelled_raises(tmp_path: Path, monkeypatch) -> None:
+    guard_calls = 0
+
+    def spy_guard(_rgb):
+        nonlocal guard_calls
+        guard_calls += 1
+        return []
+
+    monkeypatch.setattr(borders, "_human_guard_boxes", spy_guard)
+    clean_p = tmp_path / "clean_large.png"
+    Image.fromarray(_picture(1600, 1200)).save(clean_p)
+    levels = borders.detect_crop_levels(clean_p)
+    assert levels == {"conservative": None, "balanced": None, "aggressive": None}
+    assert guard_calls == 0
+
+    boxed_p = tmp_path / "boxed.png"
+    _save(_framed(640, 480, top=60), boxed_p)
+    rec = FileRecord(
+        path=str(boxed_p), size=1, mtime=0.0,
+        media_type=MediaType.IMAGE, extension=".png",
+    )
+    with pytest.raises(InterruptedError):
+        borders.analyze_borders([rec], cancelled=lambda: True)
+
+
+def test_16bit_flattened_and_alpha_shadow_handling(tmp_path: Path) -> None:
+    # 16-bit grayscale TIFF/PNG: values > 255 must scale rather than clip to white 255.
+    arr16 = np.full((600, 800), 32768, dtype=np.uint16)
+    arr16[:100] = 0
+    arr16[100:, ::2] = 48000
+    im16 = Image.frombytes("I;16", (800, 600), arr16.astype("<u2").tobytes())
+    flat = borders._flattened(im16)
+    flat_arr = np.asarray(flat)
+    assert int(flat_arr[200, 0, 0]) < 245 and int(flat_arr[200, 1, 0]) < 200
+    assert abs(int(flat_arr[200, 0, 0]) - int(flat_arr[200, 1, 0])) >= 40
+
+    # Stray single alpha=254 pixel does not suppress solid colour bar on opaque interior.
+    canvas = np.full((600, 800, 4), (245, 245, 245, 255), dtype=np.uint8)
+    canvas[80:520, 80:720, :3] = _picture(640, 440)
+    canvas[300, 400, 3] = 254
+    stray_p = tmp_path / "stray_alpha.png"
+    Image.fromarray(canvas, mode="RGBA").save(stray_p)
+    stray_box = detect_black_borders(stray_p)
+    assert stray_box is not None and stray_box.top == 80
+
+    # Transparent macOS window shadow padding around an opaque window trims cleanly.
+    win = np.zeros((700, 900, 4), dtype=np.uint8)
+    # Soft drop shadow alpha 1..40 around window
+    win[60:640, 80:820, 3] = 30
+    win[90:610, 110:790, :3] = _picture(680, 520)
+    win[90:610, 110:790, 3] = 255
+    win_p = tmp_path / "Screenshot 2024-01-01.png"
+    Image.fromarray(win, mode="RGBA").save(win_p)
+    win_box = detect_black_borders(win_p)
+    assert win_box is not None
+    assert (win_box.left, win_box.top, win_box.right, win_box.bottom) == (110, 90, 790, 610)
+
+
+def test_metadata_quality_lossless_webp_multiframe_and_exdev_rollback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import errno
+
+    from PIL import PngImagePlugin, features
+    from PIL.TiffImagePlugin import ImageFileDirectory_v2
+
+    # 1. JPEG Q75 + XMP + IPTC APP13 + EXIF (PixelXDimension + IFD1 thumbnail cleaned!)
+    pic = np.zeros((480, 640, 3), dtype=np.uint8)
+    pic[48:432, 32:608] = _picture(576, 384)
+    im = Image.fromarray(pic)
+    ex = Image.Exif()
+    ex[0x010F] = "Canon"
+    ex.get_ifd(0x8769)[0xA002] = 640
+    ex.get_ifd(0x8769)[0xA003] = 480
+    ex.get_ifd(1)[0x0103] = 6
+    xmp = b"<x:xmpmeta>kept-xmp</x:xmpmeta>"
+    app13 = b"Photoshop 3.0\x008BIM\x04\x04\x00\x00\x00\x04iptc"
+    extra = b"\xff\xed" + (len(app13) + 2).to_bytes(2, "big") + app13
+    src_jpg = tmp_path / "q75.jpg"
+    im.save(src_jpg, format="JPEG", quality=75, exif=ex.tobytes(), xmp=xmp, extra=extra)
+    box_jpg = CropBox(left=32, top=48, right=608, bottom=432, width=640, height=480)
+    dst_jpg = tmp_path / "q75_cropped.jpg"
+    borders.write_cropped_copy(src_jpg, box_jpg, dst_jpg)
+    with Image.open(dst_jpg) as out_j:
+        assert out_j.size == (576, 384)
+        out_ex = out_j.getexif()
+        assert out_ex.get(0x010F) == "Canon"
+        assert 0xA002 not in out_ex.get_ifd(0x8769)
+        assert not out_ex.get_ifd(1)
+        assert out_j.info.get("xmp") == xmp
+        assert "APP13" in getattr(out_j, "app", {})
+    assert dst_jpg.stat().st_size <= src_jpg.stat().st_size * 1.15
+
+    # 2. PNG PngInfo + XMP + EXIF
+    pi = PngImagePlugin.PngInfo()
+    pi.add_text("Comment", "keep-me")
+    pi.add_itxt("XML:com.adobe.xmp", xmp.decode())
+    src_png = tmp_path / "meta.png"
+    im.save(src_png, format="PNG", pnginfo=pi, exif=ex.tobytes())
+    dst_png = tmp_path / "meta_out.png"
+    borders.write_cropped_copy(src_png, box_jpg, dst_png)
+    with Image.open(dst_png) as out_p:
+        assert out_p.text.get("Comment") == "keep-me"
+        assert "kept-xmp" in out_p.text.get("XML:com.adobe.xmp", "")
+        assert out_p.getexif().get(0x010F) == "Canon"
+
+    # 3. Compressed TIFF (tiff_lzw) preserves IFD0 EXIF & XMP cleanly
+    ifd = ImageFileDirectory_v2()
+    ifd[271] = "Nikon"
+    ifd[700] = xmp
+    src_tif = tmp_path / "comp.tif"
+    im.save(src_tif, format="TIFF", compression="tiff_lzw", tiffinfo=ifd)
+    dst_tif = tmp_path / "comp_out.tif"
+    borders.write_cropped_copy(src_tif, box_jpg, dst_tif)
+    with Image.open(dst_tif) as out_t:
+        assert out_t.tag_v2.get(271) == "Nikon"
+        assert out_t.tag_v2.get(700) == xmp
+
+    # 4. Lossless WebP stays VP8L lossless
+    src_webp = tmp_path / "lossless.webp"
+    im.save(src_webp, format="WEBP", lossless=True, xmp=xmp)
+    assert borders._is_lossless_webp(src_webp)
+    dst_webp = tmp_path / "lossless_out.webp"
+    borders.write_cropped_copy(src_webp, box_jpg, dst_webp)
+    assert borders._is_lossless_webp(dst_webp)
+    with Image.open(dst_webp) as out_w:
+        assert out_w.info.get("xmp") == xmp
+
+    # 5. Animated WebP and multi-page TIFF refused cleanly
+    anim_webp = tmp_path / "anim.webp"
+    frame2 = Image.fromarray((255 - pic).astype(np.uint8))
+    im.save(anim_webp, format="WEBP", save_all=True, append_images=[frame2])
+    assert borders.detect_crop_levels(anim_webp) == {k: None for k in borders.CROP_LEVELS}
+    with pytest.raises(ValueError, match="multi-frame|animated"):
+        borders.write_cropped_copy(anim_webp, box_jpg, tmp_path / "fail.webp")
+
+    multi_tif = tmp_path / "multi.tif"
+    im.save(multi_tif, format="TIFF", save_all=True, append_images=[frame2])
+    assert borders.detect_crop_levels(multi_tif) == {k: None for k in borders.CROP_LEVELS}
+    with pytest.raises(ValueError, match="multi-frame|animated"):
+        borders.write_cropped_copy(multi_tif, box_jpg, tmp_path / "fail.tif")
+
+    # 6. AVIF supported when Pillow avif codec is enabled
+    if features.check("avif"):
+        src_avif = tmp_path / "boxed.avif"
+        im.save(src_avif, format="AVIF", quality=90)
+        assert borders.detect_black_borders(src_avif) is not None
+
+    # 7. EXDEV rollback via shutil.move in crop_file_in_place
+    rb_p = tmp_path / "rb.png"
+    im.save(rb_p)
+    rb_bytes = rb_p.read_bytes()
+    rec = FileRecord(path=str(rb_p), size=len(rb_bytes), mtime=0.0,
+                     media_type=MediaType.IMAGE, extension=".png")
+    orig_replace = borders.os.replace
+    calls = 0
+
+    def fail_both_replaces(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "temp replace failed")
+        raise OSError(errno.EXDEV, "cross-device trash")
+
+    monkeypatch.setattr(borders.os, "replace", fail_both_replaces)
+    with pytest.raises(OSError, match="temp replace failed"):
+        crop_file_in_place(rec, box_jpg, send_to_trash=_fake_trash(tmp_path / "trash"))
+    monkeypatch.setattr(borders.os, "replace", orig_replace)
+    assert rb_p.read_bytes() == rb_bytes
+
+
+@requires_ffmpeg
+def test_video_batched_decode_colour_blurred_ui_hdr_and_mkv_webm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from PIL import ImageDraw
+
+    # 1. Single batched ffmpeg decode (verify only 1 ffmpeg subprocess call for sample frames)
+    v_pillar = _pillarboxed(tmp_path / "pillar.mp4")
+    real_run = borders.subprocess.run
+    ffmpeg_calls = 0
+
+    def spy_run(cmd, *args, **kwargs):
+        nonlocal ffmpeg_calls
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "ffmpeg":
+            ffmpeg_calls += 1
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(borders.subprocess, "run", spy_run)
+    pbox = borders.detect_video_borders(v_pillar)
+    assert pbox is not None and "black_bar" in pbox.to_dict()["provenance"]
+    assert ffmpeg_calls == 1
+    monkeypatch.undo()
+
+    # 2. Flat white colour pillarbox video
+    v_white = _make_video(
+        tmp_path / "white_pillar.mp4",
+        "color=c=white:size=640x360:rate=15:duration=2.0[bg];"
+        "testsrc2=size=220x360:rate=15:duration=2.0[fg];"
+        "[bg][fg]overlay=210:0",
+    )
+    wbox = borders.detect_video_borders(v_white)
+    assert wbox is not None and wbox.left >= 204 and wbox.right <= 436
+    assert "colour_bar" in wbox.to_dict()["provenance"]
+
+    # 3. Blurred/mirrored pillarbox video
+    v_blur = _make_video(
+        tmp_path / "blurred_pillar.mp4",
+        "testsrc2=size=202x360:rate=15:duration=2.0,split[fg][bg];"
+        "[bg]scale=640:360:flags=bicubic,gblur=sigma=12[blur];"
+        "[blur][fg]overlay=(W-w)/2:0",
+    )
+    bbox = borders.detect_video_borders(v_blur)
+    assert bbox is not None and 208 <= bbox.left <= 230 and 410 <= bbox.right <= 432
+    assert "blurred_bar" in bbox.to_dict()["provenance"]
+
+    # 4. Static screen-recording UI bar over moving video (vs non-moving static video)
+    frames = []
+    for i in range(18):
+        img = Image.new("RGB", (360, 640), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        _status_glyphs(draw, 360, 14, 30, (0, 0, 0))
+        _nav_buttons(draw, 360, 606, 630, (0, 0, 0))
+        # Animated center picture (shifting seed per frame so temp_std is high inside)
+        img.paste(Image.fromarray(_picture(360, 460, seed=10 + i * 3)), (0, 68))
+        frames.append(img)
+    seq_dir = tmp_path / "ui_seq"
+    seq_dir.mkdir()
+    for idx, im_f in enumerate(frames):
+        im_f.save(seq_dir / f"f_{idx:03d}.png")
+    v_ui = tmp_path / "screen_rec.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-framerate", "15",
+         "-i", str(seq_dir / "f_%03d.png"), "-pix_fmt", "yuv420p", str(v_ui)],
+        check=True,
+    )
+    uibox = borders.detect_video_borders(v_ui)
+    assert uibox is not None and "top" in uibox.chrome and 28 <= uibox.top <= 70
+    assert "chrome" in uibox.to_dict()["provenance"]
+
+    # 5. Crop .mkv and .webm containers + progress_cb + HDR metadata tags
+    v_mkv = _make_video(
+        tmp_path / "box.mkv",
+        "color=c=black:size=640x360:rate=15:duration=1.5[bg];"
+        "testsrc=size=220x360:rate=15:duration=1.5[fg];[bg][fg]overlay=210:0",
+    )
+    mkv_box = borders.detect_video_borders(v_mkv)
+    assert mkv_box is not None
+    prog: list[float] = []
+    out_mkv = tmp_path / "out.mkv"
+    w_m, h_m = borders.write_cropped_video_copy(v_mkv, mkv_box, out_mkv, progress_cb=prog.append)
+    assert (w_m, h_m) == (mkv_box.crop_width, mkv_box.crop_height)
+    assert prog and prog[-1] == 1.0
+
+    encoders = borders._ffmpeg_encoders()
+    if "libvpx-vp9" in encoders or "libvpx" in encoders:
+        v_webm = tmp_path / "box.webm"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+             ("color=c=black:size=320x180:rate=15:duration=1[bg];"
+              "testsrc=size=160x180:rate=15:duration=1[fg];[bg][fg]overlay=80:0"),
+             "-c:v", "libvpx-vp9" if "libvpx-vp9" in encoders else "libvpx",
+             "-pix_fmt", "yuv420p", str(v_webm)],
+            check=True,
+        )
+        webm_box = borders.detect_video_borders(v_webm)
+        assert webm_box is not None
+        out_webm = tmp_path / "out.webm"
+        w_w, h_w = borders.write_cropped_video_copy(v_webm, webm_box, out_webm)
+        assert (w_w, h_w) == (webm_box.crop_width, webm_box.crop_height)
+
+    # HDR color tag preservation + software fallback test via DEDUPE_DISABLE_HWACCEL
+    v_hdr = tmp_path / "hdr.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+         ("color=c=black:size=320x180:rate=15:duration=1[bg];"
+          "testsrc=size=160x180:rate=15:duration=1[fg];[bg][fg]overlay=80:0,"
+          "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc"),
+         "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+         "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+         str(v_hdr)],
+        check=True,
+    )
+    monkeypatch.setenv("DEDUPE_DISABLE_HWACCEL", "1")
+    hdr_box = borders.detect_video_borders(v_hdr)
+    assert hdr_box is not None
+    out_hdr = tmp_path / "out_hdr.mp4"
+    borders.write_cropped_video_copy(v_hdr, hdr_box, out_hdr)
+    hdr_probe = borders._probe_video_stream(out_hdr)
+    assert hdr_probe is not None
+    assert hdr_probe["color_primaries"] == "bt2020"
+    assert hdr_probe["color_trc"] == "smpte2084"

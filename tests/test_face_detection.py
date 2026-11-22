@@ -395,3 +395,107 @@ def test_count_faces_in_files_includes_videos(tmp_path: Path, monkeypatch) -> No
     assert analyzed == [record]
     assert record.face_count == 0
     assert record.face_detection_signature == face_detection_signature()
+
+
+def test_load_genderage_false_skips_genderage_model(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("cv2")
+    monkeypatch.setattr(
+        "dedupe.face_detection.GENDERAGE_MODEL_PATH", tmp_path / "missing-genderage.onnx"
+    )
+    counter = _YuNetFaceCounter(load_genderage=False)
+    assert counter.gender is None
+    assert counter.analyze_frame(np.zeros((64, 64, 3), dtype=np.uint8)) == (0, 0, 0)
+
+
+def test_detect_best_runs_second_pass_when_long_side_exceeds_480() -> None:
+    counter, face = _fake_counter()
+
+    counter._detect_best(np.zeros((400, 800, 3), dtype=np.uint8))
+
+    assert face.detect_calls == [(800, 400), (480, 240)]
+
+
+def test_classify_faces_guards_zero_pixel_face_boxes() -> None:
+    counter, _face = _fake_counter()
+    counter.gender = object()
+    degenerate = np.array([[10.0, 20.0, 0.0, 0.0], [10.0, 20.0, 0.0, 12.0]], dtype=np.float32)
+
+    assert counter._classify_faces(np.zeros((64, 64, 3), dtype=np.uint8), degenerate) == (0, 0)
+
+
+def test_analyze_face_count_takes_gender_counts_from_busiest_frame(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = _video_record(tmp_path / "clip.mp4")
+    record.duration = 6.0
+    _stub_video_frames(monkeypatch, [0.0, 3.0, 5.9])
+    counter = _StubCounter([(3, 2, 1), (2, 0, 2), (1, 1, 0)])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 3
+    assert record.face_count == 3
+    assert record.male_face_count == 2
+    assert record.female_face_count == 1
+    assert record.male_face_count + record.female_face_count <= record.face_count
+
+
+def test_protect_no_person_candidates_forwards_workers_progress_cancelled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    candidate = _image_record(tmp_path / "c.jpg")
+    candidate.human_detection_status = "no_person_detected"
+    seen: dict = {}
+
+    def fake_count(records, **kwargs):
+        seen["records"] = list(records)
+        seen["kwargs"] = kwargs
+        return list(records)
+
+    monkeypatch.setattr("dedupe.face_detection.count_faces_in_files", fake_count)
+
+    def progress(*_args) -> None:
+        return None
+
+    def cancelled() -> bool:
+        return False
+
+    protect_no_person_candidates([candidate], workers=3, progress=progress, cancelled=cancelled)
+
+    assert seen["records"] == [candidate]
+    assert seen["kwargs"] == {"workers": 3, "progress": progress, "cancelled": cancelled}
+
+
+def test_analyze_face_count_never_exceeds_busiest_frame_total(
+    tmp_path: Path, monkeypatch
+) -> None:
+    record = _video_record(tmp_path / "split.mp4")
+    record.duration = 4.0
+    _stub_video_frames(monkeypatch, [0.0, 2.0])
+    counter = _StubCounter([(2, 2, 0), (2, 0, 2)])
+
+    count = analyze_face_count(record, counter, cache_signature="sig")
+
+    assert count == 2
+    assert (record.male_face_count or 0) + (record.female_face_count or 0) <= count
+
+
+def test_face_counter_verifies_onnx_sha256_once_per_process(monkeypatch) -> None:
+    import hashlib
+
+    pytest.importorskip("cv2")
+    from dedupe.people_score import _cached_file_sha256
+
+    _cached_file_sha256.cache_clear()
+    digests = 0
+    real_digest = hashlib.file_digest
+
+    def spy_digest(fileobj, algorithm):
+        nonlocal digests
+        digests += 1
+        return real_digest(fileobj, algorithm)
+
+    monkeypatch.setattr(hashlib, "file_digest", spy_digest)
+    _YuNetFaceCounter(load_genderage=True)
+    _YuNetFaceCounter(load_genderage=True)
+    assert digests == 2

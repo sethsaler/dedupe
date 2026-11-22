@@ -75,17 +75,23 @@
               Files…
             </button>
           </div>
+          <div class="path-chips" id="pathChips" hidden aria-label="Selected scan folders and files"></div>
           <div class="recent-paths" id="recentPaths" hidden></div>
           <p class="thresh-hint cross-folder-hint" id="crossFolderHint" hidden>
             Scan folders separately is on: duplicates <em>across</em> folders are not found.
             Turn off “Scan folders separately” in Scan settings below to compare all selected folders together.
           </p>
+          <p class="thresh-hint setup-conflict-hint" id="setupConflictHint" hidden role="status"></p>
         </div>
 
         <section class="protected-setup" aria-label="Protected library">
-          <label class="field-row" for="protectedFolders">Compare against a protected library (optional, one folder per line)
-            <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
-          </label>
+          <div class="field-row">
+            <label for="protectedFolders">Compare against a protected library (optional, one folder per line)</label>
+            <div class="textarea-pick-row">
+              <textarea id="protectedFolders" rows="2" placeholder="~/Pictures/Archive" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
+              <button type="button" class="btn ghost path-pick-sm" id="btnPickProtected" title="Choose protected folders">Folders…</button>
+            </div>
+          </div>
           <p class="thresh-hint">These folders are included in the comparison. Their files cannot be removed or moved; only the cleanup folders above can change.</p>
         </section>
 
@@ -98,7 +104,7 @@
               <option value="deep">Find duplicates and edited copies</option>
             </optgroup>
             <optgroup label="Review">
-              <option value="crop">Find images &amp; videos to crop (black bars, flat borders, screenshot interface)</option>
+              <option value="crop">Find images &amp; videos to crop</option>
               <option value="faces">Find photos with faces</option>
               <option value="no_humans">Find photos without people</option>
               <option value="low_resolution">Find low-resolution media</option>
@@ -111,7 +117,7 @@
           <p class="thresh-hint" id="presetHint">Find exact copies and similar versions, including resized or lightly edited media, across all folders.</p>
         </div>
         <section class="saved-jobs" id="savedJobs" aria-label="Saved cleanup jobs">
-          <h3 class="setup-heading">Saved cleanup jobs</h3>
+          <h2 class="setup-heading">Saved cleanup jobs</h2>
           <div class="job-controls">
             <label for="cleanupJob">Job<select id="cleanupJob"><option value="">New cleanup</option></select></label>
             <label for="cleanupJobName">Name<input id="cleanupJobName" type="text" maxlength="100" placeholder="Downloads against archive" /></label>
@@ -123,7 +129,7 @@
           <p class="thresh-hint" id="jobHint">Save folders and settings together. Each job keeps its own review progress.</p>
         </section>
         <div class="options-heading">
-          <h3>Scan settings</h3>
+          <h2>Scan settings</h2>
           <p class="thresh-hint">Every setting is shown here. Pick a goal above, or adjust anything directly — then Scan, pinned below.</p>
         </div>
 
@@ -132,23 +138,27 @@
             <legend class="opt-label">Detect</legend>
             <label class="chip-check" id="optExactWrap"><input type="checkbox" id="optExact" checked /><span>Exact</span></label>
             <label class="chip-check" id="optSimilarWrap"><input type="checkbox" id="optSimilar" checked /><span>Similar</span></label>
-            <label class="chip-check" id="optVideoVersionsWrap"><input type="checkbox" id="optVideoVersions" /><span>Video clips &amp; versions</span></label>
-            <label class="chip-check" id="optSemanticWrap" title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp"><input type="checkbox" id="optSemantic" /><span>Sets &amp; look-alikes (DigUp)</span></label>
+            <label class="chip-check" id="optVideoVersionsWrap" title="Find trimmed clips, offset versions, and soundtrack differences across videos"><input type="checkbox" id="optVideoVersions" /><span>Video clips &amp; versions</span></label>
+            <label class="chip-check" id="optSemanticWrap" title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp" data-default-title="Find look-alike images by meaning with EmbeddingGemma 2, through DigUp"><input type="checkbox" id="optSemantic" /><span>Sets &amp; look-alikes (DigUp)</span></label>
             <label class="chip-check" id="optNoHumansWrap"><input type="checkbox" id="optNoHumans" /><span>Non-Human (no person)</span></label>
             <label class="chip-check" id="optCountFacesWrap"><input type="checkbox" id="optCountFaces" /><span>Count faces</span></label>
             <label class="chip-check" id="optBlackBordersWrap" title="Find images and MP4/MOV videos framed by black bars, images framed in white or another flat colour, and screenshots with interface at the edges (status bar, app header, navigation bar, reply field), and suggest a crop"><input type="checkbox" id="optBlackBorders" /><span>Crops — images &amp; videos (black bars, flat borders, screenshot interface)</span></label>
             <span class="thresh-hint" id="depHint" hidden></span>
           </fieldset>
-          <label class="field-row" for="preferredFolders">Preferred keeper folders (one per line, highest priority first)
-            <textarea id="preferredFolders" rows="2" placeholder="~/Pictures/Originals" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
+          <div class="field-row">
+            <label for="preferredFolders">Preferred keeper folders (one per line, highest priority first)</label>
+            <div class="textarea-pick-row">
+              <textarea id="preferredFolders" rows="2" placeholder="~/Pictures/Originals" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
+              <button type="button" class="btn ghost path-pick-sm" id="btnPickPreferred" title="Choose preferred folders">Folders…</button>
+            </div>
             <span class="thresh-hint">A preference chooses which duplicate survives. It does not protect every file in the folder.</span>
-          </label>
+          </div>
           <div class="semantic-fields" id="semanticFields" hidden>
             <label class="thresh" for="semanticDuplicateThreshold">
               <span class="opt-label">Look-alike duplicates</span>
-              <input type="range" id="semanticDuplicateThreshold" min="90" max="99.9" step="0.1" value="97" />
-              <span id="semanticDuplicateVal" class="thresh-val">97%</span>
-              <span class="thresh-hint">Below 97% requires geometric copy verification (OpenCV). Higher scores are still review suggestions, not proof.</span>
+              <input type="range" id="semanticDuplicateThreshold" min="90" max="99.9" step="0.1" value="92" />
+              <span id="semanticDuplicateVal" class="thresh-val">92%</span>
+              <span class="thresh-hint">Below 92% uses local geometric verification (OpenCV). Higher scores are still review suggestions, not proof.</span>
             </label>
             <label class="thresh" for="semanticSetThreshold">
               <span class="opt-label">Sets</span>
@@ -156,7 +166,7 @@
               <span id="semanticSetVal" class="thresh-val">88%</span>
               <span class="thresh-hint">higher = tighter sets of one shoot; lower = broader subjects</span>
             </label>
-            <label class="chip-check" id="optDeciderWrap" title="Add a second opinion for look-alikes that pass the image detail checks; visible differences always keep photos separate"><input type="checkbox" id="optDecider" /><span>Verify look-alikes with Decider</span></label>
+            <label class="chip-check" id="optDeciderWrap" title="Add a second opinion for look-alikes that pass the image detail checks; visible differences always keep photos separate" data-default-title="Add a second opinion for look-alikes that pass the image detail checks; visible differences always keep photos separate"><input type="checkbox" id="optDecider" /><span>Verify look-alikes with Decider</span></label>
             <label class="chip-check" id="optSemanticFastWrap" title="Embed new images at full GPU speed: about a third less embedding time, but the Mac runs warmer and other apps may stutter. When off, DigUp runs at background priority."><input type="checkbox" id="optSemanticFast" /><span>Embed at full speed (warmer)</span></label>
             <span class="thresh-hint">Rescans reuse cached embeddings, so trying another value is quick.</span>
           </div>
@@ -183,18 +193,20 @@
             <label class="chip-check"><input type="checkbox" id="optLowResolution" /><span>Low resolution</span></label>
             <label class="chip-check"><input type="checkbox" id="optRandomReview" /><span>Random set of 50</span></label>
           </fieldset>
-          <fieldset class="opt-group">
-            <legend class="opt-label">Low-res types</legend>
-            <label class="chip-check"><input type="checkbox" id="optLowResolutionImages" checked /><span>Images</span></label>
-            <label class="chip-check"><input type="checkbox" id="optLowResolutionGifs" checked /><span>GIFs</span></label>
-            <label class="chip-check"><input type="checkbox" id="optLowResolutionVideos" checked /><span>Videos</span></label>
-          </fieldset>
-          <fieldset class="low-resolution-bounds">
-            <legend class="opt-label">Low-res bounds</legend>
-            <label>Images below <input id="lowResolutionImageMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
-            <label>GIFs below <input id="lowResolutionGifMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
-            <label>Videos below <input id="lowResolutionVideoMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
-          </fieldset>
+          <div id="lowResFields" class="low-res-fields" hidden>
+            <fieldset class="opt-group">
+              <legend class="opt-label">Low-res types</legend>
+              <label class="chip-check"><input type="checkbox" id="optLowResolutionImages" checked /><span>Images</span></label>
+              <label class="chip-check"><input type="checkbox" id="optLowResolutionGifs" checked /><span>GIFs</span></label>
+              <label class="chip-check"><input type="checkbox" id="optLowResolutionVideos" checked /><span>Videos</span></label>
+            </fieldset>
+            <fieldset class="low-resolution-bounds">
+              <legend class="opt-label">Low-res bounds</legend>
+              <label>Images below <input id="lowResolutionImageMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
+              <label>GIFs below <input id="lowResolutionGifMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
+              <label>Videos below <input id="lowResolutionVideoMaxMp" type="number" min="0.01" step="0.1" value="1" /> MP</label>
+            </fieldset>
+          </div>
           <fieldset class="opt-group">
             <legend class="opt-label">Types</legend>
             <label class="chip-check"><input type="checkbox" id="optImages" checked /><span>Images</span></label>
@@ -206,24 +218,26 @@
             <label class="chip-check"><input type="checkbox" id="optParallel" /><span>Scan folders separately</span></label>
             <span class="thresh-hint">By default, find matches within and across all selected folders. Separate scans only find matches within each folder.</span>
           </fieldset>
-          <label class="preset-field">
-            <span class="opt-label">Similarity preset</span>
-            <select id="similarityPreset">
-              <option value="0">Exact visual</option>
-              <option value="3">Very strict</option>
-              <option value="6" selected>Balanced</option>
-              <option value="10">Broader</option>
-              <option value="" disabled>Custom (raw slider)</option>
-            </select>
-            <span class="thresh-hint">Start strict; broader results need closer review.</span>
-          </label>
-          <div class="advanced-options">
-            <label class="thresh" for="threshold">
-              <span class="opt-label">Similarity distance (raw)</span>
-              <input type="range" id="threshold" min="0" max="16" value="6" />
-              <span id="threshVal" class="thresh-val">6</span>
-              <span class="thresh-hint">lower = stricter</span>
+          <div id="similarityFields" class="similarity-fields">
+            <label class="preset-field">
+              <span class="opt-label">Similarity preset</span>
+              <select id="similarityPreset">
+                <option value="0">Exact visual</option>
+                <option value="3">Very strict</option>
+                <option value="6" selected>Balanced</option>
+                <option value="10">Broader</option>
+                <option value="" disabled>Custom (raw slider)</option>
+              </select>
+              <span class="thresh-hint">Start strict; broader results need closer review.</span>
             </label>
+            <div class="advanced-options">
+              <label class="thresh" for="threshold">
+                <span class="opt-label">Similarity distance (raw)</span>
+                <input type="range" id="threshold" min="0" max="16" value="6" />
+                <span id="threshVal" class="thresh-val">6</span>
+                <span class="thresh-hint">lower = stricter</span>
+              </label>
+            </div>
           </div>
           <label class="thresh workers-field">
             <span class="opt-label">Workers</span>
@@ -278,7 +292,7 @@
         <button class="linkish session-dismiss" id="btnDismissSession" type="button" title="Dismiss this banner" aria-label="Dismiss this banner">✕</button>
       </div>
       <details class="scan-quality" id="scanQuality" hidden>
-        <summary>Scan quality <span id="scanQualitySummary"></span></summary>
+        <summary>Scan quality <span id="scanQualitySummary"></span> <span class="quality-badge" id="scanQualityBadge" hidden></span></summary>
         <div class="quality-warning" id="scanQualityWarning" hidden role="alert"></div>
         <div class="quality-grid" id="scanQualityGrid"></div>
         <ul class="quality-warnings" id="scanQualityWarnings"></ul>
@@ -303,23 +317,23 @@
           <li><span>3</span> Review, smart-select, act safely</li>
         </ul>
         <p class="empty-hint">
-          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd>/<kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>↑</kbd> back · <kbd>d</kbd> Trash Non-Human/Faces/Files · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
+          Keyboard: <kbd>j</kbd>/<kbd>k</kbd> groups · <kbd>←</kbd> Delete · <kbd>→</kbd> Keep in Low-res &amp; Random · <kbd>↑</kbd> back · <kbd>d</kbd> Trash Non-Human/Faces/Files · <kbd>Enter</kbd> lightbox · <kbd>?</kbd> help
         </p>
       </div>
     </section>
 
     <section class="results" id="results" hidden>
         <div class="filter-tabs" role="tablist" aria-label="Result categories">
-          <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
-          <button class="tab" data-kind="exact" type="button" role="tab" aria-selected="false" tabindex="-1">Exact <span class="tab-count" id="countExact">0</span></button>
-          <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
-          <button class="tab" data-kind="sets" type="button" role="tab" aria-selected="false" tabindex="-1" title="Look-alike images of one subject or shoot (EmbeddingGemma 2 through DigUp)">Sets <span class="tab-count" id="countSets">0</span></button>
-          <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false" tabindex="-1">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
-          <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
-          <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
-          <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
-          <button class="tab" data-kind="crop" type="button" role="tab" aria-selected="false" tabindex="-1" title="Images and videos framed by black bars, a flat border, or screenshot interface, with a suggested crop">Crop <span class="tab-count" id="countCrop">0</span></button>
-          <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" tabindex="-1">All files <span class="tab-count" id="countAllFiles">0</span></button>
+          <button class="tab active" data-kind="all" type="button" role="tab" aria-selected="true" aria-controls="main" tabindex="0">All <span class="tab-count" id="countAll">0</span></button>
+          <button class="tab" data-kind="exact" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Exact <span class="tab-count" id="countExact">0</span></button>
+          <button class="tab" data-kind="similar" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Similar <span class="tab-count" id="countSimilar">0</span></button>
+          <button class="tab" data-kind="sets" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1" title="Look-alike images of one subject or shoot (EmbeddingGemma 2 through DigUp)">Sets <span class="tab-count" id="countSets">0</span></button>
+          <button class="tab" data-kind="low_resolution" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Low-res <span class="tab-count" id="countLowResolution">0</span></button>
+          <button class="tab" data-kind="random_review" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Random <span class="tab-count" id="countRandomReview">0</span></button>
+          <button class="tab" data-kind="no_humans" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Non-Human <span class="tab-count" id="countNoHumans">0</span></button>
+          <button class="tab" data-kind="faces" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">Faces <span class="tab-count" id="countFaces">0</span></button>
+          <button class="tab" data-kind="crop" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1" title="Images and videos framed by black bars, a flat border, or screenshot interface, with a suggested crop">Crop <span class="tab-count" id="countCrop">0</span></button>
+          <button class="tab" data-kind="all_files" type="button" role="tab" aria-selected="false" aria-controls="main" tabindex="-1">All files <span class="tab-count" id="countAllFiles">0</span></button>
         </div>
       <aside class="sidebar">
         <search class="result-controls" aria-label="Find and organize results">
@@ -333,7 +347,7 @@
           </label>
           <div class="review-filters" id="reviewFilters">
             <div class="filter-head-row">
-              <h3 class="filter-heading">Filter &amp; organize</h3>
+              <h2 class="filter-heading">Filter &amp; organize</h2>
               <button class="btn ghost" id="exportReviewLabels" type="button" title="Export local Same/Different decisions and review timing; restore trashed samples before benchmarking">Export review labels</button>
             </div>
           <div class="result-control-grid">
@@ -359,7 +373,7 @@
             <label class="toggle-option"><input id="hideCompleted" type="checkbox" /> Hide completed</label>
           </div>
           <section class="sidebar-panel filter-section" id="advancedFilters" aria-label="Advanced filters">
-            <h4 class="filter-heading" title="A group matches when any file matches. Path: substring or glob. Faces need a Count faces scan.">Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></h4>
+            <h3 class="filter-heading" title="A group matches when any file matches. Path: substring or glob. Faces need a Count faces scan.">Advanced filters <span class="panel-flag" id="advancedFilterFlag" hidden>on</span></h3>
             <div class="adv-grid">
               <label class="adv-field" for="filterMinMb">Size MB
                 <span class="range-pair">
@@ -388,7 +402,7 @@
           </section>
           <section class="sidebar-panel filter-section" id="bulkPanel" aria-label="Bulk selection">
             <div class="filter-head-row">
-              <h4 class="filter-heading">Bulk selection</h4>
+              <h3 class="filter-heading">Bulk selection</h3>
               <span class="muted small" id="bulkScope">Groups shown only</span>
             </div>
             <div class="bulk-row">
@@ -425,7 +439,7 @@
           <p>Select a group from the left to compare files.</p>
           <p class="muted small">Suggested keeps are outlined; files marked for removal are outlined in red. Files are revalidated against the scan before they move.</p>
         </div>
-        <div class="detail-body" id="detailBody" hidden>
+        <div class="detail-body" id="detailBody" hidden aria-labelledby="detailTitle">
           <div class="detail-header">
             <div class="detail-heading">
               <h2 id="detailTitle">Group</h2>
@@ -455,6 +469,8 @@
             <button class="btn ghost" id="btnToggleCropZones" type="button" hidden aria-pressed="true" title="Hide every suggested crop zone to see the untouched pictures; show them again to see what a crop removes">
               Hide crop zones
             </button>
+            <button class="btn ghost" id="btnMarkGroupReviewed" type="button" hidden aria-pressed="false" title="Mark this group reviewed so Hide completed skips it">Mark reviewed</button>
+            <button class="btn ghost" id="btnRecheckCropDups" type="button" hidden title="Check newly cropped files against your scanned library for duplicates">Check cropped for duplicates</button>
             <div class="non-human-banner popover guide-popover" id="nonHumanBanner" hidden>
               <button type="button" class="guide-trigger" id="btnNonHumanGuide" popovertarget="nonHumanGuidePopover" title="About Non-Human review">? Guide</button>
               <div class="guide-popover-panel" id="nonHumanGuidePopover" popover="auto">
@@ -550,6 +566,16 @@
               <option value="maybe-none" title="People score 20% or less">Maybe no people</option>
             </select>
           </nav>
+          <p class="scan-preview-note muted small" id="scanPreviewNote" hidden>Previewing while scan finishes — selections unlock when done.</p>
+          <div class="crop-filters" id="cropFilters" hidden role="group" aria-label="Filter crop candidates">
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="pending" aria-pressed="true">Pending</button>
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="all" aria-pressed="false">All</button>
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="images" aria-pressed="false">Images</button>
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="videos" aria-pressed="false">Videos</button>
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="screenshots" aria-pressed="false">Screenshots</button>
+            <button class="btn ghost crop-filter-chip" type="button" data-crop-filter="clear_bars" aria-pressed="false">Clear bars</button>
+            <button class="btn ghost" id="btnSkipAllCrops" type="button" hidden>Skip remaining</button>
+          </div>
           <div class="members" id="members"></div>
           <nav class="member-pagination member-pagination-bottom" id="memberPaginationBottom" aria-label="More review results" hidden>
             <button class="btn ghost member-prev" type="button">Previous</button>
@@ -574,8 +600,23 @@
               <select id="boardFilter">
                 <option value="all">All groups</option>
                 <option value="uncertain">Needs a look (&lt; 95% match)</option>
+                <option value="strong">Strong match (≥ 95%)</option>
+                <option value="semantic">Look-alikes (DigUp)</option>
+                <option value="videos">Videos only</option>
               </select>
             </label>
+            <label class="control-field board-sort" for="boardSort">
+              <span>Sort</span>
+              <select id="boardSort">
+                <option value="opportunity">Best opportunities</option>
+                <option value="reclaimable">Largest savings</option>
+                <option value="date">Newest</option>
+              </select>
+            </label>
+            <div class="board-bulk-actions" id="boardBulkActions">
+              <button class="btn ghost" id="btnBoardUseSuggested" type="button" title="Reset shown rows to suggested selection">Use suggested (shown)</button>
+              <button class="btn ghost" id="btnBoardMarkReviewed" type="button" title="Mark shown rows reviewed">Mark shown reviewed</button>
+            </div>
           </search>
           <label class="preview-size" for="boardTileSize">Thumbnails
             <input id="boardTileSize" type="range" min="120" max="280" step="20" value="180" />
@@ -641,7 +682,8 @@
         <button type="button" class="btn ghost" id="btnCloseHistory">Close</button>
       </div>
       <p class="muted">Restore previous cleanups or reconsider files marked as different.</p>
-      <div id="historyList" aria-live="polite"></div>
+      <div id="historyList"></div>
+      <div id="historyStatus" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     </div>
   </dialog>
 
@@ -662,18 +704,33 @@
           <div class="lb-image-plane">
             <img id="lbImage" alt="Current file preview" />
             <img id="lbKeeperImage" class="lb-keeper-image" alt="Suggested keeper preview" hidden />
+            <div class="lb-split-handle" id="lbSplitHandle" hidden aria-hidden="true"><span class="lb-split-knob">↔</span></div>
+            <span class="lb-stage-badge" id="lbStageBadge" hidden>Candidate</span>
+            <span class="lb-status-pill" id="lbStatusPill" hidden></span>
           </div>
         </div>
         <video id="lbVideo" controls playsinline preload="metadata" hidden></video>
       </div>
       <div class="lb-stage-tools" id="lbStageTools" hidden>
         <button class="btn ghost" id="lbZoom" type="button" aria-pressed="false" title="Full-resolution zoom (z)">Zoom</button>
+        <select id="lbZoomLevel" aria-label="Zoom level">
+          <option value="fit">Fit</option>
+          <option value="1">100%</option>
+          <option value="2">200%</option>
+          <option value="4">400%</option>
+        </select>
       </div>
       <div class="lb-compare-tools" id="lbCompareTools" hidden>
         <label for="lbCompareMode">Comparison</label>
-        <select id="lbCompareMode"><option value="overlay">Overlay</option><option value="difference">Difference</option></select>
+        <select id="lbCompareMode">
+          <option value="overlay">Overlay</option>
+          <option value="difference">Difference</option>
+          <option value="split">Split curtain</option>
+          <option value="side">Side-by-side</option>
+        </select>
         <label for="lbOpacity">Keeper overlay</label>
-        <input id="lbOpacity" type="range" min="0" max="100" value="50" />
+        <input id="lbOpacity" type="range" min="0" max="100" value="0" />
+        <label class="lb-diff-gain-wrap" id="lbDiffGainWrap" hidden for="lbDiffGain">Gain <select id="lbDiffGain"><option value="1">1×</option><option value="4">4×</option><option value="8">8×</option></select></label>
         <button class="btn ghost" id="lbFlicker" type="button" aria-pressed="false">Hold to flicker keeper</button>
       </div>
       <div class="lb-video-tools" id="lbVideoTools" hidden>
@@ -690,6 +747,7 @@
       </div>
       <div class="lb-counter" id="lbCounter" aria-live="polite"></div>
       <div class="lb-meta" id="lbMeta"></div>
+      <div class="lb-diff-strip" id="lbDiffStrip" hidden></div>
       <div class="lb-details" id="lbDetails"></div>
       <div class="lb-select" id="lbSelectWrap" hidden>
         <button class="btn" id="lbSelect" type="button" aria-pressed="false">Mark for removal</button>
@@ -704,6 +762,16 @@
         <button class="btn primary-soft" id="lbKeep" type="button">Keep →</button>
         <span class="lb-action-hint">Nothing moves until you confirm staged removals.</span>
       </div>
+      <div class="lb-actions" id="lbPairActions" hidden>
+        <button class="btn primary-soft" id="lbKeepOnly" type="button" title="Keep only this file (Shift+K)">Keep only this</button>
+        <button class="btn ghost" id="lbNotDup" type="button" title="Mark group as not duplicates (n)">Not duplicates</button>
+        <button class="btn ghost" id="lbUndo" type="button" hidden>Undo</button>
+      </div>
+      <div class="lb-actions" id="lbCropActions" hidden>
+        <button class="btn primary-soft" id="lbCropAdjust" type="button">Adjust zone (e)</button>
+        <button class="btn primary" id="lbCropApply" type="button">Crop (c)</button>
+        <button class="btn ghost" id="lbCropSkip" type="button">Skip (x)</button>
+      </div>
       <div class="lb-actions lb-reveal">
         <button class="btn ghost" id="lbReveal" type="button" title="Reveal in Finder (r)">Reveal in Finder</button>
       </div>
@@ -714,41 +782,71 @@
   <!-- Confirm modal -->
   <dialog class="modal-backdrop" id="modalBackdrop" closedby="any" aria-labelledby="modalTitle">
     <div class="modal">
-      <h3 id="modalTitle">Confirm</h3>
+      <h2 id="modalTitle">Confirm</h2>
       <div id="modalBody"></div>
       <div class="modal-actions">
         <button class="btn ghost" id="modalCancel" type="button" autofocus>Cancel</button>
         <button class="btn danger" id="modalConfirm" type="button">Confirm</button>
       </div>
-      <p class="modal-validity" id="modalValidity" hidden aria-live="polite"></p>
+      <p class="modal-validity" id="modalValidity" hidden></p>
+      <div id="modalLiveRegion" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     </div>
   </dialog>
 
   <!-- Shortcuts help -->
   <dialog class="modal-backdrop" id="helpBackdrop" closedby="any" aria-labelledby="helpTitle">
     <div class="modal help-modal">
-      <h3 id="helpTitle">Keyboard shortcuts</h3>
-      <dl class="shortcuts">
-        <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group · in Low-res and Random review, ↓ steps to the next candidate without deciding</dd></div>
-        <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group · in Low-res and Random review, ↑ goes back to the previous candidate</dd></div>
+      <h2 id="helpTitle">Keyboard shortcuts</h2>
+      <div class="shortcuts">
+      <h3 class="help-section">Navigation</h3>
+      <dl class="shortcut-list">
+        <div><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next group · in Low-res and Random review, <kbd>↓</kbd> skips to the next candidate without deciding</dd></div>
+        <div><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous group · in Low-res and Random review, <kbd>↑</kbd> goes back to the previous candidate</dd></div>
         <div><dt><kbd>[</kbd> / <kbd>]</kbd></dt><dd>Previous / next group needing attention</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Previous / next card · in Low-res and Random review, Delete / Keep</dd></div>
+        <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox for focused card</dd></div>
+      </dl>
+      <h3 class="help-section">Review &amp; Triage</h3>
+      <dl class="shortcut-list">
         <div><dt><kbd>Space</kbd></dt><dd>Toggle remove on focused card · on a Non-Human, Faces, Files, or Sets picture, move it to Trash (same as clicking it)</dd></div>
-        <div><dt><kbd>Enter</kbd></dt><dd>Open lightbox</dd></div>
+        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, Files, or Sets file to Trash (one click, undo from the toast) · in exact/similar review, toggles removal</dd></div>
         <div><dt><kbd>u</kbd></dt><dd>Use suggested selection for this group</dd></div>
         <div><dt><kbd>s</kbd></dt><dd>Apply the selection rule to this group</dd></div>
+        <div><dt><kbd>r</kbd></dt><dd>Reveal the focused card's file in Finder</dd></div>
         <div><dt><kbd>a</kbd> / <kbd>A</kbd> / <kbd>D</kbd></dt><dd>Preview Trash for selected exact / similar / Low-res + Random review files</dd></div>
-        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Delete / Keep in Low-res and Random review · Same (Trash) / Different in Similar swipe · otherwise previous / next card · navigate in the lightbox</dd></div>
-        <div><dt><kbd>c</kbd> / <kbd>x</kbd> / <kbd>v</kbd></dt><dd>Crop the focused image or video in the Crop review (original to Trash, undo from the toast) / skip its suggestion / show or hide its suggested crop zone</dd></div>
-        <div><dt><kbd>e</kbd></dt><dd>Adjust the focused file's crop zone on a large view, with a field for each side (also the card's Adjust button, or a double-click on the zone)</dd></div>
-        <div><dt><kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd></dt><dd>In the Crop review, show the focused file's Conservative / Balanced / Aggressive suggestion — Crop cuts the level on show</dd></div>
-        <div><dt>Crop zone</dt><dd>Click a suggested crop zone to select it, drag it to move it, or drag an edge or corner to resize it — Crop then cuts the zone as shown (Reset zone on the card restores the suggestion). A dragged edge lands on the edges found at each level and on the picture's own edge; hold <kbd>Alt</kbd> to place it freely. With a zone focused, arrow keys move it, <kbd>⇧</kbd>+arrows move its bottom and right edges, and <kbd>Alt</kbd>+arrows its top and left edges. Clicking the picture outside the zone still opens the lightbox</dd></div>
-        <div><dt><kbd>d</kbd> / <kbd>⌫</kbd></dt><dd>Move the focused Non-Human, Faces, or Files file to Trash (one click, undo from the toast) · ⌫ undoes the last Similar swipe · in the lightbox, toggles removal for exact/similar files</dd></div>
-        <div><dt><kbd>r</kbd></dt><dd>Reveal the focused card's file in Finder · in the lightbox: reveal the current file</dd></div>
-        <div><dt><kbd>Space</kbd> / <kbd>z</kbd></dt><dd>In the lightbox: toggle removal / full-resolution zoom</dd></div>
-        <div><dt>Similar board</dt><dd><kbd>j</kbd>/<kbd>k</kbd> rows · <kbd>←</kbd>/<kbd>→</kbd> files · <kbd>Space</kbd> keep/remove · <kbd>⇧K</kbd> keep only this file · <kbd>u</kbd> suggested selection · <kbd>n</kbd> not duplicates · <kbd>Enter</kbd> lightbox · <kbd>c</kbd> swipe compare · <kbd>A</kbd> Trash every marked copy</dd></div>
-        <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
-        <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
       </dl>
+      <h3 class="help-section">Similar Board &amp; Swipe</h3>
+      <dl class="shortcut-list">
+        <div><dt><kbd>j</kbd>/<kbd>k</kbd> or <kbd>↑</kbd>/<kbd>↓</kbd></dt><dd>Move between rows on the Similar board</dd></div>
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Move between files in a board row · in Swipe mode, <kbd>←</kbd> Same (Trash) / <kbd>→</kbd> Different</dd></div>
+        <div><dt><kbd>Space</kbd> / <kbd>⇧K</kbd></dt><dd>Toggle keep/remove on focused file / keep only this file</dd></div>
+        <div><dt><kbd>u</kbd> / <kbd>n</kbd></dt><dd>Use suggested selection for row / mark group as not duplicates</dd></div>
+        <div><dt><kbd>r</kbd> / <kbd>Enter</kbd></dt><dd>Reveal focused file in Finder / open lightbox</dd></div>
+        <div><dt><kbd>c</kbd> / <kbd>⌫</kbd> / <kbd>A</kbd></dt><dd>Switch to swipe compare / undo last swipe / Trash every marked copy</dd></div>
+      </dl>
+      <h3 class="help-section">Lightbox</h3>
+      <dl class="shortcut-list">
+        <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Navigate files in normal lightbox · in Swipe lightbox, <kbd>←</kbd> Same (Trash) / <kbd>→</kbd> Different</dd></div>
+        <div><dt><kbd>[</kbd> / <kbd>]</kbd></dt><dd>Previous / next pair in Swipe lightbox</dd></div>
+        <div><dt><kbd>f</kbd> / <kbd>z</kbd></dt><dd>Hold <kbd>f</kbd> to flicker keeper / toggle full-resolution zoom (<kbd>z</kbd>)</dd></div>
+        <div><dt><kbd>Space</kbd> / <kbd>d</kbd></dt><dd>Toggle removal for exact or similar files</dd></div>
+        <div><dt><kbd>⇧K</kbd> / <kbd>n</kbd> / <kbd>r</kbd></dt><dd>Keep only this file / mark group not duplicates / reveal current file in Finder</dd></div>
+      </dl>
+      <h3 class="help-section">Crop &amp; Crop Editor</h3>
+      <dl class="shortcut-list">
+        <div><dt><kbd>c</kbd> / <kbd>x</kbd> / <kbd>v</kbd></dt><dd>Crop the focused image or video (original to Trash, undo from toast) / skip suggestion / show or hide crop zone (in Crop Editor, <kbd>v</kbd> cycles preview mode)</dd></div>
+        <div><dt><kbd>e</kbd> / <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Adjust crop zone in the Crop Editor / switch between Conservative (<kbd>1</kbd>), Balanced (<kbd>2</kbd>), and Aggressive (<kbd>3</kbd>) levels</dd></div>
+        <div><dt><kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd></dt><dd>Move crop zone · <kbd>Shift</kbd>+arrows resize bottom &amp; right edges · <kbd>Alt</kbd>+arrows resize top &amp; left edges (hold <kbd>Alt</kbd> while dragging to place freely)</dd></div>
+        <div><dt><kbd>r</kbd> / <kbd>[</kbd> <kbd>]</kbd> / <kbd>Esc</kbd></dt><dd>Reset suggested zone / previous &amp; next file in Crop Editor / close Crop Editor</dd></div>
+      </dl>
+      <h3 class="help-section">Global</h3>
+      <dl class="shortcut-list">
+        <div><dt><kbd>/</kbd></dt><dd>Focus the search box</dd></div>
+        <div><dt><kbd>⌘Z</kbd> / <kbd>Ctrl+Z</kbd></dt><dd>Undo the last Trash, Crop, or Not-duplicates action</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>This help</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Close overlay</dd></div>
+      </dl>
+      </div>
       <div class="modal-actions">
         <button class="btn primary" id="helpClose" type="button" autofocus>Got it</button>
       </div>
@@ -761,8 +859,11 @@
     <div class="ce-stage" id="ceStage">
       <div class="ce-frame" id="ceFrame">
         <img class="ce-image" id="ceImage" alt="" draggable="false" />
+        <video class="ce-video" id="ceVideo" muted playsinline preload="metadata" hidden></video>
+        <div class="ce-guides" id="ceGuides" hidden aria-hidden="true"></div>
         <span class="ce-box" id="ceBox" tabindex="0" role="group"></span>
       </div>
+      <div class="ce-video-strip" id="ceVideoStrip" hidden aria-label="Jump to sampled video positions"></div>
     </div>
     <aside class="ce-panel">
       <header class="ce-head">
@@ -770,6 +871,7 @@
         <div class="ce-count" id="ceCount"></div>
       </header>
       <p class="ce-summary" id="ceSummary" role="status"></p>
+      <div class="ce-aspect" id="ceAspect" hidden></div>
       <fieldset class="ce-sides">
         <legend>Pixels to remove from each side</legend>
         <div class="ce-side">
@@ -794,10 +896,12 @@
         </div>
       </fieldset>
       <div class="ce-levels" id="ceLevels"></div>
+      <button class="btn ghost" id="cePreviewToggle" type="button" title="Cycle preview: cut mask, cropped view, original (v)">Preview: Cut mask</button>
       <div class="ce-actions">
         <button class="btn primary" id="ceApply" type="button" title="Crop to the zone shown — the original goes to the Trash (c)">Crop</button>
         <button class="btn ghost" id="ceSkip" type="button" title="Leave this file as it is and stop suggesting it (x)">Skip</button>
         <button class="btn ghost" id="ceReset" type="button" title="Put the suggested zone back (r)">Reset zone</button>
+        <button class="btn ghost danger-soft" id="ceTrash" type="button" title="Move original file to Trash">Trash</button>
       </div>
       <div class="ce-nav">
         <button class="btn ghost" id="cePrev" type="button" title="Previous file to review ([)">‹ Previous</button>
@@ -814,6 +918,7 @@
 
   <div class="toast-region" role="region" aria-label="Notifications">
     <div id="toastLiveRegion" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div id="toastAlertRegion" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
     <div class="toast" id="toast" popover="manual" aria-labelledby="toastMessage">
       <span id="toastMessage"></span>
       <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>

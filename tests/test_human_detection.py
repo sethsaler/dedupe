@@ -30,7 +30,9 @@ from dedupe.scanner import inventory
 
 def test_detector_signature_pins_recall_settings() -> None:
     signature = human_detection_signature("opencv")
-    assert signature.startswith("human-presence-v5-detail|")
+    assert signature.startswith("human-presence-v6-yolox|")
+    assert "yolox=" in signature
+    assert "yunet=" in signature
     assert "face-confidence=0.35" in signature
     assert "face-flip=1" in signature
     assert "face-tiles=2x2" in signature
@@ -48,15 +50,29 @@ def test_blank_landscape_is_review_candidate(tmp_path: Path) -> None:
     assert found == [record]
     assert record.human_detection_status == "no_person_detected"
     assert record.human_frames_analyzed == 1
-    assert record.human_detector == "opencv_yunet_hog"
+    assert record.human_detector == "opencv_yunet_yolox"
 
 
-def test_opencv_detector_has_full_body_hog_detectors() -> None:
+def test_opencv_detector_uses_yolox_person_scorer() -> None:
     pytest.importorskip("cv2")
+    from dedupe.people_score import PeopleScorer
+
     detector = create_person_detector("opencv")
 
-    assert detector.hog is not None
-    assert detector.hog_daimler is not None
+    assert detector.backend == "opencv_yunet_yolox"
+    assert isinstance(detector.people, PeopleScorer)
+
+
+def test_opencv_detector_fails_closed_without_yolox_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pytest.importorskip("cv2")
+    monkeypatch.setattr(
+        "dedupe.people_score.PEOPLE_MODEL_PATH", tmp_path / "missing-yolox.onnx"
+    )
+
+    with pytest.raises(RuntimeError, match="missing"):
+        create_person_detector("opencv")
 
 
 def test_opencv_detector_fails_closed_without_face_model(
@@ -93,9 +109,9 @@ def test_opencv_detector_short_circuits_full_body_pass_after_face_hit() -> None:
             face[0, -1] = 0.92
             return 1, face
 
-    class FailingHog:
-        def detectMultiScale(self, *_args, **_kwargs):
-            raise AssertionError("HOG should not run after a YuNet face hit")
+    class FailingPeopleScorer:
+        def score_rgb(self, *_args, **_kwargs):
+            raise AssertionError("YOLOX should not run after a YuNet face hit")
 
     class FakeCV2:
         COLOR_RGB2BGR = 1
@@ -113,8 +129,8 @@ def test_opencv_detector_short_circuits_full_body_pass_after_face_hit() -> None:
     detector.cv2 = FakeCV2()
     detector.confidence = 0.25
     detector.face = FakeFace()
-    detector.hog = FailingHog()
-    detector.backend = "opencv_yunet_hog"
+    detector.people = FailingPeopleScorer()
+    detector.backend = "opencv_yunet_yolox"
 
     assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(
         0.92
@@ -151,9 +167,8 @@ def test_opencv_presence_keeps_mid_confidence_faces() -> None:
     detector.cv2 = FakeCV2()
     detector.confidence = 0.25
     detector.face = MidConfidenceFace()
-    detector.hog = None
-    detector.hog_daimler = None
-    detector.backend = "opencv_yunet_hog"
+    detector.people = None
+    detector.backend = "opencv_yunet_yolox"
 
     assert 0.40 >= YUNET_PRESENCE_SCORE_THRESHOLD
     assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(0.40)
@@ -193,9 +208,8 @@ def test_opencv_face_flip_fallback_keeps_mirrored_faces() -> None:
     detector.cv2 = FakeCV2()
     detector.confidence = 0.25
     detector.face = FlipOnlyFace()
-    detector.hog = None
-    detector.hog_daimler = None
-    detector.backend = "opencv_yunet_hog"
+    detector.people = None
+    detector.backend = "opencv_yunet_yolox"
 
     assert detector.score(np.zeros((240, 320, 3), dtype=np.uint8)) == pytest.approx(0.80)
 
@@ -549,10 +563,10 @@ def test_confirm_with_faces_flag_controls_yunet_second_opinion(
     monkeypatch.setattr(
         "dedupe.human_detection.create_person_detector", fail_if_created
     )
-    calls: list[list] = []
+    calls: list[tuple[list, dict]] = []
     monkeypatch.setattr(
         "dedupe.face_detection.protect_no_person_candidates",
-        lambda records: calls.append(list(records)),
+        lambda records, **kwargs: calls.append((list(records), kwargs)),
     )
 
     found = find_no_human_files(
@@ -564,10 +578,23 @@ def test_confirm_with_faces_flag_controls_yunet_second_opinion(
     assert calls == []
     assert found == [record]
 
+    def cancelled() -> bool:
+        return False
+
+    def progress(*_args) -> None:
+        return None
+
     found = find_no_human_files(
-        [record], backend="photon", photon_model="test-model"
+        [record],
+        backend="photon",
+        photon_model="test-model",
+        workers=3,
+        progress=progress,
+        cancelled=cancelled,
     )
-    assert calls == [[record]]
+    assert len(calls) == 1
+    assert calls[0][0] == [record]
+    assert calls[0][1] == {"workers": 3, "progress": progress, "cancelled": cancelled}
     assert found == [record]
 
 
@@ -608,6 +635,8 @@ def test_photon_queries_woman_before_generic_person(monkeypatch) -> None:
 
 
 def test_find_no_human_files_drops_counted_female_faces(tmp_path: Path, monkeypatch) -> None:
+    from dedupe.face_detection import face_detection_signature
+
     signature = human_detection_signature("opencv")
     path = tmp_path / "woman.jpg"
     Image.new("RGB", (40, 40), "white").save(path)
@@ -616,6 +645,7 @@ def test_find_no_human_files_drops_counted_female_faces(tmp_path: Path, monkeypa
     record.human_detection_signature = signature
     record.face_count = 1
     record.female_face_count = 1
+    record.face_detection_signature = face_detection_signature()
 
     monkeypatch.setattr(
         "dedupe.human_detection.create_person_detector",
@@ -818,3 +848,103 @@ def test_old_no_person_decision_is_reanalyzed(tmp_path: Path, monkeypatch) -> No
     assert find_no_human_files([record], workers=1) == []
     assert record.human_detection_signature == human_detection_signature()
     assert record.human_detection_status == "person_detected"
+
+
+def test_ensemble_parallelizes_opencv_prepass_and_skips_photon_for_positives(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.human_detection as hd
+
+    monkeypatch.setattr(hd, "_photon_ready_path", lambda: tmp_path / "photon-ready.json")
+    pos_path = tmp_path / "person.jpg"
+    neg_path = tmp_path / "landscape.jpg"
+    Image.new("RGB", (40, 40), "white").save(pos_path)
+    Image.new("RGB", (40, 40), "black").save(neg_path)
+    pos, neg = inventory([pos_path, neg_path])
+
+    photon_seen: list[int] = []
+    opencv_threads: set[int] = set()
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    class FakeOpenCV:
+        backend = "opencv_yunet_yolox"
+
+        def score(self, frame):
+            with lock:
+                opencv_threads.add(threading.get_ident())
+            barrier.wait(timeout=2)
+            return 0.9 if float(frame.mean()) > 127 else 0.0
+
+        def close(self):
+            return None
+
+    class FakePhoton:
+        backend = "photon:test-model"
+
+        def score(self, frame):
+            photon_seen.append(int(frame.mean()))
+            return 0.0
+
+        def close(self):
+            return None
+
+    def fake_create(backend="opencv", **_kwargs):
+        if backend == "opencv":
+            return FakeOpenCV()
+        if backend == "photon":
+            return FakePhoton()
+        raise AssertionError(f"unexpected backend {backend}")
+
+    monkeypatch.setattr(hd, "create_person_detector", fake_create)
+    progress_updates: list[tuple] = []
+
+    found = find_no_human_files(
+        [pos, neg],
+        backend="ensemble",
+        photon_model="test-model",
+        workers=2,
+        confirm_with_faces=False,
+        progress=lambda *args: progress_updates.append(args),
+    )
+
+    assert found == [neg]
+    assert pos.human_detection_status == "person_detected"
+    assert pos.human_detector == "ensemble:opencv_yunet_yolox"
+    assert neg.human_detection_status == "no_person_detected"
+    assert neg.human_detector == "ensemble:opencv_yunet_yolox+photon:test-model"
+    assert len(opencv_threads) == 2
+    assert len(photon_seen) == 1
+    assert progress_updates[-1][:3] == ("human-detection", 2, 2)
+
+
+def test_opencv_detector_uses_yolox_on_body_without_face() -> None:
+    pytest.importorskip("cv2")
+    detector = create_person_detector("opencv")
+    # Even if face detection finds nothing, YOLOX detects the astronaut body.
+    detector._face_score = lambda _frame: 0.0  # type: ignore[method-assign]
+    with Image.open(Path(__file__).parent / "fixtures" / "astronaut.png") as image:
+        frame = np.asarray(image.convert("RGB"))
+    assert detector.score(frame) > 0.5
+
+
+def test_onnx_sha256_verified_once_per_process(monkeypatch) -> None:
+    import hashlib
+
+    pytest.importorskip("cv2")
+    from dedupe.people_score import _cached_file_sha256
+
+    _cached_file_sha256.cache_clear()
+    digests = 0
+    real_digest = hashlib.file_digest
+
+    def spy_digest(fileobj, algorithm):
+        nonlocal digests
+        digests += 1
+        return real_digest(fileobj, algorithm)
+
+    monkeypatch.setattr(hashlib, "file_digest", spy_digest)
+    create_person_detector("opencv")
+    create_person_detector("opencv")
+    # Once for YuNet + once for YOLOX across both detector creations.
+    assert digests == 2

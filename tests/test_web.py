@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from dedupe.grouping import (
 from dedupe.human_detection import human_detection_signature
 from dedupe.keep_decisions import load_keep_decisions
 from dedupe.models import (
+    DuplicateGroup,
     FileRecord,
     GroupKind,
     MediaType,
@@ -2621,9 +2623,17 @@ def test_thumbnail_is_generated_once_and_served_from_disk(tmp_path: Path, monkey
     assert second.status_code == 200
     assert first.data == second.data == b"jpeg-bytes"
     assert len(calls) == 1
-    assert "immutable" in second.headers["Cache-Control"]
+    assert "must-revalidate" in second.headers["Cache-Control"]
+    assert "immutable" not in second.headers["Cache-Control"]
     assert second.headers["ETag"]
     assert second.headers["Last-Modified"]
+
+    versioned = client.get(
+        "/api/thumbnail",
+        query_string={"path": str(scanned), "v": f"{scanned.stat().st_mtime_ns}:{scanned.stat().st_size}"},
+    )
+    assert versioned.status_code == 200
+    assert "immutable" in versioned.headers["Cache-Control"]
 
     cached = list((tmp_path / "thumbs").rglob("*.jpg"))
     assert len(cached) == 1
@@ -3393,7 +3403,14 @@ def test_preview_variant_downscales_browser_safe_images(tmp_path: Path) -> None:
     )
 
     assert response.status_code == 200
-    assert "immutable" in response.headers["Cache-Control"]
+    assert "must-revalidate" in response.headers["Cache-Control"]
+    assert response.headers["ETag"]
+
+    versioned = client.get(
+        "/api/thumbnail", query_string={"path": str(path), "variant": "preview", "v": "1"}
+    )
+    assert versioned.status_code == 200
+    assert "immutable" in versioned.headers["Cache-Control"]
     with Image.open(BytesIO(response.data)) as preview:
         assert max(preview.size) <= 2560
         assert preview.format == "JPEG"
@@ -3767,3 +3784,715 @@ def test_modern_web_platform_markup_and_layers(tmp_path: Path) -> None:
 
     stylesheet = client.get("/static/app.css").get_data(as_text=True)
     assert "@layer legacy, workspace, theme, modern;" in stylesheet
+
+
+def test_shutdown_timer_uses_own_lock_and_defers_during_acting_or_scanning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(web_app, "SHUTDOWN_GRACE_SECONDS", 0.05)
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    app = create_app(_result(tmp_path))
+    fake = FakeServer()
+    app.extensions["dedupe_server"] = fake
+    state = app.extensions["dedupe_state"]
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+
+    state["acting"] = True
+    assert client.post("/api/shutdown", json={}, headers={"X-Dedupe-Token": token}).status_code == 200
+    time.sleep(0.15)
+    assert fake.shutdown_calls == 0
+
+    state["acting"] = False
+    deadline = time.monotonic() + 5
+    while not fake.shutdown_calls and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert fake.shutdown_calls == 1
+
+
+def test_debounce_by_file_count_and_failed_persist_keeps_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_MIN_FILES", 2)
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_SECONDS", 0.05)
+    app = create_app(_result(tmp_path))
+    client = app.test_client()
+    token = app.config["DEDUPE_CSRF_TOKEN"]
+    state = app.extensions["dedupe_state"]
+    state["persist_dirty"] = False
+    group = client.get("/api/groups").get_json()["groups"][0]
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Result has only 1 group (<2000) but >=2 files, so it still debounces cleanly.
+    res = client.post(
+        "/api/selection",
+        json={"group_id": group["id"], "selected": [group["members"][0]["path"]], "scan_id": scan_id},
+        headers={"X-Dedupe-Token": token},
+    )
+    assert res.status_code == 200
+    assert state["persist_dirty"] is True
+    deadline = time.monotonic() + 5
+    while state["persist_dirty"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert state["persist_dirty"] is False
+
+    # Failed session save at scan completion must not discard completed in-memory results.
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_MIN_FILES", 1000)
+
+    def _boom(*_a, **_kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(web_app, "save_review_session", _boom)
+    monkeypatch.setattr(web_app, "run_scan", lambda *_a, **_kw: _result(tmp_path))
+    started = client.post(
+        "/api/scan", json={"paths": [str(tmp_path)]}, headers={"X-Dedupe-Token": token}
+    )
+    assert started.status_code == 200
+    deadline = time.monotonic() + 5
+    while client.get("/api/status").get_json()["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    status = client.get("/api/status").get_json()
+    assert status["scanning"] is False
+    assert status["has_result"] is True
+    assert "disk full" in (status["error"] or "")
+
+
+def test_session_metadata_edits_decoupled_from_acting_state(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from dedupe.borders import BORDER_LEVELS_SIGNATURE, BORDER_SIGNATURE, CropBox
+    from dedupe.grouping import build_crop_groups
+
+    framed = tmp_path / "framed.png"
+    img = Image.new("RGB", (120, 120), (2, 2, 2))
+    img.paste(Image.new("RGB", (120, 80), (150, 90, 40)), (0, 20))
+    img.save(framed)
+    a = tmp_path / "a.jpg"
+    b = tmp_path / "b.jpg"
+    a.write_bytes(b"same")
+    b.write_bytes(b"same")
+
+    box = CropBox(0, 20, 120, 100, 120, 120, provenance=("black_bar",))
+    st_f = framed.stat()
+    crop_rec = FileRecord(
+        path=str(framed),
+        size=st_f.st_size,
+        mtime=st_f.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        width=120,
+        height=120,
+        border_crop=box.encode(),
+        border_signature=BORDER_SIGNATURE,
+        border_crop_conservative=box.encode(),
+        border_crop_aggressive=box.encode(),
+        border_levels_signature=BORDER_LEVELS_SIGNATURE,
+    )
+    exact_a = FileRecord(path=str(a), size=4, mtime=a.stat().st_mtime, media_type=MediaType.IMAGE, extension=".jpg")
+    exact_b = FileRecord(path=str(b), size=4, mtime=b.stat().st_mtime, media_type=MediaType.IMAGE, extension=".jpg")
+    crop_group = build_crop_groups([crop_rec])[0]
+    exact_group = DuplicateGroup(
+        id="exact-decouple",
+        kind=GroupKind.EXACT,
+        media_type=MediaType.IMAGE,
+        members=[exact_a, exact_b],
+        suggested_keep=str(a),
+        selected_for_removal=[str(b)],
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[exact_a, exact_b, crop_rec], groups=[exact_group, crop_group])
+    app = create_app(result)
+    state = app.extensions["dedupe_state"]
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Simulate an active background file mutation on another file.
+    state["acting"] = True
+    assert client.post(
+        "/api/selection",
+        json={"group_id": exact_group.id, "selected": [str(b)], "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/group/reviewed",
+        json={"group_id": exact_group.id, "reviewed": True, "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/crop/adjust",
+        json={"group_id": crop_group.id, "path": str(framed), "keep_whole": True, "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/crop/level",
+        json={"group_id": crop_group.id, "path": str(framed), "level": "aggressive", "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/crop/skip",
+        json={"group_id": crop_group.id, "path": str(framed), "skip": True, "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 200
+
+    # Active single-file crop lock blocks edits only for that path.
+    state["cropping_paths"].add(str(framed))
+    assert client.post(
+        "/api/crop/adjust",
+        json={"group_id": crop_group.id, "path": str(framed), "box": None, "scan_id": scan_id},
+        headers=headers,
+    ).status_code == 409
+
+
+def test_people_scoring_metric_dedup_and_hashcache_preservation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from PIL import Image
+
+    from dedupe.cache import HashCache
+    from dedupe.people_score import non_person_coverage_signature, people_score_signature
+
+    img_path = tmp_path / "scene.png"
+    Image.new("RGB", (64, 64), "teal").save(img_path)
+    st = img_path.stat()
+    rec = FileRecord(
+        path=str(img_path),
+        size=st.st_size,
+        mtime=st.st_mtime,
+        mtime_ns=st.st_mtime_ns,
+        ctime_ns=st.st_ctime_ns,
+        device=st.st_dev,
+        inode=st.st_ino,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        sha256="keep-this-sha256",
+        phash="1111222233334444",
+    )
+    cache_path = tmp_path / "cache.sqlite3"
+    cache = HashCache(cache_path)
+    cache.store_all([rec])
+    cache.close()
+
+    started_calls: list[str] = []
+    gate = threading.Event()
+
+    def fake_score(pending, *, progress, cancelled, require_coverage):
+        metric = "non_person_coverage" if require_coverage else "people_score"
+        started_calls.append(metric)
+        if not require_coverage:
+            gate.wait(5)
+        for idx, item in enumerate(pending, 1):
+            if require_coverage:
+                item.non_person_coverage = 85.0
+                item.non_person_coverage_signature = non_person_coverage_signature()
+            else:
+                item.people_score = 0.05
+                item.people_score_signature = people_score_signature()
+            progress(idx, len(pending))
+        return pending
+
+    monkeypatch.setattr(web_app, "people_scoring_available", lambda: (True, "ok"))
+    monkeypatch.setattr(web_app, "score_people", fake_score)
+
+    result = ScanResult(roots=[str(tmp_path)], files=[replace(rec)], groups=[])
+    app = create_app(result, cache_path=cache_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    group_id = next(g["id"] for g in client.get("/api/groups").get_json()["groups"] if g["kind"] == "all_files")
+
+    first = client.post(
+        "/api/people-scores",
+        json={"group_id": group_id, "scan_id": scan_id, "metric": "people_score"},
+        headers=headers,
+    )
+    assert first.status_code == 202
+    second = client.post(
+        "/api/people-scores",
+        json={"group_id": group_id, "scan_id": scan_id, "metric": "non_person_coverage"},
+        headers=headers,
+    )
+    assert second.status_code == 202
+    assert second.get_json()["metric"] == "non_person_coverage"
+    gate.set()
+
+    deadline = time.monotonic() + 5
+    while client.get("/api/people-scores").get_json()["running"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert "non_person_coverage" in started_calls
+
+    probe = [replace(rec, sha256=None, phash=None, non_person_coverage=None)]
+    cache = HashCache(cache_path)
+    cache.hydrate(probe)
+    cache.close()
+    assert probe[0].sha256 == "keep-this-sha256"
+    assert probe[0].phash == "1111222233334444"
+    assert probe[0].non_person_coverage == 85.0
+
+
+def test_crop_keep_whole_level_clear_undo_levels_and_recheck_duplicates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from PIL import Image
+
+    from dedupe.borders import BORDER_LEVELS_SIGNATURE, BORDER_SIGNATURE, CropBox
+    from dedupe.cache import HashCache
+    from dedupe.decision_log import read_decisions
+    from dedupe.grouping import build_crop_groups
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    trash_dir = tmp_path / "Trash"
+
+    class FakeBatch:
+        def send(self, src: Path) -> Path:
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            dest = trash_dir / f"{Path(src).stem}_{time.time_ns()}{Path(src).suffix}"
+            import shutil
+
+            shutil.move(str(src), str(dest))
+            return dest
+
+    monkeypatch.setattr(web_app, "TrashBatch", FakeBatch)
+
+    orig_clean = tmp_path / "orig.png"
+    framed = tmp_path / "framed.png"
+    inner = Image.new("RGB", (120, 80), (200, 120, 60))
+    inner.save(orig_clean)
+    outer = Image.new("RGB", (120, 120), (0, 0, 0))
+    outer.paste(inner, (0, 20))
+    outer.save(framed)
+
+    box_bal = CropBox(0, 20, 120, 100, 120, 120, provenance=("black_bar",))
+    box_cons = CropBox(0, 16, 120, 104, 120, 120, provenance=("black_bar",))
+    box_aggr = CropBox(0, 22, 120, 98, 120, 120, provenance=("black_bar",))
+    st_o = orig_clean.stat()
+    st_f = framed.stat()
+    rec_o = FileRecord(
+        path=str(orig_clean),
+        size=st_o.st_size,
+        mtime=st_o.st_mtime,
+        mtime_ns=st_o.st_mtime_ns,
+        ctime_ns=st_o.st_ctime_ns,
+        device=st_o.st_dev,
+        inode=st_o.st_ino,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        width=120,
+        height=80,
+    )
+    rec_f = FileRecord(
+        path=str(framed),
+        size=st_f.st_size,
+        mtime=st_f.st_mtime,
+        mtime_ns=st_f.st_mtime_ns,
+        ctime_ns=st_f.st_ctime_ns,
+        device=st_f.st_dev,
+        inode=st_f.st_ino,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        width=120,
+        height=120,
+        border_crop=box_bal.encode(),
+        border_signature=BORDER_SIGNATURE,
+        border_crop_conservative=box_cons.encode(),
+        border_crop_aggressive=box_aggr.encode(),
+        border_levels_signature=BORDER_LEVELS_SIGNATURE,
+    )
+    crop_group = build_crop_groups([rec_f])[0]
+    exact_group = DuplicateGroup(
+        id="exact-warn",
+        kind=GroupKind.EXACT,
+        media_type=MediaType.IMAGE,
+        members=[rec_f, replace(rec_o)],
+        suggested_keep=str(orig_clean),
+        selected_for_removal=[],
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[rec_o, rec_f], groups=[exact_group, crop_group])
+    cache_path = tmp_path / "cache.sqlite3"
+    log_path = tmp_path / "decisions.jsonl"
+    app = create_app(result, cache_path=cache_path, decision_log_path=log_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    base = {"group_id": crop_group.id, "path": str(framed), "scan_id": scan_id}
+
+    # Group payload exposes media_version, crop_provenance, and in_duplicate_group.
+    fetched = client.get(f"/api/groups/{crop_group.id}").get_json()
+    member = fetched["members"][0]
+    assert member["media_version"] == f"{rec_f.mtime_ns}:{rec_f.size}"
+    assert member["crop_provenance"] == ["black_bar"]
+    assert exact_group.id in member["in_duplicate_group"]
+
+    # keep_whole persists empty intent without falling back to suggested box on apply.
+    whole = client.post("/api/crop/adjust", json={**base, "keep_whole": True}, headers=headers)
+    assert whole.status_code == 200
+    w_member = whole.get_json()["members"][0]
+    assert w_member["crop"] is None
+    assert w_member["crop_keep_whole"] is True
+    assert w_member["crop_adjusted"] is True
+    assert client.post("/api/crop/apply", json=base, headers=headers).status_code == 400
+
+    # Switching level clears keep_whole/manual adjustments by default.
+    switched = client.post("/api/crop/level", json={**base, "level": "conservative"}, headers=headers)
+    assert switched.status_code == 200
+    s_member = switched.get_json()["members"][0]
+    assert s_member["crop_keep_whole"] is False
+    assert s_member["crop_adjusted"] is False
+    assert s_member["crop"]["top"] == 16
+
+    # Drag box then switch level back to balanced -> cleared adjustment, shows balanced.
+    custom = {"left": 0, "top": 20, "right": 120, "bottom": 100}
+    assert client.post("/api/crop/level", json={**base, "level": "balanced"}, headers=headers).status_code == 200
+    # Adjust slightly so adjusted != balanced suggestion.
+    dragged = {"left": 2, "top": 20, "right": 118, "bottom": 100}
+    assert client.post("/api/crop/adjust", json={**base, "box": dragged}, headers=headers).status_code == 200
+    applied = client.post("/api/crop/apply", json=base, headers=headers)
+    assert applied.status_code == 200
+    applied_json = applied.get_json()
+    receipt_ref = applied_json["log_path"]
+
+    # Cache updated for cropped file so next scan skips re-suggesting crop.
+    cur_st = framed.stat()
+    probe = [
+        FileRecord(
+            path=str(framed),
+            size=cur_st.st_size,
+            mtime=cur_st.st_mtime,
+            mtime_ns=cur_st.st_mtime_ns,
+            ctime_ns=cur_st.st_ctime_ns,
+            device=cur_st.st_dev,
+            inode=cur_st.st_ino,
+            media_type=MediaType.IMAGE,
+            extension=".png",
+        )
+    ]
+    cache = HashCache(cache_path)
+    assert cache.hydrate(probe) == 1
+    cache.close()
+    assert probe[0].border_crop == ""
+    assert probe[0].border_levels_signature == BORDER_LEVELS_SIGNATURE
+
+    # Receipt undo via /api/action/undo restores original bytes & preserves detector level S!
+    prev = client.post(
+        "/api/action/undo",
+        json={"receipts": [receipt_ref], "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert prev.status_code == 200
+    undone = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [receipt_ref],
+            "dry_run": False,
+            "preview_token": prev.get_json()["preview_token"],
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert undone.status_code == 200
+    restored_group = client.get(f"/api/groups/{crop_group.id}").get_json()
+    r_member = restored_group["members"][0]
+    assert r_member["crop_state"] == "pending"
+    # Original balanced level suggestion S (top=20, left=0) stays intact alongside dragged box!
+    assert r_member["crop_levels"]["balanced"]["left"] == 0
+    assert r_member["crop"]["left"] == 2
+    assert r_member["crop_adjusted"] is True
+    events, _ = read_decisions(log_path)
+    undone_ev = next(e for e in events if e["decision"] == "undone")
+    assert undone_ev["suggestion"]["left"] == 0
+    assert undone_ev["adjusted"]["left"] == 2
+
+    # Reset to exact balanced box, apply via apply-all (incremental journal), then recheck duplicates.
+    assert client.post("/api/crop/adjust", json={**base, "box": custom}, headers=headers).status_code == 200
+    # Drop decoy exact_group so recheck-duplicates creates a fresh match after crop.
+    state = app.extensions["dedupe_state"]
+    state["result"].groups = [crop_group]
+    bulk = client.post("/api/crop/apply-all", json={"group_id": crop_group.id, "scan_id": scan_id}, headers=headers)
+    assert bulk.status_code == 200
+    assert bulk.get_json()["cropped_count"] == 1
+
+    recheck = client.post(
+        "/api/crop/recheck-duplicates",
+        json={"group_id": crop_group.id, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert recheck.status_code == 200
+    recheck_data = recheck.get_json()
+    assert recheck_data["checked"] == 1
+    assert len(recheck_data["new_groups"]) + len(recheck_data["updated_groups"]) >= 1
+
+
+def test_cross_scope_quarantine_and_bulk_selection_protections(tmp_path: Path) -> None:
+    lib = tmp_path / "protected"
+    lib.mkdir()
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    p1 = lib / "keep.jpg"
+    p2 = inbox / "dup.jpg"
+    p3 = lib / "ref_dup.jpg"
+    p1.write_bytes(b"identical-bytes")
+    p2.write_bytes(b"identical-bytes")
+    p3.write_bytes(b"identical-bytes")
+
+    r1 = FileRecord(path=str(p1), size=15, mtime=p1.stat().st_mtime, media_type=MediaType.IMAGE, extension=".jpg", protected=True)
+    r2 = FileRecord(path=str(p2), size=15, mtime=p2.stat().st_mtime, media_type=MediaType.IMAGE, extension=".jpg", protected=False)
+    r3 = FileRecord(path=str(p3), size=15, mtime=p3.stat().st_mtime, media_type=MediaType.IMAGE, extension=".jpg", protected=True)
+    exact = DuplicateGroup(
+        id="exact-scope",
+        kind=GroupKind.EXACT,
+        media_type=MediaType.IMAGE,
+        members=[r1, r2, r3],
+        suggested_keep=str(p1),
+        selected_for_removal=[str(p2)],
+    )
+    low_res = DuplicateGroup(
+        id="lowres-scope",
+        kind=GroupKind.LOW_RESOLUTION,
+        media_type=MediaType.IMAGE,
+        members=[r2],
+        selected_for_removal=[str(p2)],
+    )
+    semantic = DuplicateGroup(
+        id="sem-manual",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[r2, r3],
+        suggested_keep=str(p3),
+        match_basis="semantic",
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[r1, r2, r3], groups=[exact, low_res, semantic])
+    app = create_app(result)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Bulk select_all skips protected members AND skips semantic manual-only groups.
+    bulk = client.post(
+        "/api/selection/bulk",
+        json={"operation": "select_all", "scan_id": scan_id},
+        headers=headers,
+    )
+    assert bulk.status_code == 200
+    groups_by_id = {g["id"]: g for g in client.get("/api/groups").get_json()["groups"]}
+    assert groups_by_id["exact-scope"]["selected_for_removal"] == [str(p2)]
+    assert groups_by_id["sem-manual"]["selected_for_removal"] == []
+
+    # Action trash with kinds="exact" must NOT divert p2 to _Dedupe Quarantine
+    # just because p2 also appears in LOW_RESOLUTION.
+    prev = client.post(
+        "/api/action",
+        json={"action": "trash", "kinds": "exact", "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert prev.status_code == 200
+    data = prev.get_json()
+    assert "review_quarantine_dir" not in data
+    assert data["items"][0]["action"] == "trash"
+
+
+def test_review_candidate_undo_trash_sentinel_and_cross_group_refresh(tmp_path: Path) -> None:
+    p = tmp_path / "cand.jpg"
+    trash_copy = tmp_path / "Trash" / "cand.jpg"
+    trash_copy.parent.mkdir()
+    trash_copy.write_bytes(b"candidate-bytes")
+
+    r_stale = FileRecord(
+        path=str(p),
+        size=len(b"candidate-bytes"),
+        mtime=1.0,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        human_detection_status="no_human",
+        human_detection_signature="sig",
+    )
+    no_human = DuplicateGroup(
+        id="nh-1",
+        kind=GroupKind.NO_HUMANS,
+        media_type=MediaType.IMAGE,
+        members=[replace(r_stale)],
+    )
+    all_files = DuplicateGroup(
+        id="all-1",
+        kind=GroupKind.ALL_FILES,
+        media_type=MediaType.IMAGE,
+        members=[replace(r_stale)],
+    )
+    result = ScanResult(roots=[str(tmp_path)], files=[replace(r_stale)], groups=[no_human, all_files])
+    app = create_app(result)
+    state = app.extensions["dedupe_state"]
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+
+    # Bare "Trash" sentinel refuses safely with 404.
+    state["deleted_files"][str(p)] = "Trash"
+    bad = client.post(
+        "/api/review-candidate/undo",
+        json={"group_id": "nh-1", "path": str(p), "scan_id": scan_id},
+        headers=headers,
+    )
+    assert bad.status_code == 404
+
+    # Real Trash copy restores and refreshes stat across ALL groups and result.files.
+    state["deleted_files"][str(p)] = str(trash_copy)
+    ok = client.post(
+        "/api/review-candidate/undo",
+        json={"group_id": "nh-1", "path": str(p), "scan_id": scan_id},
+        headers=headers,
+    )
+    assert ok.status_code == 200
+    restored_stat = p.stat()
+    assert state["result"].files[0].inode == restored_stat.st_ino
+    assert all_files.members[0].inode == restored_stat.st_ino
+
+
+def test_media_cache_headers_and_reveal_cross_platform(
+    tmp_path: Path, monkeypatch
+) -> None:
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"video-data")
+    rec = FileRecord(path=str(vid), size=10, mtime=vid.stat().st_mtime, media_type=MediaType.VIDEO, extension=".mp4")
+    result = ScanResult(roots=[str(tmp_path)], files=[rec], groups=[])
+    app = create_app(result)
+    client = app.test_client()
+
+    media_resp = client.get("/api/media", query_string={"path": str(vid)})
+    assert media_resp.status_code == 200
+    assert media_resp.headers["Cache-Control"] == "private, max-age=3600"
+
+    # Nonexistent file returns 404 from /api/thumbnail without 500.
+    ghost = tmp_path / "vanished.jpg"
+    app.extensions["dedupe_state"]["result"].files.append(
+        FileRecord(path=str(ghost), size=1, mtime=1.0, media_type=MediaType.IMAGE, extension=".jpg")
+    )
+    app.extensions["dedupe_state"]["paths_version"] += 1
+    assert client.get("/api/thumbnail", query_string={"path": str(ghost)}).status_code == 404
+
+    opened: list[list[str]] = []
+    monkeypatch.setattr("subprocess.Popen", lambda cmd, **_kw: opened.append(cmd))
+    monkeypatch.setattr(web_app.sys, "platform", "linux")
+    assert client.get(
+        "/api/reveal",
+        query_string={"path": str(vid), "open": "1"},
+        headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]},
+    ).status_code == 200
+    assert opened == [["xdg-open", str(vid.parent)]]
+
+
+def test_action_undo_blocked_details_allow_partial_sets_groups_and_semantic_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    src = tmp_path / "src"
+    q = tmp_path / "q"
+    logs = tmp_path / "logs"
+    src.mkdir()
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    k = src / "keep.jpg"
+    r1 = src / "rem1.jpg"
+    r2 = src / "rem2.jpg"
+    for p in (k, r1, r2):
+        p.write_bytes(b"dup-payload")
+
+    def _frec(p: Path) -> FileRecord:
+        st = p.stat()
+        return FileRecord(
+            path=str(p), size=st.st_size, mtime=st.st_mtime, media_type=MediaType.IMAGE, extension=".jpg"
+        )
+
+    exact = DuplicateGroup(
+        id="ex-1",
+        kind=GroupKind.EXACT,
+        media_type=MediaType.IMAGE,
+        members=[_frec(k), _frec(r1), _frec(r2)],
+        suggested_keep=str(k),
+        selected_for_removal=[str(r1), str(r2)],
+    )
+    set_group = DuplicateGroup(
+        id="set-1",
+        kind=GroupKind.SETS,
+        media_type=MediaType.IMAGE,
+        members=[_frec(k)],
+    )
+    from dedupe.actions import apply_actions
+
+    action_res = apply_actions(
+        [exact],
+        action="quarantine",
+        quarantine_dir=q,
+        dry_run=False,
+        roots=[str(src)],
+        log_dir=logs,
+    )
+    assert action_res.success_count == 2
+    # Occupy one original path so item r1 is blocked while r2 stays restorable.
+    r1.write_bytes(b"occupant")
+
+    result = ScanResult(roots=[str(tmp_path)], files=[_frec(k)], groups=[exact, set_group])
+    app = create_app(result)
+    state = app.extensions["dedupe_state"]
+    state["deleted_files"][str(r2)] = str(q / "rem2.jpg")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    status = client.get("/api/status").get_json()
+    assert status["summary"]["sets_groups"] == 1
+    assert "sets" in web_app.scan_done_summary(result, {"exact": True, "sets": True})
+
+    scan_id = status["scan_id"]
+    prev = client.post(
+        "/api/action/undo",
+        json={"receipts": [action_res.log_path], "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    token_p = prev.get_json()["preview_token"]
+    refused = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [action_res.log_path],
+            "dry_run": False,
+            "preview_token": token_p,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert refused.get_json()["blocked_count"] == 1
+    assert refused.get_json()["blocked"][0]["destination"] == str(r1)
+
+    prev2 = client.post(
+        "/api/action/undo",
+        json={"receipts": [action_res.log_path], "dry_run": True, "scan_id": scan_id},
+        headers=headers,
+    )
+    partial = client.post(
+        "/api/action/undo",
+        json={
+            "receipts": [action_res.log_path],
+            "dry_run": False,
+            "allow_partial": True,
+            "preview_token": prev2.get_json()["preview_token"],
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert partial.status_code == 200
+    assert r2.exists()
+    assert str(r2) not in state["deleted_files"]
+
+    seen_kwargs: dict = {}
+    monkeypatch.setattr(web_app, "run_scan", lambda _paths, **kw: (seen_kwargs.update(kw), _result(tmp_path))[1])
+    scan_res = client.post(
+        "/api/scan", json={"paths": [str(tmp_path)]}, headers=headers
+    )
+    assert scan_res.status_code == 200
+    deadline = time.monotonic() + 5
+    while client.get("/api/status").get_json()["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert seen_kwargs["semantic_duplicate_threshold"] == 0.92

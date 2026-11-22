@@ -500,3 +500,80 @@ def test_web_refuses_stale_or_unknown_scoring_requests(media: Path, tmp_path: Pa
         "/api/people-scores", json={"scan_id": scan_id, "group_id": "x"}, headers=headers
     )
     assert busy.status_code == 409
+
+
+def test_decode_boxes_filters_before_exp_avoiding_overflow() -> None:
+    import numpy as np
+
+    scorer = PeopleScorer()
+    output = np.zeros((scorer._anchor_count, 85), dtype=np.float32)
+    # Huge raw w/h on rejected anchors must not produce NaN/overflow warnings.
+    output[:, 2:4] = 1000.0
+    scores = np.zeros(scorer._anchor_count, dtype=np.float32)
+    output[0, :4] = [0.0, 0.0, 0.0, 0.0]
+    scores[0] = 0.9
+
+    boxes = scorer._decode_boxes(output, scores, 1.0, 512, 512, 0.3)
+
+    assert len(boxes) == 1
+    assert all(0.0 <= coord <= 1.0 for coord in boxes[0])
+
+
+def test_forward_uses_inter_area_for_downscaling(monkeypatch) -> None:
+    import numpy as np
+
+    scorer = PeopleScorer()
+    interpolations: list[int] = []
+    real_resize = cv2.resize
+
+    def spy_resize(src, dsize, *args, **kwargs):
+        interpolations.append(kwargs.get("interpolation"))
+        return real_resize(src, dsize, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "resize", spy_resize)
+    scorer.score_rgb(np.zeros((1024, 1024, 3), dtype=np.uint8))
+    scorer.score_rgb(np.zeros((128, 128, 3), dtype=np.uint8))
+
+    assert interpolations == [cv2.INTER_AREA, cv2.INTER_LINEAR]
+
+
+def test_video_frames_falls_back_to_extract_frames_when_unprobeable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dedupe.people_score import _video_frames
+
+    video = tmp_path / "unprobeable.mp4"
+    video.write_bytes(b"video")
+    record = FileRecord(
+        path=str(video), size=5, mtime=1.0, media_type=MediaType.VIDEO, extension=".mp4"
+    )
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _p: (None, None, None))
+
+    def fake_extract(_path, out_dir, **_kwargs):
+        frame = Path(out_dir) / "frame_001.jpg"
+        Image.new("RGB", (32, 32), "blue").save(frame)
+        return [frame]
+
+    monkeypatch.setattr("dedupe.similar_video._extract_frames", fake_extract)
+    frames = list(_video_frames(record))
+
+    assert len(frames) == 1
+    assert frames[0].shape == (32, 32, 3)
+
+
+def test_score_people_caps_workers_with_human_cap(tmp_path: Path, monkeypatch) -> None:
+    from dedupe.parallel import DEFAULT_HUMAN_WORKERS_CAP
+
+    seen_workers: list[int] = []
+    Image.new("RGB", (32, 32), "green").save(tmp_path / "a.png")
+    records = inventory([tmp_path])
+
+    def fake_map(fn, items, *, workers, **_kwargs):
+        seen_workers.append(workers)
+        return [fn(item) for item in items]
+
+    monkeypatch.setattr("dedupe.people_score.map_parallel", fake_map)
+    score_people(records, workers=64)
+
+    assert seen_workers == [DEFAULT_HUMAN_WORKERS_CAP]

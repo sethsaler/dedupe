@@ -216,3 +216,106 @@ def test_decider_deadline_falls_back_and_does_not_repeat_the_request(
             assert len(server.requests) == 1
     finally:
         server.close()
+
+
+def test_decider_judge_mirrored_kwarg_and_mirrored_orientation_non_veto(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Mirrored candidates and local mirrored copies are never vetoed by DeciderJudge."""
+    from dedupe import decider as dec
+
+    a = _record(tmp_path / "a.jpg", (30, 80, 120))
+    b = _record(tmp_path / "b.jpg", (30, 80, 120))
+
+    server = FakeDecider(probability=0.05)
+    try:
+        with DeciderJudge(url=server.url, cache_path=tmp_path / "cache.db") as judge:
+            assert judge(a, b, mirrored=True) is None
+            assert len(server.requests) == 0
+
+            monkeypatch.setattr(dec, "aligned_image_copy_orientation", lambda *_a: "FLIP_LEFT_RIGHT")
+            assert judge(a, b) is None
+            assert len(server.requests) == 1
+            # A second call must not hit a poisoned low score in cache.
+            monkeypatch.setattr(dec, "aligned_image_copy_orientation", lambda *_a: None)
+            assert judge(a, b) == pytest.approx(0.05)
+    finally:
+        server.close()
+
+
+def test_verdict_cache_invalidates_on_ctime_ns_change(tmp_path: Path) -> None:
+    """Changing ctime_ns with identical size and mtime_ns invalidates VerdictCache."""
+    from dedupe.decider import VerdictCache
+
+    p1, p2 = tmp_path / "a.jpg", tmp_path / "b.jpg"
+    a1 = _record(p1, (200, 20, 20))
+    b = _record(p2, (200, 20, 20))
+    a2 = _record(p1, (200, 20, 20))
+    a2.ctime_ns = (a1.ctime_ns or 0) + 1
+
+    cache = VerdictCache(tmp_path / "verdicts.sqlite3")
+    try:
+        cache.put(a1, b, "sig", 0.91)
+        assert cache.get(a1, b, "sig") == pytest.approx(0.91)
+        assert cache.get(a2, b, "sig") is None
+    finally:
+        cache.close()
+
+
+def test_decider_judge_resilient_to_single_transient_http_error(tmp_path: Path) -> None:
+    """One or two transient HTTP 500s return None without bricking the judge."""
+    post_statuses = [503]
+
+    class FlakyHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def _reply(self, payload: dict, status: int = 200) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                self._reply({"status": "ready", "images": True})
+            elif self.path == "/v1/models":
+                self._reply({"data": [{"id": "perplexity/pplx-decider-flash-v1.2"}]})
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            status = post_statuses[0]
+            if status != 200:
+                self._reply({"error": {"message": f"http {status}"}}, status=status)
+                return
+            self._reply({"answers": {"copy": {"type": "choice", "probabilities": {"same": 0.92}}}})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FlakyHandler)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        a = _record(tmp_path / "a.jpg", (0, 0, 128))
+        b = _record(tmp_path / "b.jpg", (0, 0, 128))
+        c = _record(tmp_path / "c.jpg", (0, 128, 128))
+        d = _record(tmp_path / "d.jpg", (0, 128, 128))
+        with DeciderJudge(url=url, use_cache=False) as judge:
+            assert judge(a, b) is None
+            assert judge.failure is None
+
+            post_statuses[0] = 200
+            assert judge(c, d) == pytest.approx(0.92)
+            assert judge.failure is None
+            assert judge.judged == 1
+
+            post_statuses[0] = 500
+            for i in range(judge.MAX_CONSECUTIVE_ERRORS):
+                x = _record(tmp_path / f"x{i}.jpg", (128, 128, 128))
+                y = _record(tmp_path / f"y{i}.jpg", (128, 128, 128))
+                assert judge(x, y) is None
+            assert judge.failure is not None
+            assert "stopped" in judge.failure
+    finally:
+        server.shutdown()
+        server.server_close()

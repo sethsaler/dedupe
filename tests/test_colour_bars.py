@@ -227,3 +227,62 @@ def test_hairline_bar_is_aggressive_only(tmp_path: Path) -> None:
     levels = _levels(Image.fromarray(canvas), tmp_path / "hairline.png")
     assert levels["conservative"] is None and levels["balanced"] is None
     assert levels["aggressive"] == CropBox(3, 0, 1200, 1500, 1200, 1500)
+
+
+def test_dark_ceiling_without_ruled_edge_is_not_balanced_bar(tmp_path: Path) -> None:
+    # Dark gray ceiling / night sky (luma 36 > DARK_LUMA) drifting gradually into scene
+    # without a ruled edge must stay uncropped at balanced as well as aggressive.
+    canvas = _picture(800, 1000)
+    canvas[:300] = 36
+    for x in range(800):
+        canvas[160 + (x * 40) // 800 : 300, x] = 175
+    levels = _levels(Image.fromarray(canvas), tmp_path / "ceiling.png")
+    assert levels["conservative"] is None and levels["balanced"] is None
+    assert levels["aggressive"] is None
+
+
+def test_bilateral_gradient_vignette_bars_cropped_but_single_sunset_kept(tmp_path: Path) -> None:
+    # Bilateral smooth vignette (e.g. IG Stories gradient) on top & bottom steps cleanly into picture.
+    canvas = np.zeros((1000, 800, 3), dtype=np.uint8)
+    for y in range(140):
+        t = y / 140.0
+        canvas[y] = (int(20 + 60 * t), int(10 + 40 * t), int(50 + 90 * t))
+        canvas[999 - y] = canvas[y]
+    canvas[140:860] = _picture(800, 720)
+    levels = _levels(Image.fromarray(canvas), tmp_path / "vignette.png")
+    assert levels["balanced"] is not None
+    assert abs(levels["balanced"].top - 140) <= 2 and abs(levels["balanced"].bottom - 860) <= 2
+
+    # Single-sided sunset gradient at top only stays uncropped.
+    sunset = _picture(800, 1000)
+    for y in range(200):
+        t = y / 200.0
+        sunset[y] = (int(220 - 40 * t), int(110 + 30 * t), int(60 + 20 * t))
+    sunset_levels = _levels(Image.fromarray(sunset), tmp_path / "sunset.png")
+    assert sunset_levels["balanced"] is None
+
+
+def test_rounded_corner_outer_artifact_peeled_on_colour_frame(tmp_path: Path) -> None:
+    from PIL import ImageDraw
+
+    # Outer 2px rounded mask corners in black around a full cream canvas with picture inside.
+    image = _on((240, 236, 226), (800, 1000), (80, 120, 720, 880))
+    draw = ImageDraw.Draw(image)
+    for corner in ((0, 0, 12, 12), (788, 0, 800, 12), (0, 988, 12, 1000), (788, 988, 800, 1000)):
+        draw.rectangle(corner, fill=(0, 0, 0))
+    levels = _levels(image, tmp_path / "rounded_card.png")
+    assert levels["balanced"] is not None
+    assert levels["balanced"].top >= 116 and levels["balanced"].left >= 76
+
+
+def test_multipass_hairline_page_ground_uses_peeled_bar_colour() -> None:
+    # Regression guard for _without_page_ground: outer 1px black hairline wraps a white page
+    # whose kept region ALSO contains full-width white paragraph spacing. The white interior
+    # colour (not raw black row 0!) must be tested as page ground so the white margins stay!
+    image = Image.new("RGB", (600, 800), (255, 255, 255))
+    arr = np.asarray(image).copy()
+    arr[:1, :] = (10, 10, 10)  # thin hairline at top
+    # Two picture blocks separated by wide blank white ground > COLOUR_GROUND_FRACTION
+    arr[80:300, 50:550] = _picture(500, 220)
+    arr[420:720, 50:550] = _picture(500, 300)
+    assert detect_colour_bars(arr) is None
