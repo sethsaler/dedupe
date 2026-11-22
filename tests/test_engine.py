@@ -1067,3 +1067,395 @@ def test_combined_progress_reaches_its_total_and_never_goes_back(tmp_path: Path)
         counts = [processed for processed, _total in reports]
         assert counts == sorted(counts)
         assert reports[-1][0] == reports[-1][1]
+
+
+def test_missing_protected_folder_reports_root_error_gracefully(tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    _save(media / "a.jpg", (10, 40, 90))
+    missing = tmp_path / "missing-protected"
+
+    result = run_scan(
+        [media],
+        protected_folders=[str(missing)],
+        exact=False,
+        similar=False,
+        use_cache=False,
+    )
+    assert result.protected_folders == []
+    assert any("protected folder does not exist" in err for err in result.errors)
+
+
+def test_protected_folder_walked_first_and_hardlinks_inherit_protection(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    protected = tmp_path / "library"
+    inbox.mkdir()
+    protected.mkdir()
+    master = protected / "orig.jpg"
+    _save(master, (20, 120, 200))
+    link = inbox / "hardlink.jpg"
+    os.link(master, link)
+
+    result = run_scan(
+        [inbox],
+        protected_folders=[str(protected)],
+        exact=True,
+        similar=False,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    # Every hardlink sharing the protected file's inode stays marked protected,
+    # so exact-group deduplication over the pair sees only protected links.
+    assert all(rec.protected for rec in result.files)
+    assert result.groups == []
+
+
+def test_crop_and_dedupe_matches_uncropped_screenshot_on_first_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "orig.jpg", (50, 90, 140))
+    _save(tmp_path / "shot.png", (210, 20, 20))
+    order: list[str] = []
+
+    def fake_borders(records, **_kwargs):
+        order.append("borders")
+        for rec in records:
+            if rec.path.endswith("shot.png"):
+                rec.border_crop = "c:0,10,48,28"
+        return []
+
+    seen_crop_in_image_stage: dict[str, str | None] = {}
+
+    def fake_images(records, **_kwargs):
+        order.append("image")
+        for rec in records:
+            seen_crop_in_image_stage[Path(rec.path).name] = rec.border_crop
+        return []
+
+    monkeypatch.setattr(engine_mod, "analyze_borders", fake_borders)
+    monkeypatch.setattr(engine_mod, "find_similar_image_groups", fake_images)
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=True,
+        find_black_borders=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    assert order == ["borders", "image"]
+    assert seen_crop_in_image_stage["shot.png"] == "c:0,10,48,28"
+
+
+def test_semantic_excluded_pairs_surfaces_original_resized_and_cropped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.engine as engine_mod
+
+    for name in ("orig.jpg", "resized.jpg", "cropped.jpg", "prot_a.jpg", "prot_b.jpg"):
+        _save(tmp_path / name, (20, 100, 180))
+
+    p = {name: str((tmp_path / name).resolve()) for name in (
+        "orig.jpg", "resized.jpg", "cropped.jpg", "prot_a.jpg", "prot_b.jpg"
+    )}
+
+    monkeypatch.setattr(engine_mod, "semantic_available", lambda: True)
+    monkeypatch.setattr(
+        engine_mod,
+        "embed_records",
+        lambda recs, **_k: ({r.path: b"\x00\x00\x80?" for r in recs}, []),
+    )
+    monkeypatch.setattr(
+        engine_mod,
+        "find_similar_image_groups",
+        lambda recs, **_k: [
+            [
+                next(r for r in recs if r.path == p["orig.jpg"]),
+                next(r for r in recs if r.path == p["resized.jpg"]),
+            ]
+        ],
+    )
+
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_group_semantic(records, vectors, **kwargs):
+        captured_kwargs.update(kwargs)
+        by_path = {r.path: r for r in records}
+        dups = [
+            (
+                [by_path[p["orig.jpg"]], by_path[p["cropped.jpg"]]],
+                {p["cropped.jpg"]: 0.95},
+            ),
+            (
+                [by_path[p["prot_a.jpg"]], by_path[p["prot_b.jpg"]]],
+                {p["prot_b.jpg"]: 0.95},
+            ),
+        ]
+        return [], dups
+
+    monkeypatch.setattr(engine_mod, "group_semantic_vectors", fake_group_semantic)
+
+    prot_dir = tmp_path / "prot"
+    prot_dir.mkdir()
+    (tmp_path / "prot_a.jpg").rename(prot_dir / "prot_a.jpg")
+    (tmp_path / "prot_b.jpg").rename(prot_dir / "prot_b.jpg")
+    p["prot_a.jpg"] = str((prot_dir / "prot_a.jpg").resolve())
+    p["prot_b.jpg"] = str((prot_dir / "prot_b.jpg").resolve())
+
+    result = run_scan(
+        [tmp_path],
+        protected_folders=[str(prot_dir)],
+        exact=False,
+        similar=True,
+        semantic=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    assert "exclude_from_duplicates" not in captured_kwargs
+    assert captured_kwargs["excluded_pairs"] == {
+        tuple(sorted((p["orig.jpg"], p["resized.jpg"])))
+    }
+    sim_groups = [g for g in result.groups if g.kind == GroupKind.SIMILAR]
+    assert len(sim_groups) == 2
+    assert {g.match_basis for g in sim_groups} == {None, "semantic"}
+    assert all(not all(m.protected for m in g.members) for g in sim_groups)
+
+
+def test_video_versions_without_similar_does_not_run_image_or_std_video_stages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.engine as engine_mod
+
+    _save(tmp_path / "photo.jpg", (40, 80, 120))
+    (tmp_path / "clip.mp4").write_bytes(b"video")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine_mod, "find_similar_image_groups", lambda *_a, **_k: calls.append("image") or []
+    )
+    monkeypatch.setattr(
+        engine_mod, "find_similar_video_groups", lambda *_a, **_k: calls.append("video") or []
+    )
+    monkeypatch.setattr(
+        engine_mod, "find_video_version_matches", lambda *_a, **_k: calls.append("versions") or []
+    )
+
+    run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        video_versions=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    assert calls == ["versions"]
+
+
+def test_incremental_new_only_short_circuits_and_isolates_arrivals(tmp_path: Path) -> None:
+    from dedupe.jobs import file_identity
+
+    lib = tmp_path / "protected"
+    inbox = tmp_path / "inbox"
+    lib.mkdir()
+    inbox.mkdir()
+    _save(inbox / "old_small.jpg", (20, 40, 60))
+    _save(lib / "old_master.jpg", (10, 90, 170))
+    cache_path = tmp_path / "cache.sqlite3"
+
+    first = run_scan(
+        [inbox],
+        protected_folders=[str(lib)],
+        cache_path=cache_path,
+        find_low_resolution=True,
+        random_review_count=50,
+    )
+    baseline = {r.path: file_identity(r) for r in first.files}
+
+    # Zero arrivals must short-circuit completely with no cache hydration or groups.
+    empty = run_scan(
+        [inbox],
+        protected_folders=[str(lib)],
+        cache_path=cache_path,
+        baseline=baseline,
+        new_only=True,
+    )
+    assert empty.groups == []
+    assert empty.diagnostics.cache_hits == 0
+
+    # Add 1 arrival matching old_master exact bytes + 1 protected arrival.
+    arrival = inbox / "arrival_dup.jpg"
+    arrival.write_bytes((lib / "old_master.jpg").read_bytes())
+    _save(lib / "prot_arrival.jpg", (200, 150, 100))
+
+    inc = run_scan(
+        [inbox],
+        protected_folders=[str(lib)],
+        cache_path=cache_path,
+        baseline=baseline,
+        new_only=True,
+        find_low_resolution=True,
+        random_review_count=50,
+    )
+    exact_groups = [g for g in inc.groups if g.kind == GroupKind.EXACT]
+    assert len(exact_groups) == 1
+    assert {m.path for m in exact_groups[0].members} == {
+        str((lib / "old_master.jpg").resolve()),
+        str(arrival.resolve()),
+    }
+    low_res = next(g for g in inc.groups if g.kind == GroupKind.LOW_RESOLUTION)
+    rand_rev = next(g for g in inc.groups if g.kind == GroupKind.RANDOM_REVIEW)
+    assert [m.path for m in low_res.members] == [str(arrival.resolve())]
+    assert [m.path for m in rand_rev.members] == [str(arrival.resolve())]
+
+
+def test_raw_thumbnail_excluded_from_low_resolution_and_pixel_exact_tagged(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "photo.cr3"
+    raw.write_bytes(b"CR3-RAW-CONTAINER")
+
+    img = Image.new("RGB", (120, 120), (30, 140, 210))
+    for x in range(10, 80, 2):
+        for y in range(10, 80, 3):
+            img.putpixel((x, y), (220, 40, 40))
+    p_a = tmp_path / "a.jpg"
+    p_b = tmp_path / "b.jpg"
+    exif_a = img.getexif()
+    exif_a[0x010E] = "First caption"
+    img.save(p_a, format="JPEG", quality=95, exif=exif_a.tobytes())
+    raw_bytes = p_a.read_bytes()
+    dqt_pos = raw_bytes.find(b"\xff\xdb")
+    p_b.write_bytes(b"\xff\xd8\xff\xfe\x00\x06INFO" + raw_bytes[dqt_pos:])
+
+    result = run_scan(
+        [tmp_path],
+        exact=True,
+        similar=True,
+        find_low_resolution=True,
+        low_resolution_max_pixels=500_000,
+        random_review_count=0,
+        use_cache=False,
+    )
+    low_res_paths = {
+        m.path for g in result.groups if g.kind == GroupKind.LOW_RESOLUTION for m in g.members
+    }
+    assert str(raw.resolve()) not in low_res_paths
+    assert result.diagnostics.stages["low_resolution"].failed == 0
+
+    sim_groups = [g for g in result.groups if g.kind == GroupKind.SIMILAR]
+    assert len(sim_groups) == 1
+    assert sim_groups[0].match_basis == "pixel_exact"
+    assert sim_groups[0].match_explanations
+
+
+def test_live_photo_pair_annotated_in_scan_diagnostics_and_groups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _save(tmp_path / "IMG_1234.jpg", (50, 100, 150))
+    (tmp_path / "IMG_1234.mov").write_bytes(b"short-live-photo-mov")
+    monkeypatch.setattr("dedupe.engine.probe_video", lambda _p: (2.2, 1080, 1920))
+
+    result = run_scan(
+        [tmp_path],
+        exact=False,
+        similar=False,
+        find_low_resolution=True,
+        low_resolution_max_pixels=50_000,
+        random_review_count=0,
+        use_cache=False,
+    )
+    inv_warnings = result.diagnostics.stages["inventory"].warnings
+    assert any("Live Photo pair detected" in w for w in inv_warnings)
+    low_res = next(g for g in result.groups if g.kind == GroupKind.LOW_RESOLUTION)
+    assert str((tmp_path / "IMG_1234.jpg").resolve()) in low_res.match_explanations
+
+
+def test_parallel_streams_reject_photos_library_aggregates_diags_dedups_hardlinks_and_cancel(
+    tmp_path: Path,
+) -> None:
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    photos_lib = tmp_path / "Photos Library.photoslibrary"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    photos_lib.mkdir()
+    master = a_dir / "master.jpg"
+    _save(master, (30, 100, 190))
+    os.link(master, b_dir / "linked.jpg")
+    _save(b_dir / "other.jpg", (200, 40, 40))
+
+    result = run_scans_parallel(
+        [a_dir, b_dir, photos_lib],
+        exact=False,
+        similar=False,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    assert any("Photos libraries cannot be scanned directly" in err for err in result.errors)
+    # Cross-root hardlink (master vs linked) is deduplicated in merged result.files.
+    assert len(result.files) == 2
+    assert result.diagnostics is not None
+    assert result.diagnostics.stages["inventory"].failed == 1
+
+    # Cancel in run_scans_parallel must NOT emit a final done=True progress message.
+    events = []
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        run_scans_parallel(
+            [a_dir, b_dir],
+            include_videos=False,
+            use_cache=False,
+            cancelled=lambda: True,
+            progress=events.append,
+        )
+    assert all(not ev.done for ev in events)
+
+
+def test_cancel_waits_for_stage_pool_to_drain_before_cache_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import threading
+
+    import dedupe.engine as engine_mod
+    from dedupe.cache import HashCache
+
+    _save(tmp_path / "a.jpg", (20, 40, 60))
+    _save(tmp_path / "b.jpg", (80, 100, 120))
+    worker_active = threading.Event()
+    worker_finished = threading.Event()
+    saw_active_during_store: list[bool] = []
+
+    def slow_images(*_a, **_k):
+        worker_active.set()
+        threading.Event().wait(0.08)
+        worker_finished.set()
+        return []
+
+    def cancel_exact(*_a, **_k):
+        assert worker_active.wait(2)
+        raise InterruptedError("scan cancelled")
+
+    real_store_all = HashCache.store_all
+
+    def guarded_store_all(self, records):
+        saw_active_during_store.append(not worker_finished.is_set())
+        return real_store_all(self, records)
+
+    monkeypatch.setattr(engine_mod, "find_similar_image_groups", slow_images)
+    monkeypatch.setattr(engine_mod, "find_exact_groups", cancel_exact)
+    monkeypatch.setattr(HashCache, "store_all", guarded_store_all)
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        run_scan(
+            [tmp_path],
+            cache_path=tmp_path / "hashes.sqlite3",
+            find_low_resolution=False,
+            random_review_count=0,
+        )
+    assert saw_active_during_store == [False]

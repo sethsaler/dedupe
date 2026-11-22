@@ -44,7 +44,7 @@ SKIP_REASONS: dict[str, str] = {
     "other": "Other",
 }
 
-CROP_DECISIONS = ("applied", "skipped", "reconsidered", "undone", "annotated")
+CROP_DECISIONS = ("applied", "skipped", "reconsidered", "undone", "annotated", "manual")
 DISTINCT_DECISIONS = ("marked", "unmarked")
 
 _lock = threading.Lock()
@@ -218,6 +218,20 @@ def pair_features(left: FileRecord, right: FileRecord) -> dict:
     return features
 
 
+def _normalize_sibling_levels(sibling_levels: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not sibling_levels:
+        return None
+    out: dict[str, Any] = {}
+    for name, box in sibling_levels.items():
+        if box is None:
+            out[str(name)] = None
+        elif hasattr(box, "to_dict"):
+            out[str(name)] = box.to_dict()
+        else:
+            out[str(name)] = box
+    return out
+
+
 def make_crop_event(
     decision: str,
     record: FileRecord,
@@ -232,6 +246,9 @@ def make_crop_event(
     receipt_path: str | None = None,
     adjusted_box=None,
     level: str | None = None,
+    border_levels_signature: str | None = None,
+    sibling_levels: dict[str, Any] | None = None,
+    provenance: tuple[str, ...] | list[str] | None = None,
 ) -> dict:
     """One crop decision; ``box`` is the suggestion the user decided on.
 
@@ -240,8 +257,18 @@ def make_crop_event(
     skip still rejected. It is kept beside the suggestion, never in place
     of it, so detector tuning can measure how far users move its boxes.
     ``level`` is the aggressiveness level whose suggestion was on screen.
+    ``border_levels_signature``, ``sibling_levels``, and ``provenance``
+    capture multi-level detector context for offline evaluation.
     """
     adjusted = adjusted_box if adjusted_box is not None and adjusted_box != box else None
+    resolved_prov = (
+        list(provenance)
+        if provenance is not None
+        else (list(box.provenance) if box is not None and getattr(box, "provenance", ()) else None)
+    )
+    resolved_levels_sig = border_levels_signature or getattr(
+        record, "border_levels_signature", None
+    )
     return {
         "kind": "crop",
         "decision": decision,
@@ -255,11 +282,26 @@ def make_crop_event(
         "adjusted": adjusted.to_dict() if adjusted is not None else None,
         "adjusted_encoded": adjusted.encode() if adjusted is not None else None,
         "border_signature": record.border_signature,
+        "border_levels_signature": resolved_levels_sig,
+        "sibling_levels": _normalize_sibling_levels(sibling_levels),
+        "provenance": resolved_prov,
         "after": after,
         "reason": reason,
         "note": note,
         "receipt_path": receipt_path,
     }
+
+
+def log_crop_decision(
+    decision: str,
+    record: FileRecord,
+    box=None,
+    *,
+    path: str | Path | None = None,
+    **kwargs: Any,
+) -> int:
+    """Build and append one crop decision event, accepting all :func:`make_crop_event` kwargs."""
+    return append_decisions([make_crop_event(decision, record, box, **kwargs)], path)
 
 
 def make_distinct_event(
@@ -376,7 +418,7 @@ def current_crop_labels(events: list[dict]) -> list[dict]:
                 }
         elif decision == "reconsidered":
             labels.pop(key, None)
-        elif decision in ("applied", "skipped", "undone"):
+        elif decision in ("applied", "skipped", "undone", "manual"):
             labels[key] = event
     return list(labels.values())
 
@@ -443,6 +485,47 @@ def _removed_band(event: dict) -> str:
     return "50%+"
 
 
+def _edge_cuts(box: dict) -> dict[str, float] | None:
+    try:
+        w = float(box["width"])
+        h = float(box["height"])
+        return {
+            "left": float(box["left"]),
+            "top": float(box["top"]),
+            "right": w - float(box["right"]),
+            "bottom": h - float(box["bottom"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _adjustment_error_stats(events: list[dict]) -> dict:
+    """Per-edge MAE and signed cut-depth bias (suggestion - adjusted) across adjusted crops."""
+    edges = ("left", "top", "right", "bottom")
+    diffs: dict[str, list[float]] = {e: [] for e in edges}
+    count = 0
+    for event in events:
+        sug = event.get("suggestion")
+        adj = event.get("adjusted")
+        if not isinstance(sug, dict) or not isinstance(adj, dict):
+            continue
+        s_cuts = _edge_cuts(sug)
+        a_cuts = _edge_cuts(adj)
+        if s_cuts is None or a_cuts is None:
+            continue
+        count += 1
+        for e in edges:
+            diffs[e].append(s_cuts[e] - a_cuts[e])
+    if not count:
+        return {"count": 0, "mae_px": None, "bias_px": None}
+    mae = {e: round(sum(abs(v) for v in diffs[e]) / count, 3) for e in edges}
+    bias = {e: round(sum(diffs[e]) / count, 3) for e in edges}
+    all_vals = [v for e in edges for v in diffs[e]]
+    mae["overall"] = round(sum(abs(v) for v in all_vals) / len(all_vals), 3)
+    bias["overall"] = round(sum(all_vals) / len(all_vals), 3)
+    return {"count": count, "mae_px": mae, "bias_px": bias}
+
+
 def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
     """Tuning-ready rollup: current labels, not raw event counts, decide rates."""
     crop_events = [e for e in events if e.get("kind") == "crop"]
@@ -482,6 +565,7 @@ def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
             "events_by_decision": _counts(e.get("decision") for e in crop_events),
             **crop_rate(crops),
             "by_media_type": rate_by(lambda e: (e.get("file") or {}).get("media_type")),
+            "by_source": rate_by(lambda e: e.get("source") or "unknown"),
             "by_kind": rate_by(
                 lambda e: "screenshot_interface"
                 if (e.get("suggestion") or {}).get("chrome")
@@ -489,6 +573,9 @@ def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
             ),
             "by_removed_fraction": rate_by(_removed_band),
             "by_border_signature": rate_by(lambda e: e.get("border_signature") or "unknown"),
+            "by_border_levels_signature": rate_by(
+                lambda e: e.get("border_levels_signature") or "unknown"
+            ),
             # Events logged before levels existed decided on balanced boxes.
             "by_crop_level": rate_by(lambda e: e.get("crop_level") or "balanced"),
             "applied_by_source": _counts(
@@ -503,6 +590,8 @@ def summarize_decisions(events: list[dict], *, skipped_lines: int = 0) -> dict:
                 1 for e in crops if e.get("decision") == "skipped" and e.get("reason")
             ),
             "adjusted_zones": sum(1 for e in crops if e.get("adjusted")),
+            "adjustment_error": _adjustment_error_stats(crops),
+            "manual_recalls": sum(1 for e in crops if e.get("decision") == "manual"),
         },
         "distinct": {
             "events_by_decision": _counts(e.get("decision") for e in distinct_events),
@@ -526,7 +615,8 @@ def crop_manifest(events: list[dict]) -> dict:
 
     Each item is one file as suggested (the original bytes for an applied
     crop are in the Trash destination named in ``after``), with the user's
-    verdict: ``applied`` is a positive, ``skipped``/``undone`` negatives.
+    verdict: ``applied`` is a positive, ``skipped``/``undone`` negatives,
+    and ``manual`` missed-crop recalls.
     """
     items = [
         {
@@ -540,6 +630,9 @@ def crop_manifest(events: list[dict]) -> dict:
             "adjusted": event.get("adjusted"),
             "adjusted_encoded": event.get("adjusted_encoded"),
             "border_signature": event.get("border_signature"),
+            "border_levels_signature": event.get("border_levels_signature"),
+            "sibling_levels": event.get("sibling_levels"),
+            "provenance": event.get("provenance"),
             "crop_level": event.get("crop_level") or "balanced",
             "media_type": (event.get("file") or {}).get("media_type"),
             "after": event.get("after"),
@@ -552,9 +645,248 @@ def crop_manifest(events: list[dict]) -> dict:
         "note": (
             "User crop verdicts from the decision log. Applied = suggestion "
             "accepted (bulk applies were not individually inspected); "
-            "skipped/undone = rejected. Not independent ground truth."
+            "skipped/undone = rejected; manual = missed crop added by user. "
+            "Not independent ground truth."
         ),
         "items": items,
+    }
+
+
+def _box_dict(box: Any) -> dict | None:
+    if box is None:
+        return None
+    if hasattr(box, "to_dict"):
+        return box.to_dict()
+    if isinstance(box, dict):
+        return box
+    return None
+
+
+def _box_iou(a: dict, b: dict) -> float | None:
+    try:
+        ax0, ay0, ax1, ay1 = float(a["left"]), float(a["top"]), float(a["right"]), float(a["bottom"])
+        bx0, by0, bx1, by1 = float(b["left"]), float(b["top"]), float(b["right"]), float(b["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _levels_monotonic(levels: dict[str, Any]) -> bool:
+    cons = _box_dict(levels.get("conservative"))
+    bal = _box_dict(levels.get("balanced"))
+    agg = _box_dict(levels.get("aggressive"))
+    pairs = ((cons, bal), (bal, agg), (cons, agg))
+    for smaller, larger in pairs:
+        if smaller is None or larger is None:
+            continue
+        if (
+            smaller["left"] > larger["left"]
+            or smaller["top"] > larger["top"]
+            or smaller["right"] < larger["right"]
+            or smaller["bottom"] < larger["bottom"]
+        ):
+            return False
+    return True
+
+
+def _resolve_eval_path(item: dict) -> Path | None:
+    after = item.get("after")
+    if item.get("decision") == "applied":
+        if isinstance(after, str) and after and Path(after).is_file():
+            return Path(after)
+        if isinstance(after, dict):
+            cand = after.get("original_in_trash") or after.get("path")
+            if isinstance(cand, str) and cand and Path(cand).is_file():
+                return Path(cand)
+    raw = item.get("path") or (item.get("file") or {}).get("path")
+    return Path(raw) if raw else None
+
+
+def _aggregate_gt_metrics(records: list[tuple[dict | None, dict]]) -> dict:
+    """Compute IoU and per-edge cut-depth MAE/bias for ``(predicted_dict, gt_dict)`` pairs."""
+    if not records:
+        return {"count": 0, "mean_iou": None, "mae_px": None, "bias_px": None}
+    edges = ("left", "top", "right", "bottom")
+    ious: list[float] = []
+    diffs: dict[str, list[float]] = {e: [] for e in edges}
+    for pred, gt in records:
+        gt_cuts = _edge_cuts(gt)
+        if gt_cuts is None:
+            continue
+        if pred is None:
+            ious.append(0.0)
+            pred_cuts = {e: 0.0 for e in edges}
+        else:
+            iou = _box_iou(pred, gt)
+            ious.append(0.0 if iou is None else iou)
+            pred_cuts = _edge_cuts(pred) or {e: 0.0 for e in edges}
+        for e in edges:
+            diffs[e].append(pred_cuts[e] - gt_cuts[e])
+    n = len(ious)
+    if not n:
+        return {"count": 0, "mean_iou": None, "mae_px": None, "bias_px": None}
+    mae = {e: round(sum(abs(v) for v in diffs[e]) / n, 3) for e in edges}
+    bias = {e: round(sum(diffs[e]) / n, 3) for e in edges}
+    all_vals = [v for e in edges for v in diffs[e]]
+    mae["overall"] = round(sum(abs(v) for v in all_vals) / len(all_vals), 3)
+    bias["overall"] = round(sum(all_vals) / len(all_vals), 3)
+    return {
+        "count": n,
+        "mean_iou": round(sum(ious) / n, 4),
+        "mae_px": mae,
+        "bias_px": bias,
+    }
+
+
+def benchmark_crops(
+    manifest_path: str | Path | dict | list[dict],
+    *,
+    level: str = "balanced",
+    detector=None,
+    only_existing: bool = True,
+) -> dict:
+    """Evaluate border detection accuracy and consistency against a crop manifest.
+
+    Accepts a JSON manifest file produced by :func:`crop_manifest`, an already-loaded
+    manifest dict, or a list of manifest items. Reports false-positive suppression
+    on ``skipped``/``undone`` items, recall on ``applied`` and ``manual`` entries,
+    IoU and per-edge cut-depth MAE/bias against ``adjusted`` (and overall) ground
+    truth, and cross-level monotonicity / level agreement.
+    """
+    from .borders import (
+        CROP_LEVELS,
+        VIDEO_CROPPABLE_EXTENSIONS,
+        detect_crop_levels,
+        detect_video_crop_levels,
+        validate_crop_level,
+    )
+
+    level = validate_crop_level(level)
+    if isinstance(manifest_path, (str, Path)):
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    else:
+        payload = manifest_path
+    items = payload.get("items", []) if isinstance(payload, dict) else list(payload)
+
+    neg_total = neg_suppressed = 0
+    pos_total = pos_detected = 0
+    man_total = man_detected = 0
+    missing_skipped = 0
+    evaluated = 0
+    monotonic_ok = 0
+    level_agreed = 0
+    level_compared = 0
+    adjusted_pairs: list[tuple[dict | None, dict]] = []
+    overall_gt_pairs: list[tuple[dict | None, dict]] = []
+    per_item: list[dict] = []
+
+    for item in items:
+        decision = item.get("decision")
+        target = _resolve_eval_path(item)
+        if target is None or (only_existing and not target.is_file()):
+            missing_skipped += 1
+            continue
+        evaluated += 1
+        media_type = item.get("media_type") or (
+            item.get("file") or {}
+        ).get("media_type")
+        is_video = media_type == "video" or target.suffix.lower() in VIDEO_CROPPABLE_EXTENSIONS
+        if detector is not None:
+            raw = detector(target)
+            levels = raw if isinstance(raw, dict) else {level: raw}
+        else:
+            levels = (
+                detect_video_crop_levels(target)
+                if is_video
+                else detect_crop_levels(target)
+            )
+        mono = _levels_monotonic(levels)
+        if mono:
+            monotonic_ok += 1
+        pred_dict = _box_dict(levels.get(level))
+
+        adj = item.get("adjusted")
+        sug = item.get("suggestion")
+        gt_adj = adj if isinstance(adj, dict) else None
+        gt_box = gt_adj or (sug if (decision in ("applied", "manual") and isinstance(sug, dict)) else None)
+
+        if decision in ("skipped", "undone"):
+            neg_total += 1
+            if pred_dict is None:
+                neg_suppressed += 1
+        elif decision == "applied":
+            pos_total += 1
+            if pred_dict is not None:
+                pos_detected += 1
+        elif decision == "manual":
+            man_total += 1
+            if pred_dict is not None:
+                man_detected += 1
+
+        if gt_adj is not None:
+            adjusted_pairs.append((pred_dict, gt_adj))
+        if gt_box is not None:
+            overall_gt_pairs.append((pred_dict, gt_box))
+
+        logged_level = item.get("crop_level") or "balanced"
+        if isinstance(sug, dict) and logged_level in CROP_LEVELS and decision == "applied":
+            level_compared += 1
+            if _box_dict(levels.get(logged_level)) == sug:
+                level_agreed += 1
+
+        iou = _box_iou(pred_dict, gt_box) if (pred_dict and gt_box) else (0.0 if gt_box else None)
+        per_item.append({
+            "path": str(target),
+            "decision": decision,
+            "detected": pred_dict is not None,
+            "monotonic": mono,
+            "iou": round(iou, 4) if iou is not None else None,
+        })
+
+    return {
+        "level": level,
+        "total_items": len(items),
+        "evaluated": evaluated,
+        "missing_skipped": missing_skipped,
+        "negatives": {
+            "total": neg_total,
+            "suppressed": neg_suppressed,
+            "triggered": neg_total - neg_suppressed,
+            "suppression_rate": round(neg_suppressed / neg_total, 4) if neg_total else None,
+            "false_positive_rate": (
+                round((neg_total - neg_suppressed) / neg_total, 4) if neg_total else None
+            ),
+        },
+        "positives": {
+            "total": pos_total,
+            "detected": pos_detected,
+            "missed": pos_total - pos_detected,
+            "recall": round(pos_detected / pos_total, 4) if pos_total else None,
+        },
+        "manual": {
+            "total": man_total,
+            "detected": man_detected,
+            "missed": man_total - man_detected,
+            "recall": round(man_detected / man_total, 4) if man_total else None,
+        },
+        "adjusted_gt": _aggregate_gt_metrics(adjusted_pairs),
+        "overall_gt": _aggregate_gt_metrics(overall_gt_pairs),
+        "level_agreement": {
+            "monotonic_count": monotonic_ok,
+            "monotonic_rate": round(monotonic_ok / evaluated, 4) if evaluated else None,
+            "exact_compared": level_compared,
+            "exact_agreed": level_agreed,
+            "exact_rate": round(level_agreed / level_compared, 4) if level_compared else None,
+        },
+        "items": per_item,
     }
 
 

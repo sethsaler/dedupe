@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hmac
 import json
 import math
@@ -16,7 +17,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
-from dataclasses import replace
+from dataclasses import asdict, replace
 from itertools import combinations
 from pathlib import Path
 from urllib.parse import urlparse
@@ -30,12 +31,15 @@ from flask import (
     send_file,
 )
 
+from ..action_journal import ActionJournal
 from ..actions import (
     ActionItem,
     ActionResult,
     TrashBatch,
+    _trash_dirs_for,
     _write_action_log,
     apply_actions,
+    auto_prune_old_previews,
     format_bytes,
     isolate_groups,
     undo_action,
@@ -43,6 +47,7 @@ from ..actions import (
 )
 from ..borders import (
     BORDER_DISMISSED,
+    BORDER_LEVELS_SIGNATURE,
     BORDER_SIGNATURE,
     CROP_LEVELS,
     CropBox,
@@ -64,9 +69,11 @@ from ..decision_log import (
     validate_skip_annotation,
 )
 from ..engine import run_scan, run_scans_parallel
+from ..exact import file_partial_hash, file_sha256
 from ..grouping import (
     apply_smart_select,
     apply_smart_select_all,
+    build_one_group,
     ensure_all_files_groups,
     refresh_crop_groups,
 )
@@ -76,7 +83,9 @@ from ..jobs import JobStore, focus_new_arrivals
 from ..keep_decisions import update_keep_decisions
 from ..media_details import comparison_details
 from ..models import (
+    FileRecord,
     GroupKind,
+    MediaType,
     ReviewPolicy,
     ScanProgress,
     ScanResult,
@@ -97,20 +106,30 @@ from ..review_session import (
     peek_review_session,
     save_review_session,
 )
+from ..semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 from ..semantic import semantic_available
 from ..similar_image import (
     ORIENTATIONS,
     TILE_HASH_VERSION,
+    compute_image_fingerprint,
     decode_orientation_phashes,
+    encode_orientation_phashes,
+    encode_tile_phashes,
+    find_similar_image_groups,
 )
-from ..similar_video import aligned_position_indexes
+from ..similar_video import (
+    aligned_position_indexes,
+    compute_video_fingerprint,
+    find_similar_video_groups,
+)
 from .media import cached_thumbnail, is_browser_safe_image, is_video, media_mimetype
 from .native_picker import pick_native_paths
 
 # Increment when adding/changing browser-facing API routes. The macOS launcher uses
 # this to avoid pairing static files from the working tree with a stale Flask process.
-WEB_API_VERSION = 33
+WEB_API_VERSION = 34
 PREVIEW_TOKEN_TTL_SECONDS = 600
+KEEP_WHOLE_MARKER = "keep_whole"
 
 #: Whole-group "not duplicates" reviews this server can still undo. The undo
 #: history is in memory and scoped to one scan session.
@@ -127,9 +146,10 @@ REVIEW_QUARANTINE_FOLDER = "_Dedupe Quarantine"
 # page reload to come back and cancel the shutdown, short enough to feel prompt.
 SHUTDOWN_GRACE_SECONDS = 1.5
 
-# Selection-change persistence is synchronous below this many groups and
-# debounced (PERSIST_DEBOUNCE_SECONDS) above it.
+# Selection-change persistence is synchronous below these thresholds and
+# debounced (PERSIST_DEBOUNCE_SECONDS) above either one.
 PERSIST_DEBOUNCE_MIN_GROUPS = 2000
+PERSIST_DEBOUNCE_MIN_FILES = 1000
 PERSIST_DEBOUNCE_SECONDS = 0.3
 
 # Why an execute was refused, phrased so the UI can tell the user what happens next.
@@ -319,27 +339,30 @@ def bulk_member_matches(member, group, criteria: dict) -> bool:
 
 
 def bulk_selection_picks(group, operation: str, criteria: dict) -> list[str]:
-    """Return the selection a bulk operation produces, with keep-one enforced.
+    """Return the selection a bulk operation produces, with keep-one and protection enforced.
 
-    Duplicate groups never have their suggested keeper selected, so at least one
-    member always survives. Non-human candidate groups are independent files and
-    may have every candidate selected.
+    Duplicate groups never have their suggested keeper or protected copies selected,
+    so at least one member always survives. Semantic and video-version look-alike
+    groups are manual-only (matching ``apply_smart_select_all``), except
+    ``select_none`` which safely clears selections.
     """
     # All-Files browse groups have no selection semantics — the view trashes
     # one click at a time — so a bulk mark would only corrupt review progress.
     if group.kind in (GroupKind.ALL_FILES, GroupKind.SETS, GroupKind.CROP):
+        return list(group.selected_for_removal)
+    if operation == "select_none":
+        return []
+    if group.match_basis in ("semantic", "video_version"):
         return list(group.selected_for_removal)
     keep_one = group.policy == ReviewPolicy.KEEP_ONE
     keeper = None
     if keep_one and group.members:
         member_paths = [member.path for member in group.members]
         keeper = group.suggested_keep if group.suggested_keep in member_paths else member_paths[0]
-    if operation == "select_none":
-        return []
     already = set(group.selected_for_removal)
     picks = []
     for member in group.members:
-        if member.path == keeper:
+        if member.path == keeper or member.protected:
             continue
         if operation == "select_all":
             chosen = True
@@ -500,6 +523,9 @@ def scan_done_summary(result: ScanResult, scan_kwargs: dict) -> str:
     parts: list[str] = []
     if scan_kwargs.get("exact") or scan_kwargs.get("similar") or scan_kwargs.get("semantic"):
         parts += [f"{result.exact_groups} exact", f"{result.similar_groups} similar"]
+    sets_count = sum(1 for g in result.groups if g.kind == GroupKind.SETS)
+    if scan_kwargs.get("sets") or sets_count:
+        parts.append(f"{sets_count} sets")
     if scan_kwargs.get("find_low_resolution"):
         parts.append(f"{result.low_resolution_files} low-resolution")
     if scan_kwargs.get("random_review_count"):
@@ -542,16 +568,22 @@ def _frame_suggestion(group, member) -> CropBox | None:
     return None
 
 
+def is_crop_kept_whole(group, member) -> bool:
+    """Return True when the user explicitly pulled a crop back to keep the whole frame."""
+    return (group.match_details.get("adjusted_crops") or {}).get(member.path) == KEEP_WHOLE_MARKER
+
+
 def adjusted_crop(group, member) -> CropBox | None:
     """The zone the user dragged ``member``'s suggestion to, if it still fits.
 
     Stored per crop group in ``match_details["adjusted_crops"]`` (encoded
     like a suggestion), so it rides the review session across restarts. A
     stored box that no longer matches the suggestion's frame, or equals the
-    shown level's suggestion, is not an adjustment. Switching levels never
-    discards a dragged zone; Reset returns to the shown level's box.
+    shown level's suggestion, is not an adjustment.
     """
     encoded = (group.match_details.get("adjusted_crops") or {}).get(member.path)
+    if encoded == KEEP_WHOLE_MARKER:
+        return None
     box = CropBox.decode(encoded)
     suggestion = _frame_suggestion(group, member)
     if box is None or suggestion is None:
@@ -564,8 +596,9 @@ def adjusted_crop(group, member) -> CropBox | None:
 
 
 def effective_crop(group, member) -> CropBox | None:
-    """The crop a Crop click would cut: the user's zone, else the shown
-    level's suggestion."""
+    """The crop a Crop click would cut: None if kept whole, else adjusted or suggested."""
+    if is_crop_kept_whole(group, member):
+        return None
     return adjusted_crop(group, member) or suggested_crop(
         member, chosen_crop_level(group, member)
     )
@@ -590,10 +623,18 @@ def create_app(
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     capabilities = detect_capabilities()
     lock = threading.RLock()
+    shutdown_lock = threading.Lock()
+    persist_lock = threading.RLock()
+    jobs_io_lock = threading.Lock()
+    decision_log_lock = threading.Lock()
     jobs = JobStore(review_session_path)
     from ..action_journal import recover_interrupted_actions
 
     recovered_actions = recover_interrupted_actions()
+    try:
+        auto_prune_old_previews()
+    except OSError:
+        pass
     # The server starts clean: the saved review is offered through the banner
     # (resume button), never auto-installed. A peek reads only the session's
     # identity, deferring the expensive per-file revalidation to an explicit
@@ -609,6 +650,8 @@ def create_app(
         "progress": ScanProgress(),
         "scanning": False,
         "acting": False,
+        "transitioning": False,
+        "cropping_paths": set(),
         "last_error": None,
         "groups_version": 0,
         "scan_id": secrets.token_hex(12),
@@ -619,18 +662,22 @@ def create_app(
         "review_session": loaded,
         "preview_tokens": {},
         "shutdown_timer": None,
+        "shutdown_token": 0,
         # Number of effectively-selected paths; maintained alongside
         # result.recompute_stats() so /api/status need not recompute per poll.
         "selected_count": 0,
+        "sets_groups": 0,
         # Bumped on every in-place membership change (group streamed, members
         # removed) so the allowed-path set used by media routes can be cached.
         "paths_version": 0,
         "allowed_paths_cache": None,  # ((id(result), paths_version), frozenset)
+        "dup_groups_cache": None,  # ((id(result), groups_version, paths_version), dict)
         # Ids of groups streamed by the active scan, for O(1) replace checks.
         "streamed_group_index": {},
         # Debounced review-session persistence for large results.
         "persist_dirty": False,
         "persist_timer": None,
+        "persist_seq": 0,
         # Last durable keep-decisions write failure (None when healthy). The
         # write must never fail a selection request, but it must be visible.
         "keep_decisions_error": None,
@@ -643,6 +690,7 @@ def create_app(
         # Similar groups dissolved by a whole-group distinct review, keyed by
         # group id, so /api/similar/restore-group can undo the review.
         "dissolved_similar": {},
+        "last_job_name": None,
         # On-demand people metrics for one group's members.
         "people_scoring": {
             "running": False,
@@ -665,11 +713,14 @@ def create_app(
         """Append review decisions to the decision log; never fail the review."""
         if not events:
             return
-        try:
-            append_decisions(events, app.config["DEDUPE_DECISION_LOG_PATH"])
-            state["decision_log_error"] = None
-        except OSError as exc:
-            state["decision_log_error"] = f"could not write the decision log: {exc}"
+        with decision_log_lock:
+            try:
+                append_decisions(events, app.config["DEDUPE_DECISION_LOG_PATH"])
+                err = None
+            except OSError as exc:
+                err = f"could not write the decision log: {exc}"
+        with lock:
+            state["decision_log_error"] = err
 
     def remember_border_verdicts(records) -> None:
         """Cache crop verdicts measured again for a resumed review."""
@@ -686,63 +737,135 @@ def create_app(
             if cache is not None:
                 cache.close()
 
+    def _snapshot_result_locked():
+        """Copy ScanResult under lock so JSON encoding + fsync run lock-free."""
+        result = state["result"]
+        if result is None:
+            return None, {}, None, state["persist_seq"]
+        cloned_records: dict[int, FileRecord] = {}
+
+        def _snap_rec(record: FileRecord) -> FileRecord:
+            cid = id(record)
+            cloned = cloned_records.get(cid)
+            if cloned is None:
+                cloned = replace(record)
+                cloned_records[cid] = cloned
+            return cloned
+
+        snap_files = [_snap_rec(record) for record in result.files]
+        snap_groups = [
+            replace(
+                group,
+                members=[_snap_rec(member) for member in group.members],
+                selected_for_removal=list(group.selected_for_removal),
+                reviewed_paths=list(group.reviewed_paths),
+                distinct_participants=list(group.distinct_participants),
+                match_scores=dict(group.match_scores),
+                match_details=copy.deepcopy(group.match_details),
+                match_explanations=dict(group.match_explanations),
+            )
+            for group in result.groups
+        ]
+        snap = ScanResult(
+            roots=list(result.roots),
+            files=snap_files,
+            groups=snap_groups,
+            errors=list(result.errors),
+            diagnostics=replace(result.diagnostics),
+            protected_folders=list(result.protected_folders),
+            job_id=result.job_id,
+            scan_settings=dict(result.scan_settings),
+        )
+        snap.recompute_stats()
+        job_name = state.get("last_job_name")
+        if not job_name and snap.scan_settings.get("job_name"):
+            job_name = str(snap.scan_settings["job_name"])
+        return snap, dict(state["deleted_files"]), job_name, state["persist_seq"]
+
     def persist_result() -> bool:
-        """Persist the active completed result, recording errors for status APIs."""
-        with lock:
-            state["persist_dirty"] = False
-            timer = state.get("persist_timer")
-            if timer is not None:
-                timer.cancel()
-                state["persist_timer"] = None
-            result = state["result"]
-            if result is None:
+        """Persist a snapshot of the active result outside state lock."""
+        with persist_lock:
+            with lock:
+                timer = state.get("persist_timer")
+                if timer is not None:
+                    timer.cancel()
+                    state["persist_timer"] = None
+                target_result = state["result"]
+                snap, deleted_copy, job_name, snap_seq = _snapshot_result_locked()
+            if snap is None:
+                with lock:
+                    state["persist_dirty"] = False
                 return False
             try:
                 metadata = save_review_session(
-                    result, review_session_path, deleted_files=state["deleted_files"]
+                    snap,
+                    review_session_path,
+                    deleted_files=deleted_copy,
+                    job_name=job_name,
                 )
-                if result.job_id:
-                    jobs.save_review(result, state["deleted_files"])
-                state["review_session"] = ReviewSessionLoad(
-                    result=result,
-                    path=Path(metadata["path"]),
-                    saved_at=metadata["saved_at"],
-                )
+                if snap.job_id:
+                    with jobs_io_lock:
+                        jobs.save_review(snap, deleted_copy)
+                with lock:
+                    if state["result"] is target_result:
+                        state["review_session"] = ReviewSessionLoad(
+                            result=target_result,
+                            path=Path(metadata["path"]),
+                            saved_at=metadata["saved_at"],
+                            roots=list(snap.roots),
+                            protected_folders=list(snap.protected_folders),
+                            scan_settings=dict(snap.scan_settings),
+                            job_id=snap.job_id,
+                            job_name=job_name,
+                            group_count=len(snap.groups),
+                            file_count=len(snap.files),
+                        )
+                    if state["persist_seq"] == snap_seq:
+                        state["persist_dirty"] = False
+                    state["events"].notify_all()
                 return True
             except (OSError, TypeError, ValueError) as exc:
-                report = state["review_session"]
-                report.error = str(exc)
-                state["last_error"] = f"Could not save review: {exc}"
+                with lock:
+                    report = state["review_session"]
+                    report.error = str(exc)
+                    state["last_error"] = f"Could not save review: {exc}"
                 return False
 
     def _flush_persist() -> None:
         with lock:
             state["persist_timer"] = None
-            if not state["persist_dirty"]:
-                return
+            dirty = state["persist_dirty"]
+        if not dirty:
+            return
         persist_result()
 
     def schedule_persist() -> None:
         """Persist small results synchronously; debounce multi-MB session writes.
 
-        A selection toggle persists the whole result as JSON, which costs
-        milliseconds for typical reviews but megabytes of churn per click on
-        very large ones. Above the threshold, writes coalesce over a short
-        window; actions, shutdown, and scan completion still flush eagerly.
+        Must be called without holding ``lock`` (acquires ``lock`` briefly to
+        inspect thresholds and release before blocking on disk I/O).
         """
         with lock:
+            state["persist_seq"] += 1
             result = state["result"]
             if result is None:
                 return
-            if len(result.groups) < PERSIST_DEBOUNCE_MIN_GROUPS:
-                persist_result()
+            file_count = max(
+                len(result.files), sum(len(group.members) for group in result.groups)
+            )
+            should_debounce = (
+                len(result.groups) >= PERSIST_DEBOUNCE_MIN_GROUPS
+                or file_count >= PERSIST_DEBOUNCE_MIN_FILES
+            )
+            if should_debounce:
+                state["persist_dirty"] = True
+                if state.get("persist_timer") is None:
+                    timer = threading.Timer(PERSIST_DEBOUNCE_SECONDS, _flush_persist)
+                    timer.daemon = True
+                    state["persist_timer"] = timer
+                    timer.start()
                 return
-            state["persist_dirty"] = True
-            if state.get("persist_timer") is None:
-                timer = threading.Timer(PERSIST_DEBOUNCE_SECONDS, _flush_persist)
-                timer.daemon = True
-                state["persist_timer"] = timer
-                timer.start()
+        persist_result()
 
     def normalized_destination(action: str, destination) -> str | None:
         if action != "quarantine" or not destination:
@@ -775,14 +898,37 @@ def create_app(
             return "changed"
         return "valid"
 
+    def dup_groups_by_path_locked() -> dict[str, tuple[str, ...]]:
+        """Map file path -> Exact/Similar group IDs containing it, cached per version."""
+        result: ScanResult | None = state["result"]
+        key = (id(result), state["groups_version"], state["paths_version"])
+        cached = state.get("dup_groups_cache")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        mapping: dict[str, list[str]] = {}
+        if result is not None:
+            for g in result.groups:
+                if g.kind not in (GroupKind.EXACT, GroupKind.SIMILAR):
+                    continue
+                for member in g.members:
+                    mapping.setdefault(member.path, []).append(g.id)
+        frozen = {path: tuple(ids) for path, ids in mapping.items()}
+        state["dup_groups_cache"] = (key, frozen)
+        return frozen
+
     def group_payload(group) -> dict:
         payload = group.to_dict()
+        dup_map = dup_groups_by_path_locked()
         for member, member_payload in zip(group.members, payload["members"], strict=True):
             # A score from an older model would sort against current ones.
             if not has_current_people_score(member):
                 member_payload["people_score"] = None
             if not has_current_non_person_coverage(member):
                 member_payload["non_person_coverage"] = None
+            member_payload["media_version"] = f"{member.mtime_ns}:{member.size}"
+            member_payload["in_duplicate_group"] = [
+                gid for gid in dup_map.get(member.path, ()) if gid != group.id
+            ]
         if group.kind == GroupKind.SETS:
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 score = group.match_scores.get(member.path)
@@ -830,11 +976,17 @@ def create_app(
             reviewed = set(group.reviewed_paths)
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 entry = cropped.get(member.path)
+                kept_whole = not entry and is_crop_kept_whole(group, member)
                 box = CropBox.decode(entry["box"]) if entry else effective_crop(group, member)
                 level = chosen_crop_level(group, member)
                 suggestion = suggested_crop(member, level)
                 levels = {name: suggested_crop(member, name) for name in CROP_LEVELS}
+                prov_box = box or suggestion
                 member_payload["crop"] = box.to_dict() if box else None
+                member_payload["crop_provenance"] = (
+                    prov_box.to_dict()["provenance"] if prov_box else []
+                )
+                member_payload["crop_keep_whole"] = kept_whole
                 member_payload["crop_level"] = level
                 member_payload["crop_levels"] = {
                     name: (levels[name].to_dict() if levels[name] and not entry else None)
@@ -844,7 +996,7 @@ def create_app(
                     suggestion.to_dict() if suggestion and not entry else None
                 )
                 member_payload["crop_adjusted"] = bool(
-                    not entry and adjusted_crop(group, member)
+                    not entry and (adjusted_crop(group, member) or kept_whole)
                 )
                 member_payload["crop_state"] = (
                     "cropped" if entry else "skipped" if member.path in reviewed else "pending"
@@ -930,6 +1082,8 @@ def create_app(
             result.faces_files += len(group.members)
         elif group.kind == GroupKind.CROP:
             result.crop_files += len(group.members)
+        elif group.kind == GroupKind.SETS:
+            state["sets_groups"] += 1
         selected = effective_selected_paths([group])
         sizes = {member.path: member.size for member in group.members}
         result.reclaimable_bytes += sum(sizes.get(path, 0) for path in selected)
@@ -944,16 +1098,21 @@ def create_app(
                 group.selected_for_removal = [
                     p for p in group.selected_for_removal if p not in protected
                 ]
-        state["selected_count"] = (
-            len(effective_selected_paths(result.groups)) if result is not None else 0
-        )
+            state["sets_groups"] = sum(
+                1 for group in result.groups if group.kind == GroupKind.SETS
+            )
+            state["selected_count"] = len(effective_selected_paths(result.groups))
+        else:
+            state["sets_groups"] = 0
+            state["selected_count"] = 0
 
     @app.before_request
     def cancel_pending_shutdown():
         """A reloaded/reopened page cancels a shutdown scheduled on pagehide."""
         if request.path == "/api/shutdown":
             return
-        with lock:
+        with shutdown_lock:
+            state["shutdown_token"] += 1
             timer = state.get("shutdown_timer")
             if timer is not None:
                 timer.cancel()
@@ -994,8 +1153,11 @@ def create_app(
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        immutable = "immutable" in response.headers.get("Cache-Control", "")
-        if request.path.startswith("/api/") and not immutable:
+        cache_control = response.headers.get("Cache-Control", "")
+        allows_private_cache = (
+            "immutable" in cache_control or cache_control.startswith("private,")
+        )
+        if request.path.startswith("/api/") and not allows_private_cache:
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1031,58 +1193,79 @@ def create_app(
 
     @app.get("/api/jobs")
     def api_jobs():
-        return jsonify({"jobs": jobs.list()})
+        with jobs_io_lock:
+            return jsonify({"jobs": jobs.list()})
 
     @app.post("/api/jobs")
     def api_save_job():
         data = request.get_json(silent=True) or {}
         with lock:
-            if state["scanning"] or state["acting"]:
+            if state["scanning"] or state["acting"] or state["transitioning"]:
                 return jsonify({"error": "Cleanup jobs are locked during active work"}), 409
-            try:
+            state["transitioning"] = True
+        try:
+            with jobs_io_lock:
                 saved = jobs.save(data.get("name"), data.get("settings"), data.get("id"))
-            except (OSError, ValueError, TypeError) as exc:
-                return jsonify({"error": str(exc)}), 400
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            with lock:
+                state["transitioning"] = False
         return jsonify(saved)
 
     @app.post("/api/jobs/delete")
     def api_delete_job():
         data = request.get_json(silent=True) or {}
+        job_id = data.get("id")
         with lock:
-            if state["scanning"] or state["acting"]:
+            if state["scanning"] or state["acting"] or state["transitioning"]:
                 return jsonify({"error": "Cleanup jobs are locked during active work"}), 409
-            try:
-                jobs.remove(data.get("id"))
-                if state["result"] and state["result"].job_id == data.get("id"):
+            state["transitioning"] = True
+        need_persist = False
+        try:
+            with jobs_io_lock:
+                jobs.remove(job_id)
+            with lock:
+                if state["result"] and state["result"].job_id == job_id:
                     state["result"].job_id = None
                     state["result"].scan_settings.pop("job_id", None)
-                    persist_result()
-                else:
-                    saved = load_review_session(review_session_path)
-                    if saved.result and saved.result.job_id == data.get("id"):
-                        saved.result.job_id = None
-                        saved.result.scan_settings.pop("job_id", None)
-                        save_review_session(saved.result, review_session_path, saved.deleted_files)
-                        if state["result"] is None:
-                            state["review_session"] = peek_review_session(review_session_path)
-                if (state.get("last_scan_settings") or {}).get("job_id") == data.get("id"):
+                    state["last_job_name"] = None
+                    need_persist = True
+                if (state.get("last_scan_settings") or {}).get("job_id") == job_id:
                     state["last_scan_settings"].pop("job_id", None)
-            except (OSError, ValueError, TypeError) as exc:
-                return jsonify({"error": str(exc)}), 400
+            if need_persist:
+                persist_result()
+            else:
+                saved = load_review_session(review_session_path)
+                if saved.result and saved.result.job_id == job_id:
+                    saved.result.job_id = None
+                    saved.result.scan_settings.pop("job_id", None)
+                    save_review_session(saved.result, review_session_path, saved.deleted_files)
+                peeked = peek_review_session(review_session_path)
+                with lock:
+                    if state["result"] is None:
+                        state["review_session"] = peeked
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            with lock:
+                state["transitioning"] = False
         return jsonify({"ok": True})
 
     @app.get("/api/history")
     def api_history():
         from ..history import list_history
 
+        limit = request.args.get("limit", 50, type=int)
+        offset = request.args.get("offset", 0, type=int)
         with lock:
             if state["acting"]:
                 return jsonify({"error": "Wait for the current file action to finish"}), 409
-            return jsonify(list_history(
-                cache_path=app.config["DEDUPE_CACHE_PATH"],
-                limit=request.args.get("limit", 50, type=int),
-                offset=request.args.get("offset", 0, type=int),
-            ))
+        return jsonify(list_history(
+            cache_path=app.config["DEDUPE_CACHE_PATH"],
+            limit=limit,
+            offset=offset,
+        ))
 
     @app.post("/api/history/reconsider")
     def api_history_reconsider():
@@ -1090,22 +1273,27 @@ def create_app(
 
         data = request.get_json(silent=True) or {}
         with lock:
-            if state["scanning"] or state["acting"]:
+            if state["scanning"] or state["acting"] or state["transitioning"]:
                 return jsonify({"error": "History is locked during active work"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
-            try:
-                outcome = reconsider_distinct_decision(
-                    data.get("path_a"), data.get("path_b"),
-                    cache_path=app.config["DEDUPE_CACHE_PATH"],
-                )
-            except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-                return jsonify({"error": str(exc)}), 400
-            if outcome.get("removed_pairs"):
-                log_decisions([make_distinct_path_event(
-                    "unmarked", data.get("path_a"), data.get("path_b"),
-                    scan_id=state["scan_id"], source="history",
-                )])
+            scan_id = state["scan_id"]
+            state["transitioning"] = True
+        try:
+            outcome = reconsider_distinct_decision(
+                data.get("path_a"), data.get("path_b"),
+                cache_path=app.config["DEDUPE_CACHE_PATH"],
+            )
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            with lock:
+                state["transitioning"] = False
+        if outcome.get("removed_pairs"):
+            log_decisions([make_distinct_path_event(
+                "unmarked", data.get("path_a"), data.get("path_b"),
+                scan_id=scan_id, source="history",
+            )])
         return jsonify(outcome)
 
     @app.get("/favicon.ico")
@@ -1149,6 +1337,7 @@ def create_app(
             "trash_undo_cleared": state["trash_undo_cleared"],
             "recovered_actions": len(recovered_actions),
             "scan_settings": state.get("last_scan_settings") or (result.scan_settings if result else {}),
+            "people_scoring": people_scoring_payload_locked(),
             "system": {
                 "cpu_count": cpu,
                 "auto_workers": resolve_workers(None),
@@ -1163,6 +1352,7 @@ def create_app(
                 "group_count": len(result.groups),
                 "exact_groups": result.exact_groups,
                 "similar_groups": result.similar_groups,
+                "sets_groups": state["sets_groups"],
                 "no_human_files": result.no_human_files,
                 "low_resolution_files": result.low_resolution_files,
                 "random_review_files": result.random_review_files,
@@ -1187,8 +1377,8 @@ def create_app(
         """Server-sent events: scan status, streamed groups, and resync hints.
 
         Replaces client-side polling during scans. Events:
-          - ``status``: the /api/status payload (throttled while scanning,
-            immediate on state transitions)
+          - ``status``: the /api/status payload (throttled for high-frequency
+            files_processed counters while scanning, immediate on transitions)
           - ``group``: one streamed group payload, in discovery order
           - ``reset``: the group list was replaced (scan finished, new scan,
             resume/discard); the client should refetch /api/groups
@@ -1222,17 +1412,20 @@ def create_app(
                                 {
                                     "groups_version": state["groups_version"],
                                     "scan_id": state["scan_id"],
+                                    "scanning": state["scanning"],
                                 },
                             )
                         )
                         if not state["scanning"]:
                             # Completion/resume/discard: the client refetches
                             # the authoritative list on reset, so skip deltas.
+                            sent_groups = len(result.groups) if result is not None else 0
                             seen_groups_version = state["groups_version"]
                         # While scanning, leave the seen version stale: groups
                         # appended since the replacement stream as deltas below.
                     if (
                         result is not None
+                        and state["scanning"]
                         and state["groups_version"] != seen_groups_version
                     ):
                         for group in result.groups[sent_groups:]:
@@ -1241,25 +1434,33 @@ def create_app(
                         seen_groups_version = state["groups_version"]
 
                     prog = state["progress"]
+                    scoring = state["people_scoring"]
+                    people_running = bool(scoring["running"])
+                    # Omit high-frequency files_processed/done counts from immediate
+                    # transitions so progress ticks obey the 0.25s throttle.
                     snapshot = (
                         state["scanning"],
                         state["acting"],
                         prog.phase,
                         prog.done,
-                        prog.files_processed,
                         prog.groups_found,
                         state["last_error"],
                         state["groups_version"],
                         state["selected_count"],
+                        len(state["deleted_files"]),
+                        people_running,
+                        scoring["group_id"],
+                        scoring["metric"],
+                        scoring["error"],
                     )
                     now = time.monotonic()
                     transitioned = snapshot != last_snapshot
-                    due = state["scanning"] and now - last_status_emit >= 0.25
+                    due = (state["scanning"] or people_running) and now - last_status_emit >= 0.25
                     if transitioned or due:
                         events.append(("status", status_payload_locked()))
                         last_snapshot = snapshot
                         last_status_emit = now
-                    scanning = state["scanning"]
+                    active_poll = state["scanning"] or people_running
 
                 if events:
                     lines = []
@@ -1275,8 +1476,8 @@ def create_app(
 
                 with lock:
                     # Coalesce per-file progress notifications into one wakeup
-                    # cadence while scanning; sleep until notified when idle.
-                    state["events"].wait(timeout=0.25 if scanning else 30.0)
+                    # cadence while active; sleep until notified when idle.
+                    state["events"].wait(timeout=0.25 if active_poll else 30.0)
 
         response = Response(stream(), mimetype="text/event-stream")
         response.headers["X-Accel-Buffering"] = "no"
@@ -1289,65 +1490,100 @@ def create_app(
 
     @app.post("/api/review-session/resume")
     def api_review_session_resume():
-        with lock:
-            if state["scanning"] or state["acting"]:
-                return jsonify({"error": "review is locked during active work"}), 409
-            if state["persist_dirty"] and not persist_result():
+        data = request.get_json(silent=True) or {}
+        while True:
+            with lock:
+                if state["scanning"] or state["acting"] or state["transitioning"]:
+                    return jsonify({"error": "review is locked during active work"}), 409
+                need_flush = state["persist_dirty"]
+                if not need_flush:
+                    state["transitioning"] = True
+                    break
+            if not persist_result():
                 return jsonify({"error": "Could not save the current review before switching"}), 400
-            data = request.get_json(silent=True) or {}
+
+        try:
             try:
-                source = (jobs.session_path(data["job_id"])
-                          if data.get("job_id") is not None else review_session_path)
+                source = (
+                    jobs.session_path(data["job_id"])
+                    if data.get("job_id") is not None
+                    else review_session_path
+                )
                 report = load_review_session(source)
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
-            state["review_session"] = report
+
             if report.result is None:
+                with lock:
+                    state["review_session"] = report
+                    state["events"].notify_all()
                 return jsonify(report.metadata()), 404
+
             # Heals sessions saved before a distinct review (e.g. poisoned by
-            # an earlier --load): covered groups never reach the review list.
+            # an earlier --load) and refreshes borders outside lock.
             drop_marked_distinct_groups(report.result, app.config["DEDUPE_CACHE_PATH"])
             ensure_all_files_groups(report.result)
-            remember_border_verdicts(refresh_crop_groups(report.result))
-            state["result"] = report.result
-            state["last_scan_settings"] = report.result.scan_settings
-            state["scan_id"] = secrets.token_hex(12)
-            state["deleted_files"] = dict(report.deleted_files)
-            state["groups_version"] += 1
-            state["paths_version"] += 1
-            refresh_selected_count_locked()
-            state["progress"] = ScanProgress(
-                phase="done",
-                done=True,
-                files_found=len(report.result.files),
-                groups_found=len(report.result.groups),
-                message="Resumed saved review",
-            )
-            payload = report.metadata()
-            payload["scan_id"] = state["scan_id"]
-            return jsonify(payload)
+            refreshed = refresh_crop_groups(report.result)
+            remember_border_verdicts(refreshed)
+            report.result.recompute_stats()
+            report.group_count = len(report.result.groups)
+            report.file_count = len(report.result.files)
+
+            with lock:
+                state["review_session"] = report
+                state["result"] = report.result
+                state["last_scan_settings"] = report.result.scan_settings
+                state["last_job_name"] = report.job_name
+                state["scan_id"] = secrets.token_hex(12)
+                state["deleted_files"] = dict(report.deleted_files)
+                state["groups_version"] += 1
+                state["paths_version"] += 1
+                state["streamed_group_index"] = {}
+                refresh_selected_count_locked()
+                state["progress"] = ScanProgress(
+                    phase="done",
+                    done=True,
+                    files_found=len(report.result.files),
+                    groups_found=len(report.result.groups),
+                    message="Resumed saved review",
+                )
+                payload = report.metadata()
+                payload["scan_id"] = state["scan_id"]
+                state["events"].notify_all()
+                return jsonify(payload)
+        finally:
+            with lock:
+                state["transitioning"] = False
 
     @app.delete("/api/review-session")
     def api_review_session_discard():
         with lock:
-            if state["scanning"] or state["acting"]:
+            if state["scanning"] or state["acting"] or state["transitioning"]:
                 return jsonify({"error": "review is locked during active work"}), 409
+            state["transitioning"] = True
+        try:
             try:
                 removed = discard_review_session(review_session_path)
             except OSError as exc:
                 # A filesystem failure, not a server bug — same status the
                 # other file-touching endpoints use for OSError.
                 return jsonify({"error": str(exc)}), 400
-            old_path = state["review_session"].path
-            state["review_session"] = ReviewSessionLoad(path=old_path)
-            state["result"] = None
-            state["deleted_files"] = {}
-            state["scan_id"] = secrets.token_hex(12)
-            state["groups_version"] += 1
-            state["paths_version"] += 1
-            state["selected_count"] = 0
-            state["progress"] = ScanProgress()
-        return jsonify({"ok": True, "discarded": removed})
+            with lock:
+                old_path = state["review_session"].path
+                state["review_session"] = ReviewSessionLoad(path=old_path)
+                state["result"] = None
+                state["deleted_files"] = {}
+                state["scan_id"] = secrets.token_hex(12)
+                state["groups_version"] += 1
+                state["paths_version"] += 1
+                state["selected_count"] = 0
+                state["sets_groups"] = 0
+                state["progress"] = ScanProgress()
+                state["events"].notify_all()
+            return jsonify({"ok": True, "discarded": removed})
+        finally:
+            with lock:
+                state["transitioning"] = False
 
     def int_arg(name: str, default: int | None = None) -> int | None:
         raw = request.args.get(name)
@@ -1415,10 +1651,119 @@ def create_app(
                     return jsonify(group_payload(g))
         return jsonify({"error": "not found"}), 404
 
-    people_scoring_gate = threading.Lock()
+    people_queue_lock = threading.Lock()
+    people_queue_cond = threading.Condition(people_queue_lock)
+    people_worker_state: dict = {"started": False, "queued": None}
 
     def people_scoring_payload_locked() -> dict:
         return dict(state["people_scoring"])
+
+    def _sync_scored_people_locked(scored_copies: list[FileRecord]) -> None:
+        for copy_rec in scored_copies:
+            fields: dict = {}
+            if has_current_people_score(copy_rec):
+                fields["people_score"] = copy_rec.people_score
+                fields["people_score_signature"] = copy_rec.people_score_signature
+            if has_current_non_person_coverage(copy_rec):
+                fields["non_person_coverage"] = copy_rec.non_person_coverage
+                fields["non_person_coverage_signature"] = copy_rec.non_person_coverage_signature
+            if copy_rec.width is not None:
+                fields["width"] = copy_rec.width
+            if copy_rec.height is not None:
+                fields["height"] = copy_rec.height
+            if fields:
+                update_records_locked(copy_rec.path, fields)
+
+    def _persist_people_cache_safely(scored_copies: list[FileRecord]) -> None:
+        if not scored_copies:
+            return
+        cache = None
+        try:
+            cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            # Preserve all existing cached columns (hashes, borders, human decisions)
+            # instead of letting store_all overwrite unpopulated fields.
+            merged = [replace(copy_rec) for copy_rec in scored_copies]
+            cache.hydrate(merged)
+            for copy_rec, target in zip(scored_copies, merged, strict=True):
+                if has_current_people_score(copy_rec):
+                    target.people_score = copy_rec.people_score
+                    target.people_score_signature = copy_rec.people_score_signature
+                if has_current_non_person_coverage(copy_rec):
+                    target.non_person_coverage = copy_rec.non_person_coverage
+                    target.non_person_coverage_signature = copy_rec.non_person_coverage_signature
+                if copy_rec.width is not None:
+                    target.width = copy_rec.width
+                if copy_rec.height is not None:
+                    target.height = copy_rec.height
+            cache.store_all(merged)
+        except (OSError, sqlite3.Error):
+            pass  # scores still apply to this session; they just are not cached
+        finally:
+            if cache is not None:
+                cache.close()
+
+    def _run_one_people_job(spec: dict) -> None:
+        job = spec["job"]
+        scan_id = spec["scan_id"]
+        require_coverage = spec["require_coverage"]
+        is_current = spec["is_current"]
+        pending_copies: list[FileRecord] = spec["pending_copies"]
+
+        def scan_current() -> bool:
+            with lock:
+                return state["scan_id"] == scan_id and not state["scanning"]
+
+        def still_current() -> bool:
+            with lock:
+                return state["people_scoring_job"] is job and scan_current()
+
+        def progress(done: int, _total: int) -> None:
+            scored_now = [rec for rec in pending_copies if is_current(rec)]
+            with lock:
+                if scored_now and scan_current():
+                    _sync_scored_people_locked(scored_now)
+                if state["people_scoring_job"] is job:
+                    state["people_scoring"]["done"] = done
+                    state["events"].notify_all()
+
+        error = None
+        try:
+            if not still_current():
+                raise InterruptedError
+            score_people(
+                pending_copies,
+                progress=progress,
+                cancelled=lambda: not still_current(),
+                require_coverage=require_coverage,
+            )
+        except InterruptedError:
+            error = "scoring stopped because the results changed"
+        except Exception as exc:  # model failure: report, never crash the server
+            error = f"people scoring failed: {exc}"
+
+        scored = [rec for rec in pending_copies if is_current(rec)]
+        if scored:
+            with lock:
+                if scan_current():
+                    _sync_scored_people_locked(scored)
+            _persist_people_cache_safely(scored)
+        with lock:
+            if state["people_scoring_job"] is job:
+                state["people_scoring"]["running"] = False
+                state["people_scoring"]["error"] = error
+                state["people_scoring"]["done"] = state["people_scoring"]["total"]
+                state["events"].notify_all()
+        if scored and scan_current():
+            schedule_persist()
+
+    def _people_worker_loop() -> None:
+        while True:
+            with people_queue_cond:
+                while people_worker_state["queued"] is None:
+                    people_queue_cond.wait()
+                spec = people_worker_state["queued"]
+                people_worker_state["queued"] = None
+            _run_one_people_job(spec)
 
     @app.get("/api/people-scores")
     def api_people_scores_status():
@@ -1449,84 +1794,53 @@ def create_app(
             if group is None:
                 return jsonify({"error": "not found"}), 404
             scoring = state["people_scoring"]
-            if (scoring["running"] and scoring["group_id"] == group_id
-                    and scoring["scan_id"] == state["scan_id"]):
+            if (
+                scoring["running"]
+                and scoring["group_id"] == group_id
+                and scoring["scan_id"] == state["scan_id"]
+                and scoring["metric"] == metric
+            ):
                 return jsonify(people_scoring_payload_locked())
-            # The folder on screen wins: a job still ranking another folder
-            # (or an earlier review) is replaced and stops at its next file,
-            # keeping the scores it already produced.
-            pending = [
-                m for m in group.members if m.media_type in PEOPLE_MEDIA_TYPES and not is_current(m)
+            pending_copies = [
+                replace(m)
+                for m in group.members
+                if m.media_type in PEOPLE_MEDIA_TYPES and not is_current(m)
             ]
             scan_id = state["scan_id"]
             job = object()
             state["people_scoring_job"] = job
             state["people_scoring"] = {
-                "running": bool(pending),
+                "running": bool(pending_copies),
                 "scan_id": scan_id,
                 "group_id": group_id,
                 "metric": metric,
                 "done": 0,
-                "total": len(pending),
+                "total": len(pending_copies),
                 "error": None,
             }
-            if not pending:
+            if not pending_copies:
+                state["events"].notify_all()
                 return jsonify(people_scoring_payload_locked())
+            state["events"].notify_all()
+            payload = people_scoring_payload_locked()
 
-        def scan_current() -> bool:
-            with lock:
-                return state["scan_id"] == scan_id and not state["scanning"]
-
-        def still_current() -> bool:
-            with lock:
-                return state["people_scoring_job"] is job and scan_current()
-
-        def progress(done: int, _total: int) -> None:
-            with lock:
-                if state["people_scoring_job"] is job:
-                    state["people_scoring"]["done"] = done
-
-        def work() -> None:
-            error = None
-            # A replaced job finishes its in-flight file before the next starts.
-            with people_scoring_gate:
-                try:
-                    if not still_current():
-                        raise InterruptedError
-                    score_people(
-                        pending,
-                        progress=progress,
-                        cancelled=lambda: not still_current(),
-                        require_coverage=require_coverage,
-                    )
-                except InterruptedError:
-                    error = "scoring stopped because the results changed"
-                except Exception as exc:  # model failure: report, never crash the server
-                    error = f"people scoring failed: {exc}"
-            # Records are scored in place, so an interrupted job still keeps
-            # (and caches) what it finished; reopening its folder resumes.
-            scored = [record for record in pending if is_current(record)]
-            if scored:
-                cache = None
-                try:
-                    cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
-                    cache.store_all(scored)
-                except (OSError, sqlite3.Error):
-                    pass  # scores still apply to this session; they just are not cached
-                finally:
-                    if cache is not None:
-                        cache.close()
-            with lock:
-                if state["people_scoring_job"] is job:
-                    state["people_scoring"]["running"] = False
-                    state["people_scoring"]["error"] = error
-                    state["people_scoring"]["done"] = state["people_scoring"]["total"]
-            if scored and scan_current():
-                schedule_persist()
-
-        threading.Thread(target=work, name="dedupe-people-scores", daemon=True).start()
-        with lock:
-            return jsonify(people_scoring_payload_locked()), 202
+        with people_queue_cond:
+            people_worker_state["queued"] = {
+                "job": job,
+                "scan_id": scan_id,
+                "require_coverage": require_coverage,
+                "is_current": is_current,
+                "pending_copies": pending_copies,
+            }
+            if not people_worker_state["started"]:
+                people_worker_state["started"] = True
+                threading.Thread(
+                    target=_people_worker_loop,
+                    name="dedupe-people-scores",
+                    daemon=True,
+                ).start()
+            people_queue_cond.notify()
+        return jsonify(payload), 202
 
     @app.post("/api/scan")
     def api_scan():
@@ -1534,7 +1848,8 @@ def create_app(
         job = None
         if data.get("job_id") is not None:
             try:
-                job = jobs.get(data["job_id"])
+                with jobs_io_lock:
+                    job = jobs.get(data["job_id"])
             except (OSError, ValueError) as exc:
                 return jsonify({"error": f"Could not load cleanup job: {exc}"}), 400
             data = {**job["settings"], **data}
@@ -1580,72 +1895,88 @@ def create_app(
 
         resolved_roots = [str(Path(p).expanduser().resolve()) for p in paths]
 
-        with lock:
-            if state["scanning"]:
-                return jsonify({"error": "scan already running"}), 409
-            if state["acting"]:
-                return jsonify({"error": "file action already running"}), 409
-            if state["persist_dirty"] and not persist_result():
+        while True:
+            with lock:
+                if state["scanning"]:
+                    return jsonify({"error": "scan already running"}), 409
+                if state["acting"]:
+                    return jsonify({"error": "file action already running"}), 409
+                if state["transitioning"]:
+                    return jsonify({"error": "review state transition already running"}), 409
+                if not state["persist_dirty"]:
+                    if job and not data.get("new_only"):
+                        try:
+                            with jobs_io_lock:
+                                jobs.save(job["name"], data, job["id"])
+                                job = jobs.get(job["id"])
+                        except (OSError, ValueError) as exc:
+                            return jsonify({"error": f"Could not save cleanup job: {exc}"}), 400
+                    state["last_scan_settings"] = dict(data)
+                    state["last_job_name"] = job["name"] if job else None
+                    scan_id = secrets.token_hex(12)
+                    previous_result = state["result"]
+                    previous_deleted = dict(state["deleted_files"])
+                    cancel_event = threading.Event()
+                    state["scanning"] = True
+                    state["scan_id"] = scan_id
+                    state["cancel_event"] = cancel_event
+                    state["last_error"] = None
+                    state["deleted_files"] = {}
+                    # A new scan ends in-app undo for anything trashed earlier; the
+                    # status payload reports this once so it is not a silent loss.
+                    state["trash_undo_cleared"] = len(previous_deleted)
+                    state["progress"] = ScanProgress(phase="starting", message="Starting…")
+                    # Empty result so the UI can stream groups as they appear.
+                    state["result"] = ScanResult(
+                        roots=list(dict.fromkeys([*resolved_roots, *protected_folders])),
+                        files=[], groups=[], protected_folders=protected_folders,
+                    )
+                    state["preview_tokens"] = {}
+                    state["groups_version"] = state.get("groups_version", 0) + 1
+                    state["paths_version"] += 1
+                    state["selected_count"] = 0
+                    state["sets_groups"] = 0
+                    state["streamed_group_index"] = {}
+                    # Compare every selected root together by default. Independent streams
+                    # intentionally exclude cross-folder matches and must be opted into.
+                    parallel_streams = bool(data.get("parallel_streams", False))
+                    state["streams"] = (
+                        [
+                            {
+                                "index": i,
+                                "root": root,
+                                "phase": "starting",
+                                "message": "Queued…",
+                                "files_found": 0,
+                                "files_processed": 0,
+                                "groups_found": 0,
+                                "done": False,
+                            }
+                            for i, root in enumerate(resolved_roots)
+                        ]
+                        if parallel_streams
+                        else []
+                    )
+                    state["events"].notify_all()
+                    break
+            if not persist_result():
                 return jsonify({"error": "Could not save the current review before scanning"}), 400
-            if job and not data.get("new_only"):
-                try:
-                    jobs.save(job["name"], data, job["id"])
-                    job = jobs.get(job["id"])
-                except (OSError, ValueError) as exc:
-                    return jsonify({"error": f"Could not save cleanup job: {exc}"}), 400
-            state["last_scan_settings"] = dict(data)
-            scan_id = secrets.token_hex(12)
-            previous_result = state["result"]
-            previous_deleted = dict(state["deleted_files"])
-            cancel_event = threading.Event()
-            state["scanning"] = True
-            state["scan_id"] = scan_id
-            state["cancel_event"] = cancel_event
-            state["last_error"] = None
-            state["deleted_files"] = {}
-            # A new scan ends in-app undo for anything trashed earlier; the
-            # status payload reports this once so it is not a silent loss.
-            state["trash_undo_cleared"] = len(previous_deleted)
-            state["progress"] = ScanProgress(phase="starting", message="Starting…")
-            # Empty result so the UI can stream groups as they appear.
-            state["result"] = ScanResult(
-                roots=list(dict.fromkeys([*resolved_roots, *protected_folders])),
-                files=[], groups=[], protected_folders=protected_folders,
-            )
-            state["preview_tokens"] = {}
-            state["groups_version"] = state.get("groups_version", 0) + 1
-            state["paths_version"] += 1
-            state["selected_count"] = 0
-            state["streamed_group_index"] = {}
-            # Compare every selected root together by default. Independent streams
-            # intentionally exclude cross-folder matches and must be opted into.
-            parallel_streams = bool(data.get("parallel_streams", False))
-            state["streams"] = (
-                [
-                    {
-                        "index": i,
-                        "root": root,
-                        "phase": "starting",
-                        "message": "Queued…",
-                        "files_found": 0,
-                        "files_processed": 0,
-                        "groups_found": 0,
-                        "done": False,
-                    }
-                    for i, root in enumerate(resolved_roots)
-                ]
-                if parallel_streams
-                else []
-            )
 
         def worker() -> None:
+            last_progress_notify = [0.0]
+            last_notified_phase = [None]
             try:
 
                 def on_progress(prog: ScanProgress) -> None:
+                    now = time.monotonic()
                     with lock:
                         if state["scan_id"] == scan_id:
                             state["progress"] = prog
-                            state["events"].notify_all()
+                            phase_changed = prog.phase != last_notified_phase[0] or prog.done
+                            if phase_changed or now - last_progress_notify[0] >= 0.25:
+                                last_notified_phase[0] = prog.phase
+                                last_progress_notify[0] = now
+                                state["events"].notify_all()
 
                 def on_group(group) -> None:
                     with lock:
@@ -1654,15 +1985,9 @@ def create_app(
                         result: ScanResult | None = state["result"]
                         if result is None or state["scan_id"] != scan_id:
                             return
-                        # Append in discovery order and bump the version; the
-                        # per-group full sort + recompute_stats this replaced
-                        # cost O(groups^2 log n) per scan. The client keeps its
-                        # own sorted view, and the final result (which replaces
-                        # this one at completion) is sorted by the engine.
                         index = state["streamed_group_index"]
                         existing = index.get(group.id)
                         if existing is not None:
-                            # Shouldn't happen; fall back to a full recompute.
                             result.groups[existing] = group
                             result.recompute_stats()
                             refresh_selected_count_locked()
@@ -1720,7 +2045,8 @@ def create_app(
                     "semantic": bool(data.get("semantic", False)),
                     "semantic_threshold": _cosine(data.get("semantic_threshold"), 0.88),
                     "semantic_duplicate_threshold": _cosine(
-                        data.get("semantic_duplicate_threshold"), 0.97
+                        data.get("semantic_duplicate_threshold"),
+                        SEMANTIC_DUPLICATE_THRESHOLD,
                     ),
                     "semantic_full_speed": bool(data.get("semantic", False))
                     and bool(data.get("semantic_full_speed", False)),
@@ -1777,13 +2103,14 @@ def create_app(
                         return
                     if not result.roots and result.errors:
                         raise RuntimeError("; ".join(result.errors))
-                    ensure_all_files_groups(result)
                     result.protected_folders = protected_folders
                     result.job_id = job["id"] if job else None
                     result.scan_settings = {
                         key: value for key, value in data.items()
                         if key not in {"scan_id", "retry"}
                     }
+                    # Set scan_settings first so new_only skips pointless ALL_FILES grouping.
+                    ensure_all_files_groups(result)
                     arrivals = None
                     if data.get("new_only"):
                         arrivals = focus_new_arrivals(result, job["baseline"])
@@ -1805,13 +2132,17 @@ def create_app(
                         elapsed_seconds=result.diagnostics.total_duration_seconds,
                         eta_seconds=0.0,
                     )
-                    if not persist_result():
-                        raise OSError(state["last_error"])
-                    if job:
-                        jobs.finish_scan(result)
                     state["scanning"] = False
                     state["cancel_event"] = None
                     state["events"].notify_all()
+                # Keep an already-completed scan in memory even if persisting to disk fails.
+                persist_result()
+                if job:
+                    try:
+                        with jobs_io_lock:
+                            jobs.finish_scan(result)
+                    except OSError:
+                        pass
             except Exception as exc:
                 with lock:
                     if state["scan_id"] != scan_id:
@@ -1853,6 +2184,7 @@ def create_app(
                 return jsonify({"error": "stale scan session"}), 409
             event.set()
             state["progress"].message = "Cancelling after current work item…"
+            state["events"].notify_all()
         return jsonify({"ok": True})
 
     @app.post("/api/scan/check-exclusions")
@@ -1893,8 +2225,8 @@ def create_app(
             return jsonify({"error": f"invalid rule: {rule_raw}"}), 400
 
         with lock:
-            if state["scanning"] or state["acting"]:
-                return jsonify({"error": "selections are locked during active work"}), 409
+            if state["scanning"]:
+                return jsonify({"error": "selections are locked during active scan"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
             result: ScanResult | None = state["result"]
@@ -1907,19 +2239,24 @@ def create_app(
                         result.recompute_stats()
                         refresh_selected_count_locked()
                         payload = group_payload(g)
-                        schedule_persist()
-                        return jsonify(payload)
-                return jsonify({"error": "not found"}), 404
-            if group_ids is None:
-                scoped = result.groups
+                        state["events"].notify_all()
+                        break
+                else:
+                    return jsonify({"error": "not found"}), 404
+                out_payload = payload
             else:
-                wanted = {str(value) for value in group_ids}
-                scoped = [g for g in result.groups if g.id in wanted]
-            apply_smart_select_all(scoped, rule)
-            result.recompute_stats()
-            refresh_selected_count_locked()
-            schedule_persist()
-            return jsonify({"ok": True, "group_count": len(scoped)})
+                if group_ids is None:
+                    scoped = result.groups
+                else:
+                    wanted = {str(value) for value in group_ids}
+                    scoped = [g for g in result.groups if g.id in wanted]
+                apply_smart_select_all(scoped, rule)
+                result.recompute_stats()
+                refresh_selected_count_locked()
+                state["events"].notify_all()
+                out_payload = {"ok": True, "group_count": len(scoped)}
+        schedule_persist()
+        return jsonify(out_payload)
 
     @app.post("/api/selection")
     def api_selection():
@@ -1931,13 +2268,14 @@ def create_app(
             return jsonify({"error": "group_id required"}), 400
 
         with lock:
-            if state["scanning"] or state["acting"]:
-                return jsonify({"error": "selections are locked during active work"}), 409
+            if state["scanning"]:
+                return jsonify({"error": "selections are locked during active scan"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
             result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
+            payload = None
             for g in result.groups:
                 if g.id == group_id:
                     if g.kind == GroupKind.CROP:
@@ -1992,8 +2330,8 @@ def create_app(
                             result, {decision_path}
                         )
                         payload = group_payload(g)
-                        schedule_persist()
-                        return jsonify(payload)
+                        state["events"].notify_all()
+                        break
                     picks = [p for p in selected if p in member_paths and p not in protected_paths]
                     # Duplicate groups retain one file; independent review candidates may remove all.
                     if (
@@ -2021,9 +2359,12 @@ def create_app(
                     result.recompute_stats()
                     refresh_selected_count_locked()
                     payload = group_payload(g)
-                    schedule_persist()
-                    return jsonify(payload)
-        return jsonify({"error": "not found"}), 404
+                    state["events"].notify_all()
+                    break
+            else:
+                return jsonify({"error": "not found"}), 404
+        schedule_persist()
+        return jsonify(payload)
 
     @app.post("/api/selection/bulk")
     def api_selection_bulk():
@@ -2049,8 +2390,8 @@ def create_app(
             return jsonify({"error": f"invalid criteria: {exc}"}), 400
 
         with lock:
-            if state["scanning"] or state["acting"]:
-                return jsonify({"error": "selections are locked during active work"}), 409
+            if state["scanning"]:
+                return jsonify({"error": "selections are locked during active scan"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
             result: ScanResult | None = state["result"]
@@ -2080,14 +2421,44 @@ def create_app(
             refresh_selected_count_locked()
             if touched_low_res_paths:
                 sync_low_resolution_keeps(result, touched_low_res_paths)
-            schedule_persist()
-            return jsonify({
+            state["events"].notify_all()
+            payload = {
                 "ok": True,
                 "operation": operation,
                 "group_count": len(scoped),
                 "changed_count": changed,
                 "selected_count": state["selected_count"],
-            })
+            }
+        schedule_persist()
+        return jsonify(payload)
+
+    @app.post("/api/group/reviewed")
+    def api_group_reviewed():
+        """Mark or unmark a review group's explicit reviewed flag."""
+        data = request.get_json(silent=True) or {}
+        group_id = data.get("group_id")
+        if not group_id:
+            return jsonify({"error": "group_id required"}), 400
+        reviewed = data.get("reviewed", True)
+        if not isinstance(reviewed, bool):
+            return jsonify({"error": "reviewed must be a boolean"}), 400
+        with lock:
+            if state["scanning"]:
+                return jsonify({"error": "reviews are locked during active scan"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            if result is None:
+                return jsonify({"error": "no scan"}), 404
+            group = next((g for g in result.groups if g.id == group_id), None)
+            if group is None:
+                return jsonify({"error": "not found"}), 404
+            group.reviewed = reviewed
+            state["groups_version"] = state.get("groups_version", 0) + 1
+            payload = group_payload(group)
+            state["events"].notify_all()
+        schedule_persist()
+        return jsonify(payload)
 
     @app.post("/api/review-candidate/delete")
     def api_delete_review_candidate():
@@ -2138,6 +2509,7 @@ def create_app(
                 action_group if candidate.id == group.id else candidate
                 for candidate in result.groups
             ]
+            scan_id = state["scan_id"]
 
         try:
             preview = apply_actions(
@@ -2146,8 +2518,9 @@ def create_app(
                 dry_run=True,
                 roots=roots,
                 safety_groups=safety_groups,
+                verify_hashes=dry_run,
             )
-            manifest = (state["scan_id"], "trash", group.kind.value, None, tuple(sorted(
+            manifest = (scan_id, "trash", group.kind.value, None, tuple(sorted(
                 item.path for item in preview.items if item.ok
             )))
             if dry_run:
@@ -2233,16 +2606,18 @@ def create_app(
                 if result is not None:
                     result.recompute_stats()
                     refresh_selected_count_locked()
+                state["persist_seq"] += 1
+                state["events"].notify_all()
                 payload = group_payload(group)
-                persist_result()
-                return jsonify(payload)
+            persist_result()
+            return jsonify(payload)
         finally:
             with lock:
                 state["acting"] = False
 
     @app.post("/api/review-candidate/undo")
     def api_undo_review_candidate():
-        """Restore one trashed Non-Human or Faces review candidate to its original path."""
+        """Restore one trashed review candidate to its original path."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         path = data.get("path")
@@ -2264,44 +2639,52 @@ def create_app(
             destination = state["deleted_files"].get(path)
             if group is None or destination is None:
                 return jsonify({"error": "there is no deleted file to undo"}), 404
+            current = next(
+                (member for member in group.members if member.path == path),
+                None,
+            )
             state["acting"] = True
 
         try:
+            if not destination or destination == "Trash":
+                return jsonify({
+                    "error": "the file is no longer in a recoverable Trash path; restore it manually from Finder (macOS Trash)"
+                }), 404
             original = Path(path)
             recoverable = Path(destination)
             if original.exists() or original.is_symlink():
                 return jsonify({"error": "the original path is already occupied"}), 409
-            if not recoverable.is_file():
+            if not recoverable.is_file() or recoverable.is_symlink():
                 return jsonify({
-                   "error": "the file is no longer in the Trash; restore it manually from Finder (macOS Trash)"
-               }), 404
+                    "error": "the file is no longer in the Trash; restore it manually from Finder (macOS Trash)"
+                }), 404
+            trash_stat = recoverable.lstat()
+            if current is not None:
+                if trash_stat.st_size != current.size:
+                    return jsonify({
+                        "error": "the file in the Trash no longer matches the deleted candidate; restore it manually"
+                    }), 409
+                if current.partial_hash and file_partial_hash(recoverable) != current.partial_hash:
+                    return jsonify({
+                        "error": "the file in the Trash no longer matches the deleted candidate; restore it manually"
+                    }), 409
+                if current.sha256 and file_sha256(recoverable) != current.sha256:
+                    return jsonify({
+                        "error": "the file in the Trash no longer matches the deleted candidate; restore it manually"
+                    }), 409
             original.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(recoverable), str(original))
             restored = original.stat()
             with lock:
                 state["deleted_files"].pop(path, None)
-                current = next(
-                    (member for member in group.members if member.path == path),
-                    None,
-                )
-                if current is not None:
-                    refreshed = replace(
-                        current,
-                        size=restored.st_size,
-                        mtime=restored.st_mtime,
-                        device=restored.st_dev,
-                        inode=restored.st_ino,
-                        mtime_ns=restored.st_mtime_ns,
-                    )
-                    group.members = [
-                        refreshed if member.path == path else member
-                        for member in group.members
-                    ]
-                    if result is not None:
-                        result.files = [
-                            refreshed if file.path == path else file
-                            for file in result.files
-                        ]
+                update_records_locked(path, {
+                    "size": int(restored.st_size),
+                    "mtime": restored.st_mtime,
+                    "mtime_ns": restored.st_mtime_ns,
+                    "ctime_ns": restored.st_ctime_ns,
+                    "device": restored.st_dev,
+                    "inode": restored.st_ino,
+                })
                 group.reviewed_paths = [
                     reviewed for reviewed in group.reviewed_paths if reviewed != path
                 ]
@@ -2311,8 +2694,13 @@ def create_app(
                 if result is not None:
                     result.recompute_stats()
                     refresh_selected_count_locked()
-                persist_result()
-                return jsonify(group_payload(group))
+                state["paths_version"] += 1
+                state["groups_version"] += 1
+                state["persist_seq"] += 1
+                state["events"].notify_all()
+                payload = group_payload(group)
+            persist_result()
+            return jsonify(payload)
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -2388,74 +2776,9 @@ def create_app(
             if cache is not None:
                 cache.close()
 
-    def write_crop_receipt(items: list) -> str | None:
-        if not items:
-            return None
-        receipt = ActionResult(dry_run=False, action="crop", items=items)
-        from datetime import UTC, datetime
-
-        receipt.completed_at = datetime.now(UTC).isoformat()
-        _write_action_log(receipt)
-        return receipt.log_path
-
-    def begin_crop_work(data: dict):
-        """Validate a crop request and take the action lock; returns (group, error)."""
-        if state["scanning"] or state["acting"]:
-            return None, (jsonify({"error": "file actions are locked during active work"}), 409)
-        if data.get("scan_id") != state["scan_id"]:
-            return None, (jsonify({"error": "stale scan session; refresh results"}), 409)
-        group = crop_group_locked(data.get("group_id"))
-        if group is None:
-            return None, (jsonify({"error": "crop review not found"}), 404)
-        return group, None
-
-    def parse_requested_box(group, member, raw):
-        """The CropBox a request's ``box`` edges name (TypeError/ValueError if not)."""
-        suggestion = _frame_suggestion(group, member)
-        if suggestion is None:
-            raise ValueError("there is no crop suggestion for this file")
-        is_video = getattr(member.media_type, "value", member.media_type) == "video"
-        return adjust_crop_box(suggestion, raw, video=is_video)
-
-    def crop_member(member, roots: list[str], batch: TrashBatch, box=None):
-        """Crop one file on disk; returns (outcome, box, error). Lock not held."""
-        if box is None:
-            box = suggested_crop(member)
-        if box is None:
-            return None, None, "there is no crop suggestion for this file"
-        if member.protected:
-            return None, box, "This file is in a protected library"
-        error, _stat = validate_record_with_stat(member, roots)
-        if error:
-            return None, box, error
-        try:
-            outcome = crop_file_in_place(member, box, send_to_trash=batch.send)
-        except Exception as exc:
-            return None, box, f"could not crop: {exc}"
-        return outcome, box, None
-
-    def record_crop_locked(group, member, box, outcome) -> None:
-        # The applied box is recorded below; a stored adjustment for it is spent.
-        (group.match_details.get("adjusted_crops") or {}).pop(member.path, None)
-        cropped = group.match_details.setdefault("cropped", {})
-        cropped[member.path] = {
-            "box": box.encode(),
-            "level": chosen_crop_level(group, member),
-            # Every level's verdict before the crop, so Undo can restore
-            # the suggestions exactly as they were (the applied box takes
-            # the applied level's place, as before levels existed).
-            "levels": {
-                "balanced": member.border_crop or "",
-                "conservative": member.border_crop_conservative or "",
-                "aggressive": member.border_crop_aggressive or "",
-            },
-            "original": outcome.original_in_trash,
-            "before": record_identity(member),
-            "after": {"size": outcome.size, "mtime_ns": outcome.stat.st_mtime_ns},
-        }
-        group.reviewed_paths = list(dict.fromkeys([*group.reviewed_paths, member.path]))
+    def _cropped_cache_fields(outcome) -> dict:
         after = outcome.stat
-        update_records_locked(member.path, {
+        return {
             "size": int(after.st_size),
             "mtime": after.st_mtime,
             "mtime_ns": after.st_mtime_ns,
@@ -2475,8 +2798,178 @@ def create_app(
             "border_signature": BORDER_SIGNATURE,
             "border_crop_conservative": "",
             "border_crop_aggressive": "",
-        })
+            "border_levels_signature": BORDER_LEVELS_SIGNATURE,
+        }
+
+    def store_cache_records(records: list[FileRecord], *, cache: HashCache | None = None) -> None:
+        """Persist updated FileRecords into HashCache; ignore cache errors safely."""
+        if not records:
+            return
+        owned = cache is None
+        try:
+            target = cache or HashCache(app.config["DEDUPE_CACHE_PATH"])
+            target.store_all(records)
+        except (OSError, sqlite3.Error):
+            pass
+        finally:
+            if owned and "target" in locals() and target is not None:
+                target.close()
+
+    def build_crop_event(
+        decision: str,
+        record: FileRecord,
+        suggestion: CropBox | None,
+        *,
+        group_id: str,
+        scan_id: str,
+        source: str,
+        adjusted_box: CropBox | None = None,
+        level: str | None = None,
+        after: dict | None = None,
+        reason: str | None = None,
+        note: str | None = None,
+        receipt_path: str | None = None,
+    ) -> dict:
+        sibling = {name: suggested_crop(record, name) for name in CROP_LEVELS}
+        prov = (
+            list(suggestion.provenance)
+            if suggestion is not None and getattr(suggestion, "provenance", ())
+            else None
+        )
+        return make_crop_event(
+            decision,
+            replace(record),
+            suggestion,
+            group_id=group_id,
+            scan_id=scan_id,
+            source=source,
+            adjusted_box=adjusted_box,
+            level=level,
+            after=after,
+            reason=reason,
+            note=note,
+            receipt_path=receipt_path,
+            border_levels_signature=getattr(record, "border_levels_signature", None),
+            sibling_levels=sibling,
+            provenance=prov,
+        )
+
+    def write_crop_receipt(items: list) -> str | None:
+        if not items:
+            return None
+        receipt = ActionResult(dry_run=False, action="crop", items=items)
+        from datetime import UTC, datetime
+
+        receipt.completed_at = datetime.now(UTC).isoformat()
+        _write_action_log(receipt)
+        return receipt.log_path
+
+    def begin_crop_work(
+        data: dict, *, allow_while_acting: bool = False, target_path: str | None = None
+    ):
+        """Validate a crop request; returns (group, error_response)."""
+        if state["scanning"]:
+            return None, (jsonify({"error": "file actions are locked during active scan"}), 409)
+        if not allow_while_acting and state["acting"]:
+            return None, (jsonify({"error": "file actions are locked during active work"}), 409)
+        if target_path is not None and target_path in state["cropping_paths"]:
+            return None, (jsonify({"error": "this file is currently being cropped"}), 409)
+        if data.get("scan_id") != state["scan_id"]:
+            return None, (jsonify({"error": "stale scan session; refresh results"}), 409)
+        group = crop_group_locked(data.get("group_id"))
+        if group is None:
+            return None, (jsonify({"error": "crop review not found"}), 404)
+        return group, None
+
+    def parse_requested_box(group, member, raw):
+        """The CropBox a request's ``box`` edges name (TypeError/ValueError if not)."""
+        suggestion = _frame_suggestion(group, member)
+        if suggestion is None:
+            raise ValueError("there is no crop suggestion for this file")
+        is_video_file = getattr(member.media_type, "value", member.media_type) == "video"
+        return adjust_crop_box(suggestion, raw, video=is_video_file)
+
+    def crop_member(member, roots: list[str], batch: TrashBatch, box=None):
+        """Crop one file on disk; returns (outcome, box, error). Lock not held."""
+        if box is None:
+            box = suggested_crop(member)
+        if box is None:
+            return None, None, "there is no crop suggestion for this file"
+        if member.protected:
+            return None, box, "This file is in a protected library"
+        error, _stat = validate_record_with_stat(member, roots)
+        if error:
+            return None, box, error
+        try:
+            outcome = crop_file_in_place(member, box, send_to_trash=batch.send)
+        except Exception as exc:
+            return None, box, f"could not crop: {exc}"
+        return outcome, box, None
+
+    def record_crop_locked(
+        group, member, box, outcome, *, level: str | None = None, suggestion: CropBox | None = None
+    ) -> dict:
+        # The applied box is recorded below; a stored adjustment for it is spent.
+        (group.match_details.get("adjusted_crops") or {}).pop(member.path, None)
+        applied_level = level or chosen_crop_level(group, member)
+        resolved_suggestion = suggestion or suggested_crop(member, applied_level)
+        cropped = group.match_details.setdefault("cropped", {})
+        cropped[member.path] = {
+            "box": box.encode(),
+            "suggestion": resolved_suggestion.encode() if resolved_suggestion else None,
+            "level": applied_level,
+            "border_levels_signature": member.border_levels_signature or BORDER_LEVELS_SIGNATURE,
+            # Every level's verdict before the crop, so Undo preserves each
+            # detector suggestion without overwriting applied_level.
+            "levels": {
+                "balanced": member.border_crop or "",
+                "conservative": member.border_crop_conservative or "",
+                "aggressive": member.border_crop_aggressive or "",
+            },
+            "original": outcome.original_in_trash,
+            "before": record_identity(member),
+            "after": {"size": outcome.size, "mtime_ns": outcome.stat.st_mtime_ns},
+        }
+        group.reviewed_paths = list(dict.fromkeys([*group.reviewed_paths, member.path]))
+        fields = _cropped_cache_fields(outcome)
+        update_records_locked(member.path, fields)
         drop_from_exact_groups_locked(member.path)
+        return fields
+
+    def _restore_crop_entry_locked(group, path: str, entry: dict, restored) -> dict:
+        """Apply restored stat/border verdicts to in-memory records after restoring a crop."""
+        (group.match_details.get("cropped") or {}).pop(path, None)
+        levels = dict(entry.get("levels") or {})
+        applied_level = entry.get("level") or "balanced"
+        # Preserve each level's original detector suggestion; if the user applied
+        # a custom adjusted zone differing from that level's suggestion, keep the
+        # custom zone in adjusted_crops so Reset continues working.
+        applied_box = CropBox.decode(entry.get("box"))
+        level_suggestion = CropBox.decode(levels.get(applied_level))
+        adjustments = group.match_details.setdefault("adjusted_crops", {})
+        if applied_box is not None and level_suggestion is not None and applied_box != level_suggestion:
+            adjustments[path] = entry["box"]
+        else:
+            adjustments.pop(path, None)
+        group.reviewed_paths = [p for p in group.reviewed_paths if p != path]
+        before = dict(entry.get("before") or {})
+        before.update({
+            "size": int(restored.st_size),
+            "mtime": restored.st_mtime,
+            "mtime_ns": restored.st_mtime_ns,
+            "ctime_ns": restored.st_ctime_ns,
+            "device": restored.st_dev,
+            "inode": restored.st_ino,
+            "border_crop": levels.get("balanced", ""),
+            "border_signature": BORDER_SIGNATURE,
+            "border_crop_conservative": levels.get("conservative", ""),
+            "border_crop_aggressive": levels.get("aggressive", ""),
+            "border_levels_signature": (
+                entry.get("border_levels_signature") or BORDER_LEVELS_SIGNATURE
+            ),
+        })
+        update_records_locked(path, before)
+        return before
 
     def finish_crop_locked(group) -> dict:
         result: ScanResult | None = state["result"]
@@ -2485,9 +2978,9 @@ def create_app(
             refresh_selected_count_locked()
         state["paths_version"] += 1
         state["groups_version"] += 1
-        payload = group_payload(group)
-        persist_result()
-        return payload
+        state["persist_seq"] += 1
+        state["events"].notify_all()
+        return group_payload(group)
 
     @app.post("/api/crop/level")
     def api_crop_level():
@@ -2495,9 +2988,9 @@ def create_app(
 
         With ``path``, that file's card switches to ``level``'s suggestion;
         without, the whole review's default level changes and per-file
-        choices are cleared. Nothing on disk changes, a dragged zone is
-        kept (Crop still cuts it; Reset returns to the shown level's box),
-        and the choice rides the review session like a skip does.
+        choices are cleared. Stale manual adjustments on switched files are
+        cleared by default (``clear_adjustment=True``) so level switching
+        immediately updates the displayed crop zone cleanly.
         """
         data = request.get_json(silent=True) or {}
         level = data.get("level")
@@ -2506,13 +2999,21 @@ def create_app(
                 "error": f"level must be one of: {', '.join(CROP_LEVELS)}"
             }), 400
         path = data.get("path")
+        clear_adj = bool(data.get("clear_adjustment", True))
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(
+                data, allow_while_acting=True, target_path=path
+            )
             if refusal:
                 return refusal
             if path is None:
                 group.match_details["crop_level"] = level
                 group.match_details["chosen_crop_levels"] = {}
+                if clear_adj:
+                    cropped_paths = set(group.match_details.get("cropped") or {})
+                    adjustments = group.match_details.get("adjusted_crops") or {}
+                    for adj_path in [p for p in adjustments if p not in cropped_paths]:
+                        adjustments.pop(adj_path, None)
             else:
                 member = next((m for m in group.members if m.path == path), None)
                 if member is None:
@@ -2523,11 +3024,15 @@ def create_app(
                     }), 400
                 chosen = group.match_details.setdefault("chosen_crop_levels", {})
                 chosen[path] = level
-            return jsonify(finish_crop_locked(group))
+                if clear_adj:
+                    (group.match_details.get("adjusted_crops") or {}).pop(path, None)
+            payload = finish_crop_locked(group)
+        schedule_persist()
+        return jsonify(payload)
 
     @app.post("/api/crop/adjust")
     def api_crop_adjust():
-        """Move one suggested crop zone, or reset it with ``box: null``.
+        """Move one suggested crop zone, reset with ``box: null``, or set ``keep_whole: true``.
 
         The moved zone is only a review decision — nothing on disk changes
         until Crop is clicked — and it is stored with the group, so it
@@ -2535,10 +3040,13 @@ def create_app(
         """
         data = request.get_json(silent=True) or {}
         path = data.get("path")
-        if "box" not in data:
+        keep_whole = bool(data.get("keep_whole", False))
+        if "box" not in data and not keep_whole:
             return jsonify({"error": "box is required (null resets the zone)"}), 400
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(
+                data, allow_while_acting=True, target_path=path
+            )
             if refusal:
                 return refusal
             member = next((m for m in group.members if m.path == path), None)
@@ -2551,7 +3059,12 @@ def create_app(
             if member.protected:
                 return jsonify({"error": "This file is in a protected library"}), 400
             adjustments = group.match_details.setdefault("adjusted_crops", {})
-            if data["box"] is None:
+            if keep_whole:
+                suggestion = _frame_suggestion(group, member)
+                if suggestion is None:
+                    return jsonify({"error": "there is no crop suggestion for this file"}), 400
+                adjustments[path] = KEEP_WHOLE_MARKER
+            elif data["box"] is None:
                 adjustments.pop(path, None)
             else:
                 try:
@@ -2562,7 +3075,9 @@ def create_app(
                     adjustments.pop(path, None)
                 else:
                     adjustments[path] = box.encode()
-            return jsonify(finish_crop_locked(group))
+            payload = finish_crop_locked(group)
+        schedule_persist()
+        return jsonify(payload)
 
     @app.post("/api/crop/apply")
     def api_crop_apply():
@@ -2570,7 +3085,7 @@ def create_app(
         data = request.get_json(silent=True) or {}
         path = data.get("path")
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(data, allow_while_acting=False)
             if refusal:
                 return refusal
             member = next((m for m in group.members if m.path == path), None)
@@ -2588,106 +3103,253 @@ def create_app(
             if path in (group.match_details.get("cropped") or {}):
                 return jsonify(group_payload(group))
             requested = requested or effective_crop(group, member)
+            if requested is None:
+                return jsonify({"error": "there is no crop suggestion for this file"}), 400
             level = chosen_crop_level(group, member)
+            suggestion = suggested_crop(member, level) or requested
+            member_snap = replace(member)
             state["acting"] = True
+            state["cropping_paths"].add(member.path)
             roots = list(state["result"].roots)
+            scan_id = state["scan_id"]
         try:
-            outcome, box, error = crop_member(member, roots, TrashBatch(), box=requested)
+            outcome, box, error = crop_member(member_snap, roots, TrashBatch(), box=requested)
             if error:
                 return jsonify({"error": error}), 400
             log_path = write_crop_receipt([
                 ActionItem(
-                    path=member.path,
+                    path=member_snap.path,
                     ok=True,
                     action="crop",
                     destination=outcome.original_in_trash,
                     group_id=group.id,
-                    size=member.size,
+                    size=member_snap.size,
                 )
             ])
-            log_decisions([make_crop_event(
-                "applied", replace(member), suggested_crop(member, level) or box,
-                group_id=group.id, scan_id=state["scan_id"], source="single",
-                adjusted_box=box, level=level,
+            log_decisions([build_crop_event(
+                "applied",
+                member_snap,
+                suggestion,
+                group_id=group.id,
+                scan_id=scan_id,
+                source="single",
+                adjusted_box=box,
+                level=level,
                 after={
-                    "size": outcome.size, "width": outcome.width,
-                    "height": outcome.height, "original_in_trash": outcome.original_in_trash,
+                    "size": outcome.size,
+                    "width": outcome.width,
+                    "height": outcome.height,
+                    "original_in_trash": outcome.original_in_trash,
                 },
                 receipt_path=log_path,
             )])
+            cropped_fields = _cropped_cache_fields(outcome)
+            store_cache_records([replace(member_snap, **cropped_fields)])
             with lock:
-                record_crop_locked(group, member, box, outcome)
+                record_crop_locked(
+                    group, member_snap, box, outcome, level=level, suggestion=suggestion
+                )
                 payload = finish_crop_locked(group)
                 payload["log_path"] = log_path
-                return jsonify(payload)
+            persist_result()
+            return jsonify(payload)
         finally:
             with lock:
+                state["cropping_paths"].discard(member_snap.path)
                 state["acting"] = False
 
     @app.post("/api/crop/apply-all")
     def api_crop_apply_all():
-        """Crop every file in the review that has no decision yet."""
+        """Crop every file in the review that has no decision yet, recording each incrementally."""
         data = request.get_json(silent=True) or {}
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(data, allow_while_acting=False)
             if refusal:
                 return refusal
             decided = set(group.reviewed_paths) | set(group.match_details.get("cropped") or {})
-            # A file whose shown level suggests no crop (and with no dragged
-            # zone) has nothing to apply; it is left undecided, not failed.
-            pending = [
-                m for m in group.members
+            pending_members = [
+                replace(m) for m in group.members
                 if m.path not in decided
                 and not m.protected
                 and effective_crop(group, m) is not None
             ]
             state["acting"] = True
             roots = list(state["result"].roots)
+            scan_id = state["scan_id"]
+        journal = None
+        cache = None
+        current_path = None
         try:
             batch = TrashBatch()
-            items, failures, done = [], [], []
-            for member in pending:
-                outcome, box, error = crop_member(
-                    member, roots, batch, box=effective_crop(group, member)
-                )
-                if error:
-                    failures.append({"path": member.path, "error": error})
+            items: list[ActionItem] = []
+            failures: list[dict] = []
+            done_count = 0
+            receipt = ActionResult(dry_run=False, action="crop")
+            log_path = None
+            if pending_members:
+                plans = [
+                    {"path": m.path, "size": m.size, "destination": "Trash"}
+                    for m in pending_members
+                ]
+                try:
+                    journal = ActionJournal(receipt.to_dict(), plans)
+                    log_path = str(journal.path)
+                    receipt.log_path = log_path
+                except OSError:
+                    journal = None
+            try:
+                cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+            except (OSError, sqlite3.Error):
+                cache = None
+
+            for idx, member_snap in enumerate(pending_members):
+                with lock:
+                    live_member = next(
+                        (m for m in group.members if m.path == member_snap.path), None
+                    )
+                    if (
+                        live_member is None
+                        or live_member.path in group.reviewed_paths
+                        or live_member.path in (group.match_details.get("cropped") or {})
+                    ):
+                        box_to_apply = None
+                        level = chosen_crop_level(group, member_snap)
+                        suggestion = suggested_crop(member_snap, level)
+                    else:
+                        box_to_apply = effective_crop(group, live_member)
+                        level = chosen_crop_level(group, live_member)
+                        suggestion = suggested_crop(live_member, level) or box_to_apply
+                        member_snap = replace(live_member)
+                    if box_to_apply is not None:
+                        current_path = member_snap.path
+                        state["cropping_paths"].add(current_path)
+
+                if box_to_apply is None:
+                    skipped_item = ActionItem(
+                        path=member_snap.path,
+                        ok=False,
+                        action="crop",
+                        error="decision changed before cropping",
+                        size=member_snap.size,
+                    )
+                    items.append(skipped_item)
+                    if journal is not None:
+                        try:
+                            journal.record(idx, asdict(skipped_item))
+                        except OSError:
+                            pass
                     continue
-                done.append((member, box, outcome))
-                items.append(ActionItem(
-                    path=member.path,
+
+                try:
+                    if journal is not None:
+                        try:
+                            journal.begin(
+                                idx,
+                                search_dirs=_trash_dirs_for(Path(member_snap.path)),
+                                require_full_hash=False,
+                            )
+                        except OSError:
+                            pass
+                    outcome, box, error = crop_member(
+                        member_snap, roots, batch, box=box_to_apply
+                    )
+                finally:
+                    with lock:
+                        if current_path is not None:
+                            state["cropping_paths"].discard(current_path)
+                            current_path = None
+
+                if error:
+                    failures.append({"path": member_snap.path, "error": error})
+                    fail_item = ActionItem(
+                        path=member_snap.path,
+                        ok=False,
+                        action="crop",
+                        error=error,
+                        size=member_snap.size,
+                    )
+                    items.append(fail_item)
+                    if journal is not None:
+                        try:
+                            journal.record(idx, asdict(fail_item))
+                        except OSError:
+                            pass
+                    continue
+
+                done_count += 1
+                ok_item = ActionItem(
+                    path=member_snap.path,
                     ok=True,
                     action="crop",
                     destination=outcome.original_in_trash,
                     group_id=group.id,
-                    size=member.size,
-                ))
-            log_path = write_crop_receipt(items)
-            log_decisions([
-                make_crop_event(
-                    "applied", replace(member),
-                    suggested_crop(member, chosen_crop_level(group, member)) or box,
-                    group_id=group.id, scan_id=state["scan_id"], source="bulk",
-                    adjusted_box=box, level=chosen_crop_level(group, member),
+                    size=member_snap.size,
+                )
+                items.append(ok_item)
+                if journal is not None:
+                    try:
+                        journal.record(idx, asdict(ok_item))
+                    except OSError:
+                        pass
+                log_decisions([build_crop_event(
+                    "applied",
+                    member_snap,
+                    suggestion or box,
+                    group_id=group.id,
+                    scan_id=scan_id,
+                    source="bulk",
+                    adjusted_box=box,
+                    level=level,
                     after={
-                        "size": outcome.size, "width": outcome.width,
+                        "size": outcome.size,
+                        "width": outcome.width,
                         "height": outcome.height,
                         "original_in_trash": outcome.original_in_trash,
                     },
                     receipt_path=log_path,
-                )
-                for member, box, outcome in done
-            ])
+                )])
+                cropped_fields = _cropped_cache_fields(outcome)
+                store_cache_records([replace(member_snap, **cropped_fields)], cache=cache)
+                with lock:
+                    record_crop_locked(
+                        group, member_snap, box, outcome, level=level, suggestion=suggestion
+                    )
+
+            if journal is not None:
+                from datetime import UTC, datetime
+
+                receipt.items = items
+                receipt.completed_at = datetime.now(UTC).isoformat()
+                try:
+                    journal.finalize(receipt.to_dict())
+                    journal = None
+                except OSError:
+                    pass
+            if cache is not None:
+                cache.close()
+                cache = None
+
             with lock:
-                for member, box, outcome in done:
-                    record_crop_locked(group, member, box, outcome)
                 payload = finish_crop_locked(group)
-                payload["cropped_count"] = len(done)
+                payload["cropped_count"] = done_count
                 payload["failures"] = failures
                 payload["log_path"] = log_path
-                return jsonify(payload)
+            persist_result()
+            return jsonify(payload)
         finally:
+            if journal is not None:
+                try:
+                    journal.close()
+                except OSError:
+                    pass
+            if cache is not None:
+                try:
+                    cache.close()
+                except (OSError, sqlite3.Error):
+                    pass
             with lock:
+                if current_path is not None:
+                    state["cropping_paths"].discard(current_path)
                 state["acting"] = False
 
     @app.post("/api/crop/skip")
@@ -2705,7 +3367,9 @@ def create_app(
         if not skip and (reason or note):
             return jsonify({"error": "a skip reason only applies when skipping"}), 400
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(
+                data, allow_while_acting=True, target_path=path
+            )
             if refusal:
                 return refusal
             member = next((m for m in group.members if m.path == path), None)
@@ -2725,13 +3389,22 @@ def create_app(
             else:
                 annotations.pop(path, None)
             snapshot = replace(member)
+            adj = effective_crop(group, snapshot)
+            scan_id = state["scan_id"]
             payload = finish_crop_locked(group)
+        schedule_persist()
         # Log before the cache verdict overwrites the rejected suggestion.
-        log_decisions([make_crop_event(
-            "skipped" if skip else "reconsidered", snapshot, box,
-            group_id=group.id, scan_id=state["scan_id"], source="single",
-            reason=reason if skip else None, note=note if skip else None,
-            adjusted_box=effective_crop(group, snapshot), level=level,
+        log_decisions([build_crop_event(
+            "skipped" if skip else "reconsidered",
+            snapshot,
+            box,
+            group_id=group.id,
+            scan_id=scan_id,
+            source="single",
+            reason=reason if skip else None,
+            note=note if skip else None,
+            adjusted_box=adj,
+            level=level,
         )])
         if box is not None:
             # A skip dismisses every level; reconsidering restores the
@@ -2751,7 +3424,9 @@ def create_app(
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(
+                data, allow_while_acting=True, target_path=path
+            )
             if refusal:
                 return refusal
             member = next((m for m in group.members if m.path == path), None)
@@ -2769,14 +3444,45 @@ def create_app(
             else:
                 annotations.pop(path, None)
             snapshot = replace(member)
+            adj = effective_crop(group, snapshot)
+            scan_id = state["scan_id"]
             payload = finish_crop_locked(group)
-        log_decisions([make_crop_event(
-            "annotated", snapshot, box,
-            group_id=group.id, scan_id=state["scan_id"], source="single",
-            reason=reason, note=note,
-            adjusted_box=effective_crop(group, snapshot), level=level,
+        schedule_persist()
+        log_decisions([build_crop_event(
+            "annotated",
+            snapshot,
+            box,
+            group_id=group.id,
+            scan_id=scan_id,
+            source="single",
+            reason=reason,
+            note=note,
+            adjusted_box=adj,
+            level=level,
         )])
         return jsonify(payload)
+
+    def _undo_one_crop_entry(group, path: str, entry: dict, scan_id: str, *, source: str):
+        """Restore one cropped file on disk from its undo metadata. Lock not held."""
+        original = Path(path)
+        backup = Path(entry["original"]) if entry.get("original") else None
+        if backup is None or not backup.is_file():
+            return None, ("the original is no longer in the Trash; restore it manually from Finder", 404)
+        try:
+            current = os.lstat(original)
+        except OSError:
+            return None, ("the cropped file is no longer at its path", 409)
+        after = entry.get("after") or {}
+        if (
+            int(current.st_size) != int(after.get("size", -1))
+            or int(current.st_mtime_ns) != int(after.get("mtime_ns", -1))
+        ):
+            return None, (
+                "the cropped file changed after cropping; restore the original manually from the Trash",
+                409,
+            )
+        restored = restore_original_in_place(original, backup, send_to_trash=TrashBatch().send)
+        return restored, None
 
     @app.post("/api/crop/undo")
     def api_crop_undo():
@@ -2784,75 +3490,383 @@ def create_app(
         data = request.get_json(silent=True) or {}
         path = data.get("path")
         with lock:
-            group, refusal = begin_crop_work(data)
+            group, refusal = begin_crop_work(data, allow_while_acting=False)
             if refusal:
                 return refusal
             entry = (group.match_details.get("cropped") or {}).get(path)
             if entry is None:
                 return jsonify({"error": "there is no crop to undo"}), 404
+            member = next((m for m in group.members if m.path == path), None)
+            member_snap = replace(member) if member is not None else None
+            scan_id = state["scan_id"]
             state["acting"] = True
         try:
-            original = Path(path)
-            backup = Path(entry["original"]) if entry.get("original") else None
-            if backup is None or not backup.is_file():
-                return jsonify({
-                    "error": "the original is no longer in the Trash; restore it manually from Finder"
-                }), 404
-            try:
-                current = os.lstat(original)
-            except OSError:
-                return jsonify({"error": "the cropped file is no longer at its path"}), 409
-            after = entry.get("after") or {}
-            if (
-                int(current.st_size) != int(after.get("size", -1))
-                or int(current.st_mtime_ns) != int(after.get("mtime_ns", -1))
-            ):
-                return jsonify({
-                    "error": "the cropped file changed after cropping; restore the original "
-                    "manually from the Trash"
-                }), 409
-            restored = restore_original_in_place(
-                original, backup, send_to_trash=TrashBatch().send
+            restored, err = _undo_one_crop_entry(group, path, entry, scan_id, source="single")
+            if err is not None:
+                msg, code = err
+                return jsonify({"error": msg}), code
+            applied_box = CropBox.decode(entry["box"])
+            applied_level = entry.get("level") or "balanced"
+            levels = dict(entry.get("levels") or {})
+            suggestion_box = (
+                CropBox.decode(entry.get("suggestion"))
+                or CropBox.decode(levels.get(applied_level))
+                or applied_box
             )
             with lock:
-                (group.match_details.get("cropped") or {}).pop(path, None)
-                # The restored file's suggestion becomes the box that was
-                # applied, so any older adjustment of it is spent.
-                (group.match_details.get("adjusted_crops") or {}).pop(path, None)
-                group.reviewed_paths = [p for p in group.reviewed_paths if p != path]
-                member = next((m for m in group.members if m.path == path), None)
-                if member is not None:
-                    log_decisions([make_crop_event(
-                        "undone", replace(member, **(entry.get("before") or {})),
-                        CropBox.decode(entry["box"]),
-                        group_id=group.id, scan_id=state["scan_id"], source="single",
-                        level=entry.get("level") or "balanced",
-                    )])
-                before = dict(entry.get("before") or {})
-                # The restored file's suggestion becomes the box that was
-                # applied, at the level it was applied from; the other
-                # levels return to what they suggested before the crop.
-                levels = dict(entry.get("levels") or {})
-                applied_level = entry.get("level") or "balanced"
-                if applied_level in CROP_LEVELS:
-                    levels[applied_level] = entry["box"]
-                before.update({
-                    "size": int(restored.st_size),
-                    "mtime": restored.st_mtime,
-                    "mtime_ns": restored.st_mtime_ns,
-                    "ctime_ns": restored.st_ctime_ns,
-                    "device": restored.st_dev,
-                    "inode": restored.st_ino,
-                    "border_crop": levels.get("balanced", entry["box"]),
-                    "border_signature": BORDER_SIGNATURE,
-                    "border_crop_conservative": levels.get("conservative", ""),
-                    "border_crop_aggressive": levels.get("aggressive", ""),
-                })
-                update_records_locked(path, before)
-                return jsonify(finish_crop_locked(group))
+                before_fields = _restore_crop_entry_locked(group, path, entry, restored)
+                payload = finish_crop_locked(group)
+            if member_snap is not None:
+                pre_restore_record = replace(member_snap, **(entry.get("before") or {}))
+                log_decisions([build_crop_event(
+                    "undone",
+                    pre_restore_record,
+                    suggestion_box,
+                    group_id=group.id,
+                    scan_id=scan_id,
+                    source="single",
+                    adjusted_box=applied_box,
+                    level=applied_level,
+                )])
+                store_cache_records([replace(member_snap, **before_fields)])
+            persist_result()
+            return jsonify(payload)
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/crop/undo-batch")
+    def api_crop_undo_batch():
+        """Undo multiple cropped files in a crop group (or all cropped files in it)."""
+        data = request.get_json(silent=True) or {}
+        paths = data.get("paths")
+        with lock:
+            group, refusal = begin_crop_work(data, allow_while_acting=False)
+            if refusal:
+                return refusal
+            cropped_map = dict(group.match_details.get("cropped") or {})
+            target_paths = list(cropped_map.keys()) if paths is None else [str(p) for p in paths]
+            members_by_path = {m.path: replace(m) for m in group.members}
+            scan_id = state["scan_id"]
+            state["acting"] = True
+        undone_count = 0
+        failures: list[dict] = []
+        decision_events: list[dict] = []
+        cache_updates: list[FileRecord] = []
+        try:
+            for path in target_paths:
+                entry = cropped_map.get(path)
+                if entry is None:
+                    failures.append({"path": path, "error": "there is no crop to undo"})
+                    continue
+                try:
+                    restored, err = _undo_one_crop_entry(
+                        group, path, entry, scan_id, source="bulk"
+                    )
+                except OSError as exc:
+                    failures.append({"path": path, "error": str(exc)})
+                    continue
+                if err is not None:
+                    failures.append({"path": path, "error": err[0]})
+                    continue
+                undone_count += 1
+                applied_box = CropBox.decode(entry["box"])
+                applied_level = entry.get("level") or "balanced"
+                levels = dict(entry.get("levels") or {})
+                suggestion_box = (
+                    CropBox.decode(entry.get("suggestion"))
+                    or CropBox.decode(levels.get(applied_level))
+                    or applied_box
+                )
+                with lock:
+                    before_fields = _restore_crop_entry_locked(group, path, entry, restored)
+                member_snap = members_by_path.get(path)
+                if member_snap is not None:
+                    cache_updates.append(replace(member_snap, **before_fields))
+                    decision_events.append(build_crop_event(
+                        "undone",
+                        replace(member_snap, **(entry.get("before") or {})),
+                        suggestion_box,
+                        group_id=group.id,
+                        scan_id=scan_id,
+                        source="bulk",
+                        adjusted_box=applied_box,
+                        level=applied_level,
+                    ))
+            if decision_events:
+                log_decisions(decision_events)
+            if cache_updates:
+                store_cache_records(cache_updates)
+            with lock:
+                payload = finish_crop_locked(group)
+                payload["undone_count"] = undone_count
+                payload["failures"] = failures
+            if undone_count:
+                persist_result()
+            return jsonify(payload)
+        finally:
+            with lock:
+                state["acting"] = False
+
+    @app.post("/api/crop/recheck-duplicates")
+    def api_crop_recheck_duplicates():
+        """Re-hash recently cropped media and match against active ScanResult files."""
+        data = request.get_json(silent=True) or {}
+        with lock:
+            if state["scanning"] or state["acting"] or state["transitioning"]:
+                return jsonify({"error": "recheck is locked during active work"}), 409
+            if data.get("scan_id") != state["scan_id"]:
+                return jsonify({"error": "stale scan session; refresh results"}), 409
+            result: ScanResult | None = state["result"]
+            if result is None:
+                return jsonify({"error": "no scan"}), 404
+            deleted = set(state["deleted_files"])
+            group_id = data.get("group_id")
+            explicit_paths = data.get("paths")
+            if explicit_paths is None and data.get("path"):
+                explicit_paths = [data["path"]]
+            if explicit_paths is not None:
+                target_paths = [
+                    str(p) for p in explicit_paths if str(p) not in deleted
+                ]
+            else:
+                target_paths = []
+                for g in result.groups:
+                    if g.kind != GroupKind.CROP:
+                        continue
+                    if group_id and g.id != group_id:
+                        continue
+                    for cropped_path in (g.match_details.get("cropped") or {}):
+                        if cropped_path not in deleted:
+                            target_paths.append(cropped_path)
+            target_set = set(dict.fromkeys(target_paths))
+            by_path = {f.path: f for f in result.files if f.path not in deleted}
+            for g in result.groups:
+                for m in g.members:
+                    if m.path not in deleted:
+                        by_path.setdefault(m.path, m)
+            target_set = {p for p in target_set if p in by_path}
+            if not target_set:
+                return jsonify({
+                    "ok": True,
+                    "checked": 0,
+                    "new_groups": [],
+                    "updated_groups": [],
+                    "exact_matches": 0,
+                    "similar_matches": 0,
+                })
+            state["acting"] = True
+            records_snapshot = {p: replace(rec) for p, rec in by_path.items()}
+            scan_settings = dict(result.scan_settings)
+
+        try:
+            cache = None
+            distinct = None
+            try:
+                cache = HashCache(app.config["DEDUPE_CACHE_PATH"])
+                distinct = cache.distinct_reviews(list(records_snapshot.values()))
+            except (OSError, sqlite3.Error):
+                distinct = None
+
+            updated_fields_by_path: dict[str, dict] = {}
+            checked_paths: list[str] = []
+            for p in sorted(target_set):
+                rec = records_snapshot[p]
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                rec.size = int(st.st_size)
+                rec.mtime = st.st_mtime
+                rec.mtime_ns = st.st_mtime_ns
+                rec.ctime_ns = st.st_ctime_ns
+                rec.device = st.st_dev
+                rec.inode = st.st_ino
+                rec.sha256 = file_sha256(Path(p))
+                rec.partial_hash = file_partial_hash(Path(p))
+                fields: dict = {
+                    "size": rec.size,
+                    "mtime": rec.mtime,
+                    "mtime_ns": rec.mtime_ns,
+                    "ctime_ns": rec.ctime_ns,
+                    "device": rec.device,
+                    "inode": rec.inode,
+                    "sha256": rec.sha256,
+                    "partial_hash": rec.partial_hash,
+                }
+                if rec.media_type in (MediaType.IMAGE, MediaType.GIF):
+                    phash, dhash, w, h, tiles, orientations = compute_image_fingerprint(p)
+                    rec.phash = phash
+                    rec.dhash = dhash
+                    rec.width = w
+                    rec.height = h
+                    rec.tile_phashes = encode_tile_phashes(tiles) if tiles else None
+                    rec.orientation_phashes = (
+                        encode_orientation_phashes(orientations) if orientations else None
+                    )
+                    fields.update({
+                        "phash": rec.phash,
+                        "dhash": rec.dhash,
+                        "width": rec.width,
+                        "height": rec.height,
+                        "tile_phashes": rec.tile_phashes,
+                        "orientation_phashes": rec.orientation_phashes,
+                    })
+                elif rec.media_type == MediaType.VIDEO:
+                    fp, w, h, dur = compute_video_fingerprint(p)
+                    rec.video_fingerprint = fp
+                    rec.width = w
+                    rec.height = h
+                    rec.duration = dur
+                    fields.update({
+                        "video_fingerprint": rec.video_fingerprint,
+                        "width": rec.width,
+                        "height": rec.height,
+                        "duration": rec.duration,
+                    })
+                updated_fields_by_path[p] = fields
+                checked_paths.append(p)
+
+            all_snaps = list(records_snapshot.values())
+            image_threshold = int(scan_settings.get("threshold", 6))
+            video_threshold = int(scan_settings.get("video_threshold", 8))
+
+            # Check exact SHA-256 matches for size-matching peers lacking hashes.
+            target_sizes = {records_snapshot[p].size for p in checked_paths}
+            for peer in all_snaps:
+                if peer.path not in target_set and peer.size in target_sizes and not peer.sha256:
+                    try:
+                        peer.sha256 = file_sha256(Path(peer.path))
+                        updated_fields_by_path.setdefault(peer.path, {})["sha256"] = peer.sha256
+                    except OSError:
+                        pass
+
+            by_sha: dict[tuple[int, str], list[FileRecord]] = {}
+            for rec in all_snaps:
+                if rec.sha256 and rec.size in target_sizes:
+                    by_sha.setdefault((rec.size, rec.sha256), []).append(rec)
+            exact_clusters = [
+                cluster for cluster in by_sha.values()
+                if len(cluster) >= 2 and any(r.path in target_set for r in cluster)
+            ]
+
+            image_clusters = find_similar_image_groups(
+                all_snaps,
+                threshold=image_threshold,
+                distinct=distinct,
+            )
+            video_clusters = find_similar_video_groups(
+                all_snaps,
+                threshold=video_threshold,
+                distinct=distinct,
+            )
+            similar_clusters = [
+                cluster
+                for cluster in [*image_clusters, *video_clusters]
+                if len(cluster) >= 2 and any(r.path in target_set for r in cluster)
+            ]
+
+            if cache is not None and updated_fields_by_path:
+                try:
+                    to_store = [records_snapshot[p] for p in updated_fields_by_path]
+                    cache.store_all(to_store)
+                except (OSError, sqlite3.Error):
+                    pass
+
+            with lock:
+                for p, fields in updated_fields_by_path.items():
+                    update_records_locked(p, fields)
+                live_by_path = {f.path: f for f in result.files}
+                for g in result.groups:
+                    for m in g.members:
+                        live_by_path.setdefault(m.path, m)
+                exact_path_sets = [
+                    {m.path for m in g.members}
+                    for g in result.groups
+                    if g.kind == GroupKind.EXACT
+                ]
+                existing_exact = [g for g in result.groups if g.kind == GroupKind.EXACT]
+                existing_similar = [g for g in result.groups if g.kind == GroupKind.SIMILAR]
+                new_groups = []
+                updated_groups = []
+
+                def _merge_or_append(kind, cluster, existing_list) -> None:
+                    live_members = [
+                        live_by_path[r.path] for r in cluster if r.path in live_by_path
+                    ]
+                    if len(live_members) < 2:
+                        return
+                    cluster_paths = {m.path for m in live_members}
+                    match_group = next(
+                        (
+                            g for g in existing_list
+                            if any(m.path in cluster_paths for m in g.members)
+                        ),
+                        None,
+                    )
+                    if match_group is not None:
+                        existing_paths = {m.path for m in match_group.members}
+                        if cluster_paths <= existing_paths:
+                            return
+                        combined = {m.path: m for m in [*match_group.members, *live_members]}
+                        rebuilt = build_one_group(
+                            kind,
+                            list(combined.values()),
+                            exact_path_sets=exact_path_sets if kind == GroupKind.SIMILAR else None,
+                        )
+                        if rebuilt is None:
+                            return
+                        match_group.members = rebuilt.members
+                        match_group.suggested_keep = rebuilt.suggested_keep
+                        match_group.selected_for_removal = rebuilt.selected_for_removal
+                        updated_groups.append(match_group)
+                        return
+                    built = build_one_group(
+                        kind,
+                        live_members,
+                        exact_path_sets=exact_path_sets if kind == GroupKind.SIMILAR else None,
+                    )
+                    if built is None:
+                        return
+                    result.groups.append(built)
+                    existing_list.append(built)
+                    if kind == GroupKind.EXACT:
+                        exact_path_sets.append({m.path for m in built.members})
+                    new_groups.append(built)
+
+                for cluster in exact_clusters:
+                    _merge_or_append(GroupKind.EXACT, cluster, existing_exact)
+                for cluster in similar_clusters:
+                    _merge_or_append(GroupKind.SIMILAR, cluster, existing_similar)
+
+                changed = bool(new_groups or updated_groups or updated_fields_by_path)
+                if new_groups or updated_groups:
+                    state["groups_version"] += 1
+                if changed:
+                    state["paths_version"] += 1
+                    state["persist_seq"] += 1
+                    result.recompute_stats()
+                    refresh_selected_count_locked()
+                    state["events"].notify_all()
+                payload = {
+                    "ok": True,
+                    "checked": len(checked_paths),
+                    "exact_matches": len(exact_clusters),
+                    "similar_matches": len(similar_clusters),
+                    "new_groups": [group_payload(g) for g in new_groups],
+                    "updated_groups": [group_payload(g) for g in updated_groups],
+                }
+            if changed:
+                persist_result()
+            return jsonify(payload)
+        finally:
+            if cache is not None:
+                try:
+                    cache.close()
+                except (OSError, sqlite3.Error):
+                    pass
             with lock:
                 state["acting"] = False
 
@@ -2921,6 +3935,8 @@ def create_app(
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                state["persist_seq"] += 1
+                state["events"].notify_all()
             persist_result()
             return jsonify({"ok": True, "marked_count": len(records)})
         except (OSError, sqlite3.Error) as exc:
@@ -2984,9 +4000,10 @@ def create_app(
             ui_source = data.get("source") if data.get("source") in (
                 "swipe", "board", "list"
             ) else "unknown"
+            scan_id = state["scan_id"]
             decision_events = distinct_events_for_records(
                 "marked", [replace(record) for record in records],
-                group_id=group_id, scan_id=state["scan_id"], source=ui_source,
+                group_id=group_id, scan_id=scan_id, source=ui_source,
                 label_scope="pair" if member is not None else "group",
                 match_basis=group.match_basis,
                 match_score=(
@@ -3036,15 +4053,13 @@ def create_app(
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                state["persist_seq"] += 1
                 dissolved = all(
                     candidate.id != group_id for candidate in result.groups
                 )
                 payload = None if dissolved else group_payload(group)
+                state["events"].notify_all()
                 if dissolved and (member is not None or group.distinct_participants):
-                    # The group is finished: suppress every pair among everyone
-                    # who took part in the review — swipe participants plus the
-                    # members just dismissed — including member-vs-member pairs
-                    # the swipe UI never showed side by side.
                     involved = set(group.distinct_participants) | {
                         m.path for m in group.members
                     }
@@ -3056,16 +4071,13 @@ def create_app(
                             if path in by_path
                         ]
             if len(backfill) > 2:
-                # Earlier swipes (including those restored from a session)
-                # already decided some pairs. Log only newly inferred pairs,
-                # never downgrade an explicit verdict to dissolution backfill.
                 decided = cache.distinct_pairs(backfill)
                 pair_count = cache.mark_distinct(backfill, source="inferred")
                 log_decisions([
                     event
                     for event in distinct_events_for_records(
                         "marked", [replace(record) for record in backfill],
-                        group_id=group_id, scan_id=state["scan_id"], source=ui_source,
+                        group_id=group_id, scan_id=scan_id, source=ui_source,
                         label_scope="backfill", match_basis=group.match_basis,
                     )
                     if (event["path_a"], event["path_b"]) not in decided
@@ -3078,9 +4090,8 @@ def create_app(
                         "group": group,
                         "index": group_index,
                         "new_pairs": sorted(new_pairs),
-                        "scan_id": state["scan_id"],
+                        "scan_id": scan_id,
                     }
-                    # In-memory undo history only; keep it bounded.
                     while len(dissolved_groups) > DISSOLVED_SIMILAR_UNDO_LIMIT:
                         dissolved_groups.pop(next(iter(dissolved_groups)))
             persist_result()
@@ -3100,12 +4111,7 @@ def create_app(
 
     @app.post("/api/similar/unmark-distinct")
     def api_unmark_similar_distinct():
-        """Undo one pair-level distinct decision and return the member to review.
-
-        Deletes the recorded pair and re-inserts the member into its group when
-        the group is still under review. When the group already dissolved, the
-        pair row is still dropped — the files can regroup on the next scan.
-        """
+        """Undo one pair-level distinct decision and return the member to review."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         member_path = data.get("path")
@@ -3152,6 +4158,7 @@ def create_app(
                 ),
                 None,
             )
+            scan_id = state["scan_id"]
             state["acting"] = True
 
         cache = None
@@ -3166,14 +4173,14 @@ def create_app(
                 if anchor_record is not None and record is not None:
                     event = make_distinct_event(
                         "unmarked", replace(anchor_record), replace(record),
-                        group_id=group_id, scan_id=state["scan_id"], source="undo",
+                        group_id=group_id, scan_id=scan_id, source="undo",
                         label_scope="pair",
                         match_basis=group.match_basis if group else None,
                     )
                 else:
                     event = make_distinct_path_event(
                         "unmarked", anchor_path, member_path,
-                        group_id=group_id, scan_id=state["scan_id"], source="undo",
+                        group_id=group_id, scan_id=scan_id, source="undo",
                     )
                 log_decisions([event])
             with lock:
@@ -3188,6 +4195,8 @@ def create_app(
                     refresh_selected_count_locked()
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
+                    state["persist_seq"] += 1
+                    state["events"].notify_all()
                 payload = group_payload(group) if group is not None else None
             if group is not None:
                 persist_result()
@@ -3206,13 +4215,7 @@ def create_app(
 
     @app.post("/api/similar/restore-group")
     def api_restore_similar_group():
-        """Undo a whole-group distinct review: the group returns to review.
-
-        Drops only the distinct pairs that review created (pairs decided
-        earlier stay recorded) and re-inserts the group where it sat. Members
-        that left the scan since (moved to Trash, quarantined) stay out; the
-        undo is refused when fewer than two remain.
-        """
+        """Undo a whole-group distinct review: the group returns to review."""
         data = request.get_json(silent=True) or {}
         group_id = data.get("group_id")
         with lock:
@@ -3240,6 +4243,7 @@ def create_app(
                 return jsonify(
                     {"error": "too few of this group's files are still in the scan to restore it"}
                 ), 409
+            scan_id = state["scan_id"]
             state["acting"] = True
 
         cache = None
@@ -3256,13 +4260,13 @@ def create_app(
             log_decisions([
                 make_distinct_event(
                     "unmarked", replace(by_path[path_a]), replace(by_path[path_b]),
-                    group_id=group_id, scan_id=state["scan_id"], source="undo",
+                    group_id=group_id, scan_id=scan_id, source="undo",
                     label_scope="group", match_basis=group.match_basis,
                 )
                 if path_a in by_path and path_b in by_path
                 else make_distinct_path_event(
                     "unmarked", path_a, path_b,
-                    group_id=group_id, scan_id=state["scan_id"], source="undo",
+                    group_id=group_id, scan_id=scan_id, source="undo",
                     label_scope="group",
                 )
                 for path_a, path_b in removed_pairs
@@ -3276,7 +4280,6 @@ def create_app(
                 if group.suggested_keep not in member_paths:
                     group.suggested_keep = members[0].path
                 if len(group.selected_for_removal) >= len(members):
-                    # Keep-one groups always retain their keeper.
                     group.selected_for_removal = [
                         path for path in group.selected_for_removal
                         if path != group.suggested_keep
@@ -3287,7 +4290,9 @@ def create_app(
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                state["persist_seq"] += 1
                 payload = group_payload(group)
+                state["events"].notify_all()
             persist_result()
             return jsonify({"ok": True, "removed_pairs": removed, "group": payload})
         except (OSError, sqlite3.Error) as exc:
@@ -3316,15 +4321,28 @@ def create_app(
                 return jsonify({"error": "wait for the scan to finish or cancel it"}), 409
             if state["acting"]:
                 return jsonify({"error": "another file action is already running"}), 409
+            if state["transitioning"]:
+                return jsonify({"error": "review state transition is running"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
             result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
             state["acting"] = True
-            groups = list(result.groups)
+            groups = [
+                replace(
+                    g,
+                    members=list(g.members),
+                    selected_for_removal=list(g.selected_for_removal),
+                    reviewed_paths=list(g.reviewed_paths),
+                    distinct_participants=list(g.distinct_participants),
+                )
+                for g in result.groups
+            ]
             roots = list(result.roots)
 
+        special_quarantine = None
+        selection_counts = {}
         try:
             kinds_raw = data.get("kinds") or data.get("isolate_kinds") or "all"
             if kinds_raw == "duplicates":
@@ -3386,8 +4404,12 @@ def create_app(
                     roots=roots,
                 )
             else:
+                # Scope review-candidate quarantine routing to scoped_groups so e.g.
+                # kinds="exact" never silently diverts files into _Dedupe Quarantine.
                 review_kinds = {GroupKind.LOW_RESOLUTION, GroupKind.RANDOM_REVIEW}
-                review_groups = [group for group in groups if group.kind in review_kinds]
+                review_groups = [
+                    group for group in scoped_groups if group.kind in review_kinds
+                ]
                 review_paths = (
                     set(
                         effective_selected_paths(
@@ -3415,7 +4437,7 @@ def create_app(
                         for group in scoped_groups
                     ]
 
-                def run_action_parts(part_dry_run: bool):
+                def run_action_parts(part_dry_run: bool, *, verify_hashes: bool = True):
                     if action != "trash":
                         return [
                             apply_actions(
@@ -3426,6 +4448,7 @@ def create_app(
                                 roots=roots,
                                 kinds=kinds,
                                 safety_groups=groups,
+                                verify_hashes=verify_hashes,
                             )
                         ]
                     partitions = []
@@ -3444,11 +4467,12 @@ def create_app(
                             roots=roots,
                             safety_groups=groups,
                             allow_cross_device=part_action == "quarantine",
+                            verify_hashes=verify_hashes,
                         )
                         for paths, part_action, part_destination in partitions
                     ]
 
-                preview_results = run_action_parts(True)
+                preview_results = run_action_parts(True, verify_hashes=dry_run)
                 preview_result = ActionResult(dry_run=True, action=action)
                 preview_result.items = [
                     item for partial in preview_results for item in partial.items
@@ -3470,7 +4494,7 @@ def create_app(
                         verdict = consume_preview_token(data.get("preview_token"), manifest)
                         if verdict != "valid":
                             return jsonify(stale_preview_payload(verdict)), 409
-                    executed_results = run_action_parts(False)
+                    executed_results = run_action_parts(False, verify_hashes=True)
                     action_result = ActionResult(dry_run=False, action=action)
                     action_result.items = [
                         item for partial in executed_results for item in partial.items
@@ -3524,7 +4548,10 @@ def create_app(
                         ]
                         result.recompute_stats()
                         refresh_selected_count_locked()
+                        state["groups_version"] += 1
                         state["paths_version"] += 1
+                        state["persist_seq"] += 1
+                        state["events"].notify_all()
                 if removed:
                     persist_result()
 
@@ -3560,14 +4587,7 @@ def create_app(
 
     @app.post("/api/action/undo")
     def api_action_undo():
-        """Restore an executed trash/quarantine action from its receipt(s).
-
-        Files return to their original paths on disk; the current review is
-        not re-populated — restored files resurface on the next scan. The
-        dry-run issues a preview token bound to the exact restorable set, and
-        the execute preflights every receipt again before moving anything, so
-        a blocked item refuses the whole restore across all receipts.
-        """
+        """Restore an executed trash, quarantine, or crop action from its receipt(s)."""
         from ..receipts import ReceiptError
 
         data = request.get_json(silent=True) or {}
@@ -3576,6 +4596,7 @@ def create_app(
             receipts = [receipts]
         receipts = [str(reference) for reference in receipts]
         dry_run = bool(data.get("dry_run", True))
+        allow_partial = bool(data.get("allow_partial", False))
         if not receipts:
             return jsonify({"error": "receipts required"}), 400
 
@@ -3584,19 +4605,23 @@ def create_app(
                 return jsonify({"error": "wait for the scan to finish or cancel it"}), 409
             if state["acting"]:
                 return jsonify({"error": "another file action is already running"}), 409
+            if state["transitioning"]:
+                return jsonify({"error": "review state transition is running"}), 409
             if data.get("scan_id") != state["scan_id"]:
                 return jsonify({"error": "stale scan session; refresh results"}), 409
+            scan_id = state["scan_id"]
             state["acting"] = True
 
         try:
             previews = [
-                undo_action(reference, dry_run=True) for reference in receipts
+                undo_action(reference, dry_run=True, verify_hashes=dry_run)
+                for reference in receipts
             ]
             restorable = tuple(sorted(
                 item.destination for preview in previews for item in preview.items
                 if item.ok and item.destination
             ))
-            manifest = (state["scan_id"], "undo", tuple(sorted(receipts)), None, restorable)
+            manifest = (scan_id, "undo", tuple(sorted(receipts)), None, restorable)
             if dry_run:
                 result = ActionResult(dry_run=True, action="undo")
                 result.items = [item for preview in previews for item in preview.items]
@@ -3610,31 +4635,129 @@ def create_app(
                 verdict = consume_preview_token(data.get("preview_token"), manifest)
                 if verdict != "valid":
                     return jsonify(stale_preview_payload(verdict)), 409
-            # Cross-receipt all-or-nothing: the manifest only matches the
-            # current restorable set, but the files could have moved since the
-            # dry run — re-verify before moving anything.
             blocked = [
                 item
                 for preview in previews
                 for item in preview.items
                 if not item.ok
             ]
-            if blocked:
+            if blocked and not allow_partial:
                 first = blocked[0]
                 return jsonify(
                     {
                         "error": f"cannot undo: {first.error} ({first.path}) — "
                         "nothing was restored",
                         "preview_stale": False,
+                        "blocked": [
+                            {
+                                "path": b.path,
+                                "destination": b.destination,
+                                "error": b.error,
+                            }
+                            for b in blocked
+                        ],
+                        "blocked_count": len(blocked),
                     }
                 ), 400
             executed = [
-                undo_action(reference, dry_run=False) for reference in receipts
+                undo_action(
+                    reference,
+                    dry_run=False,
+                    verify_hashes=True,
+                    allow_partial=allow_partial,
+                )
+                for reference in receipts
             ]
             result = ActionResult(dry_run=False, action="undo")
             result.items = [item for run in executed for item in run.items]
+
+            restored_crops: list[tuple[str, object]] = []
+            restored_paths: set[str] = set()
+            for run in executed:
+                for item in run.items:
+                    if not item.ok or not item.destination:
+                        continue
+                    restored_paths.add(item.destination)
+                    if run.action == "undo:crop":
+                        try:
+                            restored_crops.append((item.destination, os.lstat(item.destination)))
+                        except OSError:
+                            pass
+
+            cache_updates: list[FileRecord] = []
+            crop_events: list[dict] = []
+            session_dirty = False
+            with lock:
+                for orig_path in restored_paths:
+                    if orig_path in state["deleted_files"]:
+                        state["deleted_files"].pop(orig_path, None)
+                        session_dirty = True
+                active_result = state["result"]
+                if active_result is not None and restored_crops:
+                    crop_groups = [
+                        g for g in active_result.groups if g.kind == GroupKind.CROP
+                    ]
+                    for orig_path, restored_stat in restored_crops:
+                        for cg in crop_groups:
+                            entry = (cg.match_details.get("cropped") or {}).get(orig_path)
+                            if entry is None:
+                                continue
+                            member = next(
+                                (m for m in cg.members if m.path == orig_path), None
+                            )
+                            member_snap = replace(member) if member is not None else None
+                            before_fields = _restore_crop_entry_locked(
+                                cg, orig_path, entry, restored_stat
+                            )
+                            session_dirty = True
+                            if member_snap is not None:
+                                cache_updates.append(replace(member_snap, **before_fields))
+                                applied_box = CropBox.decode(entry["box"])
+                                applied_level = entry.get("level") or "balanced"
+                                levels = dict(entry.get("levels") or {})
+                                suggestion_box = (
+                                    CropBox.decode(entry.get("suggestion"))
+                                    or CropBox.decode(levels.get(applied_level))
+                                    or applied_box
+                                )
+                                crop_events.append(build_crop_event(
+                                    "undone",
+                                    replace(member_snap, **(entry.get("before") or {})),
+                                    suggestion_box,
+                                    group_id=cg.id,
+                                    scan_id=scan_id,
+                                    source="receipt_undo",
+                                    adjusted_box=applied_box,
+                                    level=applied_level,
+                                ))
+                if session_dirty and active_result is not None:
+                    active_result.recompute_stats()
+                    refresh_selected_count_locked()
+                    state["groups_version"] += 1
+                    state["paths_version"] += 1
+                    state["persist_seq"] += 1
+                    state["events"].notify_all()
+
+            if crop_events:
+                log_decisions(crop_events)
+            if cache_updates:
+                store_cache_records(cache_updates)
+            if session_dirty:
+                persist_result()
+
             payload = result.to_dict()
             payload["log_paths"] = [run.log_path for run in executed if run.log_path]
+            blocked_exec = [item for item in result.items if not item.ok]
+            if blocked_exec:
+                payload["blocked"] = [
+                    {
+                        "path": b.path,
+                        "destination": b.destination,
+                        "error": b.error,
+                    }
+                    for b in blocked_exec
+                ]
+                payload["blocked_count"] = len(blocked_exec)
             return jsonify(payload)
         except ReceiptError as exc:
             return jsonify({"error": str(exc)}), 404
@@ -3662,40 +4785,63 @@ def create_app(
         if not path:
             return jsonify({"error": "path required"}), 400
         p = Path(path)
-        if not p.is_file():
+        try:
+            src_stat = p.stat()
+            if not p.is_file():
+                return jsonify({"error": "not found"}), 404
+        except OSError:
             return jsonify({"error": "not found"}), 404
 
         # Only serve files that were part of the last scan (path traversal safety)
         if not is_scanned_file(p, path):
             return jsonify({"error": "not in scan"}), 403
 
-        # Variants: "thumb" (grid cards), "preview" (lightbox, ≤2560px, cached),
-        # "full" (original-resolution transcode for formats browsers cannot
-        # render; browser-safe originals are served untouched as before).
+        has_version = bool(request.args.get("v"))
+        src_etag = f"{src_stat.st_mtime_ns}:{src_stat.st_size}"
         variant_arg = request.args.get("variant")
         if variant_arg in ("thumb", "preview", "full"):
             variant = variant_arg
         else:
             variant = "full" if request.args.get("full") == "1" else "thumb"
-        if variant == "full" and not is_video(p) and is_browser_safe_image(p):
-            return send_file(p, mimetype=media_mimetype(p), conditional=True)
-        cached = cached_thumbnail(p, variant=variant)
-        if cached is None:
-            # Videos have no still to fall back to; images can serve the original.
-            if is_video(p):
-                return jsonify({"error": "no preview"}), 404
-            return send_file(p, mimetype=media_mimetype(p))
 
-        thumb_path, key = cached
-        response = send_file(
-            thumb_path,
-            mimetype="image/jpeg",
-            conditional=True,
-            etag=key,
-            last_modified=p.stat().st_mtime,
-        )
-        # The key already includes source mtime/size, so the body can never change.
-        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        try:
+            if variant == "full" and not is_video(p) and is_browser_safe_image(p):
+                response = send_file(
+                    p,
+                    mimetype=media_mimetype(p),
+                    conditional=True,
+                    etag=src_etag,
+                    last_modified=src_stat.st_mtime,
+                )
+            else:
+                cached = cached_thumbnail(p, variant=variant)
+                if cached is None:
+                    # Videos have no still to fall back to; images can serve the original.
+                    if is_video(p):
+                        return jsonify({"error": "no preview"}), 404
+                    response = send_file(
+                        p,
+                        mimetype=media_mimetype(p),
+                        conditional=True,
+                        etag=src_etag,
+                        last_modified=src_stat.st_mtime,
+                    )
+                else:
+                    thumb_path, key = cached
+                    response = send_file(
+                        thumb_path,
+                        mimetype="image/jpeg",
+                        conditional=True,
+                        etag=key,
+                        last_modified=src_stat.st_mtime,
+                    )
+        except OSError:
+            return jsonify({"error": "not found"}), 404
+
+        if has_version:
+            response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
         return response
 
     @app.get("/api/media-details")
@@ -3721,15 +4867,20 @@ def create_app(
         if not is_scanned_file(media_path, path):
             return jsonify({"error": "not in scan"}), 403
 
-        return send_file(
-            media_path,
-            mimetype=media_mimetype(media_path),
-            conditional=True,
-        )
+        try:
+            response = send_file(
+                media_path,
+                mimetype=media_mimetype(media_path),
+                conditional=True,
+            )
+        except OSError:
+            return jsonify({"error": "not found"}), 404
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        return response
 
     @app.get("/api/reveal")
     def api_reveal():
-        """Return path so client can show it; on macOS we can also open Finder."""
+        """Return path so client can show it and open the OS file manager when requested."""
         path = request.args.get("path", "")
         open_finder = request.args.get("open") == "1"
         if not path:
@@ -3737,16 +4888,20 @@ def create_app(
         p = Path(path)
         resolved = str(p.expanduser().resolve(strict=False))
         with lock:
-            result: ScanResult | None = state["result"]
-            allowed = {file.path for file in result.files} if result else set()
-            allowed.update(state["allowed_reveal_paths"])
+            allowed = allowed_paths_locked() | state["allowed_reveal_paths"]
         if resolved not in allowed and path not in allowed:
             return jsonify({"error": "path is not part of this Dedupe session"}), 403
-        if open_finder and p.exists():
+        exists = p.exists()
+        if open_finder and exists:
             import subprocess
 
-            subprocess.Popen(["open", "-R", str(p)])
-        return jsonify({"path": path, "exists": p.exists()})
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(p)])
+            elif sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p.parent)])
+        return jsonify({"path": path, "exists": exists})
 
     @app.post("/api/shutdown")
     def api_shutdown():
@@ -3754,30 +4909,58 @@ def create_app(
 
         The page sends this on pagehide, which also fires on reloads and
         navigation, so wait a grace period; any request that arrives in the
-        meantime (e.g. the reloaded page) cancels the shutdown.
+        meantime cancels shutdown. Never tear down mid-scan or mid-action;
+        re-arm cleanly until in-flight work finishes.
         """
 
-        def stop() -> None:
-            # Flush any debounced review-session write before the process exits.
-            _flush_persist()
-            server = app.extensions.get("dedupe_server")
-            if server is not None:
-                # Unblocks serve_forever() in run_app, so the process exits
-                # cleanly and the launcher can close its Terminal window.
-                server.shutdown()
-            else:
-                # App is being served some other way; SIGINT is the best we
-                # can do (equivalent to Ctrl+C).
-                os.kill(os.getpid(), signal.SIGINT)
-
-        with lock:
-            timer = state.get("shutdown_timer")
-            if timer is not None:
-                timer.cancel()
-            timer = threading.Timer(SHUTDOWN_GRACE_SECONDS, stop)
+        def _arm_timer_locked(expected_token: int) -> None:
+            timer = threading.Timer(SHUTDOWN_GRACE_SECONDS, lambda: stop(expected_token))
             timer.daemon = True
             state["shutdown_timer"] = timer
             timer.start()
+
+        def stop(expected_token: int) -> None:
+            with shutdown_lock:
+                if state.get("shutdown_token") != expected_token:
+                    return
+                state["shutdown_timer"] = None
+            with lock:
+                busy = bool(
+                    state["scanning"] or state["acting"] or state["transitioning"]
+                )
+            if busy:
+                with shutdown_lock:
+                    if (
+                        state.get("shutdown_token") == expected_token
+                        and state.get("shutdown_timer") is None
+                    ):
+                        _arm_timer_locked(expected_token)
+                return
+            _flush_persist()
+            with lock:
+                busy = bool(
+                    state["scanning"] or state["acting"] or state["transitioning"]
+                )
+            if busy:
+                with shutdown_lock:
+                    if (
+                        state.get("shutdown_token") == expected_token
+                        and state.get("shutdown_timer") is None
+                    ):
+                        _arm_timer_locked(expected_token)
+                return
+            server = app.extensions.get("dedupe_server")
+            if server is not None:
+                server.shutdown()
+            else:
+                os.kill(os.getpid(), signal.SIGINT)
+
+        with shutdown_lock:
+            timer = state.get("shutdown_timer")
+            if timer is not None:
+                timer.cancel()
+            state["shutdown_token"] += 1
+            _arm_timer_locked(state["shutdown_token"])
         return jsonify({"ok": True})
 
     return app

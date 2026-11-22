@@ -365,3 +365,21 @@ def test_web_bulk_level_and_crop_all_use_it(tmp_path: Path, monkeypatch) -> None
     for path, size in expected.items():
         with Image.open(path) as cropped:
             assert cropped.size == size
+
+
+def test_order_level_boxes_enforces_strict_monotonicity_even_when_balanced_missing() -> None:
+    from dedupe import borders
+
+    cons = borders.CropBox(left=20, top=40, right=980, bottom=960, width=1000, height=1000,
+                           provenance=("black_bar",))
+    agg = borders.CropBox(left=10, top=80, right=950, bottom=940, width=1000, height=1000,
+                          provenance=("black_bar", "colour_bar"))
+    ordered = borders._order_level_boxes({"conservative": cons, "balanced": None, "aggressive": agg})
+    c, b, a = ordered["conservative"], ordered["balanced"], ordered["aggressive"]
+    assert c is not None and b is not None and a is not None
+    assert c.left <= b.left <= a.left
+    assert c.top <= b.top <= a.top
+    assert c.right >= b.right >= a.right
+    assert c.bottom >= b.bottom >= a.bottom
+    assert b.provenance == ("black_bar",)
+    assert "colour_bar" in a.provenance

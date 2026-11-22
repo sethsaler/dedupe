@@ -4,47 +4,81 @@
 // Remove toggle keeps fine control (keeping more than one copy) possible.
 
 import { api } from "./api.js";
-import { applyResultControls, selectionFiltersActive, updateGroupListItem } from "./groups.js";
+import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { openLightbox } from "./lightbox.js";
-import { markGroupTouched, patchGroup } from "./model.js";
+import {
+  currentGroup,
+  lightboxItemFor,
+  markGroupTouched,
+  parentDirectory,
+  parentFolderName,
+  patchGroup,
+} from "./model.js";
 import { scheduleRender } from "./render.js";
 import { state } from "./state.js";
-import { $, basename, escapeHtml, formatBytes, formatMtime, setPreviewAspectRatio, toast } from "./util.js";
+import {
+  $,
+  basename,
+  escapeHtml,
+  formatBytes,
+  formatMtime,
+  setPreviewAspectRatio,
+  toast,
+  withMediaVersion,
+} from "./util.js";
 
-function previewUrl(path) {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}&variant=preview`;
+function previewUrl(member) {
+  return withMediaVersion(
+    `/api/thumbnail?path=${encodeURIComponent(member.path)}&variant=preview`,
+    member.path,
+    member.media_version,
+  );
 }
 
-function thumbUrl(path) {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}`;
+function thumbUrl(member) {
+  return withMediaVersion(
+    `/api/thumbnail?path=${encodeURIComponent(member.path)}`,
+    member.path,
+    member.media_version,
+  );
 }
 
-function copyRowHtml(g, member, index, survivors, lightboxIndex) {
+function copyChipsHtml(g, member, isSelected, isSurvivor, keeper) {
+  const diffDir = keeper
+    && member.path !== keeper.path
+    && parentDirectory(member.path) !== parentDirectory(keeper.path);
+  const folder = diffDir ? parentFolderName(member.path) || "other folder" : "";
+  return [
+    member.protected ? '<span class="copy-chip keeping protected-label">Protected library</span>' : "",
+    isSurvivor ? '<span class="copy-chip keeping">Keeping</span>' : "",
+    member.path === g.suggested_keep ? '<span class="copy-chip suggested">Suggested</span>' : "",
+    isSelected ? '<span class="copy-chip removing">Will be removed</span>' : "",
+    diffDir
+      ? `<span class="copy-chip diff-folder" title="In a different folder from the suggested keeper: ${escapeHtml(parentDirectory(member.path))}">in ${escapeHtml(folder)}</span>`
+      : "",
+    member.error ? `<span class="copy-chip error" title="${escapeHtml(member.error)}">Scan issue</span>` : "",
+  ].join("");
+}
+
+function copyRowHtml(g, member, index, survivors, keeper, lightboxIndex) {
   const selected = new Set(g.selected_for_removal || []);
+  const deleted = new Set(g.deleted_paths || []);
   const isSelected = selected.has(member.path);
-  const isSurvivor = !isSelected;
-  const isSuggested = member.path === g.suggested_keep;
+  const isDeleted = deleted.has(member.path);
+  const isSurvivor = !isSelected && !isDeleted;
   const soleSurvivor = isSurvivor && survivors.size === 1;
   const dims = Number.isFinite(member.width) && Number.isFinite(member.height)
     && member.width > 0 && member.height > 0
     ? `${member.width}×${member.height}`
     : "—";
-  const chips = [
-    member.protected ? '<span class="copy-chip keeping protected-label">Protected library</span>' : "",
-    isSurvivor ? '<span class="copy-chip keeping">Keeping</span>' : "",
-    isSuggested ? '<span class="copy-chip suggested">Suggested</span>' : "",
-    isSelected ? '<span class="copy-chip removing">Will be removed</span>' : "",
-    member.error ? `<span class="copy-chip error" title="${escapeHtml(member.error)}">Scan issue</span>` : "",
-  ].join("");
+  const chips = copyChipsHtml(g, member, isSelected, isSurvivor, keeper);
   const keepTitle = soleSurvivor
     ? "The surviving copy"
     : "Keep only this copy — every other copy is marked for removal";
-  const thumb = thumbUrl(member.path);
-  // Same hover affordances as the member grid: videos play on hover, GIFs
-  // animate, stills linger-preview through the .thumb-wrap/.thumb-image hooks.
+  const thumb = thumbUrl(member);
   const mediaPreview = member.media_type === "video"
-    ? `<video class="hover-video" poster="${thumb}" data-src="/api/media?path=${encodeURIComponent(member.path)}" muted loop playsinline preload="none"></video>`
-    : `<img class="thumb-image ${member.media_type === "gif" ? "hover-gif" : ""}" src="${thumb}" ${member.media_type === "gif" ? `data-thumbnail="${thumb}" data-src="/api/media?path=${encodeURIComponent(member.path)}"` : ""} alt="Preview of ${escapeHtml(basename(member.path))}" loading="lazy" decoding="async" />`;
+    ? `<video class="hover-video" poster="${escapeHtml(thumb)}" data-src="/api/media?path=${encodeURIComponent(member.path)}" muted loop playsinline preload="none"></video>`
+    : `<img class="thumb-image ${member.media_type === "gif" ? "hover-gif" : ""}" src="${escapeHtml(thumb)}" ${member.media_type === "gif" ? `data-thumbnail="${escapeHtml(thumb)}" data-src="/api/media?path=${encodeURIComponent(member.path)}"` : ""} alt="Preview of ${escapeHtml(basename(member.path))}" loading="lazy" decoding="async" />`;
   const mediaBadge = ["video", "gif"].includes(member.media_type)
     ? '<span class="video-preview-badge" aria-hidden="true">▶</span>'
     : "";
@@ -53,14 +87,15 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
   const previewDims = hasDims
     ? ` data-preview-width="${member.width}" data-preview-height="${member.height}"`
     : "";
+  const lockControls = Boolean(state.scanning || isDeleted);
   return `
-    <article class="card copy-row ${isSelected ? "selected" : "keep"} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
+    <article class="card copy-row ${isSelected ? "selected" : "keep"} ${isDeleted ? "deleted" : ""} ${index === state.memberFocus ? "focused" : ""}" data-path="${escapeHtml(member.path)}" data-index="${index}">
       <button class="copy-thumb thumb-wrap" data-path="${escapeHtml(member.path)}" data-index="${lightboxIndex}"${previewDims} type="button" aria-label="Open ${escapeHtml(basename(member.path))} in the comparison view">
         ${mediaPreview}${mediaBadge}
       </button>
       <div class="copy-info">
         <div class="name" title="${escapeHtml(member.path)}">${escapeHtml(basename(member.path))}</div>
-        ${chips ? `<div class="copy-chips">${chips}</div>` : ""}
+        <div class="copy-chips"${chips ? "" : " hidden"}>${chips}</div>
         <div class="path" title="${escapeHtml(member.path)}">${escapeHtml(member.path)}</div>
         <div class="card-meta">
           <span>${formatBytes(member.size)}</span>
@@ -69,11 +104,11 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
         </div>
       </div>
       <div class="copy-side">
-        <button class="copy-keep" data-path="${escapeHtml(member.path)}" type="button" aria-pressed="${soleSurvivor}" title="${keepTitle}">
+        <button class="copy-keep" data-path="${escapeHtml(member.path)}" type="button" aria-pressed="${soleSurvivor}" title="${keepTitle}"${lockControls ? " disabled" : ""}>
           <span class="copy-radio" aria-hidden="true"></span>Keep
         </button>
         <label class="copy-remove" title="Mark this copy for removal">
-          <input type="checkbox" class="sel-cb" data-path="${escapeHtml(member.path)}" ${isSelected ? "checked" : ""} ${member.protected ? "disabled" : ""} />
+          <input type="checkbox" class="sel-cb" data-path="${escapeHtml(member.path)}" ${isSelected ? "checked" : ""} ${member.protected || lockControls ? "disabled" : ""} />
           Remove
         </label>
         <button class="linkish reveal" data-path="${escapeHtml(member.path)}" type="button">Reveal</button>
@@ -81,32 +116,281 @@ function copyRowHtml(g, member, index, survivors, lightboxIndex) {
     </article>`;
 }
 
-async function postSelection(g, selected) {
-  const updated = await api("/api/selection", {
-    method: "POST",
-    body: JSON.stringify({
-      group_id: g.id,
-      selected: [...selected],
-      scan_id: state.scanId,
-    }),
-  });
-  markGroupTouched(g.id);
-  patchGroup(updated);
-  return updated;
+function updateExactMetaAndSummary(g) {
+  const members = g.members || [];
+  const selected = new Set(g.selected_for_removal || []);
+  const deleted = new Set(g.deleted_paths || []);
+  const selectedBytes = members
+    .filter((member) => selected.has(member.path) && !deleted.has(member.path))
+    .reduce((sum, member) => sum + (member.size || 0), 0);
+  const keeperReason = g.cleanup?.keeper_reason
+    ? ` · keep: ${g.cleanup.keeper_reason}`
+    : "";
+  $("detailMeta").textContent =
+    `${formatBytes(selectedBytes)} marked for removal (${formatBytes(g.reclaimable_bytes)} reclaimable) · ${members.length} byte-identical copies · pick the one to keep, the rest are marked for removal${keeperReason}`;
+
+  const selectionBase = `${selected.size} of ${members.length} selected for removal`;
+  $("groupSelectionSummary").textContent =
+    selected.size > 0 && !state.touchedGroups.has(g.id)
+      ? `Suggested selection — ${selectionBase} · adjust freely`
+      : selectionBase;
 }
 
-function afterSelection(updated) {
-  renderExactReview(updated);
-  if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+function syncExactLightboxItems(g) {
+  const deleted = new Set(g.deleted_paths || []);
+  state.lightboxItems = (g.members || [])
+    .filter((member) => !deleted.has(member.path))
+    .map((member) => lightboxItemFor(member, g));
+}
+
+function syncCopyRow(row, g, path, survivors = null, keeper = null) {
+  if (!row || !g) return;
+  const members = g.members || [];
+  const member = members.find((item) => item.path === path);
+  if (!member) return;
+  const selected = new Set(g.selected_for_removal || []);
+  const deleted = new Set(g.deleted_paths || []);
+  const liveSurvivors = survivors || new Set(
+    members.filter((item) => !selected.has(item.path) && !deleted.has(item.path)).map((item) => item.path),
+  );
+  const resolvedKeeper = keeper || members.find((item) => item.path === g.suggested_keep) || members[0];
+  const isSelected = selected.has(path);
+  const isDeleted = deleted.has(path);
+  const isSurvivor = !isSelected && !isDeleted;
+  const soleSurvivor = isSurvivor && liveSurvivors.size === 1;
+
+  row.classList.toggle("selected", isSelected);
+  row.classList.toggle("keep", !isSelected);
+  row.classList.toggle("deleted", isDeleted);
+
+  let chipsEl = row.querySelector(".copy-chips");
+  const chipsMarkup = copyChipsHtml(g, member, isSelected, isSurvivor, resolvedKeeper);
+  if (!chipsEl) {
+    chipsEl = document.createElement("div");
+    chipsEl.className = "copy-chips";
+    row.querySelector(".copy-info .name")?.after(chipsEl);
+  }
+  chipsEl.innerHTML = chipsMarkup;
+  chipsEl.hidden = !chipsMarkup;
+
+  const keepBtn = row.querySelector(".copy-keep");
+  if (keepBtn) {
+    keepBtn.setAttribute("aria-pressed", String(soleSurvivor));
+    keepBtn.title = soleSurvivor
+      ? "The surviving copy"
+      : "Keep only this copy — every other copy is marked for removal";
+    keepBtn.disabled = Boolean(state.scanning || isDeleted);
+  }
+
+  const cb = row.querySelector(".sel-cb");
+  if (cb) {
+    cb.checked = isSelected;
+    cb.disabled = Boolean(member.protected || state.scanning || isDeleted);
+  }
+}
+
+function syncExactSelectionState(g) {
+  if (!g) return;
+  const members = g.members || [];
+  const selected = new Set(g.selected_for_removal || []);
+  const deleted = new Set(g.deleted_paths || []);
+  const survivors = new Set(
+    members.filter((member) => !selected.has(member.path) && !deleted.has(member.path)).map((member) => member.path),
+  );
+  const keeper = members.find((member) => member.path === g.suggested_keep) || members[0];
+
+  syncExactLightboxItems(g);
+  updateExactMetaAndSummary(g);
+  $("members").querySelectorAll(".copy-row[data-path]").forEach((row) => {
+    syncCopyRow(row, g, row.dataset.path, survivors, keeper);
+  });
+}
+
+// —— Serialized selection updates per group ——
+const pendingExactSelection = new Map();
+const exactSelectionInFlight = new Set();
+
+function applyExactSelection(g, wanted) {
+  if (state.scanning || state.actionBusy) {
+    toast("Selections are locked while a scan or file action runs", "error");
+    return false;
+  }
+  const selectedSet = new Set(wanted);
+  const ordered = (g.members || [])
+    .filter((member) => !member.protected && selectedSet.has(member.path))
+    .map((member) => member.path);
+  const optimistic = { ...g, selected_for_removal: ordered };
+  state.selectToken += 1;
+  markGroupTouched(g.id);
+  patchGroup(optimistic);
+  syncExactSelectionState(optimistic);
+  if (selectionFiltersActive() || !updateGroupListItem(optimistic)) {
     scheduleRender({ groupList: true });
   } else {
     applyResultControls();
   }
   scheduleRender({ selection: true });
+  pendingExactSelection.set(g.id, ordered);
+  flushExactSelection(g.id);
+  return true;
+}
+
+async function flushExactSelection(id) {
+  if (exactSelectionInFlight.has(id)) return;
+  exactSelectionInFlight.add(id);
+  try {
+    while (pendingExactSelection.has(id)) {
+      const selected = pendingExactSelection.get(id);
+      pendingExactSelection.delete(id);
+      const updated = await api("/api/selection", {
+        method: "POST",
+        body: JSON.stringify({
+          group_id: id,
+          selected,
+          scan_id: state.scanId,
+        }),
+      });
+      if (!pendingExactSelection.has(id)) {
+        patchGroup(updated);
+        if (currentGroup()?.id === id && $("members").querySelector(".exact-review")) {
+          syncExactSelectionState(updated);
+        }
+        if (selectionFiltersActive() || !updateGroupListItem(updated)) {
+          scheduleRender({ groupList: true });
+        } else {
+          applyResultControls();
+        }
+        scheduleRender({ selection: true });
+      }
+    }
+  } catch (error) {
+    pendingExactSelection.delete(id);
+    toast(error.message || "Could not update selection", "error");
+    loadGroups().catch(() => {});
+  } finally {
+    exactSelectionInFlight.delete(id);
+  }
+}
+
+function unloadVideos(container) {
+  container.querySelectorAll("video").forEach((video) => {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  });
+}
+
+function wireExactDelegation(root) {
+  root.addEventListener("click", async (event) => {
+    const g = currentGroup();
+    if (!g || g.kind !== "exact") return;
+
+    const keepBtn = event.target.closest(".copy-keep");
+    if (keepBtn) {
+      const keepPath = keepBtn.dataset.path;
+      const deleted = new Set(g.deleted_paths || []);
+      const picks = (g.members || [])
+        .filter((member) => !member.protected && !deleted.has(member.path) && member.path !== keepPath)
+        .map((member) => member.path);
+      applyExactSelection(g, picks);
+      return;
+    }
+
+    const revealBtn = event.target.closest(".reveal");
+    if (revealBtn) {
+      event.stopPropagation();
+      try {
+        await api(`/api/reveal?path=${encodeURIComponent(revealBtn.dataset.path)}&open=1`);
+      } catch (error) {
+        toast(error.message, "error");
+      }
+      return;
+    }
+
+    const thumbBtn = event.target.closest(".copy-thumb");
+    if (thumbBtn) {
+      const row = thumbBtn.closest(".copy-row");
+      const path = row?.dataset.path;
+      const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === path);
+      state.memberFocus = Number(row?.dataset.index || 0);
+      openLightbox(lightboxIndex >= 0 ? lightboxIndex : 0);
+      return;
+    }
+
+    if (event.target.closest(".exact-preview")) {
+      const keeperPath = g.suggested_keep || g.members?.[0]?.path;
+      const index = state.lightboxItems.findIndex((item) => item.path === keeperPath);
+      openLightbox(index >= 0 ? index : 0);
+      return;
+    }
+
+    const row = event.target.closest(".copy-row");
+    if (row && !event.target.closest("input, button, label, a")) {
+      state.memberFocus = Number(row.dataset.index);
+      root.querySelectorAll(".copy-row").forEach((other) => other.classList.remove("focused"));
+      row.classList.add("focused");
+    }
+  });
+
+  // Capturing change listener also catches Space's non-bubbling synthetic
+  // change event from keyboard.js.
+  root.addEventListener("change", (event) => {
+    const cb = event.target.closest?.(".sel-cb");
+    if (!cb) return;
+    const g = currentGroup();
+    if (!g || g.kind !== "exact") return;
+    if (state.scanning || state.actionBusy) {
+      cb.checked = !cb.checked;
+      toast("Selections are locked while a scan or file action runs", "error");
+      return;
+    }
+    const next = new Set(g.selected_for_removal || []);
+    if (cb.checked) next.add(cb.dataset.path);
+    else next.delete(cb.dataset.path);
+    if (!applyExactSelection(g, next)) {
+      cb.checked = !cb.checked;
+    }
+  }, true);
+
+  root.addEventListener("pointerover", (event) => {
+    const wrap = event.target.closest?.(".thumb-wrap");
+    if (!wrap || wrap.contains(event.relatedTarget)) return;
+    const video = wrap.querySelector(".hover-video");
+    if (video) {
+      video.muted = true;
+      if (!video.src) video.src = video.dataset.src;
+      video.play().catch(() => {
+        /* The static poster remains when the browser cannot play this codec. */
+      });
+    }
+    const gif = wrap.querySelector(".hover-gif");
+    if (gif && gif.dataset.src) gif.src = gif.dataset.src;
+  });
+
+  root.addEventListener("pointerout", (event) => {
+    const wrap = event.target.closest?.(".thumb-wrap");
+    if (!wrap || wrap.contains(event.relatedTarget)) return;
+    const video = wrap.querySelector(".hover-video");
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+    const gif = wrap.querySelector(".hover-gif");
+    if (gif && gif.dataset.thumbnail) gif.src = gif.dataset.thumbnail;
+  });
+
+  root.addEventListener("loadedmetadata", (event) => {
+    const video = event.target;
+    if (video?.classList?.contains("hover-video")) {
+      setPreviewAspectRatio(video.closest(".thumb-wrap"), video.videoWidth, video.videoHeight);
+    }
+  }, true);
 }
 
 function renderExactReview(g) {
   const box = $("members");
+  unloadVideos(box);
   box.classList.remove("triage-grid");
   for (const id of ["memberPagination", "memberPaginationBottom", "memberSort", "memberModified", "memberPeople"]) {
     const el = $(id);
@@ -116,32 +400,13 @@ function renderExactReview(g) {
   const members = g.members || [];
   const selected = new Set(g.selected_for_removal || []);
   const deleted = new Set(g.deleted_paths || []);
-  const survivors = new Set(members.filter((member) => !selected.has(member.path)).map((member) => member.path));
+  const survivors = new Set(
+    members.filter((member) => !selected.has(member.path) && !deleted.has(member.path)).map((member) => member.path),
+  );
   const keeper = members.find((member) => member.path === g.suggested_keep) || members[0];
 
-  state.lightboxItems = members
-    .filter((member) => !deleted.has(member.path))
-    .map((member) => ({
-      path: member.path,
-      mediaType: member.media_type,
-      keeper: g.suggested_keep,
-      kind: g.kind,
-      size: member.size,
-      width: member.width,
-      height: member.height,
-      mtime: member.mtime,
-    }));
-
-  $("detailMeta").textContent =
-    `${formatBytes(g.reclaimable_bytes)} reclaimable · ${members.length} byte-identical copies · pick the one to keep, the rest are marked for removal`;
-
-  // The toolbar is hidden in this layout, but keep the selection summary text
-  // current — the action bar and other consumers still read it.
-  const selectionBase = `${selected.size} of ${members.length} selected for removal`;
-  $("groupSelectionSummary").textContent =
-    selected.size > 0 && !state.touchedGroups.has(g.id)
-      ? `Suggested selection — ${selectionBase} · adjust freely`
-      : selectionBase;
+  syncExactLightboxItems(g);
+  updateExactMetaAndSummary(g);
 
   const lightboxIndexByPath = new Map(
     state.lightboxItems.map((item, lightboxIndex) => [item.path, lightboxIndex]),
@@ -149,8 +414,11 @@ function renderExactReview(g) {
 
   const preview = keeper
     ? `<button class="exact-preview" type="button" aria-label="Open the identical preview in the comparison view">
-         <img src="${previewUrl(keeper.path)}" alt="Preview shared by every copy" decoding="async" />
+         <img src="${escapeHtml(previewUrl(keeper))}" alt="Preview shared by every copy" decoding="async" />
        </button>`
+    : "";
+  const keeperReason = g.cleanup?.keeper_reason
+    ? `<span class="keeper-reason">Suggested keeper: ${escapeHtml(g.cleanup.keeper_reason)}</span>`
     : "";
   box.innerHTML = `
     <div class="exact-review">
@@ -159,104 +427,20 @@ function renderExactReview(g) {
         <div class="exact-banner-copy">
           <strong>${members.length} identical copies</strong>
           <span class="muted">Byte-identical SHA-256 match — only the locations differ. Choose the copy that stays; the rest move to Trash when you run the action below.</span>
+          ${keeperReason}
         </div>
       </div>
       <div class="copy-list">
-        ${members.map((member, index) => copyRowHtml(g, member, index, survivors, lightboxIndexByPath.get(member.path) ?? index)).join("")}
+        ${members.map((member, index) => copyRowHtml(g, member, index, survivors, keeper, lightboxIndexByPath.get(member.path) ?? index)).join("")}
       </div>
     </div>`;
+
+  const reviewRoot = box.querySelector(".exact-review");
+  if (reviewRoot) wireExactDelegation(reviewRoot);
 
   box.querySelectorAll(".copy-thumb").forEach((thumb) => {
     setPreviewAspectRatio(thumb, thumb.dataset.previewWidth, thumb.dataset.previewHeight);
   });
-
-  box.querySelectorAll(".copy-keep").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const keepPath = btn.dataset.path;
-      const picks = members.filter((member) => !member.protected).map((member) => member.path).filter((path) => path !== keepPath);
-      try {
-        afterSelection(await postSelection(g, picks));
-      } catch (error) {
-        toast(error.message, "error");
-      }
-    });
-  });
-
-  box.querySelectorAll(".hover-video").forEach((video) => {
-    const wrap = video.closest(".thumb-wrap");
-    video.addEventListener("loadedmetadata", () => {
-      setPreviewAspectRatio(wrap, video.videoWidth, video.videoHeight);
-    });
-    wrap.addEventListener("pointerenter", () => {
-      video.muted = true;
-      if (!video.src) video.src = video.dataset.src;
-      video.play().catch(() => {
-        /* The static poster remains when the browser cannot play this codec. */
-      });
-    });
-    wrap.addEventListener("pointerleave", () => {
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    });
-  });
-
-  box.querySelectorAll(".hover-gif").forEach((image) => {
-    const wrap = image.closest(".thumb-wrap");
-    wrap.addEventListener("pointerenter", () => {
-      image.src = image.dataset.src;
-    });
-    wrap.addEventListener("pointerleave", () => {
-      image.src = image.dataset.thumbnail;
-    });
-  });
-
-  box.querySelectorAll(".sel-cb").forEach((cb) => {
-    cb.addEventListener("change", async () => {
-      const next = new Set(g.selected_for_removal || []);
-      if (cb.checked) next.add(cb.dataset.path);
-      else next.delete(cb.dataset.path);
-      try {
-        afterSelection(await postSelection(g, next));
-      } catch (error) {
-        cb.checked = !cb.checked;
-        toast(error.message, "error");
-      }
-    });
-  });
-
-  box.querySelectorAll(".reveal").forEach((btn) => {
-    btn.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      try {
-        await api(`/api/reveal?path=${encodeURIComponent(btn.dataset.path)}&open=1`);
-      } catch (error) {
-        toast(error.message, "error");
-      }
-    });
-  });
-
-  box.querySelectorAll(".copy-thumb").forEach((thumb) => {
-    thumb.addEventListener("click", () => {
-      const path = thumb.closest(".copy-row")?.dataset.path;
-      const lightboxIndex = state.lightboxItems.findIndex((item) => item.path === path);
-      state.memberFocus = Number(thumb.closest(".copy-row")?.dataset.index || 0);
-      openLightbox(lightboxIndex >= 0 ? lightboxIndex : 0);
-    });
-  });
-  box.querySelector(".exact-preview")?.addEventListener("click", () => {
-    const index = state.lightboxItems.findIndex((item) => item.path === keeper?.path);
-    openLightbox(index >= 0 ? index : 0);
-  });
-
-  box.querySelectorAll(".copy-row").forEach((row) => {
-    row.addEventListener("click", (event) => {
-      if (event.target.closest("input, button, label, a")) return;
-      state.memberFocus = Number(row.dataset.index);
-      box.querySelectorAll(".copy-row").forEach((other) => other.classList.remove("focused"));
-      row.classList.add("focused");
-    });
-  });
 }
 
-export { renderExactReview };
+export { renderExactReview, syncCopyRow, syncExactSelectionState };

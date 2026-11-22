@@ -2,7 +2,10 @@
 
 from pathlib import Path
 
+import pytest
+
 from dedupe.keep_decisions import (
+    MAX_KEEP_DECISIONS_BYTES,
     default_keep_decisions_path,
     kept_paths,
     load_keep_decisions,
@@ -12,7 +15,14 @@ from dedupe.keep_decisions import (
 from dedupe.models import FileRecord, MediaType
 
 
-def _rec(path: str, size: int = 100, mtime_ns: int = 1_000_000_000) -> FileRecord:
+def _rec(
+    path: str,
+    size: int = 100,
+    mtime_ns: int = 1_000_000_000,
+    *,
+    device: int | None = None,
+    inode: int | None = None,
+) -> FileRecord:
     return FileRecord(
         path=path,
         size=size,
@@ -20,6 +30,8 @@ def _rec(path: str, size: int = 100, mtime_ns: int = 1_000_000_000) -> FileRecor
         media_type=MediaType.IMAGE,
         extension=Path(path).suffix.lower(),
         mtime_ns=mtime_ns,
+        device=device,
+        inode=inode,
     )
 
 
@@ -71,3 +83,52 @@ def test_corrupt_or_missing_store_loads_as_empty(tmp_path: Path) -> None:
     assert load_keep_decisions(missing) == {}
     assert load_keep_decisions(corrupt) == {}
     assert load_keep_decisions(wrong_version) == {}
+
+
+def test_update_refuses_to_overwrite_corrupt_or_oversized_store(tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{corrupt-existing-data")
+    record = _rec("/photos/small.jpg")
+
+    with pytest.raises(OSError):
+        update_keep_decisions(keep=[record], path=corrupt)
+    assert corrupt.read_text() == "{corrupt-existing-data"
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"x" * (MAX_KEEP_DECISIONS_BYTES + 1))
+    with pytest.raises(OSError):
+        update_keep_decisions(keep=[record], path=oversized)
+    assert oversized.stat().st_size == MAX_KEEP_DECISIONS_BYTES + 1
+
+
+def test_keep_decision_falls_back_to_device_inode_after_rename(tmp_path: Path) -> None:
+    store = tmp_path / "keep-decisions.json"
+    original = _rec("/photos/old_name.jpg", size=250, mtime_ns=5_000_000_000, device=7, inode=99)
+    update_keep_decisions(keep=[original], path=store)
+
+    renamed = _rec("/photos/archive/new_name.jpg", size=250, mtime_ns=5_000_000_000, device=7, inode=99)
+    edited_renamed = _rec(
+        "/photos/archive/new_name.jpg", size=251, mtime_ns=5_000_000_000, device=7, inode=99
+    )
+    different_inode = _rec(
+        "/photos/archive/other.jpg", size=250, mtime_ns=5_000_000_000, device=7, inode=100
+    )
+
+    decisions = load_keep_decisions(store)
+    assert matches_keep_decision(renamed, decisions) is True
+    assert matches_keep_decision(edited_renamed, decisions) is False
+    assert matches_keep_decision(different_inode, decisions) is False
+    assert kept_paths([renamed, edited_renamed, different_inode], path=store) == {renamed.path}
+
+
+def test_concurrent_updates_preserve_all_decisions_with_flock(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = tmp_path / "keep-decisions.json"
+    records = [_rec(f"/photos/{i}.jpg", size=100 + i, device=1, inode=1000 + i) for i in range(12)]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda rec: update_keep_decisions(keep=[rec], path=store), records))
+
+    decisions = load_keep_decisions(store)
+    assert set(decisions) == {rec.path for rec in records}

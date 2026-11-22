@@ -1,14 +1,11 @@
 import { api } from "./api.js";
-import { collectScanSettings, startScan } from "./scan.js";
-import { loadGroups } from "./groups.js";
+import { groupNeedsAttention } from "./model.js";
 import { confirmModal } from "./modal.js";
+import { collectScanSettings, startScan, switchTab } from "./scan.js";
 import {
-  SCAN_PRESETS,
+  applySettingsToForm,
   collapseScanPanel,
-  inferScanPreset,
   scanGoalShortLabel,
-  syncCustomPresetHint,
-  updateWorkersUI,
 } from "./settings.js";
 import { state } from "./state.js";
 import { refreshStatus } from "./status.js";
@@ -16,60 +13,74 @@ import { $, escapeHtml, toast } from "./util.js";
 
 let jobs = [];
 let lastCompletedScan = null;
-const fields = {
-  exact: "optExact", similar: "optSimilar", semantic: "optSemantic", semantic_full_speed: "optSemanticFast", decider: "optDecider",
-  video_versions: "optVideoVersions", find_no_humans: "optNoHumans", count_faces: "optCountFaces",
-  find_black_borders: "optBlackBorders", crop_aggressiveness: "optCropAggressiveness",
-  find_low_resolution: "optLowResolution", low_resolution_images: "optLowResolutionImages",
-  low_resolution_gifs: "optLowResolutionGifs", low_resolution_videos: "optLowResolutionVideos",
-  human_backend: "humanBackend", include_images: "optImages", include_gifs: "optGifs",
-  include_videos: "optVideos", threshold: "threshold", parallel_streams: "optParallel", workers: "workers",
-};
 
-function restoreSettings(settings) {
-  for (const [key, id] of Object.entries(fields)) {
-    if (!(key in settings)) continue;
-    const element = $(id);
-    if (element.type === "checkbox") element.checked = !!settings[key];
-    else element.value = settings[key] ?? 0;
-    element.dispatchEvent(new Event("change"));
+function normalizedSettingValue(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim());
+  if (value === undefined) return null;
+  return value;
+}
+
+function areJobSettingsDirty(savedSettings) {
+  if (!savedSettings || typeof savedSettings !== "object") return false;
+  const current = collectScanSettings();
+  for (const [key, savedRaw] of Object.entries(savedSettings)) {
+    if (key === "job_id" || key === "new_only" || key === "scan_id" || key === "retry") continue;
+    const saved = normalizedSettingValue(savedRaw);
+    const cur = normalizedSettingValue(current[key]);
+    if (Array.isArray(saved) || Array.isArray(cur)) {
+      const a = Array.isArray(saved) ? saved : [];
+      const b = Array.isArray(cur) ? cur : [];
+      if (a.length !== b.length || a.some((val, idx) => val !== b[idx])) return true;
+    } else if (cur !== saved) {
+      return true;
+    }
   }
-  $("paths").value = (settings.paths || []).join(", ");
-  $("preferredFolders").value = (settings.preferred_folders || []).join("\n");
-  $("protectedFolders").value = (settings.protected_folders || []).join("\n");
-  $("exclusions").value = (settings.exclusions || []).join(", ");
-  $("optRandomReview").checked = (settings.random_review_count || 0) > 0;
-  for (const [key, id, multiplier] of [
-    ["semantic_threshold", "semanticSetThreshold", 100],
-    ["semantic_duplicate_threshold", "semanticDuplicateThreshold", 100],
-    ["low_resolution_image_max_pixels", "lowResolutionImageMaxMp", 0.000001],
-    ["low_resolution_gif_max_pixels", "lowResolutionGifMaxMp", 0.000001],
-    ["low_resolution_video_max_pixels", "lowResolutionVideoMaxMp", 0.000001],
-  ]) {
-    if (settings[key] != null) $(id).value = settings[key] * multiplier;
-    $(id).dispatchEvent(new Event("input"));
-  }
-  $("threshold").dispatchEvent(new Event("input"));
-  const inferredPreset = inferScanPreset(settings);
-  $("scanPreset").value = inferredPreset;
-  if (inferredPreset === "custom") syncCustomPresetHint();
-  else $("presetHint").textContent = SCAN_PRESETS[inferredPreset]?.hint || "";
-  $("semanticFields").hidden = !$("optSemantic").checked;
-  updateWorkersUI();
+  return false;
 }
 
 function chosenJob() { return jobs.find((job) => job.id === $("cleanupJob").value); }
+
+function syncJobButtons(busy = state.scanning || state.acting) {
+  const job = chosenJob();
+  $("btnSaveJob").disabled = busy;
+  $("btnResumeJob").disabled = busy || !job?.last_scan_at;
+  $("btnNewArrivals").disabled = busy || !job?.last_scan_at;
+  $("btnDeleteJob").disabled = busy || !job;
+}
+
+function updateJobHint() {
+  const hint = $("jobHint");
+  if (!hint) return;
+  const job = chosenJob();
+  if (!job) {
+    hint.textContent = "Save folders and settings together. Each job keeps its own review progress.";
+    return;
+  }
+  if (areJobSettingsDirty(job.settings)) {
+    hint.textContent =
+      `Unsaved changes for "${job.name}" — click Save job or Scan to overwrite (or choose "New cleanup" to keep it unchanged).`;
+    return;
+  }
+  hint.textContent = job.last_scan_at
+    ? `Last scanned ${new Date(job.last_scan_at).toLocaleString()}. Resume your review or check new arrivals.`
+    : `Saved job "${job.name}" — run Scan to build its baseline and review progress.`;
+}
+
+function restoreSettings(settings) {
+  applySettingsToForm(settings);
+  updateJobHint();
+}
 
 async function refreshJobs(selected = $("cleanupJob").value) {
   const data = await api("/api/jobs");
   jobs = data.jobs;
   $("cleanupJob").innerHTML = '<option value="">New cleanup</option>' + jobs.map((job) =>
     `<option value="${job.id}">${escapeHtml(job.name)}</option>`).join("");
-  $("cleanupJob").value = selected;
-  state.selectedJobId = chosenJob()?.id || null;
-  $("btnResumeJob").disabled = !chosenJob()?.last_scan_at;
-  $("btnNewArrivals").disabled = !chosenJob()?.last_scan_at;
-  $("btnDeleteJob").disabled = !chosenJob();
+  $("cleanupJob").value = jobs.some((job) => job.id === selected) ? selected : "";
+  const job = chosenJob();
+  state.selectedJobId = job?.id || null;
+  syncJobButtons();
+  updateJobHint();
 }
 
 $("cleanupJob").addEventListener("change", () => {
@@ -77,20 +88,17 @@ $("cleanupJob").addEventListener("change", () => {
   state.selectedJobId = job?.id || null;
   $("cleanupJobName").value = job?.name || "";
   if (job) restoreSettings(job.settings);
-  $("btnResumeJob").disabled = !job?.last_scan_at;
-  $("btnNewArrivals").disabled = !job?.last_scan_at;
-  $("btnDeleteJob").disabled = !job;
-  $("jobHint").textContent = job?.last_scan_at
-    ? `Last scanned ${new Date(job.last_scan_at).toLocaleString()}. Resume your review or check new arrivals.`
-    : "Save folders and settings together. Each job keeps its own review progress.";
+  else updateJobHint();
+  syncJobButtons();
 });
 
-$("scanPreset").addEventListener("change", () => {
-  const job = chosenJob();
-  if (!job) return;
-  $("jobHint").textContent =
-    `Selected job "${job.name}" will use these updated settings on Scan (or choose "New cleanup" to keep the job unchanged).`;
-});
+const onJobFormChange = (event) => {
+  const id = event.target?.id;
+  if (id === "cleanupJob" || id === "cleanupJobName") return;
+  updateJobHint();
+};
+$("scanMain")?.addEventListener("input", onJobFormChange);
+$("scanMain")?.addEventListener("change", onJobFormChange);
 
 $("btnSaveJob").addEventListener("click", async () => {
   try {
@@ -107,17 +115,57 @@ $("btnSaveJob").addEventListener("click", async () => {
 $("btnResumeJob").addEventListener("click", async () => {
   const job = chosenJob();
   if (!job) return;
+  const button = $("btnResumeJob");
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.textContent = "Resuming…";
   try {
-    await api("/api/review-session/resume", { method: "POST", body: JSON.stringify({ job_id: job.id }) });
-    await refreshStatus();
-    await loadGroups();
-    collapseScanPanel((job.settings?.paths || []).join(", "), scanGoalShortLabel(job.settings));
-  } catch (error) { toast(error.message, "error"); }
+    const resumed = await api("/api/review-session/resume", {
+      method: "POST",
+      body: JSON.stringify({ job_id: job.id }),
+    });
+    state.scanId = resumed.scan_id || state.scanId;
+    const status = await refreshStatus();
+    const settings = status?.scan_settings && Object.keys(status.scan_settings).length
+      ? status.scan_settings
+      : job.settings;
+    applySettingsToForm(settings);
+    updateJobHint();
+    collapseScanPanel(
+      (settings?.paths || job.settings?.paths || []).join(", "),
+      scanGoalShortLabel(settings),
+    );
+    if (state.allGroups.length > 0 || status?.summary?.group_count > 0) {
+      $("emptyState").hidden = true;
+      $("results").hidden = false;
+      if (state.groups.length === 0 && state.allGroups.length > 0) {
+        await switchTab("all");
+      }
+    }
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.removeAttribute("aria-busy");
+    button.textContent = originalLabel;
+    syncJobButtons();
+  }
 });
 
-$("btnNewArrivals").addEventListener("click", () => {
+$("btnNewArrivals").addEventListener("click", async () => {
   const job = chosenJob();
-  if (job) startScan({ ...job.settings, job_id: job.id, new_only: true });
+  if (!job) return;
+  const hasOpenUnfinished = state.allGroups.some(groupNeedsAttention);
+  const hasUnloadedSaved = Boolean(job.last_scan_at && state.lastScanSettings?.job_id !== job.id);
+  if (hasOpenUnfinished || hasUnloadedSaved) {
+    const ok = await confirmModal({
+      title: `Check new arrivals for ${job.name}?`,
+      body: "<p>Checking new arrivals scans only for new or changed files against the job's baseline. If 0 new files are found, the saved review snapshot for this job is cleared — resume your review first if you still have unfinished items.</p>",
+      confirmLabel: "Check new arrivals",
+    });
+    if (!ok) return;
+  }
+  startScan({ ...job.settings, job_id: job.id, new_only: true });
 });
 
 $("btnDeleteJob").addEventListener("click", async () => {
@@ -138,10 +186,7 @@ refreshJobs().catch((error) => toast(error.message, "error"));
 
 window.addEventListener("dedupe:work-state", (event) => {
   const { busy, scanId, done } = event.detail;
-  $("btnSaveJob").disabled = busy;
-  $("btnResumeJob").disabled = busy || !chosenJob()?.last_scan_at;
-  $("btnNewArrivals").disabled = busy || !chosenJob()?.last_scan_at;
-  $("btnDeleteJob").disabled = busy || !chosenJob();
+  syncJobButtons(busy);
   if (!busy && done && scanId !== lastCompletedScan) {
     lastCompletedScan = scanId;
     refreshJobs().catch((error) => toast(error.message, "error"));

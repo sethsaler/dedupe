@@ -125,3 +125,12 @@ def test_semantic_block_search_keeps_cross_block_matches(monkeypatch):
                for i, v in enumerate(([1, 0], [0, 1], [1, 0], [0, 1], [-1, 0]))}
     _, scores = semantic.semantic_neighbors(vectors, 0.99)
     assert set(scores) == {("0", "2"), ("1", "3")}
+
+
+def test_cleanup_opportunity_handles_pixel_exact_groups():
+    members = [record("/a.jpg", width=100, height=100), record("/b.jpg", width=100, height=100)]
+    pixel_exact = build_one_group(GroupKind.SIMILAR, members, match_basis="pixel_exact")
+    verified = build_one_group(GroupKind.SIMILAR, members)
+    info = cleanup_opportunity(pixel_exact, [100])
+    assert info["score"] > cleanup_opportunity(verified, [60])["score"]
+    assert info["label"] == "Strong match"

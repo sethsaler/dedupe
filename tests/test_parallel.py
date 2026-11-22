@@ -235,3 +235,34 @@ def test_cancel_while_all_workers_are_blocked(monkeypatch) -> None:
     finally:
         release.set()
         caller.join(5)
+
+
+def test_map_parallel_chunk_size_preserves_order_and_cancels() -> None:
+    import pytest
+
+    items = list(range(15))
+    seen_progress: list[tuple[int, int]] = []
+    result = map_parallel(
+        lambda x: x * x,
+        items,
+        workers=3,
+        chunk_size=4,
+        progress=lambda done, total: seen_progress.append((done, total)),
+    )
+    assert result == [x * x for x in items]
+    assert seen_progress[-1] == (15, 15)
+
+    calls = {"n": 0}
+
+    def cancel_midway() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        map_parallel(
+            lambda x: x + 1,
+            list(range(20)),
+            workers=1,
+            chunk_size=2,
+            cancelled=cancel_midway,
+        )

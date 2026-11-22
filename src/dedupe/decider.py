@@ -41,7 +41,9 @@ from pathlib import Path
 from typing import Self
 
 from .cache import HashCache, default_cache_path
+from .edited_copy import MIRRORED_ORIENTATIONS, aligned_image_copy_orientation
 from .models import FileRecord
+from .similar_image import ensure_heif_registered
 
 URL_ENV = "DEDUPE_DECIDER_URL"
 DEFAULT_URL = "http://127.0.0.1:8080"
@@ -100,20 +102,26 @@ def image_part(path: str) -> dict:
     """An upright first frame as a JPEG data-URL content part."""
     from PIL import Image, ImageOps
 
-    try:
-        from pillow_heif import register_heif_opener
-
-        register_heif_opener()
-    except Exception:
-        pass
+    ensure_heif_registered()
     with Image.open(path) as img:
         img.seek(0)
+        try:
+            img.draft("RGB", (PREPARE_MAX_SIDE, PREPARE_MAX_SIDE))
+        except Exception:
+            pass
         frame = ImageOps.exif_transpose(img).convert("RGB")
     frame.thumbnail((PREPARE_MAX_SIDE, PREPARE_MAX_SIDE))
     buffer = io.BytesIO()
     frame.save(buffer, "JPEG", quality=88)
     data = base64.b64encode(buffer.getvalue()).decode("ascii")
     return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
+
+
+def _safe_ctime_ns(path: str) -> int | None:
+    try:
+        return Path(path).stat().st_ctime_ns
+    except OSError:
+        return None
 
 
 class VerdictCache:
@@ -143,7 +151,12 @@ class VerdictCache:
     @staticmethod
     def _key(a: FileRecord, b: FileRecord) -> tuple[str, str]:
         a, b = (a, b) if a.path < b.path else (b, a)
-        return f"{a.path}\0{b.path}", f"{HashCache._identity(a)}\0{HashCache._identity(b)}"
+        ctime_a = a.ctime_ns if a.ctime_ns is not None else _safe_ctime_ns(a.path)
+        ctime_b = b.ctime_ns if b.ctime_ns is not None else _safe_ctime_ns(b.path)
+        return (
+            f"{a.path}\0{b.path}",
+            f"{HashCache._identity(a)}|{ctime_a}\0{HashCache._identity(b)}|{ctime_b}",
+        )
 
     def get(self, a: FileRecord, b: FileRecord, signature: str) -> float | None:
         pair, identity = self._key(a, b)
@@ -192,6 +205,7 @@ class DeciderJudge:
         self.signature = f"{self.model}|{PROMPT_VERSION}|s{PREPARE_MAX_SIDE}"
         self.cache = VerdictCache(cache_path) if use_cache else None
         self.failure: str | None = None
+        self._consecutive_failures = 0
         self.judged = 0
 
     def _ask(self, left: dict, right: dict) -> float:
@@ -290,14 +304,25 @@ class DeciderJudge:
             thread.join(timeout=0.1)
         return float(reply["answers"]["copy"]["probabilities"]["same"])
 
-    def __call__(self, a: FileRecord, b: FileRecord) -> float | None:
+    MAX_CONSECUTIVE_ERRORS = 3
+
+    def __call__(
+        self, a: FileRecord, b: FileRecord, *, mirrored: bool = False
+    ) -> float | None:
         if self.cancelled and self.cancelled():
             raise InterruptedError("scan cancelled")
+        if mirrored:
+            return None
         if self.failure is not None:
             return None
         if self.cache is not None:
             cached = self.cache.get(a, b, self.signature)
             if cached is not None:
+                if (
+                    cached < DEFAULT_MIN_PROBABILITY
+                    and aligned_image_copy_orientation(a.path, b.path) in MIRRORED_ORIENTATIONS
+                ):
+                    return None
                 return cached
         try:
             left, right = image_part(a.path), image_part(b.path)
@@ -307,10 +332,24 @@ class DeciderJudge:
             probability = self._ask(left, right)
         except InterruptedError:
             raise
-        except Exception as exc:
+        except TimeoutError as exc:
             self.failure = f"Decider verification stopped: {exc}"
             return None
+        except Exception as exc:
+            self._consecutive_failures += 1
+            if (
+                isinstance(exc, OSError) and not decider_available(self.url)
+            ) or self._consecutive_failures >= self.MAX_CONSECUTIVE_ERRORS:
+                self.failure = f"Decider verification stopped: {exc}"
+            return None
+        self._consecutive_failures = 0
         self.judged += 1
+        if (
+            probability < DEFAULT_MIN_PROBABILITY
+            and aligned_image_copy_orientation(a.path, b.path) in MIRRORED_ORIENTATIONS
+        ):
+            # Do not cache a low score or veto a mirrored copy verified locally.
+            return None
         if self.cache is not None:
             self.cache.put(a, b, self.signature, probability)
         return probability

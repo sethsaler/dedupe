@@ -3,14 +3,21 @@
 import { boardActive, handleBoardKey } from "./board.js";
 import { handleCropKey } from "./crop.js";
 import { cropEditorOpen, handleCropEditorKey } from "./cropeditor.js";
-import { openHelp, closeHelp } from "./help.js";
-import { closeLightbox, lightboxOpen, openLightbox } from "./lightbox.js";
+import { openHelp } from "./help.js";
+import { closeLightbox, lightboxOpen, openLightbox, setFlicker, stepLightbox } from "./lightbox.js";
 import { reviewCandidate, changeMemberPage, selectGroup, trashReviewCandidate } from "./members.js";
 import { currentGroup, groupNeedsAttention, isDecisionReview, isPagedIndependentReview } from "./model.js";
 import { collapseScanPanel } from "./settings.js";
 import { state } from "./state.js";
 import { decideSwipe, skipSwipe, swipeActive, undoSwipe } from "./swipe.js";
 import { $, isOverlayOpen, toast, trapTabKey } from "./util.js";
+
+function triggerActionButton(id) {
+  const btn = $(id);
+  if (!btn || btn.hidden || btn.disabled) return false;
+  btn.click();
+  return true;
+}
 
 // —— Keyboard ——
 document.addEventListener("keydown", async (e) => {
@@ -44,6 +51,26 @@ document.addEventListener("keydown", async (e) => {
   // The crop editor is a top-layer popover: every key is its to take.
   if (!lightboxOpen() && handleCropEditorKey(e)) return;
 
+  // Global Undo (⌘Z / Ctrl+Z): acts on the latest active Undo toast or swipe stack.
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z" && !typing) {
+    if (lightboxOpen() && swipeActive()) {
+      undoSwipe();
+      e.preventDefault();
+      return;
+    }
+    const toastAction = $("toastAction");
+    if (toastAction && !toastAction.hidden && isOverlayOpen($("toast"))) {
+      toastAction.click();
+      e.preventDefault();
+      return;
+    }
+    if (swipeActive() && !lightboxOpen()) {
+      undoSwipe();
+      e.preventDefault();
+      return;
+    }
+  }
+
   if (!typing && (e.key === "?" || (e.shiftKey && e.key === "/"))) {
     openHelp();
     e.preventDefault();
@@ -51,13 +78,26 @@ document.addEventListener("keydown", async (e) => {
   }
 
   if (lightboxOpen()) {
-      if (e.key === "Tab") {
-        // Same anti-escape guard as the help overlay: an empty moment in the
-        // focusable set must not hand focus to the page behind the lightbox.
-        if (!trapTabKey($("lightbox"), e)) e.preventDefault();
-        return;
+    if (e.key === "Tab") {
+      // Trap focus when the overlay has no focusable controls; otherwise let
+      // util.js:trapTabKey cycle cleanly through interior controls.
+      if (!trapTabKey($("lightbox"), e)) e.preventDefault();
+      return;
+    }
+    if (typing || e.target === $("lbVideo")) return;
+    if (e.target === $("lbSplitHandle") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (key === "f") {
+      if (!$("lbCompareTools").hidden) {
+        if (!e.repeat) setFlicker(true);
+        e.preventDefault();
       }
-      if (typing || e.target === $("lbVideo")) return;
+      return;
+    }
     if (isDecisionReview(currentGroup()) && ["ArrowLeft", "ArrowRight"].includes(e.key)) {
       $(e.key === "ArrowLeft" ? "lbStageDelete" : "lbKeep").click();
       e.preventDefault();
@@ -66,10 +106,10 @@ document.addEventListener("keydown", async (e) => {
     // A focused button handles Space/Enter natively (e.g. hold-to-flicker).
     const onButton = e.target?.tagName === "BUTTON";
     if (swipeActive()) {
-      // In swipe review the lightbox keeps the ←/→ decide grammar and applies
-      // it to the file on screen (the deck's reference card is not decidable).
+      // In swipe review the lightbox keeps the ←/→ decide grammar and uses
+      // [ / ] to step between the reference and queued candidates.
       const itemPath = state.lightboxItems[state.lightboxIndex]?.path;
-      if (e.key === "ArrowLeft" || e.key === "d" || e.key === "Delete") {
+      if (e.key === "ArrowLeft" || (key === "d" && !e.shiftKey) || e.key === "Delete") {
         decideSwipe("same", itemPath);
         e.preventDefault();
         return;
@@ -84,7 +124,16 @@ document.addEventListener("keydown", async (e) => {
         e.preventDefault();
         return;
       }
-      // Other keys (r, z, Space) keep their normal lightbox meaning.
+      if (e.key === "[") {
+        stepLightbox(-1);
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "]") {
+        stepLightbox(1);
+        e.preventDefault();
+        return;
+      }
     }
     if (e.key === "ArrowLeft") {
       $("lbPrev").click();
@@ -92,20 +141,49 @@ document.addEventListener("keydown", async (e) => {
     } else if (e.key === "ArrowRight") {
       $("lbNext").click();
       e.preventDefault();
-    } else if (e.key === "z" || e.key === "Z") {
+    } else if (key === "z") {
       if (!$("lbStageTools").hidden) $("lbZoom").click();
       e.preventDefault();
-    } else if (e.key === "r" || e.key === "R") {
+    } else if (key === "r") {
       $("lbReveal").click();
       e.preventDefault();
+    } else if (e.key === "K" || (e.shiftKey && key === "k")) {
+      if (!$("lbPairActions")?.hidden && !$("lbKeepOnly")?.hidden && !$("lbKeepOnly")?.disabled) {
+        $("lbKeepOnly").click();
+      }
+      e.preventDefault();
+    } else if (key === "n" && !e.shiftKey) {
+      if (!$("lbPairActions")?.hidden && !$("lbNotDup")?.hidden && !$("lbNotDup")?.disabled) {
+        $("lbNotDup").click();
+      }
+      e.preventDefault();
+    } else if (currentGroup()?.kind === "crop" && !$("lbCropActions")?.hidden) {
+      if (key === "c" && !$("lbCropApply")?.disabled) {
+        $("lbCropApply").click();
+        e.preventDefault();
+      } else if (key === "x" && !$("lbCropSkip")?.disabled) {
+        $("lbCropSkip").click();
+        e.preventDefault();
+      } else if (key === "e" && !$("lbCropAdjust")?.disabled) {
+        $("lbCropAdjust").click();
+        e.preventDefault();
+      }
     } else if (e.key === " " && !onButton) {
-      if (!$("lbSelectWrap").hidden) $("lbSelect").click();
+      if (!$("lbSelectWrap").hidden && !$("lbSelect").disabled) $("lbSelect").click();
       e.preventDefault();
-    } else if (["d", "Delete", "Backspace"].includes(e.key)) {
-      // Triage reviews trash in one click; duplicate groups toggle removal.
-      if (!$("lbActions").hidden) $("lbDelete").click();
-      else if (!$("lbSelectWrap").hidden) $("lbSelect").click();
-      e.preventDefault();
+    } else if ((key === "d" && !e.shiftKey) || e.key === "Delete" || e.key === "Backspace") {
+      // Triage reviews trash in one click; duplicate groups toggle removal on d/Delete.
+      if (!$("lbActions").hidden && !$("lbDelete").disabled) {
+        $("lbDelete").click();
+        e.preventDefault();
+      } else if (
+        (key === "d" || e.key === "Delete")
+        && !$("lbSelectWrap").hidden
+        && !$("lbSelect").disabled
+      ) {
+        $("lbSelect").click();
+        e.preventDefault();
+      }
     }
     return;
   }
@@ -114,14 +192,22 @@ document.addEventListener("keydown", async (e) => {
 
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+  if (e.key === "/" && !e.shiftKey) {
+    const search = boardActive() ? $("boardSearch") : $("resultSearch");
+    if (search) {
+      search.focus();
+      e.preventDefault();
+      return;
+    }
+  }
+
   if (boardActive()) {
     // Space/Enter on the board's other buttons activate them natively; on a
     // tile they mean toggle / compare and are handled by the board.
     const onButton = e.target?.tagName === "BUTTON" && !e.target.classList.contains("board-thumb");
     if ((e.key === " " || e.key === "Enter") && onButton) return;
-    if (e.key === "A") {
-      $("btnTrashSimilar").click();
-      e.preventDefault();
+    if (e.key === "A" || (e.shiftKey && e.key.toLowerCase() === "a")) {
+      if (triggerActionButton("btnTrashSimilar")) e.preventDefault();
     } else if (handleBoardKey(e)) {
       e.preventDefault();
     }
@@ -143,6 +229,8 @@ document.addEventListener("keydown", async (e) => {
     return;
   }
 
+  const lower = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
   if (e.key === "j" || e.key === "ArrowDown") {
     // In a decision review, ↓ steps to the next candidate without deciding;
     // in the swipe deck it sends the card to the back ("decide later").
@@ -163,21 +251,18 @@ document.addEventListener("keydown", async (e) => {
   } else if (e.key === "[") {
     navAttention(-1);
     e.preventDefault();
-  } else if (e.key === "u" && state.currentId && !swipeActive()) {
+  } else if (lower === "u" && !e.shiftKey && state.currentId && !swipeActive()) {
     $("btnSelectSuggested").click();
     e.preventDefault();
-  } else if (e.key === "s" && state.currentId && !swipeActive()) {
+  } else if (lower === "s" && !e.shiftKey && state.currentId && !swipeActive()) {
     $("btnSmartGroup").click();
     e.preventDefault();
-  } else if (e.key === "a") {
-    $("btnTrashExact").click();
-    e.preventDefault();
-  } else if (e.key === "A") {
-    $("btnTrashSimilar").click();
-    e.preventDefault();
-  } else if (e.key === "D") {
-    $("btnTrashReview").click();
-    e.preventDefault();
+  } else if (lower === "a" && !e.shiftKey) {
+    if (triggerActionButton("btnTrashExact")) e.preventDefault();
+  } else if (e.key === "A" || (e.shiftKey && lower === "a")) {
+    if (triggerActionButton("btnTrashSimilar")) e.preventDefault();
+  } else if (e.key === "D" && e.shiftKey) {
+    if (triggerActionButton("btnTrashReview")) e.preventDefault();
   } else if (e.key === "Enter" && state.currentId) {
     if (swipeActive()) {
       // The deck's lightbox order is reference first, then candidates.
@@ -189,7 +274,7 @@ document.addEventListener("keydown", async (e) => {
     const index = Number(focused?.dataset.index ?? state.memberFocus ?? 0);
     openLightbox(Number.isFinite(index) ? index : 0);
     e.preventDefault();
-  } else if (["d", "Delete", "Backspace"].includes(e.key) && state.currentId) {
+  } else if (((lower === "d" && !e.shiftKey) || e.key === "Delete" || e.key === "Backspace") && state.currentId) {
     if (swipeActive()) {
       // Same grammar as the deck buttons: d/Delete calls it the same photo
       // (Trash); ⌫ undoes the last swipe decision.
@@ -206,7 +291,7 @@ document.addEventListener("keydown", async (e) => {
       trashReviewCandidate(group, card.dataset.path);
       e.preventDefault();
     }
-  } else if ((e.key === "r" || e.key === "R") && state.currentId) {
+  } else if (lower === "r" && state.currentId) {
     if (swipeActive()) {
       const reveal = document.querySelector("#members .swipe-top .reveal");
       if (reveal) {
@@ -272,6 +357,11 @@ document.addEventListener("keydown", async (e) => {
     e.preventDefault();
   }
 });
+
+document.addEventListener("keyup", (e) => {
+  if (e.key === "f" || e.key === "F") setFlicker(false);
+});
+window.addEventListener("blur", () => setFlicker(false));
 
 function navGroup(delta) {
   if (!state.groups.length) return;

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import platform
 import subprocess
+import threading
 from pathlib import Path
+
+_picker_lock = threading.Lock()
 
 
 def _macos_picker_script(kind: str) -> str:
@@ -50,8 +53,7 @@ def _process_result(proc: subprocess.CompletedProcess[str]) -> tuple[dict, int]:
     return {"path": paths[0], "paths": paths, "cancelled": False}, 200
 
 
-def pick_native_paths(kind: str) -> tuple[dict, int]:
-    """Open the platform picker and return its API-ready payload and status."""
+def _invoke_picker(kind: str) -> tuple[dict, int]:
     try:
         if platform.system() == "Darwin":
             proc = subprocess.run(
@@ -110,3 +112,13 @@ def pick_native_paths(kind: str) -> tuple[dict, int]:
         return {"error": "The native picker timed out", "paths": []}, 504
     except Exception as exc:
         return {"error": str(exc), "paths": []}, 500
+
+
+def pick_native_paths(kind: str) -> tuple[dict, int]:
+    """Open the platform picker and return its API-ready payload and status."""
+    if not _picker_lock.acquire(blocking=False):
+        return {"cancelled": True, "path": None, "paths": [], "busy": True}, 200
+    try:
+        return _invoke_picker(kind)
+    finally:
+        _picker_lock.release()

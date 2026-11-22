@@ -27,15 +27,17 @@ selected or removed because of it.
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import threading
 from collections.abc import Callable
+from functools import lru_cache
 from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
 
 from .image_frames import animation_frame_count
 from .models import FileRecord, MediaType
-from .parallel import map_parallel, resolve_workers
+from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
 
 ProgressCb = Callable[[int, int], None]
 
@@ -112,6 +114,30 @@ def non_person_coverage(boxes: list[PersonBox]) -> float:
     return 100.0 * (1.0 - min(1.0, area))
 
 
+@lru_cache(maxsize=16)
+def _cached_file_sha256(path_str: str, mtime_ns: int, size: int) -> str:
+    with open(path_str, "rb") as model_file:
+        return hashlib.file_digest(model_file, "sha256").hexdigest()
+
+
+def verify_model_sha256(
+    path: Path,
+    expected_sha256: str,
+    *,
+    missing_error: str,
+    integrity_error: str,
+) -> None:
+    """Verify a bundled ONNX model file once per process per (path, mtime, size)."""
+    try:
+        if not path.is_file():
+            raise RuntimeError(missing_error)
+        stat = path.stat()
+    except OSError as exc:
+        raise RuntimeError(missing_error) from exc
+    if _cached_file_sha256(str(path), stat.st_mtime_ns, stat.st_size) != expected_sha256:
+        raise RuntimeError(integrity_error)
+
+
 def people_scoring_available() -> tuple[bool, str | None]:
     """(available, reason) without loading the model."""
     try:
@@ -134,12 +160,14 @@ class PeopleScorer:
             raise RuntimeError(
                 "people scoring requires OpenCV; install with `pip install -e '.[human]'`"
             ) from exc
-        if not PEOPLE_MODEL_PATH.is_file():
-            raise RuntimeError("the bundled person-detection model is missing")
-        with PEOPLE_MODEL_PATH.open("rb") as model_file:
-            digest = hashlib.file_digest(model_file, "sha256").hexdigest()
-        if digest != PEOPLE_MODEL_SHA256:
-            raise RuntimeError("the bundled person-detection model failed its integrity check")
+        if hasattr(cv2, "setNumThreads"):
+            cv2.setNumThreads(1)
+        verify_model_sha256(
+            PEOPLE_MODEL_PATH,
+            PEOPLE_MODEL_SHA256,
+            missing_error="the bundled person-detection model is missing",
+            integrity_error="the bundled person-detection model failed its integrity check",
+        )
         self.cv2 = cv2
         self.np = np
         try:
@@ -168,7 +196,7 @@ class PeopleScorer:
         resized = cv2.resize(
             rgb,
             (max(1, int(width * ratio)), max(1, int(height * ratio))),
-            interpolation=cv2.INTER_LINEAR,
+            interpolation=cv2.INTER_AREA if ratio < 1.0 else cv2.INTER_LINEAR,
         )
         canvas = np.full((size, size, 3), _PAD_VALUE, np.float32)
         # The released YOLOX weights expect OpenCV-style BGR, 0–255, unnormalized.
@@ -215,8 +243,12 @@ class PeopleScorer:
         keep = scores >= threshold
         if not keep.any():
             return []
-        xy = (output[:, :2] + self._grid) * self._stride
-        wh = np.exp(output[:, 2:4]) * self._stride
+        kept_output = output[keep]
+        kept_grid = self._grid[keep]
+        kept_stride = self._stride[keep]
+        kept_scores = scores[keep]
+        xy = (kept_output[:, :2] + kept_grid) * kept_stride
+        wh = np.exp(np.clip(kept_output[:, 2:4], -20.0, 20.0)) * kept_stride
         corners = np.stack(
             [
                 (xy[:, 0] - wh[:, 0] / 2) / ratio,
@@ -225,8 +257,7 @@ class PeopleScorer:
                 wh[:, 1] / ratio,
             ],
             axis=1,
-        )[keep]
-        kept_scores = scores[keep]
+        )
         chosen = cv2.dnn.NMSBoxes(corners.tolist(), kept_scores.tolist(), threshold, 0.45)
         boxes = []
         for index in np.ravel(chosen):
@@ -267,6 +298,7 @@ def _video_frames(record: FileRecord):
     from PIL import Image
 
     from .similar_video import (
+        _extract_frames,
         _extract_seek_frame_ppm,
         _extract_seek_frames_ppm,
         ffmpeg_available,
@@ -277,30 +309,47 @@ def _video_frames(record: FileRecord):
         raise RuntimeError("people scoring for videos requires ffmpeg")
     duration = record.duration
     if duration is None or duration <= 0:
-        duration, _width, _height = probe_video(record.path)
-    if not duration or duration <= 0:
-        raise RuntimeError("could not read the video's duration")
-    count = PEOPLE_VIDEO_FRAMES
-    timestamps = [(index + 0.5) * duration / count for index in range(count)]
-    ppms = _extract_seek_frames_ppm(
-        record.path, timestamps, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
-    )
-    if len(ppms) != len(timestamps):
-        ppms = [
-            ppm
-            for ppm in (
-                _extract_seek_frame_ppm(
-                    record.path, timestamp, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
+        duration, width, height = probe_video(record.path)
+        record.duration = duration or record.duration
+        record.width = width or record.width
+        record.height = height or record.height
+    if duration and duration > 0:
+        count = PEOPLE_VIDEO_FRAMES
+        timestamps = [(index + 0.5) * duration / count for index in range(count)]
+        ppms = _extract_seek_frames_ppm(
+            record.path, timestamps, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
+        )
+        if len(ppms) != len(timestamps):
+            ppms = [
+                ppm
+                for ppm in (
+                    _extract_seek_frame_ppm(
+                        record.path, timestamp, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
+                    )
+                    for timestamp in timestamps
                 )
-                for timestamp in timestamps
-            )
-            if ppm is not None
-        ]
-    if not ppms:
-        raise RuntimeError("no video frames could be decoded")
-    for ppm in ppms:
-        with Image.open(BytesIO(ppm)) as image:
-            yield np.asarray(image.convert("RGB"))
+                if ppm is not None
+            ]
+        if not ppms:
+            raise RuntimeError("no video frames could be decoded")
+        for ppm in ppms:
+            with Image.open(BytesIO(ppm)) as image:
+                yield np.asarray(image.convert("RGB"))
+        return
+
+    with tempfile.TemporaryDirectory(prefix="dedupe-people-video-") as tmp:
+        frame_paths = _extract_frames(
+            record.path,
+            Path(tmp),
+            max_frames=PEOPLE_VIDEO_FRAMES,
+            frame_width=PEOPLE_VIDEO_FRAME_WIDTH,
+            require_complete=True,
+        )
+        if not frame_paths:
+            raise RuntimeError("no video frames could be decoded")
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                yield np.asarray(image.convert("RGB"))
 
 
 def score_record(record: FileRecord, scorer: PeopleScorer) -> float | None:
@@ -376,7 +425,7 @@ def score_people(
     map_parallel(
         lambda record: score_record(record, scorer_for_thread()),
         pending,
-        workers=resolve_workers(workers),
+        workers=resolve_workers(workers, cap=DEFAULT_HUMAN_WORKERS_CAP),
         backend="thread",
         progress=progress,
         progress_every=1,

@@ -29,6 +29,7 @@ from .engine import run_scan, run_scans_parallel
 from .grouping import apply_smart_select_all
 from .human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from .models import GroupKind, SmartRule
+from .semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 
 
 def application_version() -> str:
@@ -86,9 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--semantic-duplicate-threshold",
         type=float,
-        default=0.97,
+        default=SEMANTIC_DUPLICATE_THRESHOLD,
         metavar="COSINE",
-        help="Cosine similarity for --semantic duplicates added to Similar (default 0.97)",
+        help=(
+            f"Cosine similarity for --semantic duplicates added to Similar "
+            f"(default {SEMANTIC_DUPLICATE_THRESHOLD:.2f})"
+        ),
     )
     scan.add_argument(
         "--semantic-full-speed",
@@ -491,6 +495,35 @@ def build_parser() -> argparse.ArgumentParser:
     similarity.add_argument("--semantic-duplicate-threshold", type=float, default=0.94)
     similarity.add_argument("--decider", action="store_true",
                             help="Judge edited-copy candidates with Decider (implies --semantic)")
+
+    crops_bench = sub.add_parser(
+        "benchmark-crops",
+        help="Evaluate border crop detection against a labeled crop manifest",
+    )
+    crops_bench.add_argument(
+        "manifest",
+        help="JSON manifest produced by `dedupe decisions export-crops`",
+    )
+    crops_bench.add_argument(
+        "--level",
+        default="balanced",
+        choices=("conservative", "balanced", "aggressive"),
+        help="Crop aggressiveness level to evaluate (default balanced)",
+    )
+    crops_bench.add_argument(
+        "--include-missing",
+        action="store_true",
+        help="Evaluate manifest entries even when the file check cannot confirm presence",
+    )
+    crops_bench.add_argument(
+        "--json",
+        dest="json_out",
+        nargs="?",
+        const="-",
+        default=None,
+        metavar="FILE",
+        help="Print JSON report to stdout, or write JSON to FILE",
+    )
 
     decisions = sub.add_parser(
         "decisions",
@@ -1114,7 +1147,6 @@ def collect_doctor_report() -> dict[str, object]:
     required_modules = {
         "PIL": "Pillow",
         "imagehash": "ImageHash",
-        "pybktree": "pybktree",
         "send2trash": "Send2Trash",
         "flask": "Flask",
     }
@@ -1249,6 +1281,60 @@ def cmd_benchmark_similarity(args: argparse.Namespace) -> int:
     return 1 if report["errors"] else 0
 
 
+def _format_crop_benchmark_report(report: dict[str, object]) -> str:
+    def pct(value: object) -> str:
+        return "n/a" if value is None else f"{float(value) * 100:.1f}%"
+
+    neg = report["negatives"]
+    pos = report["positives"]
+    manual = report["manual"]
+    lvl = report["level_agreement"]
+    lines = [
+        (
+            f"Crop benchmark ({report['level']}): "
+            f"{report['evaluated']}/{report['total_items']} evaluated "
+            f"({report['missing_skipped']} missing skipped)"
+        ),
+        f"Negatives suppressed: {neg['suppressed']}/{neg['total']} ({pct(neg['suppression_rate'])})",
+        f"Applied recall: {pos['detected']}/{pos['total']} ({pct(pos['recall'])})",
+        f"Manual recall: {manual['detected']}/{manual['total']} ({pct(manual['recall'])})",
+        f"Level monotonic: {lvl['monotonic_count']}/{report['evaluated']} ({pct(lvl['monotonic_rate'])})",
+    ]
+    overall_gt = report.get("overall_gt") or {}
+    if overall_gt.get("count"):
+        lines.append(
+            f"Overall GT ({overall_gt['count']}): "
+            f"mean IoU {overall_gt['mean_iou']}, "
+            f"MAE {overall_gt['mae_px'].get('overall')}px"
+        )
+    return "\n".join(lines)
+
+
+def cmd_benchmark_crops(args: argparse.Namespace) -> int:
+    from .decision_log import benchmark_crops
+
+    try:
+        report = benchmark_crops(
+            args.manifest,
+            level=args.level,
+            only_existing=not args.include_missing,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json_out == "-":
+        print(json.dumps(report, indent=2))
+    elif args.json_out:
+        out = Path(args.json_out).expanduser()
+        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(_format_crop_benchmark_report(report))
+        print(f"Wrote {out}")
+    else:
+        print(_format_crop_benchmark_report(report))
+    return 0
+
+
 def _format_decisions_summary(summary: dict) -> str:
     crop, distinct = summary["crop"], summary["distinct"]
 
@@ -1335,6 +1421,7 @@ _COMMANDS = frozenset(
         "receipts",
         "benchmark-humans",
         "doctor",
+        "benchmark-crops",
         "benchmark-similarity",
         "rank-people",
         "benchmark-people",
@@ -1372,6 +1459,8 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return cmd_benchmark_humans(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "benchmark-crops":
+        return cmd_benchmark_crops(args)
     if args.command == "benchmark-similarity":
         return cmd_benchmark_similarity(args)
     if args.command == "rank-people":

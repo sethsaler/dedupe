@@ -58,9 +58,10 @@ function initThemeSwitcher() {
 
 function syncRangeInput(input) {
   if (!input || input.type !== "range") return;
-  const min = Number(input.min || 0);
-  const max = Number(input.max || 100);
-  const value = Number(input.value || 0);
+  const min = Number(input.min === "" ? 0 : input.min);
+  const max = Number(input.max === "" ? 100 : input.max);
+  const rawValue = Number(input.value === "" ? min : input.value);
+  const value = Number.isFinite(rawValue) ? rawValue : min;
   const span = max - min;
   const pct = span > 0 ? Math.max(0, Math.min(100, ((value - min) / span) * 100)) : 0;
   input.style.setProperty("--attr-min", String(min));

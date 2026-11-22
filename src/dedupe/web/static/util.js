@@ -11,6 +11,7 @@ const toastQueue = [];
 const TOAST_QUEUE_MAX = 4;
 let toastStickyVisible = false;
 let toastCurrentKey = "";
+let toastCurrentKind = "";
 let toastRemainingMs = 0;
 let toastDeadline = 0;
 let toastFocusBound = false;
@@ -38,12 +39,12 @@ function promoteToastTopLayer() {
   el.showPopover?.();
 }
 
-function announceToast(msg) {
+function announceToast(msg, kind = "") {
   if (typeof document.ariaNotify === "function") {
     document.ariaNotify(msg);
     return;
   }
-  const live = $("toastLiveRegion");
+  const live = (kind === "error" && $("toastAlertRegion")) || $("toastLiveRegion");
   if (!live) return;
   live.textContent = "";
   requestAnimationFrame(() => {
@@ -92,12 +93,14 @@ function hideToast() {
   el._fadeTimer = setTimeout(() => {
     toastStickyVisible = false;
     toastCurrentKey = "";
+    toastCurrentKind = "";
     // Flush the queue only after the exit fade, so toasts don't overlap visually.
     if (toastQueue.length) showToast(toastQueue.shift());
   }, 150);
 }
 
-// Cycle Tab within an overlay (focus trap). Returns true when it handled the key.
+// Cycle Tab within an overlay (focus trap). Returns true when Tab stays inside
+// the container (either handled by wrapping/entering or allowed to step natively).
 function trapTabKey(container, e) {
   if (e.key !== "Tab" || !container) return false;
   const focusable = [...container.querySelectorAll(
@@ -122,11 +125,12 @@ function trapTabKey(container, e) {
     e.preventDefault();
     return true;
   }
-  return false;
+  return true;
 }
 
 function showToast({ msg, kind, actionLabel, onAction, duration }) {
   const el = $("toast");
+  if (!el) return;
   const message = $("toastMessage") || el;
   const action = $("toastAction");
   const dismiss = $("toastDismiss");
@@ -150,7 +154,8 @@ function showToast({ msg, kind, actionLabel, onAction, duration }) {
   el.showPopover?.();
   void el.offsetWidth;
   el.classList.add("show");
-  announceToast(msg);
+  toastCurrentKind = kind || "";
+  announceToast(msg, toastCurrentKind);
   toastStickyVisible = duration === undefined && Boolean(actionLabel || kind === "error");
   toastCurrentKey = `${kind}|${msg}`;
   const ms = duration ?? (toastStickyVisible ? 0 : 3400);
@@ -160,9 +165,14 @@ function showToast({ msg, kind, actionLabel, onAction, duration }) {
 function toast(msg, kind = "", { actionLabel, onAction, duration } = {}) {
   const item = { msg, kind, actionLabel, onAction, duration };
   const key = `${kind}|${msg}`;
-  // A sticky toast (error / Undo) must survive until the user deals with it:
-  // queue anything that arrives while one is up. Identical messages collapse.
+  // Sticky error toasts queue newer distinct toasts behind them (collapsing
+  // repeats). Non-error sticky Undo toasts are immediately preempted by errors
+  // and immediately replaced by newer Undo actions so rapid triage stays current.
   if (toastStickyVisible && isOverlayOpen($("toast"))) {
+    if (toastCurrentKind !== "error" && (kind === "error" || Boolean(actionLabel))) {
+      showToast(item);
+      return;
+    }
     if (key === toastCurrentKey || toastQueue.some((queued) => `${queued.kind}|${queued.msg}` === key)) {
       return;
     }
@@ -242,8 +252,8 @@ function noteMediaVersion(path, version) {
   mediaVersions.set(path, String(version));
 }
 
-function withMediaVersion(url, path) {
-  const version = mediaVersions.get(path);
+function withMediaVersion(url, path, fallbackVersion = "") {
+  const version = mediaVersions.get(path) || fallbackVersion;
   return version ? `${url}&v=${encodeURIComponent(version)}` : url;
 }
 

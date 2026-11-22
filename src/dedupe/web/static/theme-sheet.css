@@ -1,10 +1,12 @@
-/* Scoped theme (sheet): the confirmation drawer (#modalBackdrop) and the
-   keyboard help dialog (#helpBackdrop). Loads inside @layer theme. */
+/* Scoped theme (sheet): the confirmation drawer (#modalBackdrop), the
+   keyboard help dialog (#helpBackdrop), and the cleanup history drawer
+   (#historyPanel). Loads inside @layer theme. */
 
 @layer theme {
 /* ---------- Scrim ---------- */
 #modalBackdrop,
-#helpBackdrop {
+#helpBackdrop,
+#historyPanel {
   background: light-dark(rgba(17, 17, 17, 0.42), rgba(0, 0, 0, 0.6));
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
@@ -60,13 +62,18 @@
 /* Body copy: 15px / 23px graphite. */
 #modalBackdrop .modal #modalBody {
   flex: 0 0 auto;
+  padding-bottom: 16px;
 }
 
 #modalBackdrop .modal p {
-  margin: 0 0 16px;
+  margin: 0 0 14px;
   font-size: 15px;
   line-height: 23px;
   color: var(--lt-graphite);
+}
+
+#modalBackdrop .modal p:last-child {
+  margin-bottom: 0;
 }
 
 #modalBackdrop .modal p strong {
@@ -74,14 +81,30 @@
   color: var(--lt-ink);
 }
 
-/* Summary line under the title ("1 unique files · 12.6 KB"): graphite, not ink. */
-#modalBackdrop .modal .review-sheet > p:first-child,
-#modalBackdrop .modal .review-sheet > p:first-child strong {
+/* Summary line ("1 unique files · 12.6 KB"): graphite, not ink, without
+   mistinting a preceding .preview-notice or quarantine notice (<p> with <code>). */
+#modalBackdrop .modal .review-sheet > p.sheet-summary,
+#modalBackdrop .modal .review-sheet > p:first-child:not(.preview-notice):not(.heuristic-warning):not(:has(code)),
+#modalBackdrop .modal .review-sheet > p.preview-notice + p:not(.heuristic-warning):not(:has(code)),
+#modalBackdrop .modal .review-sheet > p:has(code) + p:not(.heuristic-warning) {
   color: var(--lt-graphite);
   font-weight: 400;
 }
 
-#modalBackdrop .modal .review-sheet > p:first-child strong {
+#modalBackdrop .modal .review-sheet > p.sheet-summary strong,
+#modalBackdrop .modal .review-sheet > p:first-child:not(.preview-notice):not(.heuristic-warning):not(:has(code)) strong,
+#modalBackdrop .modal .review-sheet > p.preview-notice + p:not(.heuristic-warning):not(:has(code)) strong,
+#modalBackdrop .modal .review-sheet > p:has(code) + p:not(.heuristic-warning) strong {
+  color: var(--lt-graphite);
+  font-weight: 600;
+}
+
+#modalBackdrop .modal .review-sheet > p:has(code) {
+  color: var(--lt-ink);
+}
+
+#modalBackdrop .modal .review-sheet > p:has(code) strong {
+  color: var(--lt-ink);
   font-weight: 600;
 }
 
@@ -92,18 +115,25 @@
   background: transparent;
   border: 0;
   padding: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Notes and warnings: a rule instead of an amber box. */
 #modalBackdrop .modal .heuristic-warning,
 #modalBackdrop .modal .preview-notice {
   margin: 0 0 16px;
-  padding: 0 0 0 12px;
+  padding: 2px 0 2px 12px;
   border: 0;
   border-left: 2px solid var(--lt-ink);
   border-radius: 0;
   background: transparent;
   color: var(--lt-ink);
+}
+
+#modalBackdrop .modal .heuristic-warning strong,
+#modalBackdrop .modal .preview-notice strong {
+  color: var(--lt-ink);
+  font-weight: 600;
 }
 
 /* Lists inside the body: hairline sleeve rules, mono for paths. */
@@ -198,7 +228,7 @@
 
 #modalBackdrop .modal .modal-actions #modalCancel.btn:focus-visible,
 #modalBackdrop .modal .modal-actions #modalConfirm.btn:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 2px;
 }
 
@@ -210,6 +240,196 @@
 
   #modalBackdrop .modal #modalTitle {
     font-size: 32px;
+  }
+}
+
+/* ---------- Cleanup history drawer (#historyPanel) ---------- */
+#historyPanel .history-drawer-inner {
+  gap: 12px;
+}
+
+#historyPanel .history-drawer-inner > p.muted {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--lt-graphite);
+}
+
+#historyPanel #historyList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#historyPanel #historyList > p.muted {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--lt-graphite);
+}
+
+#historyPanel #historyList h3 {
+  margin: 14px 0 4px;
+  font-family: var(--lt-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--lt-ink);
+}
+
+#historyPanel #historyList .section-heading {
+  margin-top: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--lt-sleeve);
+}
+
+#historyPanel #historyList .section-heading h3 {
+  margin: 0;
+}
+
+#historyPanel .btn {
+  min-height: 34px;
+  min-block-size: 34px;
+  padding: 5px 12px;
+  border: 1px solid var(--lt-sleeve);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--lt-ink);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+#historyPanel .btn:hover:not(:disabled) {
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
+  color: var(--lt-ink);
+}
+
+#historyPanel .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+#historyPanel .history-entry {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  overflow-wrap: anywhere;
+}
+
+#historyPanel .history-entry-title {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-bottom: 4px;
+}
+
+#historyPanel .history-entry-title strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--lt-ink);
+}
+
+#historyPanel .history-entry-title span {
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+#historyPanel .history-entry > p {
+  margin: 4px 0 6px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--lt-graphite);
+}
+
+#historyPanel .history-entry > p.muted {
+  font-size: 12px;
+}
+
+#historyPanel .history-entry > p[role="status"] {
+  margin: 8px 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--lt-warn);
+  background: var(--lt-warn-soft);
+  color: var(--lt-ink);
+  font-size: 12px;
+}
+
+#historyPanel .history-entry details {
+  margin: 6px 0;
+}
+
+#historyPanel .history-entry details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--lt-ink);
+}
+
+#historyPanel .history-files {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--lt-sleeve);
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+#historyPanel .history-files li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  color: var(--lt-graphite);
+}
+
+#historyPanel .history-files li strong {
+  color: var(--lt-ink);
+  font-weight: 600;
+}
+
+#historyPanel [data-history-restore],
+#historyPanel [data-history-reconsider] {
+  margin-top: 8px;
+}
+
+/* Dual pagination controls for Cleanups and Not duplicates */
+#historyPanel .history-pagination,
+#historyPanel .history-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 0 12px;
+  margin: 2px 0 10px;
+  border-bottom: 1px solid var(--lt-sleeve);
+}
+
+#historyPanel .history-pagination span,
+#historyPanel .history-pager span {
+  font-family: var(--lt-mono);
+  font-size: 12px;
+  color: var(--lt-graphite);
+  font-variant-numeric: tabular-nums;
+}
+
+#historyPanel [role="alert"] {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--lt-pencil);
+  background: var(--lt-pencil-soft);
+  color: var(--lt-ink);
+  font-size: 12px;
+}
+
+@media (max-width: 560px) {
+  #historyPanel .history-drawer-inner {
+    padding: 20px 16px;
   }
 }
 

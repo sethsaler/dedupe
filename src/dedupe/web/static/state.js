@@ -37,7 +37,11 @@ const state = {
   trashUndoClearedNotified: false,
   dismissedSessionKey: "",
   emptyResumeNotified: false,
-  groupsVersion: -1, // tracks streaming updates mid-scan
+  groupsVersion: null, // tracks streaming updates mid-scan
+  loadedGroupsVersion: null,
+  completedScanId: null,
+  pendingScanStart: false,
+  pendingScanPriorId: null,
   scanId: null,
   reviewSession: null,
   groupListStart: 0, // first sidebar row in the rendered window
@@ -63,11 +67,13 @@ const state = {
   // "board" preference opens single groups in the swipe deck.
   similarView: "board",
   // Similar board: rows in the DOM, the focused row and tile, the board's own
-  // filter ("all" | "uncertain"), and "Not duplicates" rows that stay in place
-  // with an Undo (group id → { group, index }) for the scan they were made in.
+  // filter ("all" | "uncertain" | "strong" | "semantic" | "videos"), sort,
+  // and "Not duplicates" rows that stay in place with an Undo (group id → { group, index })
+  // for the scan they were made in.
   boardLimit: 30,
   boardFocus: { id: null, index: 0 },
   boardFilter: "all",
+  boardSort: "opportunity",
   boardDismissed: new Map(),
   boardDismissedScanId: null,
   // Per-group swipe review state, keyed by group id so it survives re-renders:

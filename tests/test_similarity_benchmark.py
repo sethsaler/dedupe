@@ -113,7 +113,19 @@ def test_generated_corpus_pairs_local_changes_with_their_own_reexports(tmp_path:
     )
 
     pairs = load_similarity_manifest(output / "pairs.json")
-    assert len(pairs) == 24
+    assert len(pairs) == 36
+    categories = {pair.category for pair in pairs}
+    assert {
+        "crop-4x3",
+        "crop-tight",
+        "screenshot",
+        "scurve",
+        "mirror",
+        "mirror-crop",
+        "mirror-bw",
+        "isoluminant-negative",
+        "three-file-set",
+    } <= categories
     for category in ("smile", "hair", "eyes", "pose"):
         negatives = [pair for pair in pairs if pair.category == f"detail-{category}"]
         assert len(negatives) == 2
@@ -124,3 +136,62 @@ def test_generated_corpus_pairs_local_changes_with_their_own_reexports(tmp_path:
             assert controls[0].path_a.name == f"detail-{category}-source.png"
             with Image.open(negative.path_b) as image:
                 assert image.size == (256, 256)
+
+    import json
+
+    raw_manifest = json.loads((output / "pairs.json").read_text())
+    assert len(raw_manifest["sets"]) == 1
+    assert len(raw_manifest["sets"][0]["files"]) == 3
+
+
+def test_semantic_benchmark_embeds_unique_paths_once_and_records_diagnostics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Semantic benchmark batches unique pending paths once and records stage telemetry."""
+    import numpy as np
+
+    import dedupe.semantic as sem
+
+    a = tmp_path / "a.png"
+    b = tmp_path / "b.png"
+    c = tmp_path / "c.png"
+    for p, color in ((a, (200, 40, 40)), (b, (40, 200, 40)), (c, (40, 40, 200))):
+        Image.new("RGB", (64, 64), color).save(p)
+
+    manifest = tmp_path / "pairs.json"
+    manifest.write_text(
+        '{"pairs": ['
+        '{"path_a": "a.png", "path_b": "b.png", "media_type": "image", "category": "crop", "similar": true},'
+        '{"path_a": "a.png", "path_b": "c.png", "media_type": "image", "category": "negative", "similar": false}'
+        "]}"
+    )
+
+    embed_calls: list[list[str]] = []
+    v_a = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    v_b = np.array([0.96, 0.28, 0.0], dtype=np.float32)
+    v_c = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    table = {
+        str(a.resolve()): v_a.tobytes(),
+        str(b.resolve()): v_b.tobytes(),
+        str(c.resolve()): v_c.tobytes(),
+    }
+
+    def fake_embed(records, **_kwargs):
+        embed_calls.append([r.path for r in records])
+        return {r.path: table[r.path] for r in records}, []
+
+    monkeypatch.setattr(sem, "embed_records", fake_embed)
+    monkeypatch.setattr(
+        sem,
+        "group_semantic_vectors",
+        lambda recs, vecs, **_kw: ([], [(recs, {})] if vecs[recs[1].path] == v_b.tobytes() else []),
+    )
+
+    report = run_similarity_benchmark(manifest, semantic=True)
+    assert len(embed_calls) == 1
+    assert set(embed_calls[0]) == {str(a.resolve()), str(b.resolve()), str(c.resolve())}
+    assert report["diagnostics"]["semantic_unique_paths"] == 3
+    assert report["diagnostics"]["stage_counts"] == {"semantic": 1, "none": 1}
+    assert report["predictions"][0]["matched_stage"] == "semantic"
+    assert report["predictions"][0]["semantic_score"] > 0.9
+    assert report["predictions"][1]["matched_stage"] == "none"

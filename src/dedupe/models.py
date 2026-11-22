@@ -150,6 +150,10 @@ class FileRecord:
     # Estimated percentage of the image not covered by people (0–100).
     non_person_coverage: float | None = None
     non_person_coverage_signature: str | None = None
+    sharpness: float | None = None
+    video_codec: str | None = None
+    video_bitrate: int | None = None
+    has_audio: bool | None = None
 
     @property
     def path_obj(self) -> Path:
@@ -160,6 +164,32 @@ class FileRecord:
         if self.width and self.height:
             return self.width * self.height
         return 0
+
+    @property
+    def effective_pixels(self) -> int:
+        """Usable content pixels excluding detected black borders or UI chrome."""
+        raw_pixels = self.pixels
+        crop = self.border_crop
+        if not crop or crop == "dismissed":
+            return raw_pixels
+        parts = crop.split(",")
+        if len(parts) not in (6, 7):
+            return raw_pixels
+        try:
+            left, top, right, bottom, box_w, box_h = (int(part) for part in parts[:6])
+        except ValueError:
+            return raw_pixels
+        if not (
+            0 <= left < right <= box_w
+            and 0 <= top < bottom <= box_h
+            and box_w > 0
+            and box_h > 0
+        ):
+            return raw_pixels
+        cropped = (right - left) * (bottom - top)
+        if raw_pixels > 0 and (box_w != self.width or box_h != self.height):
+            return max(1, round(cropped * (raw_pixels / (box_w * box_h))))
+        return cropped
 
     @property
     def mtime_sort_stamp(self) -> int:
@@ -228,6 +258,16 @@ class FileRecord:
             people_score_signature=data.get("people_score_signature"),
             non_person_coverage=data.get("non_person_coverage"),
             non_person_coverage_signature=data.get("non_person_coverage_signature"),
+            sharpness=(
+                float(data["sharpness"]) if data.get("sharpness") is not None else None
+            ),
+            video_codec=data.get("video_codec"),
+            video_bitrate=(
+                int(data["video_bitrate"]) if data.get("video_bitrate") is not None else None
+            ),
+            has_audio=(
+                bool(data["has_audio"]) if data.get("has_audio") is not None else None
+            ),
             border_crop=data.get("border_crop"),
             border_signature=data.get("border_signature"),
             border_crop_conservative=data.get("border_crop_conservative"),
@@ -263,6 +303,9 @@ class ReviewGroup:
     match_basis: str | None = None
     match_scores: dict[str, float] = field(default_factory=dict)
     match_details: dict[str, Any] = field(default_factory=dict)
+    anchor_path: str | None = None
+    reviewed: bool = False
+    match_explanations: dict[str, str] = field(default_factory=dict)
 
     @property
     def policy(self) -> ReviewPolicy:
@@ -321,6 +364,9 @@ class ReviewGroup:
             "match_basis": self.match_basis,
             "match_scores": dict(self.match_scores),
             "match_details": dict(self.match_details),
+            "anchor_path": self.anchor_path,
+            "reviewed": self.reviewed,
+            "match_explanations": dict(self.match_explanations),
         }
 
     @classmethod
@@ -378,6 +424,13 @@ class ReviewGroup:
             match_scores={
                 path: float(score)
                 for path, score in (data.get("match_scores") or {}).items()
+                if path in member_paths
+            },
+            anchor_path=data.get("anchor_path"),
+            reviewed=bool(data.get("reviewed", False)),
+            match_explanations={
+                str(path): str(text)
+                for path, text in (data.get("match_explanations") or {}).items()
                 if path in member_paths
             },
         )

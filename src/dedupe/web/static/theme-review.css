@@ -59,7 +59,7 @@
   min-height: 36px;
   padding: 5px 10px;
   font-size: 13px;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 8px;
   background: var(--lt-table);
   color: var(--lt-ink);
@@ -105,7 +105,7 @@
   font-weight: 500;
   background: transparent;
   color: var(--lt-ink);
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   box-shadow: none;
 }
 
@@ -228,7 +228,7 @@
   font-size: 11px;
   letter-spacing: 0.06em;
   color: var(--lt-graphite);
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
 }
 
 .results .group-more-wrap .btn:hover { color: var(--lt-ink); border-color: var(--lt-ink); }
@@ -300,28 +300,30 @@
   text-underline-offset: 3px;
 }
 
+.results #btnMarkGroupReviewed[aria-pressed="true"] {
+  color: var(--lt-keep);
+  background: var(--lt-keep-soft);
+  border-radius: 6px;
+  padding: 6px 10px;
+  text-decoration: none;
+}
+
 /* Guide keeps a hairline box; it is the one boxed header control. */
 .results .detail-header .guide-popover {
   align-self: flex-end;
 }
 
-.results .detail-header .guide-popover > summary {
-  display: inline-flex;
-  align-items: center;
-  min-height: 36px;
-  padding: 6px 12px;
-  border: 1px solid var(--lt-sleeve);
-  border-radius: 6px;
+.scan-preview-note {
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--lt-sleeve);
+  font-family: var(--lt-mono);
+  font-size: 12px;
   color: var(--lt-graphite);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  list-style: none;
 }
 
-.results .detail-header .guide-popover > summary:hover {
-  color: var(--lt-ink);
-  border-color: var(--lt-ink);
+.scan-preview-note[hidden] {
+  display: none;
 }
 
 /* Progress / helper line under the header keeps the table quiet. */
@@ -364,9 +366,31 @@
   outline-offset: 4px;
 }
 
-/* Candidate that will be trashed: 3px pencil outline. */
+/* Candidate starts neutral until hovered/focused/dragged toward a decision. */
 .results .swipe-card .swipe-media {
+  outline: 1px solid var(--lt-control-border);
+  outline-offset: 4px;
+  transition: outline-color 0.12s var(--ease-out);
+}
+
+.results .swipe-pair:has(#swipeSame:hover, #swipeSame:focus-visible) .swipe-card .swipe-media,
+.results .swipe-card[data-committing="1"] .swipe-media {
   outline: 3px solid var(--lt-pencil);
+  outline-offset: 4px;
+}
+
+.results .swipe-pair:has(#swipeDiff:hover, #swipeDiff:focus-visible) .swipe-card .swipe-media {
+  outline: 3px solid var(--lt-keep);
+  outline-offset: 4px;
+}
+
+.results .swipe-pair:has(#swipeKeepRight:hover, #swipeKeepRight:focus-visible) .swipe-keeper .swipe-media {
+  outline: 3px solid var(--lt-pencil);
+  outline-offset: 4px;
+}
+
+.results .swipe-pair:has(#swipeKeepRight:hover, #swipeKeepRight:focus-visible) .swipe-card .swipe-media {
+  outline: 3px solid var(--lt-keep);
   outline-offset: 4px;
 }
 
@@ -483,37 +507,48 @@
 }
 
 .results .swipe-same {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
 }
 
 .results .swipe-same:hover {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   filter: brightness(0.92);
 }
 
 .results .swipe-same kbd {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.22);
   border: 0;
   color: #FFFFFF;
 }
 
-.results .swipe-diff {
+.results .swipe-diff,
+.results .swipe-keep-right {
   background: var(--lt-table);
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   color: var(--lt-ink);
 }
 
-.results .swipe-diff:hover {
+.results .swipe-diff:hover,
+.results .swipe-keep-right:hover:not(:disabled) {
   background: var(--lt-table);
   border-color: var(--lt-ink);
 }
 
-.results .swipe-diff kbd {
+.results .swipe-diff kbd,
+.results .swipe-keep-right kbd {
   background: var(--lt-loupe);
   border: 1px solid var(--lt-sleeve);
+  color: var(--lt-graphite);
+}
+
+.results .comparison-summary {
+  padding: 6px 0 6px 12px;
+  border-left: 2px solid var(--lt-sleeve);
+  font-size: 13px;
+  line-height: 1.45;
   color: var(--lt-graphite);
 }
 
@@ -598,17 +633,54 @@
 }
 
 .results .board-search input,
-.results .board-filter select {
+.results .board-filter select,
+.results .board-sort select {
   min-height: 36px;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 8px;
   background: var(--lt-table);
+  color: var(--lt-ink);
+}
+
+.results .board-sort {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--lt-graphite);
+}
+
+.results .board-sort select {
+  width: auto;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.results .board-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.results .board-bulk-actions .btn {
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--lt-control-border);
+  color: var(--lt-ink);
+  font-size: 12px;
+}
+
+.results .board-bulk-actions .btn:hover:not(:disabled) {
+  border-color: var(--lt-ink);
+  background: var(--lt-loupe);
 }
 
 .results .board-rows { gap: 0; }
 
 .results .board-row {
-  padding: 16px 0;
+  padding: 16px 14px;
   border-top: 1px solid var(--lt-sleeve);
   border-radius: 0;
   gap: 18px;
@@ -621,17 +693,19 @@
   box-shadow: inset 3px 0 0 var(--lt-ink);
   outline: 2px solid var(--lt-ink);
   outline-offset: -2px;
-  padding-left: 14px;
 }
 
 .results .board-row-head { gap: 4px; }
 .results .board-row-head strong { font-size: 13px; font-weight: 600; color: var(--lt-ink); }
 .results .board-row-head .muted { font-family: var(--lt-mono); font-size: 12px; color: var(--lt-graphite); }
 .results .board-row-num,
-.results .board-row-reclaim {
+.results .board-row-reclaim,
+.results .board-keeper-reason,
+.results .keeper-reason {
   font-family: var(--lt-mono);
   font-size: 12px;
   color: var(--lt-graphite);
+  line-height: 1.4;
 }
 
 .results .board-row-actions .btn {
@@ -649,22 +723,23 @@
 
 .results .board-tiles { gap: 14px; }
 
-/* Tiles sit on the loupe mat. Keeper = ink outline; removal = pencil outline. */
-.results .board-tile { gap: 6px; padding: 7px 7px 11px; }
+/* Tiles sit on the loupe mat. Keeper = ink ring; removal = pencil ring.
+   Status uses box-shadow so keyboard focus (outline) never erases it. */
+.results .board-tile { gap: 6px; padding: 11px 11px 12px; }
 
 .results .board-thumb {
   border: 0;
   border-radius: 4px;
   background: var(--lt-loupe);
-  outline: 3px solid var(--lt-ink);
-  outline-offset: 4px;
-  /* Outline reaches 7px below the thumb; the meta line starts after that plus 6px. */
+  outline: 0;
+  box-shadow: 0 0 0 3px var(--lt-table), 0 0 0 6px var(--lt-ink);
+  /* Status ring reaches 6px below the thumb; leave room before metadata. */
   margin-bottom: 7px;
-  transition: outline-color 0.12s var(--ease-out), opacity 0.12s var(--ease-out);
+  transition: box-shadow 0.12s var(--ease-out), opacity 0.12s var(--ease-out);
 }
 
 .results .board-tile.remove .board-thumb {
-  outline-color: var(--lt-pencil);
+  box-shadow: 0 0 0 3px var(--lt-table), 0 0 0 6px var(--lt-pencil);
 }
 
 .results .board-tile.remove .board-thumb img { opacity: 0.72; }
@@ -675,13 +750,9 @@
   text-decoration-thickness: 2px;
 }
 
-.results .board-tile.focused .board-thumb {
-  outline: 2px solid var(--lt-ink);
-  outline-offset: 8px;
-}
-
+.results .board-tile.focused .board-thumb,
 .results .board-thumb:focus-visible {
-  outline: 2px solid var(--lt-ink);
+  outline: 2px solid var(--lt-focus);
   outline-offset: 8px;
 }
 
@@ -697,9 +768,9 @@
 }
 
 .results .board-tile .thumb-badge.remove {
-  background: var(--lt-pencil);
+  background: var(--lt-danger-fill);
   color: #FFFFFF;
-  border: 1px solid var(--lt-ink);
+  border: 1px solid var(--lt-danger-fill);
   border-radius: 3px;
   font-family: var(--lt-mono);
   font-size: 11px;
@@ -732,6 +803,58 @@
 
 .results .board-chip.keeper { color: var(--lt-ink); font-weight: 600; }
 .results .board-chip.uncertain { color: var(--lt-graphite); }
+.results .board-chip.reviewed {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--lt-keep-soft);
+  color: var(--lt-keep);
+  font-weight: 600;
+}
+
+/* A-vs-B comparison pills on Board tiles and Similar list cards */
+.results .diff-pills,
+.results .board-diff-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.results .diff-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--lt-sleeve);
+  background: var(--lt-loupe);
+  color: var(--lt-graphite);
+  font-family: var(--lt-mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.results .diff-pill.res-higher,
+.results .diff-pill.size-larger {
+  background: var(--lt-keep-soft);
+  border-color: transparent;
+  color: var(--lt-keep);
+}
+
+.results .diff-pill.res-lower,
+.results .diff-pill.size-smaller {
+  background: var(--lt-pencil-soft);
+  border-color: transparent;
+  color: var(--lt-pencil);
+}
+
+.results .diff-pill.aspect-diff,
+.results .diff-pill.format-diff,
+.results .diff-pill.duration-diff {
+  background: var(--lt-warn-soft);
+  border-color: transparent;
+  color: var(--lt-warn);
+}
 
 .results .board-keep-only {
   font-family: var(--lt-mono);
@@ -743,8 +866,15 @@
 }
 
 .results .board-expand {
-  background: rgba(17, 17, 17, 0.72);
+  background: rgba(17, 17, 17, 0.78);
+  color: #FFFFFF;
   border-radius: 4px;
+}
+
+@media (hover: none) {
+  .results .board-expand {
+    opacity: 1;
+  }
 }
 
 .results .board-keys-hint,
@@ -763,6 +893,66 @@
 
 .results .board-row.dismissed { opacity: 0.7; }
 
+/* ---------- Exact-match copy list ---------- */
+.results .exact-banner {
+  background: var(--lt-loupe);
+  border: 1px solid var(--lt-sleeve);
+}
+
+.results .exact-preview,
+.results .copy-thumb {
+  background: var(--lt-loupe);
+  background-image: none;
+}
+
+.results .copy-chip.keeping {
+  background: var(--lt-keep-soft);
+  color: var(--lt-keep);
+}
+
+.results .copy-chip.suggested {
+  background: var(--lt-loupe);
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-ink);
+}
+
+.results .copy-chip.removing {
+  background: var(--lt-pencil-soft);
+  color: var(--lt-pencil);
+}
+
+.results .copy-chip.diff-folder {
+  background: var(--lt-loupe);
+  border: 1px solid var(--lt-sleeve);
+  color: var(--lt-graphite);
+}
+
+.results .copy-chip.error {
+  background: var(--lt-warn-soft);
+  color: var(--lt-warn);
+}
+
+.results .copy-keep {
+  border-color: var(--lt-control-border);
+  color: var(--lt-ink);
+}
+
+.results .copy-keep:hover:not(:disabled) {
+  border-color: var(--lt-keep);
+  background: var(--lt-keep-soft);
+}
+
+.results .copy-keep[aria-pressed="true"] {
+  border-color: var(--lt-keep);
+  background: var(--lt-keep-soft);
+  color: var(--lt-keep);
+}
+
+.results .copy-keep[aria-pressed="true"] .copy-radio {
+  border-color: var(--lt-keep);
+  background: radial-gradient(circle, var(--lt-keep) 0 45%, transparent 50%);
+}
+
 /* ---------- Action bar ---------- */
 #actionBar.actionbar {
   background: var(--lt-table);
@@ -778,7 +968,7 @@
   min-height: 40px;
   min-width: 0;
   background: transparent;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   color: var(--lt-ink);
   font-size: 13px;
   font-weight: 500;
@@ -791,18 +981,18 @@
   color: var(--lt-ink);
 }
 
-/* The button that trashes marked files: pencil filled, white text. */
+/* The button that trashes marked files: high-contrast danger fill, white text. */
 #actionBar #btnTrashSimilar:not(:disabled),
 #actionBar #btnTrashReview:not(:disabled) {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
 }
 
 #actionBar #btnTrashSimilar:not(:disabled):hover,
 #actionBar #btnTrashReview:not(:disabled):hover {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
   filter: brightness(0.92);
 }
@@ -933,9 +1123,9 @@
 }
 
 .results .decision-card .thumb-badge.remove {
-  background: var(--lt-pencil);
+  background: var(--lt-danger-fill);
   color: #FFFFFF;
-  border: 1px solid var(--lt-ink);
+  border: 1px solid var(--lt-danger-fill);
 }
 
 /* File info under the mat: name 15px/600, meta and path mono 12px. */
@@ -1056,8 +1246,8 @@
 }
 
 .results .decision-card .candidate-delete:hover {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
 }
 

@@ -33,23 +33,31 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from .cache import HashCache, default_cache_path
-from .edited_copy import edited_copy_verdict, is_aligned_image_copy
+from .edited_copy import (
+    MIRRORED_ORIENTATIONS,
+    aligned_image_copy_orientation,
+    edited_copy_verdict,
+    is_aligned_image_copy,
+)
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
 
 if TYPE_CHECKING:
     from .cache import DistinctReviews
 
+_ORIG_IS_ALIGNED_IMAGE_COPY = is_aligned_image_copy
+
 # Same subject or shoot: groups for the Sets review.
 DEFAULT_THRESHOLD = 0.88
 # Near-duplicates for the Similar review, when local image verification agrees too.
-DEFAULT_DUPLICATE_THRESHOLD = 0.97
+DEFAULT_DUPLICATE_THRESHOLD = 0.92
 # Vision tokens per image. 140 separated edits from unrelated photos as well
 # as 280 did, at roughly half the cost.
 DEFAULT_BUDGET = 140
@@ -381,26 +389,35 @@ class EmbeddingCache:
             for path, identity, row_signature, vector in rows:
                 if row_signature == signature and identity == self._identities.get(path):
                     found[path] = bytes(vector)
-        renamed: list[tuple[FileRecord, bytes]] = []
-        for record in records:
-            if record.path in found:
-                continue
-            try:
-                digest = self._digest(record, cancelled)
-                if self._identity(record) != self._identities.get(record.path):
-                    continue
-                self._digests[record.path] = digest
-            except OSError:
-                continue
-            row = self._conn.execute(
-                "SELECT vector FROM semantic_content_embeddings "
-                "WHERE content_hash = ? AND signature = ?", (digest, signature),
-            ).fetchone()
-            if row:
-                found[record.path] = bytes(row[0])
-                renamed.append((record, bytes(row[0])))
-        if renamed:
-            self.put_many(renamed, signature)
+        misses = [record for record in records if record.path not in found]
+        if misses:
+            has_content = (
+                self._conn.execute(
+                    "SELECT 1 FROM semantic_content_embeddings WHERE signature = ? LIMIT 1",
+                    (signature,),
+                ).fetchone()
+                is not None
+            )
+            if has_content:
+                renamed: list[tuple[FileRecord, bytes]] = []
+                for record in misses:
+                    try:
+                        digest = record.sha256 or self._digest(record, cancelled)
+                        if self._identity(record) != self._identities.get(record.path):
+                            continue
+                        self._digests[record.path] = digest
+                    except OSError:
+                        continue
+                    row = self._conn.execute(
+                        "SELECT vector FROM semantic_content_embeddings "
+                        "WHERE content_hash = ? AND signature = ?",
+                        (digest, signature),
+                    ).fetchone()
+                    if row:
+                        found[record.path] = bytes(row[0])
+                        renamed.append((record, bytes(row[0])))
+                if renamed:
+                    self.put_many(renamed, signature)
         return found
 
     def put_many(self, items: list[tuple[FileRecord, bytes]], signature: str) -> None:
@@ -409,7 +426,7 @@ class EmbeddingCache:
                 identity = self._identity(record)
                 if record.path in self._identities and identity != self._identities[record.path]:
                     continue
-                digest = self._digests.get(record.path) or self._digest(record)
+                digest = self._digests.get(record.path) or record.sha256 or self._digest(record)
                 if identity != self._identity(record):
                     continue
             except OSError:
@@ -455,20 +472,28 @@ def prepare_image(path: str, out_dir: str) -> str:
     """Write an upright RGB JPEG of the first frame for the helper; return its path."""
     from PIL import Image, ImageOps
 
-    try:
-        from pillow_heif import register_heif_opener
+    from .similar_image import ensure_heif_registered
 
-        register_heif_opener()
-    except Exception:
-        pass
+    ensure_heif_registered()
     with Image.open(path) as img:
         img.seek(0)
+        try:
+            img.draft("RGB", (PREPARE_MAX_SIDE, PREPARE_MAX_SIDE))
+        except Exception:
+            pass
         frame = ImageOps.exif_transpose(img).convert("RGB")
     frame.thumbnail((PREPARE_MAX_SIDE, PREPARE_MAX_SIDE))
     handle, target = tempfile.mkstemp(suffix=".jpg", dir=out_dir)
     os.close(handle)
     frame.save(target, "JPEG", quality=90)
     return target
+
+
+class _WorkerStartupError(RuntimeError):
+    """Raised when restarting the embedding helper fails completely."""
+
+
+MAX_CONSECUTIVE_WORKER_FAILURES = 3
 
 
 def embed_records(
@@ -514,8 +539,12 @@ def embed_records(
                 if progress:
                     progress("semantic-embed", total, total)
                 return vectors, errors
-        with EmbeddingWorker(helper, cancelled=cancelled, background=background) as worker:
-            signature = worker.signature
+        worker_box: list[EmbeddingWorker | None] = [
+            EmbeddingWorker(helper, cancelled=cancelled, background=background)
+        ]
+        try:
+            assert worker_box[0] is not None
+            signature = worker_box[0].signature
             if cache is not None:
                 if helper_key:
                     cache.remember_helper_signature(helper_key, signature)
@@ -542,6 +571,77 @@ def embed_records(
                         errors.append(message[:300])
                         return None
 
+                def ensure_worker() -> EmbeddingWorker:
+                    if worker_box[0] is None:
+                        try:
+                            worker_box[0] = EmbeddingWorker(
+                                helper, cancelled=cancelled, background=background
+                            )
+                        except InterruptedError:
+                            raise
+                        except Exception as exc:
+                            raise _WorkerStartupError(str(exc)) from exc
+                    return worker_box[0]
+
+                def embed_with_isolation(
+                    items: list[tuple[FileRecord, str]],
+                    fresh_out: list[tuple[FileRecord, bytes]],
+                ) -> None:
+                    """Embed ``items``, bisecting on worker failure to isolate poison items."""
+                    nonlocal consecutive_failures
+                    if not items:
+                        return
+                    if consecutive_failures >= MAX_CONSECUTIVE_WORKER_FAILURES:
+                        raise _WorkerStartupError("worker failed repeatedly")
+                    active = ensure_worker()
+                    try:
+                        rows, row_errors = active.embed_images([p for _r, p in items])
+                    except InterruptedError:
+                        raise
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        if worker_box[0] is not None:
+                            worker_box[0].close(force=True)
+                            worker_box[0] = None
+                        if len(items) == 1:
+                            rec, _prepared = items[0]
+                            consecutive_failures += 1
+                            errors.append(
+                                f"{ERROR_SEMANTIC_FAILED}: {rec.path}: {exc}"[:300]
+                            )
+                            return
+                        mid = len(items) // 2
+                        try:
+                            ensure_worker()
+                            embed_with_isolation(items[:mid], fresh_out)
+                            embed_with_isolation(items[mid:], fresh_out)
+                        except _WorkerStartupError as abort_exc:
+                            remaining = [
+                                r
+                                for r, _p in items
+                                if r.path not in vectors
+                                and not any(e.startswith(f"{ERROR_SEMANTIC_FAILED}: {r.path}:") for e in errors)
+                            ]
+                            errors.extend(
+                                f"{ERROR_SEMANTIC_FAILED}: {r.path}: {abort_exc}"[:300]
+                                for r in remaining
+                            )
+                            raise
+                        return
+                    any_ok = False
+                    for (record, _prepared_path), row, error in zip(
+                        items, rows, row_errors, strict=True
+                    ):
+                        if row is None:
+                            errors.append(
+                                f"{ERROR_SEMANTIC_FAILED}: {record.path}: {error}"[:300]
+                            )
+                            continue
+                        any_ok = True
+                        vectors[record.path] = row
+                        fresh_out.append((record, row))
+                    if any_ok:
+                        consecutive_failures = 0
+
                 starts = range(0, len(pending), REQUEST_BATCH)
 
                 def submit(start: int) -> list:
@@ -550,6 +650,7 @@ def embed_records(
                 # Decode the next batch while the helper embeds this one, so
                 # the GPU never waits on Pillow.
                 upcoming = submit(0) if pending else []
+                consecutive_failures = 0
                 for start in starts:
                     check_cancelled()
                     batch = pending[start : start + REQUEST_BATCH]
@@ -559,33 +660,41 @@ def embed_records(
                     ready = [(r, p) for r, p in zip(batch, prepared, strict=True) if p]
                     batch_started = time.monotonic()
                     if ready:
+                        fresh: list[tuple[FileRecord, bytes]] = []
                         try:
-                            rows, row_errors = worker.embed_images([p for _r, p in ready])
-                        except InterruptedError:
-                            raise
-                        except (RuntimeError, OSError, ValueError) as exc:
-                            # Keep completed batches useful and cached. Failed
-                            # files remain pending on a retry of these folders.
-                            unfinished = [r for r, _p in ready] + pending[start + len(batch):]
+                            embed_with_isolation(ready, fresh)
+                            if fresh and cache is not None:
+                                cache.put_many(fresh, signature)
+                        except _WorkerStartupError as exc:
+                            # Errors for ready items not yet recorded are added if missing.
+                            seen_err = {
+                                e.split(": ", 2)[1]
+                                for e in errors
+                                if e.count(": ") >= 2
+                            }
+                            for r, _p in ready:
+                                if r.path not in vectors and r.path not in seen_err:
+                                    errors.append(
+                                        f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
+                                    )
                             errors.extend(
                                 f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
-                                for r in unfinished
+                                for r in pending[start + len(batch) :]
                             )
                             break
-                        fresh: list[tuple[FileRecord, bytes]] = []
-                        for (record, prepared_path), row, error in zip(
-                            ready, rows, row_errors, strict=True
-                        ):
-                            os.unlink(prepared_path)
-                            if row is None:
-                                errors.append(
-                                    f"{ERROR_SEMANTIC_FAILED}: {record.path}: {error}"[:300]
-                                )
-                                continue
-                            vectors[record.path] = row
-                            fresh.append((record, row))
-                        if cache is not None and fresh:
-                            cache.put_many(fresh, signature)
+                        finally:
+                            for _rec, prepared_path in ready:
+                                try:
+                                    os.unlink(prepared_path)
+                                except OSError:
+                                    pass
+                        if consecutive_failures >= MAX_CONSECUTIVE_WORKER_FAILURES:
+                            remaining_records = pending[start + len(batch) :]
+                            errors.extend(
+                                f"{ERROR_SEMANTIC_FAILED}: {r.path}: worker failed repeatedly"[:300]
+                                for r in remaining_records
+                            )
+                            break
                     done += len(batch)
                     if progress:
                         progress("semantic-embed", done, total)
@@ -594,6 +703,9 @@ def embed_records(
                             time.monotonic() - batch_started, done, total,
                             progress, check_cancelled,
                         )
+        finally:
+            if worker_box[0] is not None:
+                worker_box[0].close()
     finally:
         if cache is not None:
             cache.close()
@@ -663,7 +775,7 @@ def semantic_neighbors(
     sets = same_set or {}
     cache = NeighborCache(cache_path) if use_cache else None
     try:
-        known, cached_scores = cache.load(threshold) if cache else (set(), {})
+        known, cached_scores = cache.load(threshold, keys) if cache else (set(), {})
         current = set(keys)
         key_scores = {
             pair: score for pair, score in cached_scores.items()
@@ -731,53 +843,180 @@ def _cosine_block(rows, matrix):
 
 
 class NeighborCache:
-    """Atomic sparse snapshot of one completely compared set of vectors.
+    """Atomic sparse snapshots of compared vector corpora, keyed by corpus hash.
 
     Missing edges mean below the saved threshold. An added/changed vector is
     compared with every current vector; unchanged pairs reuse those results.
     Lowering the threshold recomputes every pair. Removing or renaming paths
     cannot change coverage because the snapshot is keyed by vector content.
+    Large graphs (>250k edges) are compressed in binary chunks so caching never
+    silently drops out.
     """
+
+    MAX_SNAPSHOTS = 16
+    EDGE_CHUNK_SIZE = 100_000
 
     def __init__(self, path: str | Path | None = None) -> None:
         target = Path(path) if path else default_cache_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(target), timeout=30.0)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.DatabaseError:
+            pass
         self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_neighbor_snapshot "
-            "(id INTEGER PRIMARY KEY, threshold REAL, payload TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS semantic_neighbor_snapshots ("
+            "corpus_hash TEXT PRIMARY KEY, "
+            "threshold REAL NOT NULL, "
+            "keys_blob BLOB NOT NULL, "
+            "edge_count INTEGER NOT NULL, "
+            "updated_at REAL NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_neighbor_chunks ("
+            "corpus_hash TEXT NOT NULL, "
+            "chunk_idx INTEGER NOT NULL, "
+            "edges_blob BLOB NOT NULL, "
+            "PRIMARY KEY (corpus_hash, chunk_idx))"
         )
         self._conn.commit()
 
-    def load(self, threshold: float) -> tuple[set[str], dict[tuple[str, str], float]]:
-        row = self._conn.execute(
-            "SELECT threshold, payload FROM semantic_neighbor_snapshot WHERE id = 1"
-        ).fetchone()
-        if not row or row[0] > threshold:
+    @staticmethod
+    def _corpus_hash(keys: list[str]) -> str:
+        hasher = hashlib.sha256()
+        for key in keys:
+            hasher.update(key.encode("ascii"))
+            hasher.update(b"\0")
+        return hasher.hexdigest()
+
+    def load(
+        self, threshold: float, keys: list[str] | None = None
+    ) -> tuple[set[str], dict[tuple[str, str], float]]:
+        import numpy as np
+
+        current_set = set(keys) if keys is not None else None
+        chosen_row = None
+        chosen_keys: list[str] | None = None
+
+        if keys is not None:
+            corpus_hash = self._corpus_hash(keys)
+            exact = self._conn.execute(
+                "SELECT corpus_hash, keys_blob FROM semantic_neighbor_snapshots "
+                "WHERE corpus_hash = ? AND threshold <= ?",
+                (corpus_hash, threshold),
+            ).fetchone()
+            if exact:
+                try:
+                    chosen_keys = json.loads(zlib.decompress(exact[1]).decode("utf-8"))
+                    chosen_row = exact[0]
+                except (ValueError, zlib.error, UnicodeDecodeError):
+                    chosen_keys = None
+
+        if chosen_row is None:
+            rows = self._conn.execute(
+                "SELECT corpus_hash, keys_blob FROM semantic_neighbor_snapshots "
+                "WHERE threshold <= ? ORDER BY updated_at DESC",
+                (threshold,),
+            ).fetchall()
+            best_overlap = -1
+            for row_hash, keys_blob in rows:
+                try:
+                    snap_keys = json.loads(zlib.decompress(keys_blob).decode("utf-8"))
+                except (ValueError, zlib.error, UnicodeDecodeError):
+                    continue
+                if current_set is None:
+                    chosen_row = row_hash
+                    chosen_keys = snap_keys
+                    break
+                overlap = len(current_set.intersection(snap_keys))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    chosen_row = row_hash
+                    chosen_keys = snap_keys
+
+        if chosen_row is None or chosen_keys is None:
             return set(), {}
+
+        edges: dict[tuple[str, str], float] = {}
+        edge_dtype = np.dtype([("a", "<u4"), ("b", "<u4"), ("score", "<f8")])
         try:
-            payload = json.loads(row[1])
-            if payload.get("version") != 1:
-                return set(), {}
-            keys = payload["keys"]
-            edges = {(keys[a], keys[b]): score for a, b, score in payload["edges"]
-                     if score >= threshold}
-            return set(keys), edges
-        except (ValueError, TypeError, KeyError, IndexError):
+            chunk_rows = self._conn.execute(
+                "SELECT edges_blob FROM semantic_neighbor_chunks "
+                "WHERE corpus_hash = ? ORDER BY chunk_idx",
+                (chosen_row,),
+            ).fetchall()
+            for (blob,) in chunk_rows:
+                raw = zlib.decompress(blob)
+                if not raw:
+                    continue
+                arr = np.frombuffer(raw, dtype=edge_dtype)
+                keep = arr["score"] >= threshold
+                if current_set is not None:
+                    # Filter chunk edges before dict construction when possible.
+                    for idx_a, idx_b, score in zip(
+                        arr["a"][keep].tolist(),
+                        arr["b"][keep].tolist(),
+                        arr["score"][keep].tolist(),
+                        strict=True,
+                    ):
+                        ka, kb = chosen_keys[idx_a], chosen_keys[idx_b]
+                        if ka in current_set and kb in current_set:
+                            edges[(ka, kb)] = float(score)
+                else:
+                    for idx_a, idx_b, score in zip(
+                        arr["a"][keep].tolist(),
+                        arr["b"][keep].tolist(),
+                        arr["score"][keep].tolist(),
+                        strict=True,
+                    ):
+                        edges[(chosen_keys[idx_a], chosen_keys[idx_b])] = float(score)
+            return set(chosen_keys), edges
+        except (ValueError, TypeError, KeyError, IndexError, zlib.error):
             return set(), {}
 
     def save(self, keys: list[str], scores: dict[tuple[str, str], float], threshold: float) -> None:
-        # Very dense libraries can produce huge graphs. Do not turn a useful
-        # cache into unbounded disk growth; detection still returns all pairs.
-        if len(scores) > 250_000:
-            return
+        import numpy as np
+
+        corpus_hash = self._corpus_hash(keys)
+        keys_blob = zlib.compress(json.dumps(keys, separators=(",", ":")).encode("utf-8"), level=6)
         index = {key: i for i, key in enumerate(keys)}
-        payload = {"version": 1, "keys": keys,
-                   "edges": [[index[a], index[b], score] for (a, b), score in scores.items()]}
+        edge_dtype = np.dtype([("a", "<u4"), ("b", "<u4"), ("score", "<f8")])
+        items = list(scores.items())
+
         self._conn.execute(
-            "INSERT OR REPLACE INTO semantic_neighbor_snapshot VALUES (1, ?, ?)",
-            (threshold, json.dumps(payload, separators=(",", ":"))),
+            "DELETE FROM semantic_neighbor_chunks WHERE corpus_hash = ?",
+            (corpus_hash,),
         )
+        for chunk_idx, start in enumerate(range(0, len(items), self.EDGE_CHUNK_SIZE)):
+            part = items[start : start + self.EDGE_CHUNK_SIZE]
+            arr = np.empty(len(part), dtype=edge_dtype)
+            for pos, ((a, b), score) in enumerate(part):
+                arr[pos] = (index[a], index[b], score)
+            edges_blob = zlib.compress(arr.tobytes(), level=6)
+            self._conn.execute(
+                "INSERT INTO semantic_neighbor_chunks (corpus_hash, chunk_idx, edges_blob) "
+                "VALUES (?, ?, ?)",
+                (corpus_hash, chunk_idx, edges_blob),
+            )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO semantic_neighbor_snapshots "
+            "(corpus_hash, threshold, keys_blob, edge_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (corpus_hash, threshold, keys_blob, len(items), time.time()),
+        )
+        stale = self._conn.execute(
+            "SELECT corpus_hash FROM semantic_neighbor_snapshots "
+            "ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
+            (self.MAX_SNAPSHOTS,),
+        ).fetchall()
+        for (old_hash,) in stale:
+            self._conn.execute(
+                "DELETE FROM semantic_neighbor_chunks WHERE corpus_hash = ?", (old_hash,)
+            )
+            self._conn.execute(
+                "DELETE FROM semantic_neighbor_snapshots WHERE corpus_hash = ?", (old_hash,)
+            )
         self._conn.commit()
 
     def close(self) -> None:
@@ -795,6 +1034,7 @@ def find_semantic_groups(
     duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     distinct: DistinctReviews | None = None,
     exclude_from_duplicates: set[str] | None = None,
+    excluded_pairs: set[tuple[str, str]] | None = None,
     exact_path_sets: list[set[str]] | None = None,
     use_cache: bool = True,
     cache_path: str | Path | None = None,
@@ -815,9 +1055,9 @@ def find_semantic_groups(
     shoot, for browsing. *Duplicates* keep only pairs at
     ``duplicate_threshold`` whose image detail also agrees after geometric or
     ordinary alignment, and whose files no perceptual Similar group holds
-    (``exclude_from_duplicates``). Each entry is ``(members, scores)``: the
-    members built around an anchor (first), and each other member's cosine
-    with it.
+    (``exclude_from_duplicates`` / ``excluded_pairs``). Each entry is
+    ``(members, scores)``: the members built around an anchor (first), and each
+    other member's cosine with it.
 
     ``judge`` (Decider) returns P(same picture) for a candidate pair. With one,
     candidates OpenCV cannot confirm still need ordinary local verification.
@@ -840,6 +1080,7 @@ def find_semantic_groups(
         duplicate_threshold=duplicate_threshold,
         distinct=distinct,
         exclude_from_duplicates=exclude_from_duplicates,
+        excluded_pairs=excluded_pairs,
         exact_path_sets=exact_path_sets,
         use_cache=use_cache,
         cache_path=cache_path,
@@ -859,6 +1100,7 @@ def group_semantic_vectors(
     duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     distinct: DistinctReviews | None = None,
     exclude_from_duplicates: set[str] | None = None,
+    excluded_pairs: set[tuple[str, str]] | None = None,
     exact_path_sets: list[set[str]] | None = None,
     use_cache: bool = True,
     cache_path: str | Path | None = None,
@@ -915,6 +1157,9 @@ def group_semantic_vectors(
     sets = build(restrict(lambda _a, _b, score: score >= set_threshold), None)
 
     excluded = exclude_from_duplicates or set()
+    excluded_edges = {
+        (a, b) if a < b else (b, a) for a, b in (excluded_pairs or ())
+    }
 
     def local_verdict(a: str, b: str) -> bool | None:
         """Image evidence alone: True/False, or None when aligned but undecided."""
@@ -925,14 +1170,25 @@ def group_semantic_vectors(
         verdict = edited_copy_verdict(a, b)
         if verdict is not None:
             return verdict
-        return None if is_aligned_image_copy(a, b) else False
+        if is_aligned_image_copy is not _ORIG_IS_ALIGNED_IMAGE_COPY:
+            return None if is_aligned_image_copy(a, b) else False
+        orientation = aligned_image_copy_orientation(a, b)
+        if orientation is None:
+            return False
+        if orientation in MIRRORED_ORIENTATIONS:
+            # Do not let Decider veto mirrored copies already verified locally.
+            return True
+        return None
 
     def verify_run(run: list[tuple[str, str]]) -> list[bool | None]:
         return [local_verdict(a, b) for a, b in run]
 
     candidates = sorted(
         pair for pair, score in scores.items()
-        if score >= duplicate_threshold and pair[0] not in excluded and pair[1] not in excluded
+        if score >= duplicate_threshold
+        and pair[0] not in excluded
+        and pair[1] not in excluded
+        and pair not in excluded_edges
     )
     # Sorted pairs come in runs that share their first file. A run is verified
     # by one thread, so that file's decoded pixels and features stay in the

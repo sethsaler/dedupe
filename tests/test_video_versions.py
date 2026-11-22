@@ -248,6 +248,12 @@ def test_optional_video_cache_failure_falls_back_to_uncached_analysis(
             monkeypatch.setattr(module.sqlite3, "connect", lambda *args, **kwargs: held)
         elif failure == "locked":
             held.execute("BEGIN EXCLUSIVE")
+            real_connect = sqlite3.connect
+            monkeypatch.setattr(
+                module.sqlite3,
+                "connect",
+                lambda *args, **kwargs: real_connect(*args, **{**kwargs, "timeout": 0.05}),
+            )
         else:
             held.close()
             held = None
@@ -319,3 +325,247 @@ def test_parallel_video_versions_matches_serial_and_skips_exact_copy_redecode(
     # Dense sampling must run once across {original, original_exact_copy}.
     orig_family_calls = [p for p in sample_calls if orig.name in p or exact_copy.name in p]
     assert len(orig_family_calls) == 1
+
+
+def test_version_candidate_pairs_counts_distinct_videos_not_raw_frames():
+    # 10 versions of a slow/tripod video each repeating 3 hashes 32 times (320 > 256 raw occurrences)
+    # must NOT drop matches, while 300 distinct videos sharing a generic hash ARE capped.
+    h1, h2, h3 = 0x1111111111111111, 0x2222222222222222, 0x3333333333333333
+    slow_timeline = (
+        [(t * 0.5, h1) for t in range(32)]
+        + [(16.0 + t * 0.5, h2) for t in range(32)]
+        + [(32.0 + t * 0.5, h3) for t in range(32)]
+    )
+    pairs = _version_candidate_pairs([slow_timeline for _ in range(10)])
+    assert len(pairs) == 45  # all 10*9/2 pairs kept
+
+    # 270 distinct videos sharing a single generic hash h1 (> 256 distinct videos) are capped.
+    generic = [[(0.0, h1), (1.0, 0x4444444444444444 + i), (2.0, 0x5555555555555555 + i)]
+               for i in range(270)]
+    # Only h1 is shared across 270 distinct videos; with h1 dropped, <3 votes remain per pair.
+    assert _version_candidate_pairs(generic) == {}
+
+
+def test_verify_video_offset_survives_hdr_sdr_luma_shift_and_rejects_two_frame_diversity(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+
+    import dedupe.similar_video as module
+    from dedupe.models import FileRecord, MediaType
+
+    # Create 7 genuinely distinct 32x32 patterns with real spatial variance.
+    base_frames = []
+    sdr_frames = []
+    other_frames = []
+    yy, xx = np.mgrid[0:32, 0:32]
+    for idx in range(7):
+        pat = ((xx * (idx * 7 + 5) + yy * (idx * 11 + 9)) % 256).astype(float)
+        u8_a = pat.astype(np.uint8)
+        # Simulated tone-mapping + TV-range compression: raw MAD ~23 (> 18) yet high NCC.
+        u8_b = (28.0 + 190.0 * ((pat / 255.0) ** 0.72)).clip(16, 235).astype(np.uint8)
+        u8_c = ((xx * (idx * 13 + 3) - yy * (idx * 5 + 7)) % 256).astype(np.uint8)
+        base_frames.append(u8_a.tobytes())
+        sdr_frames.append(u8_b.tobytes())
+        other_frames.append(u8_c.tobytes())
+
+    a = FileRecord(path=str(tmp_path / "hdr.mp4"), size=10, mtime=1,
+                   media_type=MediaType.VIDEO, extension=".mp4", duration=10.0)
+    b = FileRecord(path=str(tmp_path / "sdr.mp4"), size=11, mtime=1,
+                   media_type=MediaType.VIDEO, extension=".mp4", duration=10.0)
+
+    monkeypatch.setattr(
+        module,
+        "_version_frame_batches",
+        lambda path, _ts, _c, **_kw: base_frames if path == a.path else sdr_frames,
+    )
+    evidence = module._verify_video_offset(a, b, 0.0, None)
+    assert evidence is not None
+    assert evidence["relation"] == "same_footage"
+
+    # Distinct scenes stay rejected.
+    monkeypatch.setattr(
+        module,
+        "_version_frame_batches",
+        lambda path, _ts, _c, **_kw: base_frames if path == a.path else other_frames,
+    )
+    assert module._verify_video_offset(a, b, 0.0, None) is None
+
+    # Two-distinct-hash sequence [A, B, B, B, B, B, B] must fail the pairwise diverse check.
+    two_only = [base_frames[0]] + [base_frames[1]] * 6
+    monkeypatch.setattr(module, "_version_frame_batches", lambda _p, _ts, _c, **_kw: two_only)
+    assert module._verify_video_offset(a, b, 0.0, None) is None
+
+
+def test_version_frame_batches_clears_hwaccel_after_chunk_zero_failure(monkeypatch):
+    import dedupe.similar_video as module
+
+    hw_calls = []
+
+    def fake_extract(path, chunk, hwaccel, **_kw):
+        hw_calls.append(hwaccel)
+        if hwaccel:
+            return []
+        return [bytes(module.HASH_FRAME_SIZE * module.HASH_FRAME_SIZE) for _ in chunk]
+
+    monkeypatch.setattr(module, "_hwaccel_args", lambda: ("-hwaccel", "videotoolbox"))
+    monkeypatch.setattr(module, "_extract_hash_frames_once", fake_extract)
+
+    frames = module._version_frame_batches("clip.mp4", [float(i) for i in range(25)], None)
+
+    assert len(frames) == 25
+    # Chunk 0 tried hwaccel and fell back; chunks 1 and 2 skipped hwaccel immediately.
+    assert hw_calls == [("-hwaccel", "videotoolbox"), (), (), ()]
+
+
+def test_refine_and_verify_offset_recovers_subsecond_drift_around_bin_median(
+    version_media, tmp_path, monkeypatch
+):
+    import dedupe.similar_video as module
+
+    orig = version_media / "original.mp4"
+    trim = version_media / "off-grid-trim.mp4"
+    rec_a, rec_b = inventory([orig, trim])
+    rec_a.duration, rec_b.duration = 8.0, 4.1
+    # True offset is -1.37s (t_b = t_a - 1.37). Supply an off-grid bin median at -1.0s
+    # (0.37s off, enough for testsrc2 frame hashes to miss at -1.0s) and verify local refinement.
+    assert module._verify_video_offset(rec_a, rec_b, -1.0, None) is None
+    refined = module._refine_and_verify_offset(rec_a, rec_b, -1.0, 1.0, None)
+    assert refined is not None
+    assert refined["ranges"][str(orig)][0] == pytest.approx(1.37, abs=0.25)
+
+
+def test_version_local_offset_refinement_and_same_footage_preservation(tmp_path):
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg and ffprobe are required")
+    orig = tmp_path / "orig.mp4"
+    tone_mapped = tmp_path / "sdr_same.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12:duration=8",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=8", "-threads", "1", orig)
+    # Same-footage copy with strong brightness/gamma shift and matching audio.
+    _ffmpeg("-i", orig, "-vf", "eq=gamma=1.7:brightness=0.10", "-c:a", "aac",
+            "-threads", "1", tone_mapped)
+
+    matches = find_video_version_matches(
+        inventory([orig, tone_mapped]), cache_path=tmp_path / "cache.sqlite3"
+    )
+    assert len(matches) == 1
+    _pair, details = matches[0]
+    assert details["relation"] == "same_footage"
+    assert details["audio"] == "same"
+
+
+def test_spectral_audio_handles_reencode_polarity_eq_drift_lag_and_silence(tmp_path):
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg and ffprobe are required")
+    expr1 = (
+        "0.4*sin(2*PI*(300+250*sin(2*PI*0.7*t))*t)*(0.5+0.5*sin(2*PI*3.1*t))"
+        "+0.15*sin(2*PI*1100*t)*(0.5+0.5*sin(2*PI*2.3*t))"
+    )
+    expr2 = (
+        "0.4*sin(2*PI*(500+400*cos(2*PI*1.3*t))*t)*(0.5+0.5*cos(2*PI*4.7*t))"
+        "+0.15*sin(2*PI*2100*t)*(0.5+0.5*cos(2*PI*1.9*t))"
+    )
+    base = tmp_path / "base.mp4"
+    inv_eq_aac = tmp_path / "inv_eq_aac.mp4"
+    drift_lag = tmp_path / "drift_lag.mp4"
+    different = tmp_path / "different.mp4"
+    tail_changed = tmp_path / "tail_changed.mp4"
+    sil_wav = tmp_path / "sil.mp4"
+    sil_aac = tmp_path / "sil_aac.mp4"
+
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=10:duration=12",
+            "-f", "lavfi", "-i", f"aevalsrc={expr1}:s=44100:d=12",
+            "-c:a", "pcm_s16le", "-f", "mov", base)
+    _ffmpeg("-i", base, "-c:v", "copy",
+            "-af", "aeval=-val(0):c=same,volume=-8dB,equalizer=f=300:width_type=h:width=200:g=6",
+            "-c:a", "aac", "-b:a", "64k", inv_eq_aac)
+    _ffmpeg("-i", base, "-c:v", "copy",
+            "-af", "atempo=1.004,adelay=1400|1400",
+            "-c:a", "aac", "-b:a", "96k", drift_lag)
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=10:duration=12",
+            "-f", "lavfi", "-i", f"aevalsrc={expr2}:s=44100:d=12",
+            "-c:a", "aac", different)
+    # First half matches base, second half switches to expr2 (caught by tail window sampling).
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=10:duration=12",
+            "-f", "lavfi", "-i", f"aevalsrc={expr1}:s=44100:d=6",
+            "-f", "lavfi", "-i", f"aevalsrc={expr2}:s=44100:d=6",
+            "-filter_complex", "[1:a][2:a]concat=n=2:v=0:a=1[a]",
+            "-map", "0:v", "-map", "[a]", "-c:a", "aac", tail_changed)
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=10:duration=6",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "6",
+            "-c:a", "pcm_s16le", "-f", "mov", sil_wav)
+    _ffmpeg("-i", sil_wav, "-c:v", "copy", "-c:a", "aac", "-b:a", "64k", sil_aac)
+
+    r12 = {str(base): [0.0, 12.0], str(inv_eq_aac): [0.0, 12.0]}
+    assert compare_video_audio(str(base), str(inv_eq_aac), r12) == "same"
+    assert compare_video_audio(
+        str(base), str(drift_lag), {str(base): [0.0, 12.0], str(drift_lag): [0.0, 12.0]}
+    ) == "same"
+    assert compare_video_audio(
+        str(base), str(different), {str(base): [0.0, 12.0], str(different): [0.0, 12.0]}
+    ) == "different"
+    assert compare_video_audio(
+        str(base), str(tail_changed), {str(base): [0.0, 12.0], str(tail_changed): [0.0, 12.0]}
+    ) != "same"
+    assert compare_video_audio(
+        str(sil_wav), str(sil_aac), {str(sil_wav): [0.0, 6.0], str(sil_aac): [0.0, 6.0]}
+    ) == "same"
+    assert compare_video_audio(
+        str(sil_wav), str(base), {str(sil_wav): [0.0, 6.0], str(base): [0.0, 6.0]}
+    ) == "different"
+
+
+def test_version_cache_uses_wal_device_inode_rename_fallback_and_persists_short_probes(
+    version_media, tmp_path, monkeypatch
+):
+    import shutil
+    import sqlite3
+
+    import dedupe.similar_video as module
+
+    cache = tmp_path / "versions.sqlite3"
+    orig = tmp_path / "orig.mp4"
+    trim = tmp_path / "trim.mp4"
+    short_clip = tmp_path / "short.mp4"
+    shutil.copy2(version_media / "original.mp4", orig)
+    shutil.copy2(version_media / "trim.mp4", trim)
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=12:duration=1.2", short_clip)
+
+    first = find_video_version_matches(inventory([orig, trim, short_clip]), cache_path=cache)
+    assert len(first) == 1
+
+    with sqlite3.connect(cache) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() == "wal"
+
+    # Rename orig -> renamed.mp4 (changes path & ctime_ns, preserves device+inode+size+mtime_ns).
+    renamed = tmp_path / "renamed.mp4"
+    orig.rename(renamed)
+
+    probe_calls = []
+    batch_calls = []
+    real_probe = module.probe_video
+    real_batches = module._version_frame_batches
+
+    def tracked_probe(path, **kw):
+        probe_calls.append(str(path))
+        return real_probe(path, **kw)
+
+    def tracked_batches(path, timestamps, cancelled):
+        if len(timestamps) != 7:
+            batch_calls.append(str(path))
+        return real_batches(path, timestamps, cancelled)
+
+    monkeypatch.setattr(module, "probe_video", tracked_probe)
+    monkeypatch.setattr(module, "_version_frame_batches", tracked_batches)
+
+    warm_records = inventory([renamed, trim, short_clip])
+    second = find_video_version_matches(warm_records, cache_path=cache)
+
+    assert len(second) == 1
+    assert batch_calls == []  # device+inode fallback avoided re-decoding renamed.mp4
+    assert probe_calls == []  # <2s short.mp4 probe was cached too
+    short_rec = next(r for r in warm_records if r.path == str(short_clip))
+    assert short_rec.duration == pytest.approx(1.2, abs=0.1)
+    assert (short_rec.width, short_rec.height) == (128, 96)

@@ -5,8 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
-from dedupe.exact import file_sha256, find_exact_groups
+from dedupe.exact import (
+    classify_pixel_exact_group,
+    file_sha256,
+    find_exact_groups,
+    find_metadata_exact_groups,
+)
 from dedupe.models import FileRecord, MediaType, classify_media
 from dedupe.scanner import inventory
 
@@ -266,3 +272,105 @@ def test_large_prefix_collision_skips_full_sha256_when_middle_or_tail_differs(
     groups = find_exact_groups([a, b, diff_mid, diff_tail], workers=2)
     assert [{r.path for r in g} for g in groups] == [{a.path, b.path}]
     assert sorted(digested_paths) == sorted([a.path, b.path])
+
+
+def test_file_sha256_cooperatively_cancels_mid_stream(tmp_path: Path) -> None:
+    p = tmp_path / "large.bin"
+    p.write_bytes(b"a" * (3 * 1024 * 1024))
+    checks = {"n": 0}
+
+    def cancelled() -> bool:
+        checks["n"] += 1
+        return checks["n"] >= 2
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        file_sha256(p, cancelled=cancelled)
+
+
+def test_sparse_transient_oserror_does_not_drop_readable_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dedupe import exact as module
+
+    payload = b"z" * (module.LARGE_SPARSE_FILTER_MIN_BYTES + 4096)
+    a = _write(tmp_path / "a.mp4", payload)
+    b = _write(tmp_path / "b.mp4", payload)
+    gone_path = tmp_path / "gone.mp4"
+    gone = _write(gone_path, payload)
+    for rec in (a, b, gone):
+        rec.media_type = MediaType.VIDEO
+        rec.extension = ".mp4"
+    # Simulate transient failure in sparse pass on `b` (kept eligible for full sha256)
+    # and permanently missing `gone` (dropped during sha256 without losing `a` or `b`).
+    gone_path.unlink()
+
+    real_sparse = module._sparse_job
+
+    def fake_sparse(item):
+        if item[0] == b.path:
+            return item[0], None
+        return real_sparse(item)
+
+    monkeypatch.setattr(module, "_sparse_job", fake_sparse)
+    errs: list[str] = []
+    groups = find_exact_groups([a, b, gone], workers=2, errors=errs)
+    assert [{r.path for r in g} for g in groups] == [{a.path, b.path}]
+    assert errs
+
+
+def test_exact_skips_rereading_cached_sha256_and_reports_cached_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dedupe import exact as module
+
+    payload = b"m" * (module.PARTIAL_SIZE + 4096)
+    a = _write(tmp_path / "a.jpg", payload)
+    b = _write(tmp_path / "b.jpg", payload)
+    digest = file_sha256(a.path)
+    a.partial_hash = "cached-ph"
+    b.partial_hash = "cached-ph"
+    a.sha256 = digest
+    b.sha256 = digest
+
+    def forbid_sha256(*_args, **_kwargs):
+        raise AssertionError("sha256 should not be recomputed when already cached")
+
+    monkeypatch.setattr(module, "file_sha256", forbid_sha256)
+    events: list[tuple[str, int, int]] = []
+    groups = find_exact_groups([a, b], progress=lambda *e: events.append(e))
+    assert [{r.path for r in g} for g in groups] == [{a.path, b.path}]
+    assert events[-1] == ("exact-full", 2, 2)
+
+
+def test_pixel_exact_classifies_metadata_only_jpeg_duplicates(tmp_path: Path) -> None:
+    img = Image.new("RGB", (64, 64), (10, 120, 210))
+    exif_a = img.getexif()
+    exif_a[0x010E] = "Original photo caption"
+    exif_b = img.getexif()
+    exif_b[0x010E] = "Re-exported copy with longer EXIF tag metadata"
+
+    p_a = tmp_path / "a.jpg"
+    p_b = tmp_path / "b.jpg"
+    img.save(p_a, format="JPEG", quality=95, exif=exif_a.tobytes())
+    # Strip/swap APP1 on raw JPEG copy so pixel bitstream matches identically while bytes differ.
+    raw = p_a.read_bytes()
+    app1_end = raw.find(b"\xff\xdb")
+    assert app1_end > 2
+    stripped = b"\xff\xd8" + b"\xff\xfe\x00\x0a" + b"COMMENT!" + raw[app1_end:]
+    p_b.write_bytes(stripped)
+
+    rec_a = _write(p_a, p_a.read_bytes())
+    rec_b = _write(p_b, p_b.read_bytes())
+    assert find_exact_groups([rec_a, rec_b]) == []
+    rec_a.width = rec_b.width = 64
+    rec_a.height = rec_b.height = 64
+    rec_a.phash = rec_b.phash = "1" * 16
+
+    basis, explanations = classify_pixel_exact_group(
+        [rec_a, rec_b], keeper_path=rec_a.path
+    )
+    assert basis == "pixel_exact"
+    assert rec_b.path in explanations
+
+    meta_groups = find_metadata_exact_groups([rec_a, rec_b])
+    assert [{r.path for r in g} for g in meta_groups] == [{rec_a.path, rec_b.path}]

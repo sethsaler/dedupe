@@ -1,7 +1,7 @@
 // Selection rules, bulk selection, and the Trash action flow.
 
 import { api } from "./api.js";
-import { boardActive } from "./board.js";
+import * as boardModule from "./board.js";
 import { applyResultControls, loadGroups, selectionFiltersActive, updateGroupListItem } from "./groups.js";
 import { renderMembers, restartMemberList, selectGroup } from "./members.js";
 import { confirmModal } from "./modal.js";
@@ -71,6 +71,7 @@ function effectiveSelection(scope) {
 const EXACT_ACTION_TABS = new Set(["all", "exact"]);
 const SIMILAR_ACTION_TABS = new Set(["all", "similar"]);
 const REVIEW_ACTION_TABS = new Set(["all", "low_resolution", "random_review"]);
+const BULK_ACTIONABLE_KINDS = new Set(["exact", "similar", "low_resolution", "random_review"]);
 
 function plural(count, one, many) {
   return count === 1 ? one : many;
@@ -79,7 +80,15 @@ function plural(count, one, many) {
 function updateSelectionSummary() {
   // On the Similar board the footer is the board's one commit: it names what
   // will move, and the unrelated Low-res + Random button steps aside.
-  const board = boardActive();
+  const board = boardModule.boardActive();
+  const source = state.allGroups.length ? state.allGroups : state.groups;
+  const bulkPanel = $("bulkPanel");
+  if (bulkPanel) {
+    const actionable = state.kind === "all"
+      ? source.some((g) => BULK_ACTIONABLE_KINDS.has(g.kind))
+      : BULK_ACTIONABLE_KINDS.has(state.kind);
+    bulkPanel.hidden = !actionable;
+  }
   const exact = effectiveSelection("exact");
   const exactBytes = exact.reduce((sum, member) => sum + (member.size || 0), 0);
   const similar = effectiveSelection("similar");
@@ -123,7 +132,6 @@ function updateSelectionSummary() {
   }
   // The auto-delete button does not depend on the current selection: it acts
   // on every exact group, so it is enabled whenever exact groups exist.
-  const source = state.allGroups.length ? state.allGroups : state.groups;
   const exactGroups = source.filter(
     (g) => g.kind === "exact" && (g.members || []).length >= 2,
   ).length;
@@ -249,6 +257,11 @@ function syncBulkValueRow() {
     : rule === "min_faces"
       ? "faces (e.g. 2)"
       : "MB";
+  const ruleTitle = rule === "smaller_than_keeper"
+    ? "Select copies whose file size (bytes) is smaller than the group's suggested keeper. Semantic look-alikes and video versions are skipped."
+    : "Apply this rule to the groups currently shown. Suggested keepers are always protected (server-checked).";
+  $("bulkCriteria").title = ruleTitle;
+  $("btnBulkCriteria").title = ruleTitle;
 }
 $("bulkCriteria").addEventListener("change", syncBulkValueRow);
 syncBulkValueRow();
@@ -359,6 +372,7 @@ function setActionBusy(busy, label = "") {
   document.querySelectorAll("#actionBar button").forEach((button) => {
     button.disabled = busy;
   });
+  if (!busy) updateSelectionSummary();
   $("actionBar").setAttribute("aria-busy", busy ? "true" : "false");
   const note = $("actionBusyNote");
   if (note) {
@@ -390,12 +404,15 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
   const blockedNote = blocked.length
     ? `<p><strong>${blocked.length} cannot be restored:</strong> ${escapeHtml(blocked[0].error)} (${escapeHtml(basename(blocked[0].destination || blocked[0].path))})${blocked.length > 1 ? ` · and ${blocked.length - 1} more` : ""}</p><p>Nothing restores while any file is blocked — resolve it, then press Undo again.</p>`
     : "";
+  const fileNoun = plural(restorable.length, "file", "files");
+  const returnVerb = restorable.length === 1 ? "returns to its original location" : "return to their original locations";
   const ok = await confirmModal({
-    title: `Restore ${restorable.length} file${restorable.length === 1 ? "" : "s"}?`,
-    body: `<div class="review-sheet"><p><strong>${restorable.length} files · ${formatBytes(totalBytes)}</strong> return to their original locations on disk.</p>${blockedNote}<p>The current review is not re-populated — restored files reappear on the next scan.</p></div>`,
+    title: `Restore ${restorable.length} ${fileNoun}?`,
+    body: `<div class="review-sheet"><p><strong>${restorable.length} ${fileNoun} · ${formatBytes(totalBytes)}</strong> ${returnVerb} on disk.</p>${blockedNote}<p>The current review is not re-populated — restored files reappear on the next scan.</p></div>`,
     confirmLabel: "Restore files",
     danger: false,
     validitySeconds: Number(preview.preview_expires_in) || null,
+    confirmDisabled: blocked.length > 0,
   });
   if (ok === "expired") {
     if (attempt >= MAX_PREVIEW_REFRESHES) {
@@ -421,9 +438,13 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
     toast(
       res.fail_count
         ? `Restored ${res.success_count}, ${res.fail_count} failed`
-        : `Restored ${res.success_count} file${res.success_count === 1 ? "" : "s"} to their original locations`,
+        : `Restored ${res.success_count} ${plural(res.success_count, "file", "files")} to their original locations`,
       res.fail_count ? "error" : "ok",
     );
+    await Promise.all([
+      state.scanId ? loadGroups().catch(() => {}) : Promise.resolve(),
+      refreshStatus().catch(() => {}),
+    ]);
     setActionBusy(false);
   } catch (e) {
     const stale = e.data?.preview_stale
@@ -440,11 +461,12 @@ async function undoAction(receipts, { attempt = 0 } = {}) {
 
 async function runDelete(scope, options = {}) {
   const { attempt = 0, notice = "" } = options;
+  if (attempt === 0) await boardModule.flushPendingBoardSelections?.();
   const scopeLabel = scopeLabelFor(scope);
   const count = effectiveSelection(scope).length;
   if (count === 0) {
     toast(`No ${scopeLabel.toLowerCase()} selected for removal`);
-    return;
+    return false;
   }
 
   setActionBusy(true, "Verifying the selection against the files on disk…");
@@ -463,7 +485,7 @@ async function runDelete(scope, options = {}) {
   } catch (error) {
     setActionBusy(false);
     toast(`Could not verify selection: ${error.message}`, "error");
-    return;
+    return false;
   }
 
   if (preview.success_count === 0) {
@@ -474,7 +496,7 @@ async function runDelete(scope, options = {}) {
       toast(e.message || String(e), "error");
     }
     setActionBusy(false);
-    return;
+    return false;
   }
 
   const selectedMembers = effectiveSelection(scope);
@@ -490,7 +512,7 @@ async function runDelete(scope, options = {}) {
   // surprise discovered after the fact.
   const reviewQuarantineCount = preview.review_quarantine_count || 0;
   const reviewQuarantineNote = reviewQuarantineCount
-    ? `<p><strong>${reviewQuarantineCount} Low-res/Random review file${reviewQuarantineCount === 1 ? "" : "s"}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
+    ? `<p><strong>${reviewQuarantineCount} Low-res/Random review ${plural(reviewQuarantineCount, "file", "files")}</strong> will move to <code>${escapeHtml(preview.review_quarantine_dir)}</code> instead of system Trash.</p>`
     : "";
   const reviewScope = scope === "review_suggestions";
   const titleScope = scope === "exact"
@@ -505,7 +527,7 @@ async function runDelete(scope, options = {}) {
     : "<p>At least one file is always kept in every duplicate group. Selected files go to system Trash and can be restored there.</p>";
   const ok = await confirmModal({
     title: `Delete all selected ${titleScope}?`,
-    body: `<div class="review-sheet">${previewNoticeHtml(notice)}${reviewQuarantineNote}<p><strong>${preview.success_count} unique files · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}${destinationNote}${heuristicWarning}</div>`,
+    body: `<div class="review-sheet">${previewNoticeHtml(notice)}${reviewQuarantineNote}<p><strong>${preview.success_count} unique ${plural(preview.success_count, "file", "files")} · ${formatBytes(totalBytes)}</strong></p>${skippedWarning}${destinationNote}${heuristicWarning}</div>`,
     confirmLabel: reviewScope ? "Move to Quarantine" : "Move to Trash",
     danger: true,
     validitySeconds: Number(preview.preview_expires_in) || null,
@@ -514,7 +536,7 @@ async function runDelete(scope, options = {}) {
     if (attempt >= MAX_PREVIEW_REFRESHES) {
       setActionBusy(false);
       toast("Preview keeps expiring — try again when you are ready to confirm", "error");
-      return;
+      return false;
     }
     toast("Preview expired — re-checking the current selection…");
     return runDelete(scope, {
@@ -524,10 +546,10 @@ async function runDelete(scope, options = {}) {
   }
   if (!ok) {
     setActionBusy(false);
-    return;
+    return false;
   }
 
-  setActionBusy(true, "Moving files to Trash…");
+  setActionBusy(true, reviewScope ? "Moving files to Quarantine…" : "Moving files to Trash…");
   try {
     const res = await api("/api/action", {
       method: "POST",
@@ -542,11 +564,11 @@ async function runDelete(scope, options = {}) {
     });
     let msg = res.fail_count > 0
       ? `Done: ${res.success_count} ok, ${res.fail_count} skipped`
-      : `Done: ${res.success_count} ok, ${res.fail_count} failed`;
-    if (res.review_quarantine_count) {
+      : `Done: ${res.success_count} ok — moved to ${reviewScope ? "Quarantine" : "Trash"}`;
+    if (res.review_quarantine_count && !reviewScope) {
       msg += ` · ${res.review_quarantine_count} in _Dedupe Quarantine`;
     }
-    if (res.log_path) msg += ` · receipt saved`;
+    if (res.log_path) msg += " · receipt saved";
     if (res.fail_count) {
       const failed = res.items?.find((item) => item.error);
       if (failed) {
@@ -568,6 +590,7 @@ async function runDelete(scope, options = {}) {
     await loadGroups();
     await refreshStatus();
     setActionBusy(false);
+    return true;
   } catch (e) {
     const stale = e.data?.preview_stale
       || /preview expired|selection changed|fresh preview/i.test(e.message);
@@ -581,21 +604,29 @@ async function runDelete(scope, options = {}) {
     }
     setActionBusy(false);
     toast(e.message, "error");
+    return false;
   }
 }
 
 // Auto-delete: select every exact group's non-keeper members (the Automatic
 // rule keeps each group's suggested keeper), then run the standard Trash flow
-// — preview, confirm, execute, undo — over that fresh selection.
+// — preview, confirm, execute, undo — over that fresh selection. If the user
+// cancels before execution, restore any prior manual keeper selections.
 async function runAutoDeleteExact() {
+  if (state.actionBusy || state.scanning || state.acting) return;
+  await boardModule.flushPendingBoardSelections?.();
   const source = state.allGroups.length ? state.allGroups : state.groups;
-  const exactIds = source
-    .filter((g) => g.kind === "exact" && (g.members || []).length >= 2)
-    .map((g) => g.id);
+  const exactGroups = source.filter((g) => g.kind === "exact" && (g.members || []).length >= 2);
+  const exactIds = exactGroups.map((g) => g.id);
   if (!exactIds.length) {
     toast("No exact duplicate groups", "error");
     return;
   }
+  const previousSelections = exactGroups.map((g) => ({
+    id: g.id,
+    selected: [...(g.selected_for_removal || [])],
+    touched: state.touchedGroups.has(g.id),
+  }));
   try {
     await api("/api/smart-select", {
       method: "POST",
@@ -611,7 +642,34 @@ async function runAutoDeleteExact() {
     toast(e.message, "error");
     return;
   }
-  await runDelete("exact");
+  const executed = await runDelete("exact");
+  if (executed) return;
+
+  const latestSource = state.allGroups.length ? state.allGroups : state.groups;
+  const changed = previousSelections.filter((prev) => {
+    const live = latestSource.find((g) => g.id === prev.id);
+    if (!live) return false;
+    return JSON.stringify(live.selected_for_removal || []) !== JSON.stringify(prev.selected);
+  });
+  if (changed.length) {
+    try {
+      await Promise.all(changed.map((prev) => api("/api/selection", {
+        method: "POST",
+        body: JSON.stringify({
+          group_id: prev.id,
+          selected: prev.selected,
+          scan_id: state.scanId,
+        }),
+      })));
+      for (const prev of previousSelections) {
+        if (!prev.touched) state.touchedGroups.delete(prev.id);
+      }
+      await loadGroups({ preserveSelection: false });
+      updateSelectionSummary();
+    } catch (e) {
+      toast(e.message || String(e), "error");
+    }
+  }
 }
 
 $("btnTrashAllExact").addEventListener("click", runAutoDeleteExact);

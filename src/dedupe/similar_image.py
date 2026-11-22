@@ -11,10 +11,12 @@ Memory-conscious: images are drafted/thumbnail-scaled before hashing so a
 
 from __future__ import annotations
 
+import hashlib
+import io
+import threading
 from bisect import bisect_right
 from collections.abc import Callable
 from functools import lru_cache
-from itertools import pairwise
 from pathlib import Path
 
 from .cache import DistinctReviews
@@ -101,21 +103,27 @@ ORIENTATIONS = (
 # Orientations that swap width and height.
 QUARTER_TURN_ORIENTATIONS = frozenset({"ROTATE_90", "ROTATE_270", "TRANSPOSE", "TRANSVERSE"})
 ORIENTATION_HASH_VERSION = "o1"
+#: Stored in ``orientation_phashes`` on animations so cached scans do not
+#: continuously backfill still-image turns (optionally followed by ``,<mid_phash>``).
+ANIMATION_ORIENTATION_SENTINEL = f"{ORIENTATION_HASH_VERSION}:anim"
 # EXIF Orientation tag and the values whose transpose swaps width and height.
 EXIF_ORIENTATION = 0x0112
 QUARTER_TURN_EXIF_ORIENTATIONS = frozenset({5, 6, 7, 8})
 # Formats whose header orientation is verified to equal exif_transpose's
 # (tests/test_similar_image.py); others take the decoding path.
 HEADER_ORIENTATION_FORMATS = frozenset({"JPEG", "MPO", "PNG", "WEBP", "HEIF", "GIF"})
-# Verification decodes a file once per scan and derives every orientation,
-# comparison size, and dense thumbnail from those frames. A still holds about
-# 1.8 MB (RGB and RGBA at 512 px); sorted pair order keeps the hit rate high.
+# Verification decodes a file once per scan at DETAIL_MAX_SIDE and derives
+# every orientation, comparison size, tile, and dense thumbnail from it.
 SAMPLE_CACHE_SIZE = 16
 # A process pool sidesteps GIL contention in the pHash/dHash/tile math (small
 # numpy/scipy ops hold the GIL even though Pillow's decoder releases it), but
 # costs an interpreter spawn plus Pillow/imagehash imports per worker. Only
 # batches at least this large amortize that startup; smaller ones use threads.
 PROCESS_POOL_MIN_IMAGES = 512
+
+_HEIF_LOCK = threading.Lock()
+_HEIF_REGISTERED = False
+_LAST_DENSE_FAILURE = threading.local()
 
 
 def _ensure_image_deps() -> None:
@@ -129,30 +137,78 @@ def _ensure_image_deps() -> None:
         ) from exc
 
 
-def _register_heif() -> None:
-    try:
-        from pillow_heif import register_heif_opener
+def ensure_heif_registered() -> None:
+    """Register pillow-heif opener once, safely across worker threads."""
+    global _HEIF_REGISTERED
+    if _HEIF_REGISTERED:
+        return
+    with _HEIF_LOCK:
+        if _HEIF_REGISTERED:
+            return
+        try:
+            from pillow_heif import register_heif_opener
 
-        register_heif_opener()
+            register_heif_opener()
+        except Exception:
+            pass
+        _HEIF_REGISTERED = True
+
+
+_register_heif = ensure_heif_registered
+
+
+def _has_alpha_channel(img) -> bool:
+    return img.mode in ("RGBA", "LA", "PA") or (
+        img.mode == "P" and "transparency" in getattr(img, "info", {})
+    )
+
+
+def _convert_icc_to_srgb(frame, icc_bytes: bytes | None):
+    if not icc_bytes:
+        return frame
+    try:
+        from PIL import ImageCms
+
+        src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+        srgb_profile = ImageCms.createProfile("sRGB")
+        mode = "RGBA" if frame.mode == "RGBA" else "RGB"
+        converted = frame if frame.mode == mode else frame.convert(mode)
+        return ImageCms.profileToProfile(converted, src_profile, srgb_profile, outputMode=mode)
     except Exception:
-        pass
+        return frame
+
+
+def _composite_neutral_matte(frame):
+    """Composite alpha onto neutral mid-gray (128, 128, 128) before hashing."""
+    from PIL import Image as PILImage
+
+    if frame.mode != "RGBA":
+        return frame.convert("RGB")
+    canvas = PILImage.new("RGB", frame.size, (128, 128, 128))
+    canvas.paste(frame, mask=frame.getchannel("A"))
+    return canvas
 
 
 def _downscale_for_hash(img, max_side: int = HASH_MAX_SIDE, *, preserve_alpha: bool = False):
-    """Return RGB(A) scaled so longest side ≤ max_side (in-place safe copy)."""
+    """Return ICC-normalized RGB(A) scaled so longest side <= max_side."""
     from PIL import Image as PILImage
 
-    rgb = img.convert("RGBA" if preserve_alpha else "RGB")
-    if max(rgb.size) > max_side:
+    icc = getattr(img, "info", {}).get("icc_profile")
+    has_alpha = _has_alpha_channel(img)
+    frame = img.convert("RGBA" if (preserve_alpha or has_alpha) else "RGB")
+    if max(frame.size) > max_side:
         # Bilinear is enough pre-pHash and much cheaper than LANCZOS on 12MP shots.
-        rgb.thumbnail((max_side, max_side), PILImage.Resampling.BILINEAR)
-    return rgb
+        frame.thumbnail((max_side, max_side), PILImage.Resampling.BILINEAR)
+    frame = _convert_icc_to_srgb(frame, icc)
+    if preserve_alpha:
+        return frame if frame.mode == "RGBA" else frame.convert("RGBA")
+    return _composite_neutral_matte(frame) if has_alpha or frame.mode == "RGBA" else frame.convert("RGB")
 
 
 def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
     """Read display-oriented image/GIF dimensions without computing hashes."""
     _ensure_image_deps()
-    _register_heif()
+    ensure_heif_registered()
 
     from PIL import Image, ImageOps
 
@@ -173,7 +229,7 @@ def probe_image_dimensions(path: str | Path) -> tuple[int | None, int | None]:
         return int(width), int(height)
 
 
-def _upright_hash_source(img):
+def _upright_hash_source(img, max_side: int = HASH_MAX_SIDE):
     """``(upright image, display width, display height, animated)`` for hashing.
 
     The size is the file's own, read before any reduced decode. JPEGs are
@@ -189,7 +245,7 @@ def _upright_hash_source(img):
     if img.format in REDUCED_DECODE_FORMATS:
         quarter_turn = img.getexif().get(EXIF_ORIENTATION, 1) in QUARTER_TURN_EXIF_ORIENTATIONS
         try:
-            img.draft("RGB", (HASH_MAX_SIDE, HASH_MAX_SIDE))
+            img.draft("RGB", (max_side, max_side))
         except Exception:
             pass
         img = ImageOps.exif_transpose(img)
@@ -227,18 +283,20 @@ def compute_image_hashes_with_tiles(
     return phash, dhash, width, height, tiles
 
 
-def compute_image_fingerprint(
+def _compute_image_fingerprint_full(
     path: str | Path, *, with_tiles: bool = True, with_orientations: bool = True
 ) -> tuple[
-    str | None, str | None, int | None, int | None, tuple[str, ...] | None, tuple[str, ...] | None
+    str | None,
+    str | None,
+    int | None,
+    int | None,
+    tuple[str, ...] | None,
+    tuple[str, ...] | None,
+    bool,
+    str | None,
 ]:
-    """Return (phash, dhash, width, height, tile_phashes, orientation_phashes).
-
-    ``orientation_phashes`` holds the pHash of each ``ORIENTATIONS`` entry for
-    still images, and is None for animations.
-    """
     _ensure_image_deps()
-    _register_heif()
+    ensure_heif_registered()
 
     import imagehash
     from PIL import Image
@@ -252,6 +310,11 @@ def compute_image_fingerprint(
         # frame order; XOR used to erase order and cancel repeated frame hashes.
         phash = str(imagehash.phash(frames[0]))
         dhash = str(imagehash.dhash(frames[0]))
+        mid_phash = (
+            str(imagehash.phash(frames[len(frames) // 2]))
+            if animated and len(frames) > 1
+            else None
+        )
 
         tiles: tuple[str, ...] | None = None
         if with_tiles:
@@ -264,7 +327,44 @@ def compute_image_fingerprint(
         if with_orientations and not animated:
             orientations = _orientation_phashes(frames[0])
 
-        return phash, dhash, width, height, tiles, orientations
+        return phash, dhash, width, height, tiles, orientations, animated, mid_phash
+
+
+def compute_image_fingerprint(
+    path: str | Path, *, with_tiles: bool = True, with_orientations: bool = True
+) -> tuple[
+    str | None, str | None, int | None, int | None, tuple[str, ...] | None, tuple[str, ...] | None
+]:
+    """Return (phash, dhash, width, height, tile_phashes, orientation_phashes).
+
+    ``orientation_phashes`` holds the pHash of each ``ORIENTATIONS`` entry for
+    still images, and is None for animations.
+    """
+    ph, dh, w, h, tiles, orientations, _animated, _mid = _compute_image_fingerprint_full(
+        path, with_tiles=with_tiles, with_orientations=with_orientations
+    )
+    return ph, dh, w, h, tiles, orientations
+
+
+def is_animation_orientation_sentinel(stored: str | None) -> bool:
+    """Whether ``orientation_phashes`` marks a known animated image."""
+    if not stored:
+        return False
+    return stored == ANIMATION_ORIENTATION_SENTINEL or stored.startswith(
+        f"{ANIMATION_ORIENTATION_SENTINEL},"
+    )
+
+
+def decode_animation_midpoint_phash(stored: str | None) -> int | None:
+    """Return stored midpoint pHash for an animated image if present."""
+    prefix = f"{ANIMATION_ORIENTATION_SENTINEL},"
+    if not stored or not stored.startswith(prefix):
+        return None
+    hex_hash = stored[len(prefix) :]
+    try:
+        return int(hex_hash, 16) if hex_hash else None
+    except ValueError:
+        return None
 
 
 def _orientation_phashes(frame) -> tuple[str, ...]:
@@ -291,6 +391,8 @@ def encode_orientation_phashes(values: tuple[str, ...]) -> str:
 def decode_orientation_phashes(stored: str | None) -> tuple[str, ...] | None:
     """Parse stored orientation hashes; anything else must be recomputed."""
     if not stored or not stored.startswith(f"{ORIENTATION_HASH_VERSION}:"):
+        return None
+    if is_animation_orientation_sentinel(stored):
         return None
     values = tuple(stored[len(ORIENTATION_HASH_VERSION) + 1 :].split(","))
     return values if len(values) == len(ORIENTATIONS) and all(values) else None
@@ -331,13 +433,22 @@ def _image_hash_job(
     int | None,
     int | None,
     tuple[str, ...] | None,
-    tuple[str, ...] | None,
+    tuple[str, ...] | str | None,
     str | None,
 ]:
     """Worker: (path, phash, dhash, width, height, tile_phashes, orientation_phashes, error)."""
     try:
-        ph, dh, w, h, tiles, orientations = compute_image_fingerprint(path)
-        return path, ph, dh, w, h, tiles, orientations, None
+        ph, dh, w, h, tiles, orientations, animated, mid_phash = _compute_image_fingerprint_full(
+            path
+        )
+        encoded_orientations: tuple[str, ...] | str | None = orientations
+        if animated:
+            encoded_orientations = (
+                f"{ANIMATION_ORIENTATION_SENTINEL},{mid_phash}"
+                if mid_phash
+                else ANIMATION_ORIENTATION_SENTINEL
+            )
+        return path, ph, dh, w, h, tiles, encoded_orientations, None
     except Exception as exc:
         return path, None, None, None, None, None, None, f"{ERROR_IMAGE_HASH_FAILED}: {exc}"
 
@@ -366,53 +477,129 @@ def _tile_phashes_from_image(img, comparison_side: int = TILE_NORMALIZE) -> list
     return [imagehash.phash(canvas.crop(box)) for box in regions]
 
 
-@lru_cache(maxsize=SAMPLE_CACHE_SIZE)
-def _hash_samples_for_path(path: str):
-    """One decode per file for verification: ``(rgb_frames, rgba_frames)``.
+def _stat_key(path: str) -> tuple[str, int, int, int] | None:
+    try:
+        stat = Path(path).stat()
+        return path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    except OSError:
+        return None
 
-    Same decode ladder as the hashing pass, so derived tiles are identical to
-    stored ones. Either entry is None when that conversion fails.
+
+def _parse_border_crop(
+    value: str | None,
+    expected_dims: tuple[int | None, int | None] | None = None,
+) -> tuple[int, int, int, int, int, int] | None:
+    """Parse ``left,top,right,bottom,width,height[,chrome]`` when valid."""
+    if not value or value == "dismissed":
+        return None
+    parts = value.split(",")
+    if len(parts) == 7:
+        parts = parts[:6]
+    if len(parts) != 6:
+        return None
+    try:
+        left, top, right, bottom, width, height = (int(part) for part in parts)
+    except ValueError:
+        return None
+    if not (
+        0 <= left < right <= width
+        and 0 <= top < bottom <= height
+        and (left, top, right, bottom) != (0, 0, width, height)
+    ):
+        return None
+    if expected_dims and all(expected_dims) and (width, height) != expected_dims:
+        return None
+    return left, top, right, bottom, width, height
+
+
+def _crop_frame(frame, crop: tuple[int, int, int, int] | None, orig_w: int, orig_h: int):
+    if crop is None or not orig_w or not orig_h:
+        return frame
+    left, top, right, bottom = crop
+    fw, fh = frame.size
+    sx, sy = fw / orig_w, fh / orig_h
+    box = (
+        max(0, min(fw - 1, round(left * sx))),
+        max(0, min(fh - 1, round(top * sy))),
+        max(1, min(fw, round(right * sx))),
+        max(1, min(fh, round(bottom * sy))),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return frame
+    return frame.crop(box)
+
+
+@lru_cache(maxsize=DETAIL_CACHE_SIZE)
+def _verification_frames_cached(path: str, size: int, mtime_ns: int, ctime_ns: int):
+    """Unified stat-keyed 768px decode cache: ``(rgb_frames, rgba_frames, orig_w, orig_h)``.
+
+    One decode per file serves tile pHashes, 128px dense/color checks, and
+    768px fine-detail verification, and invalidates immediately on any file
+    replacement (including preserved-size/mtime edits via ``ctime_ns``).
     """
     _ensure_image_deps()
-    _register_heif()
+    ensure_heif_registered()
     from PIL import Image
 
     try:
         with Image.open(path) as img:
-            img, _width, _height, _animated = _upright_hash_source(img)
+            img, width, height, _animated = _upright_hash_source(img, max_side=DETAIL_MAX_SIDE)
+            has_alpha = _has_alpha_channel(img)
             try:
-                rgb = tuple(_hash_frames(img))
+                rgb = tuple(_hash_frames(img, max_side=DETAIL_MAX_SIDE))
             except Exception:
                 rgb = None
             try:
-                rgba = tuple(_hash_frames(img, preserve_alpha=True))
+                if not has_alpha and rgb is not None:
+                    rgba = tuple(frame.convert("RGBA") for frame in rgb)
+                else:
+                    rgba = tuple(_hash_frames(img, preserve_alpha=True, max_side=DETAIL_MAX_SIDE))
             except Exception:
                 rgba = None
-            return rgb, rgba
+            return rgb, rgba, width, height
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 @lru_cache(maxsize=TILE_CACHE_SIZE)
-def _tile_phashes_for_path(
-    path: str, comparison_side: int = TILE_NORMALIZE, orientation: str | None = None
+def _tile_phashes_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    comparison_side: int = TILE_NORMALIZE,
+    orientation: str | None = None,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> tuple[str, ...] | None:
-    """Run-cached tile hashes for records that carry no stored tile hashes.
-
-    ``orientation`` turns every frame first, for verifying a rotated or
-    mirrored pair; those hashes are never stored on the record.
-    """
-    frames, _rgba = _hash_samples_for_path(path)
+    frames, _rgba, orig_w, orig_h = _verification_frames_cached(path, size, mtime_ns, ctime_ns)
     if frames is None:
         return None
     try:
         tiles = [
-            tile for frame in frames
-            for tile in _tile_phashes_from_image(_orient(frame, orientation), comparison_side)
+            tile
+            for frame in frames
+            for tile in _tile_phashes_from_image(
+                _orient(_crop_frame(frame, crop, orig_w, orig_h), orientation),
+                comparison_side,
+            )
         ]
         return tuple(str(t) for t in tiles)
     except Exception:
         return None
+
+
+def _tile_phashes_for_path(
+    path: str,
+    comparison_side: int = TILE_NORMALIZE,
+    orientation: str | None = None,
+    *,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[str, ...] | None:
+    """Stat-keyed tile hashes for records without stored tiles or with orientations/crops."""
+    key = _stat_key(path)
+    if key is None:
+        return None
+    return _tile_phashes_cached(*key, comparison_side, orientation, crop)
 
 
 def tile_distances(path_a: str, path_b: str) -> list[int] | None:
@@ -429,6 +616,35 @@ def tile_distances(path_a: str, path_b: str) -> list[int] | None:
     ]
 
 
+def _tiles_agree(
+    tiles_a: tuple[str, ...],
+    tiles_b: tuple[str, ...],
+    tile_max: int,
+    tile_mean: float,
+) -> bool:
+    dists = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(tiles_a, tiles_b, strict=True)]
+    if max(dists) <= tile_max and (sum(dists) / len(dists)) <= tile_mean:
+        return True
+    # Symmetric +-1-frame temporal tolerance for animations (e.g. FPS-decimated GIFs).
+    n_frames = len(tiles_a) // 5
+    if n_frames <= 1 or len(tiles_a) % 5:
+        return False
+
+    def frame_ok(fa: tuple[str, ...], fb: tuple[str, ...]) -> bool:
+        fd = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(fa, fb, strict=True)]
+        return max(fd) <= tile_max and (sum(fd) / 5.0) <= tile_mean
+
+    frames_a = [tiles_a[i * 5 : (i + 1) * 5] for i in range(n_frames)]
+    frames_b = [tiles_b[i * 5 : (i + 1) * 5] for i in range(n_frames)]
+    for k in range(n_frames):
+        lo, hi = max(0, k - 1), min(n_frames, k + 2)
+        if not any(frame_ok(frames_a[k], frames_b[j]) for j in range(lo, hi)):
+            return False
+        if not any(frame_ok(frames_b[k], frames_a[j]) for j in range(lo, hi)):
+            return False
+    return True
+
+
 def is_near_identical(
     path_a: str,
     path_b: str,
@@ -440,16 +656,20 @@ def is_near_identical(
     dimensions_a: tuple[int | None, int | None] | None = None,
     dimensions_b: tuple[int | None, int | None] | None = None,
     orientation_a: str | None = None,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
 ) -> bool:
     """
     True if regional structure matches (same image / scale / quality variants).
     False for same-person different-pose shots that can still pass global pHash.
 
     ``orientation_a`` compares path_a turned that way; stored ``tiles_a`` are
-    for the file as decoded, so they are ignored for a turned comparison.
+    for the file as decoded, so they are ignored for a turned or cropped comparison.
     """
-    if orientation_a is not None:
-        tiles_a = _tile_phashes_for_path(path_a, TILE_NORMALIZE, orientation_a)
+    if orientation_a is not None or crop_a is not None:
+        tiles_a = _tile_phashes_for_path(path_a, TILE_NORMALIZE, orientation_a, crop=crop_a)
+    if crop_b is not None:
+        tiles_b = _tile_phashes_for_path(path_b, TILE_NORMALIZE, None, crop=crop_b)
     if tiles_a is None:
         tiles_a = _tile_phashes_for_path(path_a)
     if tiles_b is None:
@@ -462,6 +682,10 @@ def is_near_identical(
         dimensions_b = dimensions_b or probe_image_dimensions(path_b)
     except (OSError, ValueError):
         return False
+    if crop_a is not None:
+        dimensions_a = (crop_a[2] - crop_a[0], crop_a[3] - crop_a[1])
+    if crop_b is not None:
+        dimensions_b = (crop_b[2] - crop_b[0], crop_b[3] - crop_b[1])
     if all(dimensions_a) and all(dimensions_b):
         side_a = min(TILE_NORMALIZE, max(dimensions_a))
         side_b = min(TILE_NORMALIZE, max(dimensions_b))
@@ -471,50 +695,56 @@ def is_near_identical(
             # Keep pair-specific hashes out of the persistent per-file cache.
             side = min(side_a, side_b)
             if side_a > side:
-                tiles_a = _tile_phashes_for_path(path_a, side, orientation_a)
+                tiles_a = _tile_phashes_for_path(path_a, side, orientation_a, crop=crop_a)
             if side_b > side:
-                tiles_b = _tile_phashes_for_path(path_b, side)
+                tiles_b = _tile_phashes_for_path(path_b, side, crop=crop_b)
             if not tiles_a or not tiles_b or len(tiles_a) != len(tiles_b):
                 return False
-    dists = [(int(a, 16) ^ int(b, 16)).bit_count() for a, b in zip(tiles_a, tiles_b, strict=True)]
-    if max(dists) > tile_max:
-        return False
-    return not sum(dists) / len(dists) > tile_mean
+    return _tiles_agree(tiles_a, tiles_b, tile_max, tile_mean)
 
 
 @lru_cache(maxsize=DENSE_CACHE_SIZE)
-def _dense_thumbs_for_path(path: str, orientation: str | None = None):
-    """Run-cached RGBA thumbnails for color and dense detail verification.
-
-    The same playback samples as the tile path are checked, so later color
-    or local changes cannot hide behind an identical first frame. Resizing
-    (not letterboxing) keeps tiny images comparable without padding mismatches.
-    Turned thumbnails reuse the upright decode.
-    """
-    if orientation is not None:
-        upright = _dense_thumbs_for_path(path)
-        return None if upright is None else tuple(_orient(frame, orientation) for frame in upright)
+def _dense_thumbs_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    orientation: str | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+):
     from PIL import Image
 
-    _rgb, frames = _hash_samples_for_path(path)
+    if orientation is not None:
+        upright = _dense_thumbs_cached(path, size, mtime_ns, ctime_ns, None, crop)
+        return None if upright is None else tuple(_orient(frame, orientation) for frame in upright)
+    _rgb, frames, orig_w, orig_h = _verification_frames_cached(path, size, mtime_ns, ctime_ns)
     if frames is None:
         return None
     try:
         return tuple(
-            frame.resize((DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR)
+            _crop_frame(frame, crop, orig_w, orig_h).resize(
+                (DENSE_THUMB_SIZE, DENSE_THUMB_SIZE), Image.Resampling.BILINEAR
+            )
             for frame in frames
         )
     except Exception:
         return None
 
 
-def _dense_frame_difference(ta, tb) -> tuple[float, float]:
-    """Mean and worst-block grayscale difference for one aligned frame pair."""
-    import numpy as np
+def _dense_thumbs_for_path(
+    path: str,
+    orientation: str | None = None,
+    *,
+    crop: tuple[int, int, int, int] | None = None,
+):
+    """Stat-keyed RGBA thumbnails for color and dense detail verification."""
+    key = _stat_key(path)
+    if key is None:
+        return None
+    return _dense_thumbs_cached(*key, orientation, crop)
 
-    diff = np.abs(
-        np.asarray(ta.convert("L"), dtype=np.int16) - np.asarray(tb.convert("L"), dtype=np.int16)
-    )
+
+def _block_means(diff) -> tuple[float, float]:
     height, width = diff.shape
     rows = [j * height // DENSE_GRID for j in range(DENSE_GRID + 1)]
     cols = [i * width // DENSE_GRID for i in range(DENSE_GRID + 1)]
@@ -529,58 +759,92 @@ def _dense_frame_difference(ta, tb) -> tuple[float, float]:
     return sum(means) / len(means), max(means)
 
 
-@lru_cache(maxsize=DETAIL_CACHE_SIZE)
-def _detail_frames_cached(path: str, size: int, mtime_ns: int, ctime_ns: int):
-    """Identity-keyed grayscale evidence, never persisted as a match verdict."""
-    from PIL import Image, ImageOps
+def _dense_frame_difference(ta, tb) -> tuple[float, float]:
+    """Mean and worst-block grayscale difference for one aligned frame pair."""
+    import numpy as np
 
-    _register_heif()
-    try:
-        with Image.open(path) as img:
-            img.draft("RGB", (DETAIL_MAX_SIDE, DETAIL_MAX_SIDE))
-            if not is_animated_image(img):
-                img = ImageOps.exif_transpose(img)
-            return tuple(frame.convert("L") for frame in _hash_frames(img, max_side=DETAIL_MAX_SIDE))
-    except (OSError, ValueError):
+    diff = np.abs(
+        np.asarray(ta.convert("L"), dtype=np.int16) - np.asarray(tb.convert("L"), dtype=np.int16)
+    )
+    return _block_means(diff)
+
+
+def _dense_chroma_difference(ta, tb) -> tuple[float, float]:
+    """Mean and worst-block Cb/Cr chroma difference for one aligned frame pair."""
+    import numpy as np
+
+    ya = np.asarray(ta.convert("YCbCr"), dtype=np.int16)[:, :, 1:]
+    yb = np.asarray(tb.convert("YCbCr"), dtype=np.int16)[:, :, 1:]
+    diff = np.abs(ya - yb).max(axis=2)
+    return _block_means(diff)
+
+
+def _detail_frames_for_path(path: str, crop: tuple[int, int, int, int] | None = None):
+    key = _stat_key(path)
+    if key is None:
         return None
+    rgb, _rgba, orig_w, orig_h = _verification_frames_cached(*key)
+    if rgb is None:
+        return None
+    return tuple(_crop_frame(frame, crop, orig_w, orig_h).convert("L") for frame in rgb)
 
 
-def _fine_detail_matches(path_a: str, path_b: str, orientation_a: str | None) -> bool:
+def _fine_detail_matches(
+    path_a: str,
+    path_b: str,
+    orientation_a: str | None,
+    *,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
+) -> bool:
     from PIL import Image
 
     from .image_detail import aligned_detail_matches
 
-    def frames(path):
-        stat = Path(path).stat()
-        return _detail_frames_cached(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-
-    try:
-        left, right = frames(path_a), frames(path_b)
-    except OSError:
-        return False
+    left = _detail_frames_for_path(path_a, crop=crop_a)
+    right = _detail_frames_for_path(path_b, crop=crop_b)
     if not left or not right or len(left) != len(right):
         return False
-    for a, b in zip(left, right, strict=True):
-        a = _orient(a, orientation_a)
+
+    def pair_matches(a_frame, b_frame) -> bool:
+        a_turned = _orient(a_frame, orientation_a)
         # Never invent detail by enlarging a small download. Both images get
         # the same sampling grid at the lower available resolution.
-        size = min(a.width, b.width), min(a.height, b.height)
-        a = a.resize(size, Image.Resampling.LANCZOS)
-        b = b.resize(size, Image.Resampling.LANCZOS)
-        if not aligned_detail_matches(a, b):
+        size = min(a_turned.width, b_frame.width), min(a_turned.height, b_frame.height)
+        return aligned_detail_matches(
+            a_turned.resize(size, Image.Resampling.LANCZOS),
+            b_frame.resize(size, Image.Resampling.LANCZOS),
+        )
+
+    if all(pair_matches(a, b) for a, b in zip(left, right, strict=True)):
+        return True
+    n_frames = len(left)
+    if n_frames <= 1:
+        return False
+    # Symmetric +-1-frame temporal tolerance for animations (e.g. FPS-decimated GIFs).
+    for k in range(n_frames):
+        lo, hi = max(0, k - 1), min(n_frames, k + 2)
+        if not any(pair_matches(left[k], right[j]) for j in range(lo, hi)):
+            return False
+        if not any(pair_matches(left[j], right[k]) for j in range(lo, hi)):
             return False
     return True
 
 
 def dense_difference(
-    path_a: str, path_b: str, *, orientation_a: str | None = None
+    path_a: str,
+    path_b: str,
+    *,
+    orientation_a: str | None = None,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
 ) -> tuple[float, float] | None:
     """Mean and worst-block mean abs difference of aligned grayscale samples.
 
     None if thumbnails fail to load or the still/animation sample counts differ.
     """
-    frames_a = _dense_thumbs_for_path(path_a, orientation_a)
-    frames_b = _dense_thumbs_for_path(path_b)
+    frames_a = _dense_thumbs_for_path(path_a, orientation_a, crop=crop_a)
+    frames_b = _dense_thumbs_for_path(path_b, crop=crop_b)
     if not frames_a or not frames_b or len(frames_a) != len(frames_b):
         return None
     differences = [
@@ -592,6 +856,41 @@ def dense_difference(
     )
 
 
+def _dense_frame_pair_ok(
+    ta,
+    tb,
+    local_max: float,
+    concentration: float,
+    *,
+    chroma_only_flag: list[bool] | None = None,
+) -> bool:
+    import numpy as np
+
+    color_diff = np.abs(
+        np.asarray(ta, dtype=np.int16) - np.asarray(tb, dtype=np.int16)
+    )
+    if float(color_diff.reshape(-1, 4).mean(axis=0).max()) > DEFAULT_DENSE_COLOR_MEAN_MAX:
+        return False
+    mean, worst = _dense_frame_difference(ta, tb)
+    if worst > local_max and mean > 0 and worst / mean > concentration:
+        return False
+    # Alpha-only edits can reveal/hide a local subject without changing RGB.
+    if np.any(color_diff[:, :, 3]):
+        mean, worst = _dense_frame_difference(ta.getchannel("A"), tb.getchannel("A"))
+        if worst > local_max and mean > 0 and worst / mean > concentration:
+            return False
+    # Isoluminant local patches keep grayscale identical while shifting Cb/Cr.
+    c_mean, c_worst = _dense_chroma_difference(ta, tb)
+    chroma_limit = max(local_max * 2.0, 6.0)
+    if c_worst > DEFAULT_DENSE_COLOR_MEAN_MAX * 2.0 or (
+        c_worst > chroma_limit and c_mean > 0 and c_worst / c_mean > concentration
+    ):
+        if chroma_only_flag is not None:
+            chroma_only_flag[0] = True
+        return False
+    return True
+
+
 def is_dense_match(
     path_a: str,
     path_b: str,
@@ -599,6 +898,8 @@ def is_dense_match(
     local_max: float = DEFAULT_DENSE_LOCAL_MAX,
     concentration: float = DEFAULT_DENSE_CONCENTRATION,
     orientation_a: str | None = None,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
 ) -> bool:
     """Require similar colors/transparency and no concentrated local change.
 
@@ -607,30 +908,55 @@ def is_dense_match(
     large, spread-out differences invisible to grayscale hashes. Missing
     thumbnails cannot verify a match, even when cached tile hashes agree.
     """
-    import numpy as np
-
-    frames_a = _dense_thumbs_for_path(path_a, orientation_a)
-    frames_b = _dense_thumbs_for_path(path_b)
+    _LAST_DENSE_FAILURE.aligned_local_reject = False
+    frames_a = _dense_thumbs_for_path(path_a, orientation_a, crop=crop_a)
+    frames_b = _dense_thumbs_for_path(path_b, crop=crop_b)
     if not frames_a or not frames_b or len(frames_a) != len(frames_b):
         return False
-    for ta, tb in zip(frames_a, frames_b, strict=True):
-        color_diff = np.abs(
-            np.asarray(ta, dtype=np.int16) - np.asarray(tb, dtype=np.int16)
-        )
-        if float(color_diff.reshape(-1, 4).mean(axis=0).max()) > DEFAULT_DENSE_COLOR_MEAN_MAX:
-            return False
-        mean, worst = _dense_frame_difference(ta, tb)
-        if worst > local_max and mean > 0 and worst / mean > concentration:
-            return False
-        # Alpha-only edits can reveal/hide a local subject without changing RGB.
-        if np.any(color_diff[:, :, 3]):
-            mean, worst = _dense_frame_difference(ta.getchannel("A"), tb.getchannel("A"))
-            if worst > local_max and mean > 0 and worst / mean > concentration:
-                return False
-    return _fine_detail_matches(path_a, path_b, orientation_a)
+
+    def all_frames_ok() -> bool:
+        chroma_flag = [False]
+        if all(
+            _dense_frame_pair_ok(
+                ta, tb, local_max, concentration, chroma_only_flag=chroma_flag
+            )
+            for ta, tb in zip(frames_a, frames_b, strict=True)
+        ):
+            return True
+        n_frames = len(frames_a)
+        if n_frames > 1:
+            for k in range(n_frames):
+                lo, hi = max(0, k - 1), min(n_frames, k + 2)
+                if not any(
+                    _dense_frame_pair_ok(frames_a[k], frames_b[j], local_max, concentration)
+                    for j in range(lo, hi)
+                ):
+                    return False
+                if not any(
+                    _dense_frame_pair_ok(frames_a[j], frames_b[k], local_max, concentration)
+                    for j in range(lo, hi)
+                ):
+                    return False
+            return True
+        if chroma_flag[0]:
+            _LAST_DENSE_FAILURE.aligned_local_reject = True
+        return False
+
+    if not all_frames_ok():
+        return False
+    if _fine_detail_matches(path_a, path_b, orientation_a, crop_a=crop_a, crop_b=crop_b):
+        return True
+    _LAST_DENSE_FAILURE.aligned_local_reject = True
+    return False
 
 
-def _color_balance_agrees(path_a: str, path_b: str) -> bool:
+def _color_balance_agrees(
+    path_a: str,
+    path_b: str,
+    *,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
+) -> bool:
     """Whole-image color balance, independent of crop and alignment.
 
     Feature alignment compares grayscale, so it cannot see a recolored
@@ -641,8 +967,8 @@ def _color_balance_agrees(path_a: str, path_b: str) -> bool:
     import numpy as np
 
     balances = []
-    for path in (path_a, path_b):
-        frames = _dense_thumbs_for_path(path)
+    for path, crop in ((path_a, crop_a), (path_b, crop_b)):
+        frames = _dense_thumbs_for_path(path, crop=crop)
         if not frames:
             return False
         means = np.asarray(frames[0], dtype=np.float32)[:, :, :3].reshape(-1, 3).mean(axis=0)
@@ -678,30 +1004,53 @@ def _record_tile_phashes(record: FileRecord) -> tuple[str, ...] | None:
 
 
 def _compatible_aspect_ratios(
-    a: FileRecord, b: FileRecord, orientation_a: str | None = None
+    a: FileRecord,
+    b: FileRecord,
+    orientation_a: str | None = None,
+    *,
+    crop_a: tuple[int, int, int, int] | None = None,
+    crop_b: tuple[int, int, int, int] | None = None,
 ) -> bool:
-    if not (a.width and a.height and b.width and b.height):
+    a_width = (crop_a[2] - crop_a[0]) if crop_a is not None else a.width
+    a_height = (crop_a[3] - crop_a[1]) if crop_a is not None else a.height
+    b_width = (crop_b[2] - crop_b[0]) if crop_b is not None else b.width
+    b_height = (crop_b[3] - crop_b[1]) if crop_b is not None else b.height
+    if not (a_width and a_height and b_width and b_height):
         return True
-    a_width, a_height = a.width, a.height
     if orientation_a in QUARTER_TURN_ORIENTATIONS:
         a_width, a_height = a_height, a_width
-    left = a_width * b.height
-    right = b.width * a_height
+    left = a_width * b_height
+    right = b_width * a_height
     return min(left, right) / max(left, right) >= MIN_ASPECT_RATIO_SIMILARITY
 
 
-class HammingIndex:
-    """All stored 64-bit hashes within a radius of a query, by pigeonhole.
+@lru_cache(maxsize=1)
+def _mih_probe_masks():
+    import numpy as np
 
-    Split into radius + 1 bit chunks, two hashes within the radius agree
-    exactly on at least one chunk, so candidates come from radius + 1 dict
-    lookups and one vectorized popcount. A BK-tree over near-uniform 64-bit
-    pHashes visits a large share of its nodes at radius 6 (about 2.6 ms per
-    query at 50,000 images); this stays well under a tenth of that. Radii too
-    wide for useful chunks scan every hash, still vectorized.
+    m0 = np.array([0], dtype=np.uint16)
+    m1 = np.array([0] + [1 << b for b in range(16)], dtype=np.uint16)
+    m2 = np.array(
+        [0]
+        + [1 << b for b in range(16)]
+        + [(1 << i) | (1 << j) for i in range(16) for j in range(i + 1, 16)],
+        dtype=np.uint16,
+    )
+    return m0, m1, m2
+
+
+class HammingIndex:
+    """All stored 64-bit hashes within a radius via 4x16-bit Multi-Index Hashing.
+
+    Each 64-bit hash is indexed into four 16-bit CSR sub-tables. Using Norouzi's
+    exact pigeonhole split with 0-, 1-, and 2-bit probes per sub-table keeps all
+    radii up to 11 indexed (with O(1) slice lookups) instead of falling back to
+    an O(N) full scan at r >= 8. Wider radii fall back to vectorized popcount.
     """
 
-    MIN_CHUNK_BITS = 8
+    MIH_CHUNKS = 4
+    MIH_BITS = 16
+    MAX_INDEXED_RADIUS = 11
 
     def __init__(self, hashes, radius: int) -> None:
         import numpy as np
@@ -710,26 +1059,18 @@ class HammingIndex:
         self.keys = list(hashes)
         self.radius = radius
         self.values = np.array(self.keys, dtype=np.uint64)
-        pieces = radius + 1
-        self.buckets: list[tuple[int, int, dict[int, object]]] = []
-        # Per bucket: distinct chunk values, and where each one's stored
-        # hashes start, how many there are, and their indexes in chunk order.
-        self._sorted: list[tuple] = []
-        if pieces * self.MIN_CHUNK_BITS > 64 or not self.keys:
+        self._tables: list[tuple] = []
+        if not self.keys:
             return
-        edges = [round(i * 64 / pieces) for i in range(pieces + 1)]
-        for lo, hi in pairwise(edges):
-            mask = (1 << (hi - lo)) - 1
-            chunks = (self.values >> np.uint64(lo)) & np.uint64(mask)
-            order = np.argsort(chunks, kind="stable")
-            ordered = chunks[order]
-            starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])
-            groups = np.split(order, starts[1:])
-            table = {int(ordered[start]): group for start, group in zip(starts, groups, strict=True)}
-            self.buckets.append((lo, mask, table))
-            self._sorted.append(
-                (ordered[starts], starts, np.diff(np.r_[starts, len(order)]), order)
-            )
+        for chunk_idx in range(self.MIH_CHUNKS):
+            shift = np.uint64(chunk_idx * self.MIH_BITS)
+            chunks = ((self.values >> shift) & np.uint64(0xFFFF)).astype(np.uint16)
+            counts = np.bincount(chunks, minlength=65536)
+            offsets = np.empty(65537, dtype=np.int32)
+            offsets[0] = 0
+            np.cumsum(counts, out=offsets[1:])
+            order = np.argsort(chunks, kind="stable").astype(np.int32)
+            self._tables.append((offsets, order))
 
     def _popcount(self, values):
         np = self._np
@@ -738,18 +1079,34 @@ class HammingIndex:
         as_bytes = values.view(np.uint8).reshape(-1, 8)
         return np.unpackbits(as_bytes, axis=1).sum(axis=1)
 
+    @staticmethod
+    def _probe_plan(radius: int) -> list[tuple[int, int]]:
+        q, rem = divmod(radius, 4)
+        plan = []
+        for chunk_idx in range(4):
+            max_err = q if chunk_idx <= rem else q - 1
+            if max_err >= 0:
+                plan.append((chunk_idx, max_err))
+        return plan
+
     def find(self, query: int, radius: int | None = None) -> list[tuple[int, int]]:
         """(distance, hash) for every stored hash within radius of query."""
         np = self._np
         radius = self.radius if radius is None else radius
-        if not self.keys:
+        if not self.keys or radius < 0:
             return []
-        if self.buckets and radius <= self.radius:
-            hits = [
-                table[chunk]
-                for lo, mask, table in self.buckets
-                if (chunk := (query >> lo) & mask) in table
-            ]
+        if self._tables and radius <= self.MAX_INDEXED_RADIUS:
+            masks = _mih_probe_masks()
+            hits = []
+            for chunk_idx, max_err in self._probe_plan(radius):
+                offsets, order = self._tables[chunk_idx]
+                chunk = (query >> (chunk_idx * self.MIH_BITS)) & 0xFFFF
+                probes = (np.uint16(chunk) ^ masks[max_err]).astype(np.int32)
+                starts = offsets[probes]
+                ends = offsets[probes + 1]
+                for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
+                    if end > start:
+                        hits.append(order[start:end])
             if not hits:
                 return []
             indexes = np.unique(np.concatenate(hits))
@@ -764,61 +1121,69 @@ class HammingIndex:
     BATCH_PAIRS = 1 << 21
 
     def find_many(self, queries, radius: int | None = None) -> list[tuple[int, int, object]]:
-        """(query position, distance, hash) for every match of every query.
-
-        The same matches as calling find on each query, found a batch of
-        queries at a time: per-query overhead dominates find once a scan
-        makes eight lookups per image.
-        """
+        """(query position, distance, hash) for every match of every query."""
         np = self._np
         radius = self.radius if radius is None else radius
         queries = np.asarray(queries, dtype=np.uint64)
-        if not self.keys or not len(queries):
+        if not self.keys or not len(queries) or radius < 0:
             return []
-        indexed = bool(self._sorted) and radius <= self.radius
-        # Expected candidates per query: a stored hash meets its own chunk
-        # group in every bucket, so weight each group's size by itself.
-        per_query = (
-            sum(
-                float((counts * counts).sum()) / len(self.keys)
-                for _values, _starts, counts, _order in self._sorted
-            )
-            if indexed
-            else len(self.keys)
-        )
+        indexed = bool(self._tables) and radius <= self.MAX_INDEXED_RADIUS
+        if indexed:
+            masks = _mih_probe_masks()
+            plan = self._probe_plan(radius)
+            total_probes = sum(len(masks[err]) for _chunk, err in plan)
+            per_query = max(1.0, total_probes * max(1.0, len(self.keys) / 65536.0))
+        else:
+            masks = None
+            plan = []
+            per_query = float(len(self.keys))
         step = max(1, int(self.BATCH_PAIRS // max(1.0, per_query)))
         found: list[tuple[int, int, object]] = []
+        n_keys = len(self.keys)
+        keys = self.keys
         for begin in range(0, len(queries), step):
             batch = queries[begin : begin + step]
             if indexed:
                 matches = []
-                for (lo, mask, _table), (values, starts, counts, order) in zip(
-                    self.buckets, self._sorted, strict=True
-                ):
-                    chunks = (batch >> np.uint64(lo)) & np.uint64(mask)
-                    slots = np.minimum(np.searchsorted(values, chunks), len(values) - 1)
-                    hit = np.flatnonzero(values[slots] == chunks)
-                    sizes = counts[slots[hit]]
-                    ends = np.cumsum(sizes)
-                    within = np.arange(int(ends[-1]) if len(ends) else 0) - np.repeat(
-                        ends - sizes, sizes
+                assert masks is not None
+                for chunk_idx, max_err in plan:
+                    offsets, order = self._tables[chunk_idx]
+                    probe_masks = masks[max_err]
+                    chunks = ((batch >> np.uint64(chunk_idx * self.MIH_BITS)) & np.uint64(0xFFFF)).astype(
+                        np.uint16
                     )
-                    row = np.repeat(hit, sizes)
-                    column = order[np.repeat(starts[slots[hit]], sizes) + within]
+                    probed = (
+                        chunks[:, None] ^ probe_masks[None, :]
+                    ).astype(np.int32)
+                    starts = offsets[probed]
+                    sizes = offsets[probed + 1] - starts
+                    hit_row, hit_probe = np.nonzero(sizes)
+                    if not len(hit_row):
+                        continue
+                    hit_starts = starts[hit_row, hit_probe]
+                    hit_sizes = sizes[hit_row, hit_probe]
+                    ends = np.cumsum(hit_sizes)
+                    within = np.arange(int(ends[-1]), dtype=np.int32) - np.repeat(
+                        ends - hit_sizes, hit_sizes
+                    )
+                    row = np.repeat(hit_row, hit_sizes)
+                    column = order[np.repeat(hit_starts, hit_sizes) + within]
                     near = self._popcount(self.values[column] ^ batch[row]) <= radius
-                    matches.append(row[near] * np.int64(len(self.keys)) + column[near])
-                # Most chunk collisions fail the full-distance check. Sort and
-                # deduplicate just the matches, which can agree on several chunks.
+                    if np.any(near):
+                        matches.append(
+                            row[near].astype(np.int64) * np.int64(n_keys) + column[near]
+                        )
+                if not matches:
+                    continue
                 pairs = np.unique(np.concatenate(matches))
-                row, column = np.divmod(pairs, len(self.keys))
+                row, column = np.divmod(pairs, n_keys)
                 distances = self._popcount(self.values[column] ^ batch[row])
             else:
-                row = np.repeat(np.arange(len(batch)), len(self.keys))
-                column = np.tile(np.arange(len(self.keys)), len(batch))
+                row = np.repeat(np.arange(len(batch)), n_keys)
+                column = np.tile(np.arange(n_keys), len(batch))
                 distances = self._popcount(self.values[column] ^ batch[row])
                 near = distances <= radius
                 row, distances, column = row[near], distances[near], column[near]
-            keys = self.keys
             found.extend(
                 (begin + r, d, keys[c])
                 for r, d, c in zip(
@@ -826,6 +1191,44 @@ class HammingIndex:
                 )
             )
         return found
+
+
+_INVERSE_ORIENTATION = {
+    "ROTATE_90": "ROTATE_270",
+    "ROTATE_270": "ROTATE_90",
+    "ROTATE_180": "ROTATE_180",
+    "FLIP_LEFT_RIGHT": "FLIP_LEFT_RIGHT",
+    "FLIP_TOP_BOTTOM": "FLIP_TOP_BOTTOM",
+    "TRANSPOSE": "TRANSPOSE",
+    "TRANSVERSE": "TRANSVERSE",
+}
+
+
+def _cropped_roi_hashes(
+    path: str, crop: tuple[int, int, int, int]
+) -> tuple[int, tuple[str, ...]] | None:
+    """Compute cropped-ROI pHash and 7 turned pHashes from the unified 768px cache."""
+    import imagehash
+
+    key = _stat_key(path)
+    if key is None:
+        return None
+    rgb, _rgba, orig_w, orig_h = _verification_frames_cached(*key)
+    if not rgb:
+        return None
+    roi = _crop_frame(rgb[0], crop, orig_w, orig_h)
+    return int(str(imagehash.phash(roi)), 16), _orientation_phashes(roi)
+
+
+def _group_runs_by_first(items: list, key_fn: Callable) -> list[list]:
+    runs: list[list] = []
+    for item in items:
+        key = key_fn(item)
+        if runs and key_fn(runs[-1][0]) == key:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
 
 
 def find_similar_image_groups(
@@ -846,11 +1249,12 @@ def find_similar_image_groups(
     """
     Cluster near-identical images/GIFs.
 
-    1. Global pHash via a multi-index Hamming lookup (fast candidates), also
-       with each still's rotated and mirrored pHashes
+    1. Global pHash via a 4x16-bit multi-index Hamming lookup (fast candidates),
+       also with still rotated/mirrored pHashes, animation midpoint pHashes,
+       and border-cropped ROI secondary pHashes when ``border_crop`` is set
     2. Secondary dHash + aspect-ratio filter
     3. Regional tile pHash (reject pose / composition changes)
-    4. Dense and fine detail checks (reject small local subject changes)
+    4. Dense, chroma, and fine detail checks (reject small local subject changes)
     """
     skip_paths = skip_paths or set()
     distinct = distinct or DistinctReviews.empty()
@@ -874,8 +1278,10 @@ def find_similar_image_groups(
             record.phash = record.dhash = record.tile_phashes = None
             record.orientation_phashes = None
             need.append(record)
-        elif record.media_type == MediaType.IMAGE and not decode_orientation_phashes(
-            record.orientation_phashes
+        elif (
+            record.media_type == MediaType.IMAGE
+            and not is_animation_orientation_sentinel(record.orientation_phashes)
+            and not decode_orientation_phashes(record.orientation_phashes)
         ):
             # Only the turns are missing. Keep upright hashes if backfill fails.
             backfilling.add(record.path)
@@ -915,7 +1321,9 @@ def find_similar_image_groups(
             rec.dhash = dh
             if tiles:
                 rec.tile_phashes = encode_tile_phashes(tiles)
-            if orientations:
+            if isinstance(orientations, str):
+                rec.orientation_phashes = orientations
+            elif orientations:
                 rec.orientation_phashes = encode_orientation_phashes(orientations)
             if w:
                 rec.width = w
@@ -929,43 +1337,63 @@ def find_similar_image_groups(
     if len(hashed) < 2:
         return []
 
-    # Parse each hash once and keep records sharing a hash in a side mapping,
-    # so the index stores each distinct integer hash once.
-    by_phash: dict[int, list[FileRecord]] = {}
-    for record in hashed:
-        by_phash.setdefault(int(record.phash or "0", 16), []).append(record)
-    tree = HammingIndex(by_phash, threshold)
     dhashes = {
         record.path: int(record.dhash, 16)
         for record in hashed
         if record.dhash
     }
-    positions = {record.path: i for i, record in enumerate(hashed)}
+    crop_rects: dict[str, tuple[int, int, int, int]] = {}
+    crop_orientations: dict[int, tuple[str, ...]] = {}
+    # Each pHash maps to (record_idx, is_cropped, is_midpoint)
+    by_phash: dict[int, list[tuple[int, bool, bool]]] = {}
+    for idx, record in enumerate(hashed):
+        by_phash.setdefault(int(record.phash or "0", 16), []).append((idx, False, False))
+        mid_phash = decode_animation_midpoint_phash(record.orientation_phashes)
+        if mid_phash is not None:
+            by_phash.setdefault(mid_phash, []).append((idx, False, True))
+        if record.media_type == MediaType.IMAGE:
+            parsed_crop = _parse_border_crop(record.border_crop, (record.width, record.height))
+            if parsed_crop is not None:
+                crop_rect = parsed_crop[:4]
+                roi_hashes = _cropped_roi_hashes(record.path, crop_rect)
+                if roi_hashes is not None:
+                    crop_phash, crop_turns = roi_hashes
+                    crop_rects[record.path] = crop_rect
+                    crop_orientations[idx] = crop_turns
+                    by_phash.setdefault(crop_phash, []).append((idx, True, False))
 
+    tree = HammingIndex(by_phash, threshold)
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
-    near_misses: list[tuple[FileRecord, FileRecord]] = []
+    near_misses: list[tuple[FileRecord, FileRecord, tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]] = []
 
-    def verified(rec: FileRecord, other: FileRecord, orientation: str | None) -> bool:
-        """Regional + dense verification of rec (turned by orientation) against other."""
-        if not _compatible_aspect_ratios(rec, other, orientation):
-            return False
-        if orientation is None:
-            # Secondary dHash check to reduce false positives. dHash has no
-            # stored orientations; turned pairs rely on the regional checks.
+    def verified_mode(
+        rec: FileRecord,
+        other: FileRecord,
+        orientation: str | None,
+        crop_a: tuple[int, int, int, int] | None,
+        crop_b: tuple[int, int, int, int] | None,
+        *,
+        skip_dhash: bool = False,
+    ) -> str:
+        """Return ``matched``, ``detail_rejected``, or ``near_miss``."""
+        if not _compatible_aspect_ratios(rec, other, orientation, crop_a=crop_a, crop_b=crop_b):
+            return "near_miss"
+        use_stored_tiles = orientation is None and crop_a is None and crop_b is None
+        if use_stored_tiles:
             if (
-                rec.path in dhashes
+                not skip_dhash
+                and rec.path in dhashes
                 and other.path in dhashes
                 and (dhashes[rec.path] ^ dhashes[other.path]).bit_count() > dhash_threshold
             ):
-                return False
+                return "near_miss"
             tiles_a = _record_tile_phashes(rec)
             tiles_b = _record_tile_phashes(other)
             if not tiles_a or not tiles_b:
-                return False
+                return "near_miss"
         else:
             tiles_a = None
-            tiles_b = _record_tile_phashes(other)
-        # Regional structure: reject different pose / composition
+            tiles_b = _record_tile_phashes(other) if crop_b is None else None
         if not is_near_identical(
             rec.path,
             other.path,
@@ -976,98 +1404,168 @@ def find_similar_image_groups(
             dimensions_a=(rec.width, rec.height),
             dimensions_b=(other.width, other.height),
             orientation_a=orientation,
+            crop_a=crop_a,
+            crop_b=crop_b,
         ):
-            return False
-        # Dense detail: reject burst-like concentrated local changes.
-        return is_dense_match(
+            return "near_miss"
+        _LAST_DENSE_FAILURE.aligned_local_reject = False
+        if is_dense_match(
             rec.path,
             other.path,
             local_max=dense_local_max,
             concentration=dense_concentration,
             orientation_a=orientation,
-        )
+            crop_a=crop_a,
+            crop_b=crop_b,
+        ):
+            return "matched"
+        if (
+            orientation is None
+            and crop_a is None
+            and crop_b is None
+            and getattr(_LAST_DENSE_FAILURE, "aligned_local_reject", False)
+            and rec.path not in crop_rects
+            and other.path not in crop_rects
+        ):
+            return "detail_rejected"
+        return "near_miss"
 
     # Candidate lookup is index arithmetic; verification decodes both files.
-    # Collect every pair first, then verify the pairs on the worker pool: a
-    # pair's verdict depends only on its two files, so the order is free.
-    # Upright candidates first, then turns in pHash-distance order.
-    # Symmetric grayscale structure can hide different color layouts,
-    # so a failed best turn must not suppress another valid orientation.
-    # Every pair only needs verification once, from its earlier record.
-    upright: dict[tuple[int, int], None] = {}
-    queries = [int(record.phash or "0", 16) for record in hashed]
-    for i, _distance, matched_hash in tree.find_many(queries, threshold):
-        for other in by_phash[matched_hash]:
-            j = positions[other.path]
-            if j > i:
-                upright[(i, j)] = None
+    # Deduplicate (q_hash, matched_hash) pairs so symmetric edges are checked once.
+    upright: dict[tuple[int, int], bool] = {}  # (i, j) -> skip_dhash
+    cropped_upright: set[tuple[int, int]] = set()
+    distinct_hashes = list(by_phash)
+    for q_idx, _distance, matched_hash in tree.find_many(distinct_hashes, threshold):
+        q_hash = distinct_hashes[q_idx]
+        if matched_hash < q_hash:
+            continue
+        left_entries = by_phash[q_hash]
+        right_entries = by_phash[matched_hash]
+        same_hash = q_hash == matched_hash
+        for a_idx, a_crop, a_mid in left_entries:
+            for b_idx, b_crop, b_mid in right_entries:
+                if same_hash and b_idx <= a_idx:
+                    continue
+                if a_idx == b_idx:
+                    continue
+                pair = (a_idx, b_idx) if a_idx < b_idx else (b_idx, a_idx)
+                if a_crop or b_crop:
+                    cropped_upright.add(pair)
+                else:
+                    skip_dh = a_mid or b_mid
+                    upright[pair] = upright.get(pair, False) or skip_dh
     if cancelled and cancelled():
         raise InterruptedError("scan cancelled")
-    turns: dict[tuple[int, int], list[tuple[int, int]]] = {}
+
+    turns: dict[tuple[int, int], list[tuple[int, str, bool]]] = {}
     turned_queries: list[int] = []
-    turned_source: list[tuple[int, int]] = []
+    turned_source: list[tuple[int, int, bool]] = []
     for i, record in enumerate(hashed):
+        if record.media_type != MediaType.IMAGE:
+            continue
         turned = decode_orientation_phashes(record.orientation_phashes)
-        if turned and record.media_type == MediaType.IMAGE:
+        if turned:
             for turn, value in enumerate(turned):
                 turned_queries.append(int(value, 16))
-                turned_source.append((i, turn))
+                turned_source.append((i, turn, False))
+        if i in crop_orientations:
+            for turn, value in enumerate(crop_orientations[i]):
+                turned_queries.append(int(value, 16))
+                turned_source.append((i, turn, True))
     for query, distance, matched_hash in tree.find_many(turned_queries, threshold):
-        i, turn = turned_source[query]
-        for other in by_phash[matched_hash]:
-            j = positions[other.path]
-            if j > i and other.media_type == MediaType.IMAGE:
-                turns.setdefault((i, j), []).append((distance, turn))
+        i, turn, i_crop = turned_source[query]
+        orientation_name = ORIENTATIONS[turn]
+        for j, j_crop, _j_mid in by_phash[matched_hash]:
+            if j == i or hashed[j].media_type != MediaType.IMAGE:
+                continue
+            if i < j:
+                turns.setdefault((i, j), []).append((distance, orientation_name, i_crop or j_crop))
+            else:
+                inv = _INVERSE_ORIENTATION[orientation_name]
+                turns.setdefault((j, i), []).append((distance, inv, i_crop or j_crop))
     if cancelled and cancelled():
         raise InterruptedError("scan cancelled")
-    jobs: list[tuple[int, FileRecord, FileRecord, list[str | None]]] = []
-    for i, j in sorted(upright.keys() | turns.keys()):
+
+    jobs: list[tuple[int, FileRecord, FileRecord, list[tuple[str | None, bool, bool]]]] = []
+    all_pairs = sorted(upright.keys() | cropped_upright | turns.keys())
+    for i, j in all_pairs:
         rec, other = hashed[i], hashed[j]
         if distinct and distinct.is_distinct(rec, other):
             continue
-        names: list[str | None] = [None] if (i, j) in upright else []
-        names.extend(ORIENTATIONS[turn] for _distance, turn in sorted(turns.get((i, j), ())))
-        jobs.append((i, rec, other, names))
+        # List of (orientation_name, use_crop, skip_dhash)
+        modes: list[tuple[str | None, bool, bool]] = []
+        seen_modes: set[tuple[str | None, bool]] = set()
+        if (i, j) in upright:
+            modes.append((None, False, upright[(i, j)]))
+            seen_modes.add((None, False))
+        if (i, j) in cropped_upright:
+            modes.append((None, True, True))
+            seen_modes.add((None, True))
+        for _distance, orient_name, is_crop_mode in sorted(turns.get((i, j), ())):
+            mode_key = (orient_name, is_crop_mode)
+            if mode_key not in seen_modes:
+                seen_modes.add(mode_key)
+                modes.append((orient_name, is_crop_mode, True))
+        jobs.append((i, rec, other, modes))
 
     def verify_pair(job) -> tuple[bool, bool]:
-        """(matched, near miss): the first orientation that verifies wins."""
-        _i, rec, other, names = job
+        _i, rec, other, modes = job
+        crop_a = crop_rects.get(rec.path)
+        crop_b = crop_rects.get(other.path)
         near_miss = False
-        for orientation in names:
-            if verified(rec, other, orientation):
+        detail_rejected = False
+        for orientation, use_crop, skip_dh in modes:
+            ca = crop_a if use_crop else None
+            cb = crop_b if use_crop else None
+            outcome = verified_mode(rec, other, orientation, ca, cb, skip_dhash=skip_dh)
+            if outcome == "matched":
                 return True, False
-            if (
-                orientation is None
+            if outcome == "detail_rejected":
+                detail_rejected = True
+            elif (
+                (orientation is None or use_crop)
                 and rec.media_type == MediaType.IMAGE
                 and other.media_type == MediaType.IMAGE
             ):
                 near_miss = True
+        if detail_rejected and not near_miss and crop_a is None and crop_b is None:
+            return False, False
         return False, near_miss
 
-    def cluster_progress(done: int, job_total: int, *, second_pass: bool = False) -> None:
-        # Comparing takes two passes, the pair checks and then the edited-copy
-        # checks on their near misses, and each is half of the shared count.
-        # Either can be most of the time, so both report.
-        if progress and (done % 20 == 0 or done == job_total):
+    def verify_run(run: list) -> list[tuple[bool, bool]]:
+        out = []
+        for job in run:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            out.append(verify_pair(job))
+        return out
+
+    job_runs = _group_runs_by_first(jobs, lambda job: job[0])
+
+    def cluster_progress(done: int, run_total: int, *, second_pass: bool = False) -> None:
+        if progress and run_total and (done % 10 == 0 or done == run_total):
             half = len(hashed) // 2
-            position = half * done // job_total + (half if second_pass else 0)
+            position = half * done // run_total + (half if second_pass else 0)
             progress("image-cluster", min(position, len(hashed) - 1), len(hashed))
 
     try:
-        outcomes = map_parallel(
-            verify_pair,
-            jobs,
+        run_outcomes = map_parallel(
+            verify_run,
+            job_runs,
             workers=n_workers,
             backend="thread",
             progress=cluster_progress,
             cancelled=cancelled,
         )
-        for (_i, rec, other, _names), (matched, near_miss) in zip(jobs, outcomes, strict=True):
-            if matched:
-                adjacency[rec.path].add(other.path)
-                adjacency[other.path].add(rec.path)
-            elif near_miss:
-                near_misses.append((rec, other))
+        for run, outcomes in zip(job_runs, run_outcomes, strict=True):
+            for (_i, rec, other, _modes), (matched, near_miss) in zip(run, outcomes, strict=True):
+                if matched:
+                    adjacency[rec.path].add(other.path)
+                    adjacency[other.path].add(rec.path)
+                elif near_miss:
+                    near_misses.append(
+                        (rec, other, crop_rects.get(rec.path), crop_rects.get(other.path))
+                    )
 
         # A crop, border, or color edit misaligns the regional checks above
         # even when the global hash agrees. Feature alignment verifies those
@@ -1076,21 +1574,33 @@ def find_similar_image_groups(
         if pending:
             from .edited_copy import verify_edited_copy
 
-            # Alignment runs first: it rejects most near misses, and the
-            # color check would decode each of those files a second time.
-            verdicts = map_parallel(
-                lambda pair: verify_edited_copy(pair[0].path, pair[1].path)
-                and _color_balance_agrees(pair[0].path, pair[1].path),
-                pending,
+            def verify_edited_run(run: list) -> list[bool]:
+                out = []
+                for rec, other, ca, cb in run:
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
+                    out.append(
+                        verify_edited_copy(rec.path, other.path, crop_a=ca, crop_b=cb)
+                        and _color_balance_agrees(rec.path, other.path, crop_a=ca, crop_b=cb)
+                    )
+                return out
+
+            pending_runs = _group_runs_by_first(pending, lambda item: item[0].path)
+            run_verdicts = map_parallel(
+                verify_edited_run,
+                pending_runs,
                 workers=n_workers,
                 backend="thread",
-                progress=lambda done, total: cluster_progress(done, total, second_pass=True),
+                progress=lambda done, run_total: cluster_progress(
+                    done, run_total, second_pass=True
+                ),
                 cancelled=cancelled,
             )
-            for (rec, other), same in zip(pending, verdicts, strict=True):
-                if same:
-                    adjacency[rec.path].add(other.path)
-                    adjacency[other.path].add(rec.path)
+            for run, verdicts in zip(pending_runs, run_verdicts, strict=True):
+                for (rec, other, _ca, _cb), same in zip(run, verdicts, strict=True):
+                    if same:
+                        adjacency[rec.path].add(other.path)
+                        adjacency[other.path].add(rec.path)
 
         if progress:
             progress("image-cluster", len(hashed), len(hashed))
@@ -1102,11 +1612,10 @@ def find_similar_image_groups(
 
 
 def clear_image_comparison_cache() -> None:
-    """Release comparison pixels and path-only hashes at a scan boundary."""
-    _hash_samples_for_path.cache_clear()
-    _tile_phashes_for_path.cache_clear()
-    _dense_thumbs_for_path.cache_clear()
-    _detail_frames_cached.cache_clear()
+    """Release comparison pixels and stat-keyed verification caches at a scan boundary."""
+    _verification_frames_cached.cache_clear()
+    _tile_phashes_cached.cache_clear()
+    _dense_thumbs_cached.cache_clear()
     from .edited_copy import _color_frame, _features
 
     _features.cache_clear()
@@ -1164,8 +1673,110 @@ def _bruteforce_groups(
         if progress and (i + 1) % 20 == 0:
             progress("image-cluster", i + 1, len(hashed))
 
-    _hash_samples_for_path.cache_clear()
-    _tile_phashes_for_path.cache_clear()
-    _dense_thumbs_for_path.cache_clear()
+    clear_image_comparison_cache()
 
     return cluster_around_best(hashed, adjacency, distinct)
+
+
+def jpeg_bitstream_sha256(path: str | Path) -> str | None:
+    """SHA-256 of JPEG image bitstream (SOI..EOI), skipping APP0..APP15/COM/post-EOI.
+
+    Returns ``None`` for non-JPEG files, unreadable paths, or malformed streams.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    n = len(data)
+    if n < 4 or data[:2] != b"\xff\xd8":
+        return None
+    hasher = hashlib.sha256()
+    hasher.update(b"\xff\xd8")
+    pos = 2
+    saw_sos = False
+    while pos < n:
+        if data[pos] != 0xFF:
+            return None
+        while pos < n and data[pos] == 0xFF:
+            pos += 1
+        if pos >= n:
+            return None
+        marker = data[pos]
+        pos += 1
+        if marker in (0x00, 0xD8):
+            return None
+        if marker == 0xD9:  # EOI
+            if not saw_sos:
+                return None
+            hasher.update(b"\xff\xd9")
+            return hasher.hexdigest()
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # TEM or RST0..RST7
+            hasher.update(bytes((0xFF, marker)))
+            continue
+        if pos + 2 > n:
+            return None
+        seg_len = int.from_bytes(data[pos : pos + 2], "big")
+        if seg_len < 2 or pos + seg_len > n:
+            return None
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:  # APP0..APP15 or COM
+            pos += seg_len
+            continue
+        hasher.update(bytes((0xFF, marker)))
+        hasher.update(data[pos : pos + seg_len])
+        pos += seg_len
+        if marker == 0xDA:  # SOS: scan entropy-coded data up to next marker
+            saw_sos = True
+            cursor = pos
+            while True:
+                idx = data.find(b"\xff", cursor)
+                if idx == -1 or idx + 1 >= n:
+                    return None
+                nxt = data[idx + 1]
+                if nxt == 0x00 or (0xD0 <= nxt <= 0xD7):
+                    cursor = idx + 2
+                    continue
+                if nxt == 0xFF:
+                    fill_end = idx + 1
+                    while fill_end < n and data[fill_end] == 0xFF:
+                        fill_end += 1
+                    if fill_end >= n:
+                        return None
+                    after_fill = data[fill_end]
+                    if after_fill == 0x00 or (0xD0 <= after_fill <= 0xD7):
+                        cursor = fill_end + 1
+                        continue
+                    hasher.update(data[pos:idx])
+                    pos = fill_end - 1
+                    break
+                hasher.update(data[pos:idx])
+                pos = idx
+                break
+    return None
+
+
+def canonical_pixel_sha256(path: str | Path) -> str | None:
+    """SHA-256 of canonical EXIF-transposed sRGB pixel bytes for still images."""
+    ensure_heif_registered()
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as img:
+            if is_animated_image(img):
+                return None
+            icc = getattr(img, "info", {}).get("icc_profile")
+            has_alpha = _has_alpha_channel(img)
+            upright = ImageOps.exif_transpose(img)
+            mode = "RGBA" if has_alpha else "RGB"
+            converted = upright.convert(mode)
+            converted = _convert_icc_to_srgb(converted, icc)
+            if converted.mode == "RGBA":
+                min_alpha, max_alpha = converted.getchannel("A").getextrema()
+                if min_alpha == 255 and max_alpha == 255:
+                    converted = converted.convert("RGB")
+            header = f"{converted.mode}:{converted.width}x{converted.height}:".encode("ascii")
+            hasher = hashlib.sha256()
+            hasher.update(header)
+            hasher.update(converted.tobytes())
+            return hasher.hexdigest()
+    except Exception:
+        return None

@@ -35,7 +35,40 @@ _inflight_lock = threading.Lock()
 _inflight: dict[str, threading.Event] = {}
 
 _prune_lock = threading.Lock()
-_prune_state = {"writes": 0, "last_run": 0.0}
+_prune_state = {"writes": 0, "last_run": 0.0, "running": False}
+
+_HEIF_LOCK = threading.Lock()
+_HEIF_REGISTERED = False
+
+VIDEO_FAIL_TTL_SECONDS = 30.0
+VIDEO_FAIL_CACHE_MAX = 512
+_video_fail_lock = threading.Lock()
+_video_fail_cache: dict[tuple[str, int | None, int | None, str], float] = {}
+
+
+def _ensure_heif_registered() -> None:
+    """Register pillow-heif opener once per process, preferring the shared helper."""
+    global _HEIF_REGISTERED
+    if _HEIF_REGISTERED:
+        return
+    try:
+        from ..similar_image import ensure_heif_registered
+
+        ensure_heif_registered()
+        _HEIF_REGISTERED = True
+        return
+    except Exception:
+        pass
+    with _HEIF_LOCK:
+        if _HEIF_REGISTERED:
+            return
+        try:
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+        except Exception:
+            pass
+        _HEIF_REGISTERED = True
 
 
 def is_video(path: Path) -> bool:
@@ -61,35 +94,31 @@ def _flatten_to_rgb(img):
         img.mode == "P" and "transparency" in img.info
     )
     if not has_alpha:
-        return img.convert("RGB")
+        return img if img.mode == "RGB" else img.convert("RGB")
     rgba = img.convert("RGBA")
     background = Image.new("RGB", rgba.size, (255, 255, 255))
     background.paste(rgba, mask=rgba.getchannel("A"))
     return background
 
 
-# Card thumbs render up to ~800 CSS px wide (~1600 physical px on Retina);
-# the lightbox preview variant targets large displays at 2560 px, which is
-# dramatically lighter than serving multi-MP originals; "full" keeps the
-# original resolution for Quick Look-exact transcodes of formats browsers
-# cannot render natively (HEIC, TIFF, …).
-VARIANT_MAX_SIDE = {"thumb": 1600, "preview": 2560, "full": None}
-VARIANT_QUALITY = {"thumb": 85, "preview": 88, "full": 95}
+# Grid cards render at small card sizes (≤512 px); standard card thumbs render
+# up to ~800 CSS px wide (~1600 physical px on Retina); the lightbox preview
+# variant targets large displays at 2560 px; "full" keeps the original
+# resolution for Quick Look-exact transcodes of formats browsers cannot render
+# natively (HEIC, TIFF, …).
+VARIANT_MAX_SIDE = {"grid": 512, "thumb": 1600, "preview": 2560, "full": None}
+VARIANT_QUALITY = {"grid": 82, "thumb": 85, "preview": 88, "full": 95}
 
 
 def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
     from PIL import Image, ImageOps
 
-    try:
-        from pillow_heif import register_heif_opener
-
-        register_heif_opener()
-    except Exception:
-        pass
+    _ensure_heif_registered()
 
     max_side = VARIANT_MAX_SIDE.get(variant, VARIANT_MAX_SIDE["thumb"])
     quality = VARIANT_QUALITY.get(variant, VARIANT_QUALITY["thumb"])
     with Image.open(path) as img:
+        icc_profile = img.info.get("icc_profile")
         if max_side is not None:
             # Decode JPEGs at a reduced DCT scale instead of full resolution;
             # PIL ignores draft() for formats that do not support it.
@@ -100,29 +129,107 @@ def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
         # Composite resized pixels to avoid full-resolution RGB/RGBA copies.
         img = _flatten_to_rgb(img)
         output = BytesIO()
-        img.save(output, format="JPEG", quality=quality)
+        save_kwargs: dict[str, object] = {"format": "JPEG", "quality": quality}
+        if icc_profile:
+            save_kwargs["icc_profile"] = icc_profile
+        img.save(output, **save_kwargs)
         return output.getvalue()
 
 
-def video_thumbnail_bytes(path: Path) -> bytes | None:
+def _video_fail_key(path: Path, variant: str) -> tuple[str, int | None, int | None, str]:
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size, variant)
+    except OSError:
+        return (str(path), None, None, variant)
+
+
+def _is_video_negatively_cached(key: tuple[str, int | None, int | None, str]) -> bool:
+    now = time.monotonic()
+    with _video_fail_lock:
+        expires = _video_fail_cache.get(key)
+        if expires is None:
+            return False
+        if now < expires:
+            return True
+        _video_fail_cache.pop(key, None)
+        return False
+
+
+def _record_video_failure(key: tuple[str, int | None, int | None, str]) -> None:
+    now = time.monotonic()
+    with _video_fail_lock:
+        expired = [k for k, exp in _video_fail_cache.items() if exp <= now]
+        for k in expired:
+            _video_fail_cache.pop(k, None)
+        _video_fail_cache.pop(key, None)
+        while len(_video_fail_cache) >= VIDEO_FAIL_CACHE_MAX:
+            _video_fail_cache.pop(next(iter(_video_fail_cache)))
+        _video_fail_cache[key] = now + VIDEO_FAIL_TTL_SECONDS
+
+
+def _clear_video_failure(key: tuple[str, int | None, int | None, str]) -> None:
+    with _video_fail_lock:
+        _video_fail_cache.pop(key, None)
+
+
+def _run_ffmpeg_frame(
+    path: Path, output_path: Path, *, seek: str, vf: str | None
+) -> bytes:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-ss",
+        seek,
+        "-i",
+        str(path),
+        "-threads",
+        "1",
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+    ]
+    if vf:
+        cmd.extend(["-vf", vf])
+    cmd.extend(["-q:v", "2", "-y", str(output_path)])
+    subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+    return output_path.read_bytes()
+
+
+def video_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes | None:
     if not shutil.which("ffmpeg"):
         return None
+    fail_key = _video_fail_key(path, variant)
+    if _is_video_negatively_cached(fail_key):
+        return None
+
+    max_side = VARIANT_MAX_SIDE.get(variant, VARIANT_MAX_SIDE["thumb"])
+    vf = (
+        f"scale=w='min({max_side},iw)':h='min({max_side},ih)'"
+        ":force_original_aspect_ratio=decrease:force_divisible_by=2"
+        if max_side is not None
+        else None
+    )
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         output_path = Path(tmp.name)
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i",
-                str(path), "-frames:v", "1", "-vf", r"scale=min(1600\,iw):-1", "-q:v", "2", "-y",
-                str(output_path),
-            ],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        data = output_path.read_bytes()
-        return data if data else None
+        data = _run_ffmpeg_frame(path, output_path, seek="1", vf=vf)
+        if not data:
+            # Clips shorter than 1s (e.g. Live Photos) produce 0 bytes at -ss 1.
+            data = _run_ffmpeg_frame(path, output_path, seek="0", vf=vf)
+        if data:
+            _clear_video_failure(fail_key)
+            return data
+        _record_video_failure(fail_key)
+        return None
     except Exception:
+        _record_video_failure(fail_key)
         return None
     finally:
         try:
@@ -170,7 +277,7 @@ def thumbnail_cache_file(key: str, *, cache_dir: Path | None = None) -> Path:
 
 def generate_thumbnail_bytes(path: Path, *, variant: str) -> bytes | None:
     if is_video(path):
-        return video_thumbnail_bytes(path)
+        return video_thumbnail_bytes(path, variant=variant)
     try:
         return image_thumbnail_bytes(path, variant=variant)
     except Exception:
@@ -183,8 +290,6 @@ def store_thumbnail(destination: Path, data: bytes) -> None:
         dir=str(destination.parent), suffix=".tmp", delete=False
     ) as tmp:
         tmp.write(data)
-        tmp.flush()
-        os.fsync(tmp.fileno())
         staged = Path(tmp.name)
     try:
         os.replace(staged, destination)
@@ -195,10 +300,6 @@ def store_thumbnail(destination: Path, data: bytes) -> None:
 
 def _stored_thumbnail(destination: Path, key: str) -> tuple[Path, str] | None:
     if destination.is_file():
-        try:
-            os.utime(destination, None)
-        except OSError:
-            pass
         return destination, key
     return None
 
@@ -235,6 +336,7 @@ def cached_thumbnail(
         event.wait(timeout=120)
         return _stored_thumbnail(destination, key)
 
+    stored = False
     try:
         # Re-check after winning leadership: a just-finished generation may
         # have produced the file while we were registering.
@@ -249,12 +351,14 @@ def cached_thumbnail(
             store_thumbnail(destination, data)
         except OSError:
             return None
-        maybe_prune_thumbnail_cache(cache_dir=cache_dir)
+        stored = True
         return destination, key
     finally:
         with _inflight_lock:
             _inflight.pop(key, None)
             event.set()
+        if stored:
+            maybe_prune_thumbnail_cache(cache_dir=cache_dir)
 
 
 def prune_thumbnail_cache(
@@ -288,18 +392,32 @@ def prune_thumbnail_cache(
     return removed
 
 
+def _run_background_prune(cache_dir: Path | None) -> None:
+    try:
+        prune_thumbnail_cache(cache_dir=cache_dir)
+    except OSError:
+        pass
+    finally:
+        with _prune_lock:
+            _prune_state["running"] = False
+
+
 def maybe_prune_thumbnail_cache(*, cache_dir: Path | None = None) -> None:
-    """Prune occasionally so the hot path never pays for a full cache walk."""
+    """Trigger an async background prune occasionally without blocking request threads."""
     now = time.monotonic()
     with _prune_lock:
         _prune_state["writes"] += 1
         due = _prune_state["writes"] >= PRUNE_EVERY_N_WRITES
         cooled = now - _prune_state["last_run"] >= PRUNE_MIN_INTERVAL_SECONDS
-        if not (due and cooled):
+        if not (due and cooled) or _prune_state["running"]:
             return
         _prune_state["writes"] = 0
         _prune_state["last_run"] = now
-    try:
-        prune_thumbnail_cache(cache_dir=cache_dir)
-    except OSError:
-        pass
+        _prune_state["running"] = True
+    thread = threading.Thread(
+        target=_run_background_prune,
+        args=(cache_dir,),
+        name="dedupe-thumb-prune",
+        daemon=True,
+    )
+    thread.start()

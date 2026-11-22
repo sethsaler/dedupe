@@ -12,8 +12,14 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 from .models import FileRecord
 
@@ -27,20 +33,54 @@ def default_keep_decisions_path() -> Path:
     return state / "dedupe" / "keep-decisions.json"
 
 
-def load_keep_decisions(path: str | Path | None = None) -> dict[str, dict]:
-    """Return {file path: identity} for every stored keep decision."""
-    target = Path(path).expanduser() if path is not None else default_keep_decisions_path()
+def _resolve_target(path: str | Path | None) -> Path:
+    return Path(path).expanduser() if path is not None else default_keep_decisions_path()
+
+
+@contextmanager
+def _locked_store(target: Path):
+    """Advisory cross-process lock around read-modify-write on ``target``."""
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(target.parent, 0o700)
+    lock_path = target.with_name(f".{target.name}.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        if target.stat().st_size > MAX_KEEP_DECISIONS_BYTES:
-            return {}
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _load_keep_decisions_strict(target: Path) -> dict[str, dict]:
+    """Load decisions, returning ``{}`` only if missing; raise OSError on corrupt/oversized."""
+    try:
+        stat = target.stat()
+    except FileNotFoundError:
+        return {}
+    if stat.st_size > MAX_KEEP_DECISIONS_BYTES:
+        raise OSError(
+            f"keep-decisions store exceeds {MAX_KEEP_DECISIONS_BYTES} bytes: {target}"
+        )
+    try:
         envelope = json.loads(target.read_bytes())
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as exc:
+        raise OSError(f"could not read keep-decisions store {target}: {exc}") from exc
     if not isinstance(envelope, dict) or envelope.get("version") != KEEP_DECISIONS_VERSION:
-        return {}
+        raise OSError(
+            f"unsupported keep-decisions format or version in {target}"
+        )
     decisions = envelope.get("decisions")
     if not isinstance(decisions, dict):
-        return {}
+        raise OSError(f"invalid keep-decisions payload in {target}")
     return {
         str(file_path): identity
         for file_path, identity in decisions.items()
@@ -48,9 +88,16 @@ def load_keep_decisions(path: str | Path | None = None) -> dict[str, dict]:
     }
 
 
-def save_keep_decisions(decisions: dict[str, dict], path: str | Path | None = None) -> None:
-    """Atomically save decisions with private directory/file permissions."""
-    target = Path(path).expanduser() if path is not None else default_keep_decisions_path()
+def load_keep_decisions(path: str | Path | None = None) -> dict[str, dict]:
+    """Return {file path: identity} for every stored keep decision."""
+    target = _resolve_target(path)
+    try:
+        return _load_keep_decisions_strict(target)
+    except OSError:
+        return {}
+
+
+def _write_keep_decisions_unlocked(decisions: dict[str, dict], target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(target.parent, 0o700)
     envelope = {"version": KEEP_DECISIONS_VERSION, "decisions": decisions}
@@ -73,19 +120,26 @@ def save_keep_decisions(decisions: dict[str, dict], path: str | Path | None = No
         raise
 
 
+def save_keep_decisions(decisions: dict[str, dict], path: str | Path | None = None) -> None:
+    """Atomically save decisions with private directory/file permissions."""
+    target = _resolve_target(path)
+    with _locked_store(target):
+        _write_keep_decisions_unlocked(decisions, target)
+
+
 def _identity(record: FileRecord) -> dict:
-    return {
+    entry: dict[str, int | str] = {
         "size": int(record.size),
         "mtime_ns": record.mtime_sort_stamp,
         "decided_at": datetime.now(UTC).isoformat(),
     }
+    if record.device is not None and record.inode is not None:
+        entry["device"] = int(record.device)
+        entry["inode"] = int(record.inode)
+    return entry
 
 
-def matches_keep_decision(record: FileRecord, decisions: dict[str, dict]) -> bool:
-    """True when the record still matches its stored keep decision."""
-    identity = decisions.get(record.path)
-    if not identity:
-        return False
+def _identity_matches(record: FileRecord, identity: dict) -> bool:
     try:
         return (
             int(identity["size"]) == int(record.size)
@@ -95,12 +149,59 @@ def matches_keep_decision(record: FileRecord, decisions: dict[str, dict]) -> boo
         return False
 
 
+def _dev_inode_matches(record: FileRecord, identity: dict) -> bool:
+    if record.device is None or record.inode is None:
+        return False
+    raw_dev = identity.get("device")
+    raw_ino = identity.get("inode")
+    if raw_dev is None or raw_ino is None:
+        return False
+    try:
+        return (
+            int(raw_dev) == int(record.device)
+            and int(raw_ino) == int(record.inode)
+            and _identity_matches(record, identity)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def matches_keep_decision(record: FileRecord, decisions: dict[str, dict]) -> bool:
+    """True when the record still matches its stored keep decision (or renamed inode)."""
+    identity = decisions.get(record.path)
+    if identity is not None:
+        return _identity_matches(record, identity)
+    if record.device is None or record.inode is None:
+        return False
+    return any(_dev_inode_matches(record, entry) for entry in decisions.values())
+
+
 def kept_paths(records: Iterable[FileRecord], path: str | Path | None = None) -> set[str]:
     """Paths among ``records`` with a still-valid stored keep decision."""
     decisions = load_keep_decisions(path)
     if not decisions:
         return set()
-    return {record.path for record in records if matches_keep_decision(record, decisions)}
+    by_inode: dict[tuple[int, int], list[dict]] = {}
+    for entry in decisions.values():
+        raw_dev = entry.get("device")
+        raw_ino = entry.get("inode")
+        if raw_dev is not None and raw_ino is not None:
+            try:
+                by_inode.setdefault((int(raw_dev), int(raw_ino)), []).append(entry)
+            except (TypeError, ValueError):
+                continue
+    kept: set[str] = set()
+    for record in records:
+        identity = decisions.get(record.path)
+        if identity is not None:
+            if _identity_matches(record, identity):
+                kept.add(record.path)
+            continue
+        if record.device is not None and record.inode is not None:
+            entries = by_inode.get((int(record.device), int(record.inode)))
+            if entries and any(_identity_matches(record, entry) for entry in entries):
+                kept.add(record.path)
+    return kept
 
 
 def update_keep_decisions(
@@ -108,19 +209,26 @@ def update_keep_decisions(
     clear: Iterable[str] = (),
     path: str | Path | None = None,
 ) -> None:
-    """Record keeps and/or drop cleared paths; no-op when nothing changes."""
+    """Record keeps and/or drop cleared paths; no-op when nothing changes.
+
+    Refuses to overwrite an existing unreadable, oversized, or corrupt store
+    (raises OSError cleanly instead of wiping prior keep decisions).
+    """
     keep = list(keep)
     clear = [str(item) for item in clear]
     if not keep and not clear:
         return
-    decisions = load_keep_decisions(path)
-    changed = False
-    for cleared in clear:
-        if decisions.pop(cleared, None) is not None:
-            changed = True
-    for record in keep:
-        if not matches_keep_decision(record, decisions):
-            decisions[record.path] = _identity(record)
-            changed = True
-    if changed:
-        save_keep_decisions(decisions, path)
+    target = _resolve_target(path)
+    with _locked_store(target):
+        decisions = _load_keep_decisions_strict(target)
+        changed = False
+        for cleared in clear:
+            if decisions.pop(cleared, None) is not None:
+                changed = True
+        for record in keep:
+            existing = decisions.get(record.path)
+            if existing is None or not _identity_matches(record, existing):
+                decisions[record.path] = _identity(record)
+                changed = True
+        if changed:
+            _write_keep_decisions_unlocked(decisions, target)

@@ -4,19 +4,30 @@
 // stays the interactive full view. Videos are excluded: their hover-to-play
 // inline preview already answers "what is this?".
 
-import { $ } from "./util.js";
+import { currentGroup } from "./model.js";
+import { $, withMediaVersion } from "./util.js";
 
 // The hover must be uninterrupted for this long before the preview opens.
 const LINGER_MS = 2000;
+const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "CapsLock", "NumLock", "ScrollLock"]);
 
 let pendingWrap = null;
 let timer = null;
 
+function mediaVersionFor(wrap) {
+  if (wrap?.dataset?.mediaVersion) return wrap.dataset.mediaVersion;
+  const path = wrap?.dataset?.path;
+  if (!path) return undefined;
+  return (currentGroup()?.members || []).find((m) => m.path === path)?.media_version;
+}
+
 // Only cards whose thumb is a still image (GIFs included) can preview; video
-// cards play inline on hover, and Trash placeholders have nothing to show.
+// cards play inline on hover, Board video tiles show a Video badge, and Trash
+// placeholders have nothing to show.
 function previewableImage(wrap) {
   // Focus/decision review already shows the full-size preview in place.
   if (wrap?.closest(".focus-card")) return null;
+  if (wrap?.querySelector?.(".board-video-badge, video")) return null;
   return wrap?.querySelector?.(".thumb-image") || null;
 }
 
@@ -25,9 +36,9 @@ function hidePreview() {
   timer = null;
   pendingWrap = null;
   const overlay = $("hoverPreview");
-  if (overlay.hidden) return;
+  if (!overlay || overlay.hidden) return;
   overlay.hidden = true;
-  $("hoverPreviewImage").removeAttribute("src");
+  $("hoverPreviewImage")?.removeAttribute("src");
 }
 
 function showPreview(wrap) {
@@ -36,11 +47,13 @@ function showPreview(wrap) {
   if (!wrap.isConnected || wrap !== pendingWrap) return;
   const thumb = previewableImage(wrap);
   if (!thumb) return;
+  const path = wrap.dataset.path;
+  const version = mediaVersionFor(wrap);
   // GIFs preview their animated original (the URL hover-play swaps in); still
   // images use the cached 2560px "preview" variant, same as the lightbox.
   const fullSrc = thumb.classList.contains("hover-gif")
-    ? thumb.dataset.src
-    : `/api/thumbnail?path=${encodeURIComponent(wrap.dataset.path)}&variant=preview`;
+    ? withMediaVersion(thumb.dataset.src, path, version)
+    : withMediaVersion(`/api/thumbnail?path=${encodeURIComponent(path)}&variant=preview`, path, version);
   const image = $("hoverPreviewImage");
   // The card's thumbnail is already in the browser cache, so it paints
   // instantly; swap in the larger variant once it finishes loading.
@@ -56,7 +69,9 @@ function showPreview(wrap) {
 
 // Member cards and the Similar board's tiles share the same thumbnail markup.
 for (const root of [$("members"), $("similarBoard")]) {
+  if (!root) continue;
   root.addEventListener("pointerover", (event) => {
+    if (event.pointerType !== "mouse") return;
     const wrap = event.target.closest?.(".thumb-wrap");
     if (!wrap || wrap === pendingWrap || !previewableImage(wrap)) return;
     clearTimeout(timer);
@@ -84,11 +99,37 @@ document.addEventListener("scroll", () => {
   if (pendingWrap && !pendingWrap.matches(":hover")) hidePreview();
 }, true);
 
+// Dismiss on any non-modifier keydown so j/k, Esc, shortcuts, etc. never leave a stuck preview.
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") hidePreview();
+  if (MODIFIER_KEYS.has(event.key)) return;
+  hidePreview();
 });
+
+// Dismiss cleanly on interactive overlay opens, tab/group switches, or pane re-renders.
+document.addEventListener(
+  "toggle",
+  (event) => {
+    if (event.newState === "open" && event.target?.id !== "toast") hidePreview();
+  },
+  true,
+);
+window.addEventListener("blur", hidePreview);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) hidePreview();
+});
+$("groupList")?.addEventListener("click", hidePreview);
+document.querySelector(".filter-tabs")?.addEventListener("click", hidePreview);
+
+const dismissObserver = new MutationObserver(() => {
+  if (pendingWrap && (!pendingWrap.isConnected || pendingWrap.closest("[hidden]"))) hidePreview();
+});
+for (const target of [$("members"), $("detailBody"), $("similarBoard")]) {
+  if (target) dismissObserver.observe(target, { childList: true, attributes: true, attributeFilter: ["hidden"] });
+}
 
 document.addEventListener("pointermove", () => {
   // If a re-render removed the hovered card, no pointerout ever fires.
   if (pendingWrap && !pendingWrap.isConnected) hidePreview();
 });
+
+export { hidePreview };

@@ -19,6 +19,7 @@ function confirmModal({
   confirmLabel = "Confirm",
   danger = true,
   validitySeconds = null,
+  confirmDisabled = false,
 }) {
   return new Promise((resolve) => {
     const dialog = $("modalBackdrop");
@@ -27,10 +28,15 @@ function confirmModal({
     const btn = $("modalConfirm");
     btn.textContent = confirmLabel;
     btn.className = danger ? "btn danger" : "btn primary";
+    btn.disabled = Boolean(confirmDisabled);
     const validity = $("modalValidity");
+    const liveRegion = $("modalLiveRegion");
     let ticker = null;
     let settled = false;
+    let announcedOpen = false;
+    let announcedExpiring = false;
     const previousFocus = document.activeElement;
+    if (liveRegion) liveRegion.textContent = "";
     if (!dialog.open) dialog.showModal();
     // Safe default: focus Cancel so a stray Enter can never confirm a
     // destructive action; Enter only confirms when Confirm itself has focus.
@@ -42,6 +48,8 @@ function confirmModal({
       settled = true;
       if (ticker !== null) clearInterval(ticker);
       ticker = null;
+      btn.disabled = false;
+      if (liveRegion) liveRegion.textContent = "";
       btn.removeEventListener("click", onOk);
       $("modalCancel").removeEventListener("click", onCancel);
       dialog.removeEventListener("close", onDialogClose);
@@ -64,8 +72,16 @@ function confirmModal({
           cleanup("expired");
           return;
         }
-        validity.textContent = `Verified against the current selection · preview valid for ${formatCountdown(left)}`;
+        const formatted = formatCountdown(left);
+        validity.textContent = `Verified against the current selection · preview valid for ${formatted}`;
         validity.classList.toggle("expiring", left <= 60);
+        if (liveRegion && !announcedOpen) {
+          announcedOpen = true;
+          liveRegion.textContent = `Preview valid for ${formatted}`;
+        } else if (liveRegion && left <= 60 && !announcedExpiring) {
+          announcedExpiring = true;
+          liveRegion.textContent = "Preview expires in under a minute";
+        }
       };
       validity.hidden = false;
       tick();

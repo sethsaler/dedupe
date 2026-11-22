@@ -41,7 +41,7 @@ def test_cache_rejects_replaced_inode(tmp_path: Path) -> None:
     cache.close()
 
 
-def test_cache_rejects_changed_ctime_even_when_other_identity_matches(tmp_path: Path) -> None:
+def test_cache_rejects_changed_ctime_on_same_path_but_allows_posix_rename(tmp_path: Path) -> None:
     cache = HashCache(tmp_path / "hashes.sqlite3")
     original = _record(tmp_path / "photo.jpg", inode=10)
     original.ctime_ns = 1_000_000_000
@@ -53,11 +53,11 @@ def test_cache_rejects_changed_ctime_even_when_other_identity_matches(tmp_path: 
     assert cache.get(changed) is None
     assert cache.hydrate([changed]) == 0
     assert changed.phash is None
-    # The inode fallback for a renamed file must enforce the same check.
+    # On POSIX, os.rename updates ctime_ns while preserving (dev, ino, size, mtime_ns).
     changed.path = str(tmp_path / "renamed.jpg")
-    assert cache.get(changed) is None
-    assert cache.hydrate([changed]) == 0
-    assert changed.phash is None
+    assert cache.get(changed) is not None
+    assert cache.hydrate([changed]) == 1
+    assert changed.phash == original.phash
     cache.close()
 
 
@@ -656,4 +656,143 @@ def test_distinct_content_identity_is_not_refreshed_for_a_changed_file(tmp_path:
 
     assert cache.backfill_distinct_content([left, changed]) == 0
     assert not cache.distinct_reviews([left, changed]).is_distinct(left, changed)
+    cache.close()
+
+
+def test_cache_user_version_synchronous_normal_and_skips_ddl_on_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "hashes.sqlite3"
+    cache = HashCache(db_path)
+    user_version = cache._conn.execute("PRAGMA user_version").fetchone()[0]
+    sync_mode = cache._conn.execute("PRAGMA synchronous").fetchone()[0]
+    assert user_version == 3
+    assert sync_mode == 1  # PRAGMA synchronous=NORMAL
+    cache.close()
+
+    # Re-opening with matching user_version must not require a schema migration transaction.
+    with closing(sqlite3.connect(db_path)) as check:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 3
+    reopened = HashCache(db_path)
+    assert reopened._conn.in_transaction is False
+    reopened.close()
+
+
+def test_cache_persists_extended_metadata_columns(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    rec = _record(tmp_path / "clip.mp4", inode=42)
+    rec.media_type = MediaType.VIDEO
+    rec.extension = ".mp4"
+    rec.male_face_count = 2
+    rec.female_face_count = 1
+    rec.face_count = 3
+    rec.capture_metadata = True
+    rec.sharpness = 87.5
+    rec.video_codec = "hevc"
+    rec.video_bitrate = 4_500_000
+    rec.has_audio = True
+    cache.store_all([rec])
+    cache.close()
+
+    fresh = _record(tmp_path / "clip.mp4", inode=42)
+    fresh.media_type = MediaType.VIDEO
+    fresh.extension = ".mp4"
+    fresh.phash = None
+    reopened = HashCache(tmp_path / "hashes.sqlite3")
+    assert reopened.hydrate([fresh]) == 1
+    assert fresh.male_face_count == 2
+    assert fresh.female_face_count == 1
+    assert fresh.face_count == 3
+    assert fresh.capture_metadata is True
+    assert fresh.sharpness == 87.5
+    assert fresh.video_codec == "hevc"
+    assert fresh.video_bitrate == 4_500_000
+    assert fresh.has_audio is True
+    reopened.close()
+
+
+def test_cache_dirty_tracking_and_coalesce_preserves_concurrent_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "hashes.sqlite3"
+    seed = _record(tmp_path / "photo.jpg", inode=55)
+    seed.sha256 = "abc123"
+    seed.people_score = 0.85
+    seed.people_score_signature = "people-v1"
+    seed.face_count = 2
+    seed.male_face_count = 1
+    seed.female_face_count = 1
+    seed.face_detection_signature = "yunet-v1"
+    writer = HashCache(db_path)
+    writer.store_all([seed])
+    writer.close()
+
+    reader = HashCache(db_path)
+    hydrated = _record(tmp_path / "photo.jpg", inode=55)
+    hydrated.phash = None
+    assert reader.hydrate([hydrated]) == 1
+    before_changes = reader._conn.total_changes
+    # Unchanged hydrated record must not rewrite rows in SQLite.
+    reader.store_all([hydrated])
+    assert reader._conn.total_changes == before_changes
+
+    # Simulate a partial direct update without prior hydrate that omits people_score/faces:
+    # COALESCE must keep concurrent non-null metadata when identity matches.
+    partial = _record(tmp_path / "photo.jpg", inode=55)
+    partial.sharpness = 99.0
+    updater = HashCache(db_path)
+    updater.store_all([partial])
+    updater.close()
+
+    check = _record(tmp_path / "photo.jpg", inode=55)
+    check.phash = None
+    assert reader.hydrate([check]) == 1
+    assert check.sharpness == 99.0
+    assert check.people_score == 0.85
+    assert check.face_count == 2
+    assert check.male_face_count == 1
+    assert check.female_face_count == 1
+    reader.close()
+
+
+def test_cache_content_cache_shares_analysis_across_copies(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    orig = _record(tmp_path / "orig.jpg", inode=10)
+    orig.sha256 = "same-sha"
+    orig.width, orig.height = 800, 600
+    orig.dhash = "1" * 16
+    orig.tile_phashes = "a,b,c"
+    orig.border_crop = "c:10,20,780,560"
+    orig.border_signature = "black-borders-v9"
+    orig.people_score = 0.75
+    orig.people_score_signature = "people-v1"
+    orig.face_count = 1
+    orig.male_face_count = 1
+    orig.female_face_count = 0
+    orig.face_detection_signature = "yunet-v1"
+    orig.capture_metadata = True
+    orig.sharpness = 42.0
+    cache.store_all([orig])
+
+    dup = _record(tmp_path / "sub" / "copy.jpg", inode=99)
+    dup.sha256 = "same-sha"
+    dup.phash = None
+    assert cache.hydrate([dup]) == 1
+    assert dup.phash == orig.phash
+    assert dup.border_crop == orig.border_crop
+    assert dup.people_score == 0.75
+    assert dup.face_count == 1
+    assert dup.capture_metadata is True
+    assert dup.sharpness == 42.0
+    cache.close()
+
+
+def test_cache_recorded_pairs_among_batches_over_500_paths(tmp_path: Path) -> None:
+    cache = HashCache(tmp_path / "hashes.sqlite3")
+    recs = [_record(tmp_path / f"img_{i:04d}.jpg", inode=100 + i) for i in range(550)]
+    cache.mark_distinct([recs[0], recs[520]])
+    cache.mark_distinct([recs[510], recs[540]])
+
+    pairs = cache.recorded_pairs_among([r.path for r in recs])
+    expected = {
+        tuple(sorted((recs[0].path, recs[520].path))),
+        tuple(sorted((recs[510].path, recs[540].path))),
+    }
+    assert pairs == expected
     cache.close()

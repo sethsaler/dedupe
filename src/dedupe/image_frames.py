@@ -1,17 +1,17 @@
 """Which decoded images are animations.
 
 Pillow reports a JPEG with a Multi-Picture (MPO) extension as a multi-frame
-image. Phones and apps write MPO for gain maps, depth maps, and stereo pairs:
-the extra images are not playback frames. Often they are truncated or
-stripped by the app that re-saved the photo. Treating them as an animation
-made hashing fail on the cut-off second image. A clean copy of the same photo
-also could not match, because its frame count differed.
+image, and reports multi-IFD TIFF/DNG files (with embedded preview/thumbnail
+IFDs) as multi-frame too. Phones and cameras write those auxiliary images, which
+are not playback frames. Often they are truncated or stripped by apps that
+re-save the photo. Treating them as an animation made hashing fail on the
+auxiliary image or mismatch plain copies whose frame count differed.
 """
 
 from __future__ import annotations
 
 #: Formats whose extra "frames" are auxiliary images, not playback frames.
-STILL_MULTI_IMAGE_FORMATS = frozenset({"MPO"})
+STILL_MULTI_IMAGE_FORMATS = frozenset({"MPO", "TIFF", "DNG"})
 
 
 def is_animated_image(img) -> bool:

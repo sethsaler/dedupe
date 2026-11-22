@@ -43,17 +43,16 @@ def test_legacy_longer_fingerprint_still_compares_with_current_samples() -> None
     assert video_fingerprint_distances(current, legacy) == [0] * 8
 
 
-def _single_pass_runner(calls: list[list[str]]):
-    """Fake subprocess.run that writes the batched extractor's frame outputs."""
+def _piped_batch_runner(calls: list[list[str]], *, count: int = 8):
+    """Fake subprocess.run that returns concatenated piped rawvideo frames."""
 
     def fake_run(cmd, **_kwargs):
-        calls.append(cmd)
-        targets = [cmd[index + 1] for index, arg in enumerate(cmd) if arg == "-y"]
-        for position, target in enumerate(targets):
-            Path(target).write_bytes(
-                bytes([position + 1]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE)
-            )
-        return SimpleNamespace(returncode=0, stdout=b"")
+        calls.append(list(cmd))
+        payload = b"".join(
+            bytes([position + 1]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE)
+            for position in range(count)
+        )
+        return SimpleNamespace(returncode=0, stdout=payload)
 
     return fake_run
 
@@ -65,24 +64,19 @@ def test_video_fingerprint_extracts_all_frames_in_one_ffmpeg_call(
 
     monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
     monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (60.0, 1920, 1080))
-    monkeypatch.setattr("dedupe.similar_video.subprocess.run", _single_pass_runner(calls))
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", _piped_batch_runner(calls))
 
     fingerprint, width, height, duration = compute_video_fingerprint(tmp_path / "video.mp4")
 
     assert fingerprint is not None and fingerprint.startswith("v3:")
     assert len(fingerprint[3:].split(",")) == 8
     assert (width, height, duration) == (1920, 1080, 60.0)
-    # One process for the whole video instead of one per sampled frame.
+    # Single-pass sequential pipe for D <= 180s: one process, zero temp files.
     assert len(calls) == 1
     command = calls[0]
-    seeks = [
-        float(command[index + 1])
-        for index, arg in enumerate(command)
-        if arg == "-ss"
-    ]
-    assert seeks == _sample_timestamps(60.0)
-    assert command.count("-map") == 8
-    assert command.count("-i") == 8
+    assert "pipe:1" in command
+    assert command.count("-i") == 1
+    assert "-y" not in command
 
 
 def test_video_fingerprint_falls_back_to_per_frame_extraction(
@@ -91,9 +85,15 @@ def test_video_fingerprint_falls_back_to_per_frame_extraction(
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
-        calls.append(cmd)
-        # The batched pass produces nothing; per-frame seeks still succeed.
-        if "pipe:1" not in cmd:
+        calls.append(list(cmd))
+        # Sequential and multi-seek batched pipes fail; per-frame seeks succeed.
+        is_per_frame = (
+            "-ss" in cmd
+            and "-frames:v" in cmd
+            and cmd[cmd.index("-frames:v") + 1] == "1"
+            and "pipe:1" in cmd
+        )
+        if not is_per_frame:
             return SimpleNamespace(returncode=1, stdout=b"")
         return SimpleNamespace(
             returncode=0,
@@ -108,7 +108,14 @@ def test_video_fingerprint_falls_back_to_per_frame_extraction(
 
     assert fingerprint is not None and fingerprint.startswith("v3:")
     assert len(fingerprint[3:].split(",")) == 8
-    per_frame_calls = [cmd for cmd in calls if "pipe:1" in cmd]
+    per_frame_calls = [
+        cmd
+        for cmd in calls
+        if "-ss" in cmd
+        and "-frames:v" in cmd
+        and cmd[cmd.index("-frames:v") + 1] == "1"
+        and "pipe:1" in cmd
+    ]
     assert len(per_frame_calls) == 8
     assert [
         float(cmd[cmd.index("-ss") + 1]) for cmd in per_frame_calls
@@ -144,19 +151,18 @@ def test_hash_frame_extraction_falls_back_to_software_decode(
 def test_batched_extraction_falls_back_to_software_decode(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The single-pass extractor retries in software when hardware decode fails."""
+    """The piped multi-seek extractor retries in software when hardware decode fails."""
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
         calls.append(list(cmd))
         if "-hwaccel" in cmd:
             return SimpleNamespace(returncode=1, stdout=b"")
-        targets = [cmd[index + 1] for index, arg in enumerate(cmd) if arg == "-y"]
-        for position, target in enumerate(targets):
-            Path(target).write_bytes(
-                bytes([position + 1]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE)
-            )
-        return SimpleNamespace(returncode=0, stdout=b"")
+        payload = b"".join(
+            bytes([position + 1]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE)
+            for position in range(2)
+        )
+        return SimpleNamespace(returncode=0, stdout=payload)
 
     monkeypatch.setattr(
         "dedupe.similar_video._hwaccel_args",
@@ -169,6 +175,7 @@ def test_batched_extraction_falls_back_to_software_decode(
     assert len(frames) == 2
     assert any("-hwaccel" in cmd for cmd in calls)
     assert "-hwaccel" not in calls[-1]
+    assert "pipe:1" in calls[-1] and "-y" not in calls[-1]
 
 
 def test_hwaccel_disabled_by_env(monkeypatch) -> None:
@@ -669,10 +676,10 @@ def test_software_decode_job_does_not_try_the_hardware_decoder(
 
     def fake_run(cmd, **_kwargs):
         calls.append(list(cmd))
-        targets = [cmd[index + 1] for index, arg in enumerate(cmd) if arg == "-y"]
-        for target in targets:
-            Path(target).write_bytes(bytes(HASH_FRAME_SIZE * HASH_FRAME_SIZE))
-        return SimpleNamespace(returncode=0, stdout=b"")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=bytes(2 * HASH_FRAME_SIZE * HASH_FRAME_SIZE),
+        )
 
     monkeypatch.setattr(
         "dedupe.similar_video._hwaccel_args", lambda: ("-hwaccel", "videotoolbox")
@@ -877,11 +884,238 @@ def test_vectorized_clustering_matches_mixed_and_equal_length_fingerprints(monke
     ]
 
     groups = find_similar_video_groups(records, distinct=DistinctReviews.empty(), workers=1)
-    assert [{r.path for r in g} for g in groups] == [
-        {"/short_unknown.mp4", "/long_20s.mp4", "/long_18s.mp4", "/too_short_17s.mp4"}
-    ]
+    # Unknown duration record must not bridge 20.0s and 17.9s (>10% apart) into one group.
+    assert len(groups) == 1
+    group_paths = {r.path for r in groups[0]}
+    assert "/short_unknown.mp4" in group_paths
+    assert not ({"/long_20s.mp4", "/too_short_17s.mp4"} <= group_paths)
     # Check exact 0.9 (18.0 / 20.0) vs 0.895 (17.9 / 20.0) duration cutoff directly.
     at_cutoff = find_similar_video_groups([records[1], records[2], records[4]], workers=1)
     assert [{r.path for r in g} for g in at_cutoff] == [{"/long_20s.mp4", "/long_18s.mp4"}]
     below_cutoff = find_similar_video_groups([records[1], records[3], records[4]], workers=1)
     assert below_cutoff == []
+
+
+def test_sample_timestamps_avoids_zero_and_eliminates_short_clip_cliff() -> None:
+    for duration in (2.0, 2.5, 3.0, 5.5, 7.9, 60.0):
+        ts = _sample_timestamps(duration)
+        assert len(ts) == 8
+        assert ts[0] > 0.0
+        assert ts[-1] < duration
+        assert ts == [round((i + 0.5) * duration / 8, 6) for i in range(8)]
+    sub_second = _sample_timestamps(0.6)
+    assert len(sub_second) == 3
+    assert sub_second[0] > 0.0 and sub_second[-1] < 0.6
+    # Explicit non-default frame budget keeps legacy behavior for detectors.
+    assert _sample_timestamps(60.0, 16) == [index * 3.75 for index in range(16)]
+
+
+@pytest.mark.parametrize(
+    ("stream_extra", "expected_dims"),
+    [
+        ({"side_data_list": [{"rotation": -90}]}, (480, 640)),
+        ({"side_data_list": [{"rotation": 90}]}, (480, 640)),
+        ({"side_data_list": [{"rotation": 270}]}, (480, 640)),
+        ({"tags": {"rotate": "90"}}, (480, 640)),
+        ({"tags": {"rotate": "180"}}, (640, 480)),
+        ({"side_data_list": [{"rotation": 0}]}, (640, 480)),
+    ],
+)
+def test_probe_video_swaps_coded_dimensions_for_quarter_turn_rotation(
+    monkeypatch, stream_extra: dict, expected_dims: tuple[int, int]
+) -> None:
+    monkeypatch.setattr("dedupe.similar_video.shutil.which", lambda _name: "ffprobe")
+    stream = {"duration": "12.0", "width": 640, "height": 480, **stream_extra}
+    monkeypatch.setattr(
+        "dedupe.similar_video.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"streams": [stream], "format": {"duration": "12.0"}}),
+        ),
+    )
+
+    duration, width, height = probe_video("rotated.mp4")
+
+    assert duration == 12.0
+    assert (width, height) == expected_dims
+
+
+def test_long_video_uses_piped_concat_seeks_and_forwards_software_and_cancel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"".join(
+                bytes([idx + 1]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE) for idx in range(8)
+            ),
+        )
+
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path, **_kw: (300.0, 1920, 1080))
+    monkeypatch.setattr(
+        "dedupe.similar_video._hwaccel_args", lambda: ("-hwaccel", "videotoolbox")
+    )
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", fake_run)
+
+    fp, width, height, duration = compute_video_fingerprint(tmp_path / "long.mp4", software=True)
+
+    assert fp is not None and fp.startswith("v3:")
+    assert (width, height, duration) == (1920, 1080, 300.0)
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "pipe:1" in cmd and "-y" not in cmd
+    assert "-hwaccel" not in cmd
+    assert cmd.count("-ss") == 8
+
+    # Software mode is also forwarded to per-frame fallback when batched pipe fails.
+    fallback_calls: list[list[str]] = []
+
+    def fail_batch_run(cmd, **_kwargs):
+        fallback_calls.append(list(cmd))
+        if "-frames:v" in cmd and cmd[cmd.index("-frames:v") + 1] == "1":
+            return SimpleNamespace(
+                returncode=0, stdout=bytes([9]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE)
+            )
+        return SimpleNamespace(returncode=1, stdout=b"")
+
+    monkeypatch.setattr("dedupe.similar_video.subprocess.run", fail_batch_run)
+    fp2, *_ = compute_video_fingerprint(tmp_path / "long.mp4", software=True)
+    assert fp2 is not None
+    assert all("-hwaccel" not in c for c in fallback_calls)
+
+    with pytest.raises(InterruptedError):
+        compute_video_fingerprint(tmp_path / "long.mp4", cancelled=lambda: True)
+
+
+def test_unknown_duration_hub_cannot_bridge_incompatible_durations(monkeypatch) -> None:
+    import dedupe.similar_video as module
+    from dedupe.cache import DistinctReviews
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    fp = "v3:" + ",".join(["0123456789abcdef"] * 8)
+    records = [
+        FileRecord(
+            path="/unknown_hub.mp4", size=500, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=fp, duration=None,
+        ),
+        FileRecord(
+            path="/clip_10s.mp4", size=100, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=fp, duration=10.0,
+        ),
+        FileRecord(
+            path="/clip_30s.mp4", size=200, mtime=1, media_type=MediaType.VIDEO,
+            extension=".mp4", video_fingerprint=fp, duration=30.0,
+        ),
+    ]
+
+    groups = find_similar_video_groups(records, distinct=DistinctReviews.empty(), workers=1)
+
+    for group in groups:
+        paths = {r.path for r in group}
+        assert not ({"/clip_10s.mp4", "/clip_30s.mp4"} <= paths)
+
+
+def test_first_last_frame_mismatch_reaches_verification_and_dual_end_trims_match(
+    tmp_path: Path,
+) -> None:
+    """An added end card or dual-end slight trim must still match via offset verification."""
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    base = tmp_path / "base.mp4"
+    with_end_card = tmp_path / "end_card.mp4"
+    dual_trimmed = tmp_path / "dual_trimmed.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=240x180:rate=24", "-t", "8", str(base))
+    # Replace the last 1.2s (including final sample frame) with solid blue end card.
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=240x180:rate=24:duration=6.8",
+        "-f", "lavfi", "-i", "color=c=blue:size=240x180:rate=24:duration=1.2",
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+        "-map", "[v]", str(with_end_card),
+    )
+    # Trim both ends slightly: 0.25s from start and 0.35s from end (7.4s total).
+    _ffmpeg("-ss", "0.25", "-i", str(base), "-t", "7.4", "-crf", "26", str(dual_trimmed))
+
+    records_end = inventory([base, with_end_card])
+    groups_end = find_similar_video_groups(records_end, workers=1)
+    assert [{Path(r.path).name for r in g} for g in groups_end] == [{"base.mp4", "end_card.mp4"}]
+
+    records_dual = inventory([base, dual_trimmed])
+    groups_dual = find_similar_video_groups(records_dual, workers=1)
+    assert [{Path(r.path).name for r in g} for g in groups_dual] == [
+        {"base.mp4", "dual_trimmed.mp4"}
+    ]
+
+
+def test_blank_static_and_hue_shifted_clips_stay_separate_while_bw_matches(
+    tmp_path: Path,
+) -> None:
+    """Variance, temporal diversity, and chroma guards reject dark/static/recolored clips."""
+    from dedupe.scanner import inventory
+
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    black_a, black_b = tmp_path / "black_a.mp4", tmp_path / "black_b.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "color=c=black:size=160x120:rate=12:duration=4", str(black_a))
+    _ffmpeg("-f", "lavfi", "-i", "color=c=#141414:size=160x120:rate=12:duration=4", str(black_b))
+    assert find_similar_video_groups(inventory([black_a, black_b]), workers=1) == []
+
+    # Static frozen clips built from a still frame.
+    still = tmp_path / "still.png"
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x120:rate=1", "-frames:v", "1", str(still))
+    static_a, static_b = tmp_path / "static_a.mp4", tmp_path / "static_b.mp4"
+    _ffmpeg("-loop", "1", "-i", str(still), "-t", "4", "-r", "12", "-crf", "20", str(static_a))
+    _ffmpeg("-loop", "1", "-i", str(still), "-t", "4", "-r", "12", "-crf", "28", str(static_b))
+    assert find_similar_video_groups(inventory([static_a, static_b]), workers=1) == []
+
+    # Color-shifted (hue=120) vs original must be rejected by chroma guard,
+    # whereas grayscale re-grade still matches original.
+    orig, recolored, bw = tmp_path / "orig.mp4", tmp_path / "recolored.mp4", tmp_path / "bw.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12:duration=4", str(orig))
+    _ffmpeg("-i", str(orig), "-vf", "hue=h=120", str(recolored))
+    _ffmpeg("-i", str(orig), "-vf", "hue=s=0", str(bw))
+
+    assert find_similar_video_groups(inventory([orig, recolored]), workers=1) == []
+    # Re-run on pre-cached fingerprints to verify guards enforce on warm scans too.
+    warm_src = inventory([orig, recolored])
+    compute_orig = compute_video_fingerprint(orig)
+    compute_rec = compute_video_fingerprint(recolored)
+    warm_src[0].video_fingerprint, warm_src[0].duration = compute_orig[0], compute_orig[3]
+    warm_src[1].video_fingerprint, warm_src[1].duration = compute_rec[0], compute_rec[3]
+    assert find_similar_video_groups(warm_src, workers=1) == []
+
+    bw_groups = find_similar_video_groups(inventory([orig, bw]), workers=1)
+    assert [{Path(r.path).name for r in g} for g in bw_groups] == [{"orig.mp4", "bw.mp4"}]
+
+
+def test_cropped_border_roi_and_horizontally_flipped_videos_match(tmp_path: Path) -> None:
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg/ffprobe not available")
+    from dedupe.scanner import inventory
+
+    orig = tmp_path / "orig.mp4"
+    letterboxed = tmp_path / "letterboxed.mp4"
+    flipped = tmp_path / "flipped.mp4"
+    _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=15:duration=4", str(orig))
+    # Pad 70px black bars top and bottom -> 320x320 letterboxed frame; bars distort uncropped pHash.
+    _ffmpeg(
+        "-i", str(orig), "-vf", "pad=320:320:0:70:black", "-crf", "24", str(letterboxed)
+    )
+    _ffmpeg("-i", str(orig), "-vf", "hflip", "-crf", "24", str(flipped))
+
+    box_records = inventory([orig, letterboxed])
+    # Attach detected border_crop ("left,top,right,bottom,width,height") to the letterboxed video.
+    box_records[1].border_crop = "0,70,320,250,320,320"
+    crop_groups = find_similar_video_groups(box_records, workers=1)
+    assert [{Path(r.path).name for r in g} for g in crop_groups] == [
+        {"orig.mp4", "letterboxed.mp4"}
+    ]
+
+    flip_records = inventory([orig, flipped])
+    flip_groups = find_similar_video_groups(flip_records, workers=1)
+    assert [{Path(r.path).name for r in g} for g in flip_groups] == [{"orig.mp4", "flipped.mp4"}]

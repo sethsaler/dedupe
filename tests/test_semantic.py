@@ -484,7 +484,8 @@ def test_later_helper_failure_preserves_completed_batches_for_retry(
     records = _records(_media(tmp_path / "media"))
     cache = tmp_path / "cache.db"
     vectors, errors = embed_records(records, helper=str(helper), cache_path=cache)
-    assert len(vectors) == 1 and len(errors) == 2
+    # Worker restarts once after batch id=2 times out, completing the third item.
+    assert len(vectors) == 2 and len(errors) == 1
     helper = _script_helper(tmp_path, FAKE_HELPER)
     vectors, errors = embed_records(records, helper=str(helper), cache_path=cache)
     assert len(vectors) == 3 and errors == []
@@ -758,3 +759,226 @@ def test_full_speed_option_reaches_the_helper_launch(tmp_path: Path, monkeypatch
             if client.get("/api/status").get_json().get("state") != "running":
                 break
             time.sleep(0.01)
+
+
+def test_default_duplicate_threshold_is_092(tmp_path: Path, monkeypatch) -> None:
+    """DEFAULT_DUPLICATE_THRESHOLD is 0.92 and separates 0.93 copies from 0.90 look-alikes."""
+    import numpy as np
+
+    from dedupe import semantic
+
+    assert semantic.DEFAULT_DUPLICATE_THRESHOLD == pytest.approx(0.92)
+    monkeypatch.setattr(semantic, "edited_copy_verdict", lambda *_a, **_kw: True)
+
+    def _unit_at(angle: float) -> bytes:
+        vec = np.zeros(8, dtype=np.float32)
+        vec[0] = float(np.cos(angle))
+        vec[1] = float(np.sin(angle))
+        return vec.tobytes()
+
+    pa = _image(tmp_path / "a.png", (40, 80, 120), False)
+    pb = _image(tmp_path / "b.png", (40, 80, 120), False)
+    pc = _image(tmp_path / "c.png", (40, 80, 120), False)
+    recs = _records(tmp_path)
+    vectors = {
+        str(pa): _unit_at(0.0),
+        str(pb): _unit_at(float(np.arccos(0.93))),
+        str(pc): _unit_at(float(-np.arccos(0.90))),
+    }
+    sets, duplicates = semantic.group_semantic_vectors(
+        recs, vectors, use_cache=False, workers=1
+    )
+    assert len(sets) == 1
+    assert len(duplicates) == 1
+    assert {r.path for r in duplicates[0][0]} == {str(pa), str(pb)}
+
+
+def test_excluded_pairs_suppresses_edge_without_banning_files(tmp_path: Path, monkeypatch) -> None:
+    """excluded_pairs removes specific edges while still letting those files match others."""
+    import numpy as np
+
+    from dedupe import semantic
+
+    monkeypatch.setattr(semantic, "edited_copy_verdict", lambda *_a, **_kw: True)
+    pa = _image(tmp_path / "a.png", (40, 80, 120), False)
+    pb = _image(tmp_path / "b.png", (40, 80, 120), False)
+    pc = _image(tmp_path / "c.png", (40, 80, 120), False)
+    recs = _records(tmp_path)
+
+    # cos(a, b) = 0.96, cos(a, c) = 0.95, cos(b, c) = 0.83 -> only a connects b and c.
+    va = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    ang_ab = float(np.arccos(0.96))
+    ang_ac = float(np.arccos(0.95))
+    vb = np.array([np.cos(ang_ab), np.sin(ang_ab), 0.0], dtype=np.float32)
+    vc = np.array([np.cos(ang_ac), -np.sin(ang_ac), 0.0], dtype=np.float32)
+    vectors = {str(pa): va.tobytes(), str(pb): vb.tobytes(), str(pc): vc.tobytes()}
+
+    _sets, duplicates = semantic.group_semantic_vectors(
+        recs,
+        vectors,
+        excluded_pairs={(str(pa), str(pb))},
+        use_cache=False,
+        workers=1,
+    )
+    assert len(duplicates) == 1
+    assert {r.path for r in duplicates[0][0]} == {str(pa), str(pc)}
+
+
+def test_embedding_cache_skips_sha256_on_empty_sig_and_reuses_record_sha256(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """get_many skips SHA-256 hashing when a signature has no rows and reuses record.sha256."""
+    media = _media(tmp_path / "media")
+    recs = _records(media)
+    cache = EmbeddingCache(tmp_path / "cache.db")
+    try:
+        sha_calls = 0
+
+        def boom_sha(*_args, **_kwargs):
+            nonlocal sha_calls
+            sha_calls += 1
+            raise AssertionError("_digest should not run here")
+
+        monkeypatch.setattr(cache, "_digest", boom_sha)
+        assert cache.get_many(recs, "empty-sig") == {}
+        assert sha_calls == 0
+
+        # Store using known sha256 on record, then query another path carrying the same record.sha256.
+        vec = b"\x01\x02\x03\x04"
+        recs[0].sha256 = "known-sha-abc"
+        cache.put_many([(recs[0], vec)], "sig-1")
+        moved = _records(media)[0]
+        moved.path = str(tmp_path / "moved.jpg")
+        Path(moved.path).write_bytes(Path(recs[0].path).read_bytes())
+        moved.sha256 = "known-sha-abc"
+        hit = cache.get_many([moved], "sig-1")
+        assert hit == {moved.path: vec}
+        assert sha_calls == 0
+    finally:
+        cache.close()
+
+
+def test_neighbor_cache_multi_corpus_wal_and_large_chunked_graph(tmp_path: Path) -> None:
+    """NeighborCache enables WAL, isolates corpora, and round-trips >250k edges cleanly."""
+    from dedupe.semantic import NeighborCache
+
+    db = tmp_path / "neighbors.db"
+    cache = NeighborCache(db)
+    try:
+        mode = cache._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert str(mode).lower() == "wal"
+
+        keys_a = ["sha-a0", "sha-a1", "sha-a2"]
+        keys_b = ["sha-b0", "sha-b1", "sha-b2"]
+        cache.save(keys_a, {("sha-a0", "sha-a1"): 0.94}, 0.88)
+        cache.save(keys_b, {("sha-b0", "sha-b2"): 0.91}, 0.88)
+
+        loaded_keys_a, edges_a = cache.load(0.88, keys_a)
+        loaded_keys_b, edges_b = cache.load(0.88, keys_b)
+        assert loaded_keys_a == set(keys_a)
+        assert edges_a == {("sha-a0", "sha-a1"): pytest.approx(0.94)}
+        assert loaded_keys_b == set(keys_b)
+        assert edges_b == {("sha-b0", "sha-b2"): pytest.approx(0.91)}
+
+        # Save and reload >250k edges across multiple chunks (EDGE_CHUNK_SIZE = 100k).
+        n_keys = 725
+        big_keys = [f"k{i:04d}" for i in range(n_keys)]
+        big_edges: dict[tuple[str, str], float] = {}
+        count = 0
+        for i in range(n_keys):
+            for j in range(i + 1, n_keys):
+                big_edges[(big_keys[i], big_keys[j])] = 0.92
+                count += 1
+                if count == 255_000:
+                    break
+            if count == 255_000:
+                break
+        cache.save(big_keys, big_edges, 0.88)
+        cache.close()
+
+        reopened = NeighborCache(db)
+        try:
+            chunks = reopened._conn.execute(
+                "SELECT count(*) FROM semantic_neighbor_chunks WHERE corpus_hash = ?",
+                (reopened._corpus_hash(big_keys),),
+            ).fetchone()[0]
+            assert chunks == 3
+            reloaded_keys, reloaded_edges = reopened.load(0.88, big_keys)
+            assert reloaded_keys == set(big_keys)
+            assert len(reloaded_edges) == 255_000
+        finally:
+            reopened.close()
+    finally:
+        cache.close()
+
+
+def test_embed_records_bisects_poisoned_batch_to_isolate_failing_item(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Multi-item batch failure bisects down to isolate only the poisoned file."""
+    from dedupe import semantic
+
+    media = tmp_path / "media"
+    _image(media / "good1.jpg", (20, 120, 220), False)
+    Image.new("RGB", (64, 64), (255, 0, 255)).save(media / "poison.jpg", quality=95)
+    _image(media / "good2.jpg", (30, 200, 40), False)
+    _image(media / "good3.jpg", (200, 40, 40), False)
+
+    poison_hook = (
+        "def _is_poison(p):\n"
+        '        r, g, b = Image.open(p).convert("RGB").resize((1, 1)).getpixel((0, 0))\n'
+        "        return r > 220 and g < 30 and b > 220\n"
+        '    if any(_is_poison(p) for p in request["inputs"]):\n'
+        "        import time\n"
+        "        time.sleep(30)\n"
+        "    floats, errors = [], []"
+    )
+    helper = _script_helper(
+        tmp_path,
+        FAKE_HELPER.replace("floats, errors = [], []", poison_hook),
+    )
+    monkeypatch.setenv("FAKE_DIGUP_LOG", str(tmp_path / "log"))
+    monkeypatch.setattr(semantic, "REQUEST_BATCH", 4)
+    monkeypatch.setattr(semantic, "REQUEST_TIMEOUT", 0.15)
+    monkeypatch.setattr(semantic, "MAX_CONSECUTIVE_WORKER_FAILURES", 10)
+
+    records = _records(media)
+    vectors, errors = embed_records(records, helper=str(helper), cache_path=tmp_path / "cache.db")
+    assert len(vectors) == 3
+    assert all(not p.endswith("poison.jpg") for p in vectors)
+    assert len(errors) == 1 and "poison.jpg" in errors[0]
+
+
+def test_mirrored_copy_verified_locally_cannot_be_vetoed_by_judge(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Locally mirrored image pairs are accepted without letting Decider veto them."""
+    import numpy as np
+
+    from dedupe import semantic
+
+    img = Image.new("RGB", (64, 96), "navy")
+    from PIL import ImageDraw
+
+    ImageDraw.Draw(img).rectangle((6, 12, 34, 60), fill="gold")
+    orig, mir = tmp_path / "orig.png", tmp_path / "mirror.png"
+    img.save(orig)
+    img.transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(mir)
+
+    recs = _records(tmp_path)
+    vec = np.array([1.0, 0.0, 0.0], dtype=np.float32).tobytes()
+    vectors = {r.path: vec for r in recs}
+
+    judge_calls: list[tuple[str, str]] = []
+
+    def strict_veto_judge(a: FileRecord, b: FileRecord) -> float:
+        judge_calls.append((a.path, b.path))
+        return 0.01
+
+    monkeypatch.setattr(semantic, "edited_copy_verdict", lambda *_a, **_kw: None)
+    _sets, duplicates = semantic.group_semantic_vectors(
+        recs, vectors, use_cache=False, workers=1, judge=strict_veto_judge
+    )
+    assert len(duplicates) == 1
+    assert {r.path for r in duplicates[0][0]} == {str(orig), str(mir)}
+    assert judge_calls == []

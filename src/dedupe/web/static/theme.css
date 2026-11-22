@@ -10,10 +10,12 @@
   --lt-table: light-dark(#FFFFFF, #111111);
   --lt-loupe: light-dark(#F2F2F0, #1B1B1B);
   --lt-sleeve: light-dark(#E2E2E0, #2C2C2C);
+  --lt-control-border: light-dark(#71716D, #686864);
   --lt-graphite: light-dark(#6B6B6B, #A0A0A0);
   --lt-faint: light-dark(#707070, #8A8A8A);
   --lt-ink: light-dark(#111111, #F2F2F0);
   --lt-pencil: light-dark(#C92A14, #FF5A43);
+  --lt-danger-fill: light-dark(#C92A14, #C92A14);
   --lt-pencil-soft: light-dark(#FDECE9, #3A1712);
   --lt-keep: light-dark(#1A7A50, #3ECF8E);
   --lt-keep-soft: light-dark(#E7F5EE, #122E21);
@@ -35,14 +37,17 @@
 }
 
 @supports not (color: light-dark(#fff, #000)) {
-  :root {
+  :root,
+  :root[data-theme="light"] {
     --lt-table: #FFFFFF;
     --lt-loupe: #F2F2F0;
     --lt-sleeve: #E2E2E0;
+    --lt-control-border: #71716D;
     --lt-graphite: #6B6B6B;
     --lt-faint: #707070;
     --lt-ink: #111111;
     --lt-pencil: #C92A14;
+    --lt-danger-fill: #C92A14;
     --lt-pencil-soft: #FDECE9;
     --lt-keep: #1A7A50;
     --lt-keep-soft: #E7F5EE;
@@ -50,14 +55,35 @@
     --lt-warn-soft: #FEF5E4;
     --lt-focus: #1D4ED8;
   }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --lt-table: #111111;
+      --lt-loupe: #1B1B1B;
+      --lt-sleeve: #2C2C2C;
+      --lt-control-border: #686864;
+      --lt-graphite: #A0A0A0;
+      --lt-faint: #8A8A8A;
+      --lt-ink: #F2F2F0;
+      --lt-pencil: #FF5A43;
+      --lt-danger-fill: #C92A14;
+      --lt-pencil-soft: #3A1712;
+      --lt-keep: #3ECF8E;
+      --lt-keep-soft: #122E21;
+      --lt-warn: #F0B44A;
+      --lt-warn-soft: #33240C;
+      --lt-focus: #7CB4FF;
+    }
+  }
   :root[data-theme="dark"] {
     --lt-table: #111111;
     --lt-loupe: #1B1B1B;
     --lt-sleeve: #2C2C2C;
+    --lt-control-border: #686864;
     --lt-graphite: #A0A0A0;
     --lt-faint: #8A8A8A;
     --lt-ink: #F2F2F0;
     --lt-pencil: #FF5A43;
+    --lt-danger-fill: #C92A14;
     --lt-pencil-soft: #3A1712;
     --lt-keep: #3ECF8E;
     --lt-keep-soft: #122E21;
@@ -76,7 +102,7 @@
   --panel-2: var(--lt-loupe);
   --panel-hover: var(--lt-loupe);
   --media-mat: var(--lt-loupe);
-  --border: var(--lt-sleeve);
+  --border: var(--lt-control-border);
   --border-soft: var(--lt-sleeve);
   --text: var(--lt-ink);
   --muted: var(--lt-graphite);
@@ -129,16 +155,16 @@ kbd {
   color: var(--lt-graphite);
 }
 
-input[type="text"], select, textarea {
+input[type="text"], input[type="search"], input[type="number"], select, textarea {
   background: var(--lt-table);
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 8px;
   color: var(--lt-ink);
   box-shadow: none;
 }
 
-input[type="text"]:focus, select:focus, textarea:focus,
-input[type="text"]:focus-visible, select:focus-visible, textarea:focus-visible {
+input[type="text"]:focus, input[type="search"]:focus, input[type="number"]:focus, select:focus, textarea:focus,
+input[type="text"]:focus-visible, input[type="search"]:focus-visible, input[type="number"]:focus-visible, select:focus-visible, textarea:focus-visible {
   border-color: var(--lt-ink);
   box-shadow: none;
   outline: 2px solid var(--lt-ink);
@@ -152,7 +178,7 @@ a:focus-visible {
 }
 
 /* ---------- Buttons ---------- */
-/* Default .btn is secondary: transparent, sleeve border, ink text. */
+/* Default .btn is secondary: transparent, control border, ink text. */
 .btn {
   font-family: var(--lt-ui);
   font-size: 13px;
@@ -161,7 +187,7 @@ a:focus-visible {
   padding: 8px 12px;
   border-radius: 6px;
   background: transparent;
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   color: var(--lt-ink);
   box-shadow: none;
 }
@@ -195,7 +221,7 @@ a:focus-visible {
 
 .btn.primary-soft {
   background: var(--lt-loupe);
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
   color: var(--lt-ink);
   font-weight: 600;
 }
@@ -207,7 +233,7 @@ a:focus-visible {
 
 .btn.secondary {
   background: transparent;
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
   color: var(--lt-ink);
   font-weight: 500;
 }
@@ -217,22 +243,22 @@ a:focus-visible {
 }
 
 .btn.danger {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
   font-weight: 600;
 }
 
 .btn.danger:hover {
-  background: var(--lt-pencil);
-  border-color: var(--lt-pencil);
+  background: var(--lt-danger-fill);
+  border-color: var(--lt-danger-fill);
   color: #FFFFFF;
-  opacity: 0.9;
+  filter: brightness(0.92);
 }
 
 .btn.warn {
   background: transparent;
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
   color: var(--lt-ink);
   font-weight: 500;
 }
@@ -259,18 +285,18 @@ a:focus-visible {
 }
 
 .btn-group {
-  border: 1px solid var(--lt-sleeve);
+  border: 1px solid var(--lt-control-border);
   border-radius: 6px;
 }
 
 .btn-group .btn {
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
 }
 
 /* The review "Next" button is an id-scoped design.css rule; keep it quiet. */
 #btnNextReview {
   background: transparent;
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
   color: var(--lt-ink);
   font-weight: 500;
 }
@@ -286,7 +312,7 @@ a:focus-visible {
 .actionbar .btn.warn {
   background: transparent;
   color: var(--lt-ink);
-  border-color: var(--lt-sleeve);
+  border-color: var(--lt-control-border);
 }
 
 .actionbar .btn.danger:hover,
@@ -371,27 +397,6 @@ a:focus-visible {
   font-weight: 400;
 }
 
-.topbar .exact-recovery > summary {
-  background: transparent;
-  border: 0;
-  border-radius: 0;
-  padding: 0;
-  color: var(--lt-graphite);
-  font-size: 13px;
-  font-weight: 500;
-  text-decoration: underline;
-  text-decoration-color: var(--lt-sleeve);
-  text-underline-offset: 4px;
-}
-
-.topbar .exact-recovery > summary:hover,
-.topbar .exact-recovery[open] > summary {
-  color: var(--lt-ink);
-  border: 0;
-  background: transparent;
-  text-decoration-color: var(--lt-ink);
-}
-
 /* ---------- Category tabs: underline row ---------- */
 .filter-tabs {
   display: flex;
@@ -420,6 +425,15 @@ a:focus-visible {
 .tab:hover {
   color: var(--lt-ink);
   background: transparent;
+}
+
+.filter-tabs .tab.empty:not(.active) {
+  opacity: 1;
+  color: var(--lt-faint);
+}
+
+.filter-tabs .tab.empty:not(.active):hover {
+  color: var(--lt-ink);
 }
 
 .tab.active {
@@ -458,19 +472,6 @@ a:focus-visible {
   background: var(--lt-table);
   border: 1px solid var(--lt-sleeve);
   border-radius: 8px;
-}
-
-.popover > summary,
-.popover[open] > summary {
-  background: transparent;
-  border-color: var(--lt-sleeve);
-  color: var(--lt-ink);
-  font-weight: 500;
-}
-
-.popover > summary:hover,
-.popover[open] > summary {
-  border-color: var(--lt-ink);
 }
 
 /* Badges lose their per-kind hues: no purple, no tinted blues. */
@@ -536,10 +537,10 @@ a:focus-visible {
   #btnNextReview,
   .tab,
   input[type="text"],
+  input[type="search"],
+  input[type="number"],
   select,
   textarea,
-  .popover > summary,
-  .topbar .exact-recovery > summary,
   .toggle-option {
     transition: none;
     animation: none;
