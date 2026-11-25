@@ -20,7 +20,7 @@ import { state } from "./state.js";
 import { decideSwipe, swipeActive, undoSwipe } from "./swipe.js";
 import {
   $, formatBytes, formatMtime, isOverlayOpen,
-  promoteToastTopLayer, syncAppInert, toast, withMediaVersion,
+  promoteToastTopLayer, showOverlay, hideOverlay, syncAppInert, toast, withMediaVersion,
 } from "./util.js";
 
 const PLAYBACK_RATE_KEY = "dedupe.videoPlaybackRate";
@@ -395,7 +395,7 @@ function openLightbox(index) {
   state.lightboxIndex = Math.max(0, Math.min(index, state.lightboxItems.length - 1));
   const lb = $("lightbox");
   updateLightbox();
-  if (!lightboxOpen()) lb.showPopover?.();
+  if (!lightboxOpen()) showOverlay(lb);
   syncAppInert();
   promoteToastTopLayer();
   layoutImagePlane();
@@ -414,7 +414,7 @@ function closeLightbox() {
     video.load();
   }
   const lb = $("lightbox");
-  if (lightboxOpen()) lb.hidePopover?.();
+  if (lightboxOpen()) hideOverlay(lb);
   syncAppInert();
   const focusTarget = previousFocus?.classList?.contains("enlarge-candidate")
     ? ".enlarge-candidate"

@@ -505,18 +505,21 @@ assets to review and use **File → Export** to a normal folder, then scan that 
 keeps Photos metadata and library ownership under supported Apple workflows. Direct library
 integration remains out of scope until it can use a supported Apple API end to end.
 
-### Optional macOS application bundle
+### macOS application bundle
 
-From the repository root of a local checkout, build a Finder-launchable wrapper around the existing installation:
+On macOS, build a self-contained double-clickable app from the repository root:
 
 ```bash
 scripts/build-macos-app.sh
 open build/Dedupe.app
 ```
 
-The ignored `build/Dedupe.app` is a launcher, not a self-contained Python distribution.
-Developer ID signing and notarization are explicit, credential-gated release steps; see
-[`packaging/README.md`](packaging/README.md).
+`build/Dedupe.app` combines a native AppKit/WKWebView shell with an embedded Python
+backend, so it does not require the checkout, a virtual environment, or a separate
+`dedupe` install. OpenCV person/face detection is included by default; ffmpeg remains
+a separate Homebrew dependency for video analysis. Developer ID signing and notarization
+are explicit, credential-gated release steps. Build variants, sharing notes, and release
+details are in [`packaging/README.md`](packaging/README.md).
 
 ## Project layout
 

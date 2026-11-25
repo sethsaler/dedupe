@@ -26,6 +26,24 @@ function isOverlayOpen(el) {
   }
 }
 
+function showOverlay(el) {
+  if (!el) return;
+  if (typeof el.showPopover === "function") {
+    el.showPopover();
+  } else {
+    el.classList.add(":popover-open");
+  }
+}
+
+function hideOverlay(el) {
+  if (!el) return;
+  if (typeof el.hidePopover === "function") {
+    el.hidePopover();
+  } else {
+    el.classList.remove(":popover-open");
+  }
+}
+
 function syncAppInert() {
   const app = document.querySelector(".app");
   if (!app) return;
@@ -35,8 +53,8 @@ function syncAppInert() {
 function promoteToastTopLayer() {
   const el = $("toast");
   if (!el || !isOverlayOpen(el)) return;
-  el.hidePopover?.();
-  el.showPopover?.();
+  hideOverlay(el);
+  showOverlay(el);
 }
 
 function announceToast(msg, kind = "") {
@@ -89,7 +107,7 @@ function hideToast() {
   clearTimeout(el._fadeTimer);
   toastRemainingMs = 0;
   toastDeadline = 0;
-  if (isOverlayOpen(el)) el.hidePopover?.();
+  if (isOverlayOpen(el)) hideOverlay(el);
   el._fadeTimer = setTimeout(() => {
     toastStickyVisible = false;
     toastCurrentKey = "";
@@ -150,8 +168,8 @@ function showToast({ msg, kind, actionLabel, onAction, duration }) {
     el.classList.toggle("has-action", Boolean(actionLabel));
   }
   if (dismiss) dismiss.hidden = false;
-  if (isOverlayOpen(el)) el.hidePopover?.();
-  el.showPopover?.();
+  if (isOverlayOpen(el)) hideOverlay(el);
+  showOverlay(el);
   void el.offsetWidth;
   el.classList.add("show");
   toastCurrentKind = kind || "";
@@ -257,4 +275,4 @@ function withMediaVersion(url, path, fallbackVersion = "") {
   return version ? `${url}&v=${encodeURIComponent(version)}` : url;
 }
 
-export { $, hideToast, toast, trapTabKey, isOverlayOpen, promoteToastTopLayer, syncAppInert, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml, noteMediaVersion, withMediaVersion };
+export { $, hideToast, toast, trapTabKey, isOverlayOpen, promoteToastTopLayer, syncAppInert, showOverlay, hideOverlay, sleep, formatBytes, formatMtime, formatDuration, basename, setPreviewAspectRatio, escapeHtml, noteMediaVersion, withMediaVersion };

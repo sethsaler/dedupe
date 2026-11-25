@@ -51,6 +51,8 @@ def lint() -> None:
         "tests",
         "scripts/verify.py",
         "scripts/ci_changes.py",
+        "scripts/macos_backend_entry.py",
+        "packaging/generate-icon.py",
     )
 
 

@@ -567,6 +567,7 @@
    cut as a card, and a panel with a field for each side. It sits under the
    toast so "Cropped … · Undo" stays in reach while the next file loads. */
 .crop-editor {
+  display: none;
   position: fixed;
   inset: 0;
   z-index: 38;

@@ -15,7 +15,8 @@ import {
 } from "./crop.js";
 import { currentGroup } from "./model.js";
 import {
-  $, basename, isOverlayOpen, promoteToastTopLayer, syncAppInert, trapTabKey, withMediaVersion,
+  $, basename, isOverlayOpen, promoteToastTopLayer, showOverlay, hideOverlay, syncAppInert, trapTabKey,
+  withMediaVersion,
 } from "./util.js";
 
 const SIDES = ["top", "right", "bottom", "left"];
@@ -564,7 +565,7 @@ function openCropEditor(path) {
     previewMode = "mask";
   }
   editorPath = path;
-  if (!wasOpen) editor().showPopover?.();
+  if (!wasOpen) showOverlay(editor());
   syncAppInert();
   promoteToastTopLayer();
   draw();
@@ -574,7 +575,7 @@ function openCropEditor(path) {
 function closeCropEditor() {
   if (!cropEditorOpen()) return;
   const path = editorPath;
-  editor().hidePopover?.();
+  hideOverlay(editor());
   syncAppInert();
   editorPath = null;
   previewMode = "mask";

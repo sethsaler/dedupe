@@ -37,18 +37,23 @@ refreshStatus()
   })
   .catch(() => {});
 
-// Shut down the server when the tab is closed so the Terminal/.command window closes too.
+// Shut down the server when a browser tab is closed so the Terminal/.command
+// window closes too. The native Mac shell owns backend shutdown itself; tying
+// it to pagehide there would kill the server on an in-app reload.
 // sendBeacon cannot carry the X-Dedupe-Token header, so use fetch with keepalive,
 // which survives page teardown and passes the CSRF check.
-window.addEventListener("pagehide", (event) => {
-  if (event.persisted) return;
-  fetch("/api/shutdown", {
-    method: "POST",
-    keepalive: true,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Dedupe-Token": CSRF_TOKEN,
-    },
-    body: "{}",
-  }).catch(() => {});
-});
+const nativeShell = document.querySelector('meta[name="dedupe-native-shell"]')?.content === "true";
+if (!nativeShell) {
+  window.addEventListener("pagehide", (event) => {
+    if (event.persisted) return;
+    fetch("/api/shutdown", {
+      method: "POST",
+      keepalive: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Dedupe-Token": CSRF_TOKEN,
+      },
+      body: "{}",
+    }).catch(() => {});
+  });
+}

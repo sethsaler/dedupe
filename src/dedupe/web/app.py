@@ -621,6 +621,7 @@ def create_app(
     app.config["DEDUPE_CACHE_PATH"] = cache_path
     app.config["DEDUPE_DECISION_LOG_PATH"] = decision_log_path
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
+    native_shell = os.environ.get("DEDUPE_NATIVE_SHELL") == "1"
     capabilities = detect_capabilities()
     lock = threading.RLock()
     shutdown_lock = threading.Lock()
@@ -1134,7 +1135,16 @@ def create_app(
         if mutating and not request.is_json:
             return jsonify({"error": "application/json required"}), 415
         supplied = request.headers.get("X-Dedupe-Token", "")
-        if not hmac.compare_digest(supplied, csrf_token):
+        native_token = os.environ.get("DEDUPE_NATIVE_TOKEN", "")
+        native_shutdown = (
+            native_shell
+            and request.path == "/api/shutdown"
+            and bool(native_token)
+            and hmac.compare_digest(
+                request.headers.get("X-Dedupe-Native-Token", ""), native_token
+            )
+        )
+        if not native_shutdown and not hmac.compare_digest(supplied, csrf_token):
             return jsonify({"error": "invalid local session token"}), 403
         origin = request.headers.get("Origin")
         if origin:
@@ -1189,7 +1199,11 @@ def create_app(
 
     @app.get("/")
     def index():
-        return render_template("index.html", csrf_token=csrf_token)
+        return render_template(
+            "index.html",
+            csrf_token=csrf_token,
+            native_shell=native_shell,
+        )
 
     @app.get("/api/jobs")
     def api_jobs():
@@ -5036,7 +5050,7 @@ def run_app(
                 break
         if bound is None:
             refused_reason = f"no port available for the UI on {host}"
-        elif actual_port != port and _is_dedupe_ui_running(host, port):
+        elif port != 0 and actual_port != port and _is_dedupe_ui_running(host, port):
             refused_reason = (
                 f"port {port} is in use by another Dedupe UI — "
                 "two UIs cannot run at once; reuse it in the browser or "
@@ -5046,7 +5060,7 @@ def run_app(
             print(f"error: {refused_reason}", file=sys.stderr)
             return 2
         assert actual_port is not None
-        if actual_port != port:
+        if port != 0 and actual_port != port:
             print(
                 f"note: port {port} is in use by another program — "
                 f"serving on {actual_port} instead",
@@ -5083,6 +5097,8 @@ def _candidate_ports(port: int) -> list[int | None]:
     a free port, which cannot collide. A designated port at or above the top
     falls straight to the OS-chosen candidate.
     """
+    if port == 0:
+        return [None]
     if port >= 65535:
         return [65535, None]
     return list(range(port, 65535)) + [None]

@@ -30,10 +30,11 @@ This fails on a missing prerequisite or failed check. It runs Ruff, all
 non-browser tests (including media integration when the required tools are
 installed), Chromium end-to-end tests, source/wheel builds, and a fresh wheel
 installation smoke test (`pip check`, `dedupe --help`, and `dedupe doctor --json`).
-On macOS it also builds the unsigned app launcher. Temporary build outputs and
-wheel environments are cleaned up; nothing is signed, notarized, uploaded, or
-published. Python dependency installation and isolated builds require access to
-the configured package index. Browser setup downloads Chromium once.
+On macOS it also builds and smoke-tests the self-contained app bundle. Temporary
+build outputs and wheel environments are cleaned up; nothing is Developer ID
+signed, notarized, uploaded, or published (the local app build is ad-hoc signed).
+Python dependency installation and isolated builds require access to the
+configured package index. Browser setup downloads Chromium once.
 
 The full command covers the current OS and Python interpreter. Run it on macOS
 to exercise macOS-only behavior; a Linux run cannot validate Finder, Trash, or
@@ -49,7 +50,7 @@ Individual suites are available for iteration:
 .venv/bin/python scripts/verify.py unit
 .venv/bin/python scripts/verify.py browser
 .venv/bin/python scripts/verify.py package
-.venv/bin/python scripts/verify.py macos  # macOS only, unsigned launcher
+.venv/bin/python scripts/verify.py macos  # macOS only, self-contained app bundle
 ```
 
 The `unit` suite respects the repository's non-browser boundary. It can skip
@@ -66,7 +67,7 @@ the existing Ruff lint gate remains enabled.
   file-safety/API-security tests still run. Optional OpenCV tests also require
   the separately installed `human` extra
 - **CI → Run workflow**: all four Python versions, Chromium tests, the macOS
-  tests and unsigned launcher build, Ruff, and Python distribution validation
+  tests and self-contained app build, Ruff, and Python distribution validation
 - Every tag: the same complete CI validation matrix as before
 - `v*` tags: the separate **Release artifacts** workflow still builds, verifies,
   uploads, and publishes the Python distributions using its existing tag gate
