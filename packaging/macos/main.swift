@@ -114,7 +114,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         backendLog = ""
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["ui", "--port", "0", "--no-browser"]
+        // Keep the normal UI port as the first choice: its collision check
+        // refuses a second Dedupe backend, and the stable loopback origin
+        // preserves the review UI's saved settings across app launches.
+        process.arguments = ["ui", "--port", "8765", "--no-browser"]
 
         var environment = ProcessInfo.processInfo.environment
         let existingPath = environment["PATH"] ?? "/usr/bin:/bin"
