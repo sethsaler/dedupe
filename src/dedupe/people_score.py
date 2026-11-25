@@ -27,6 +27,8 @@ selected or removed because of it.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import subprocess
 import tempfile
 import threading
 from collections.abc import Callable
@@ -293,7 +295,37 @@ def _image_frames(path: Path, max_frames: int):
             yield np.asarray(rgb)
 
 
-def _video_frames(record: FileRecord):
+MAX_CONSECUTIVE_VIDEO_TIMEOUTS = 2
+
+
+def call_with_cancelled(
+    fn: Callable,
+    *args,
+    cancelled: Callable[[], bool] | None = None,
+    **kwargs,
+):
+    """Invoke ``fn`` passing ``cancelled=cancelled`` only when its signature accepts it.
+
+    Keeps callers compatible with both cancellation-aware video helpers and
+    older / monkeypatched stubs whose signatures do not declare ``cancelled``.
+    """
+    if cancelled is not None:
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "cancelled" in params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
+            kwargs["cancelled"] = cancelled
+    return fn(*args, **kwargs)
+
+
+def _video_frames(
+    record: FileRecord,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+):
     import numpy as np
     from PIL import Image
 
@@ -305,55 +337,96 @@ def _video_frames(record: FileRecord):
         probe_video,
     )
 
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     if not ffmpeg_available():
         raise RuntimeError("people scoring for videos requires ffmpeg")
     duration = record.duration
     if duration is None or duration <= 0:
-        duration, width, height = probe_video(record.path)
+        duration, width, height = call_with_cancelled(
+            probe_video, record.path, cancelled=cancelled
+        )
         record.duration = duration or record.duration
         record.width = width or record.width
         record.height = height or record.height
     if duration and duration > 0:
         count = PEOPLE_VIDEO_FRAMES
         timestamps = [(index + 0.5) * duration / count for index in range(count)]
-        ppms = _extract_seek_frames_ppm(
-            record.path, timestamps, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
-        )
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        try:
+            ppms = call_with_cancelled(
+                _extract_seek_frames_ppm,
+                record.path,
+                timestamps,
+                frame_width=PEOPLE_VIDEO_FRAME_WIDTH,
+                cancelled=cancelled,
+            )
+        except (subprocess.TimeoutExpired, TimeoutError):
+            ppms = []
         if len(ppms) != len(timestamps):
-            ppms = [
-                ppm
-                for ppm in (
-                    _extract_seek_frame_ppm(
-                        record.path, timestamp, frame_width=PEOPLE_VIDEO_FRAME_WIDTH
+            ppms = []
+            consecutive_timeouts = 0
+            for timestamp in timestamps:
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                try:
+                    ppm = call_with_cancelled(
+                        _extract_seek_frame_ppm,
+                        record.path,
+                        timestamp,
+                        frame_width=PEOPLE_VIDEO_FRAME_WIDTH,
+                        cancelled=cancelled,
                     )
-                    for timestamp in timestamps
-                )
-                if ppm is not None
-            ]
+                except (subprocess.TimeoutExpired, TimeoutError):
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_VIDEO_TIMEOUTS:
+                        break
+                    continue
+                if ppm is None:
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_VIDEO_TIMEOUTS:
+                        break
+                    continue
+                consecutive_timeouts = 0
+                ppms.append(ppm)
         if not ppms:
             raise RuntimeError("no video frames could be decoded")
         for ppm in ppms:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             with Image.open(BytesIO(ppm)) as image:
                 yield np.asarray(image.convert("RGB"))
         return
 
     with tempfile.TemporaryDirectory(prefix="dedupe-people-video-") as tmp:
-        frame_paths = _extract_frames(
+        frame_paths = call_with_cancelled(
+            _extract_frames,
             record.path,
             Path(tmp),
             max_frames=PEOPLE_VIDEO_FRAMES,
             frame_width=PEOPLE_VIDEO_FRAME_WIDTH,
             require_complete=True,
+            cancelled=cancelled,
         )
         if not frame_paths:
             raise RuntimeError("no video frames could be decoded")
         for frame_path in frame_paths:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             with Image.open(frame_path) as image:
                 yield np.asarray(image.convert("RGB"))
 
 
-def score_record(record: FileRecord, scorer: PeopleScorer) -> float | None:
+def score_record(
+    record: FileRecord,
+    scorer: PeopleScorer,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> float | None:
     """Populate both metrics in place; unreadable files keep any prior current results."""
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     if not has_current_people_score(record):
         record.people_score = None
         record.people_score_signature = None
@@ -364,10 +437,16 @@ def score_record(record: FileRecord, scorer: PeopleScorer) -> float | None:
         return None
     try:
         if record.media_type == MediaType.VIDEO:
-            frames = _video_frames(record)
+            frames = _video_frames(record, cancelled=cancelled)
         else:
             frames = _image_frames(Path(record.path), max_frames=3)
-        metrics = [scorer.frame_metrics(frame) for frame in frames]
+        metrics = []
+        for frame in frames:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            metrics.append(scorer.frame_metrics(frame))
+    except InterruptedError:
+        raise
     except Exception:
         return None
     if not metrics:
@@ -423,7 +502,7 @@ def score_people(
         return scorer
 
     map_parallel(
-        lambda record: score_record(record, scorer_for_thread()),
+        lambda record: score_record(record, scorer_for_thread(), cancelled=cancelled),
         pending,
         workers=resolve_workers(workers, cap=DEFAULT_HUMAN_WORKERS_CAP),
         backend="thread",

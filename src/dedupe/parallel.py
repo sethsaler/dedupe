@@ -7,6 +7,7 @@ does not pin every core or flood RAM/disk with unbounded work.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from typing import Literal, TypeVar
@@ -214,6 +215,22 @@ def map_parallel(
                     proc.terminate()
             except Exception:
                 pass
+        if procs:
+            deadline = time.monotonic() + 0.5
+            for proc in procs:
+                try:
+                    if proc.is_alive():
+                        remaining = max(0.0, deadline - time.monotonic())
+                        proc.join(timeout=remaining)
+                except Exception:
+                    pass
+            for proc in procs:
+                try:
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=0.5)
+                except Exception:
+                    pass
         raise
     else:
         ex.shutdown(wait=True)

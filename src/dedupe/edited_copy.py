@@ -159,7 +159,7 @@ def _prepare_rgb_frame(path: str, crop: tuple[int, int, int, int] | None):
         return _composite_neutral_matte(frame) if has_alpha else frame.convert("RGB")
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=128)
 def _features(
     path: str,
     size: int,
@@ -168,7 +168,8 @@ def _features(
     crop: tuple[int, int, int, int] | None = None,
 ):
     # Identity keys invalidate cached pixels after a source changes. Keep at
-    # most 32 downscaled frames/descriptors, rather than a whole photo library.
+    # most 128 downscaled frames/descriptors so worker threads do not thrash
+    # while staying bounded in RAM.
     import numpy as np
     from PIL import Image
 
@@ -190,6 +191,59 @@ def _features(
         nfeatures=1800, edgeThreshold=edge_threshold, patchSize=edge_threshold
     ).detectAndCompute(pixels, None)
     return pixels, keypoints, descriptors, monochrome, cbcr
+
+
+@lru_cache(maxsize=128)
+def _flipped_orb_features(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    crop: tuple[int, int, int, int] | None = None,
+):
+    """Horizontally flipped grayscale frame, ORB features, and chroma thumbnail."""
+    cv2 = _cv2()
+    pixels, _kp, _desc, _mono, cbcr = _features(path, size, mtime_ns, ctime_ns, crop)
+    if pixels is None:
+        return None, [], None, None
+    flipped = cv2.flip(pixels, 1)
+    fh, fw = flipped.shape
+    edge_threshold = min(31, max(7, min(fh, fw) // 4))
+    kp_f, desc_f = cv2.ORB_create(
+        nfeatures=1800, edgeThreshold=edge_threshold, patchSize=edge_threshold
+    ).detectAndCompute(flipped, None)
+    flipped_cbcr = cbcr[:, ::-1] if cbcr is not None else None
+    return flipped, kp_f, desc_f, flipped_cbcr
+
+
+@lru_cache(maxsize=128)
+def _sift_features(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    crop: tuple[int, int, int, int] | None = None,
+    flipped: bool = False,
+):
+    """Cached SIFT keypoints and descriptors keyed by file stat, crop, and flip."""
+    cv2 = _cv2()
+    if not hasattr(cv2, "SIFT_create"):
+        return [], None
+    if flipped:
+        gray = _flipped_orb_features(path, size, mtime_ns, ctime_ns, crop)[0]
+    else:
+        gray = _features(path, size, mtime_ns, ctime_ns, crop)[0]
+    if gray is None:
+        return [], None
+    return cv2.SIFT_create().detectAndCompute(gray, None)
+
+
+def clear_edited_copy_cache() -> None:
+    """Release cached frames and ORB/SIFT feature descriptors at scan boundaries."""
+    _features.cache_clear()
+    _flipped_orb_features.cache_clear()
+    _sift_features.cache_clear()
+    _color_frame.cache_clear()
 
 
 @lru_cache(maxsize=4)
@@ -325,14 +379,23 @@ def edited_copy_verdict(
     fine-detail check. The verdict no longer depends on argument order.
     """
     verdicts = []
-    for (left, crop_l), (right, crop_r) in (
-        ((left_path, crop_a), (right_path, crop_b)),
-        ((right_path, crop_b), (left_path, crop_a)),
-    ):
-        verdict = _aligned_verdict(left, right, crop_l=crop_l, crop_r=crop_r)
-        if verdict is True:
-            return True
-        verdicts.append(verdict)
+    first_verdict, matched_features = _aligned_verdict_with_match_info(
+        left_path, right_path, crop_l=crop_a, crop_r=crop_b
+    )
+    if first_verdict is True:
+        return True
+    verdicts.append(first_verdict)
+    # When raw ORB/SIFT matching failed to find 24 correspondences in both
+    # upright and flipped orientations, reversing the pair cannot align it
+    # either; short-circuit the redundant reverse pass.
+    if not matched_features:
+        return None
+    second_verdict, _ = _aligned_verdict_with_match_info(
+        right_path, left_path, crop_l=crop_b, crop_r=crop_a
+    )
+    if second_verdict is True:
+        return True
+    verdicts.append(second_verdict)
     return False if False in verdicts else None
 
 
@@ -426,19 +489,35 @@ def _aligned_verdict(
     crop_l: tuple[int, int, int, int] | None = None,
     crop_r: tuple[int, int, int, int] | None = None,
 ) -> bool | None:
+    return _aligned_verdict_with_match_info(
+        left_path, right_path, crop_l=crop_l, crop_r=crop_r
+    )[0]
+
+
+def _aligned_verdict_with_match_info(
+    left_path: str,
+    right_path: str,
+    *,
+    crop_l: tuple[int, int, int, int] | None = None,
+    crop_r: tuple[int, int, int, int] | None = None,
+) -> tuple[bool | None, bool]:
     try:
         import numpy as np
 
         cv2 = _cv2()
 
-        def features(path, crop):
+        def stat_sig(path: str) -> tuple[str, int, int, int]:
             stat = Path(path).stat()
-            return _features(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, crop)
+            return path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
-        left, kp_a, desc_a, left_mono, left_cbcr = features(left_path, crop_l)
-        right, kp_b, desc_b, right_mono, right_cbcr = features(right_path, crop_r)
+        left_sig = stat_sig(left_path)
+        right_sig = stat_sig(right_path)
+        left, kp_a, desc_a, left_mono, left_cbcr = _features(*left_sig, crop_l)
+        right, kp_b, desc_b, right_mono, right_cbcr = _features(*right_sig, crop_r)
         if left is None or right is None or min(*left.shape, *right.shape) < 64:
-            return None
+            return None, False
+
+        had_enough_matches = False
 
         def align_once(
             src_gray,
@@ -448,18 +527,19 @@ def _aligned_verdict(
             *,
             flip: bool,
         ) -> bool | None:
+            nonlocal had_enough_matches
             matches = _match_descriptors(cv2, src_desc, desc_b, cv2.NORM_HAMMING)
             pts_src_kp, pts_dst_kp = src_kp, kp_b
             if len(matches) < 24 and hasattr(cv2, "SIFT_create"):
-                sift = cv2.SIFT_create()
-                s_kp_a, s_desc_a = sift.detectAndCompute(src_gray, None)
-                s_kp_b, s_desc_b = sift.detectAndCompute(right, None)
+                s_kp_a, s_desc_a = _sift_features(*left_sig, crop_l, flip)
+                s_kp_b, s_desc_b = _sift_features(*right_sig, crop_r, False)
                 sift_matches = _match_descriptors(cv2, s_desc_a, s_desc_b, cv2.NORM_L2)
                 if len(sift_matches) >= 24:
                     matches = sift_matches
                     pts_src_kp, pts_dst_kp = s_kp_a, s_kp_b
             if len(matches) < 24:
                 return None
+            had_enough_matches = True
 
             points_a = np.float32([pts_src_kp[m.queryIdx].pt for m in matches])
             points_b = np.float32([pts_dst_kp[m.trainIdx].pt for m in matches])
@@ -640,22 +720,18 @@ def _aligned_verdict(
 
         verdict = align_once(left, kp_a, desc_a, left_cbcr, flip=False)
         if verdict is not None:
-            return verdict
+            return verdict, True
 
         # Mirror/flip fallback: handles mirrored+cropped and mirrored+B&W copies.
-        flipped = cv2.flip(left, 1)
-        fh, fw = flipped.shape
-        edge_threshold = min(31, max(7, min(fh, fw) // 4))
-        kp_f, desc_f = cv2.ORB_create(
-            nfeatures=1800, edgeThreshold=edge_threshold, patchSize=edge_threshold
-        ).detectAndCompute(flipped, None)
-        flipped_cbcr = left_cbcr[:, ::-1] if left_cbcr is not None else None
-        return align_once(flipped, kp_f, desc_f, flipped_cbcr, flip=True)
+        flipped, kp_f, desc_f, flipped_cbcr = _flipped_orb_features(*left_sig, crop_l)
+        if flipped is None:
+            return None, had_enough_matches
+        return align_once(flipped, kp_f, desc_f, flipped_cbcr, flip=True), had_enough_matches
     except (ImportError, OSError, ValueError):
-        return None
+        return None, False
     except Exception:
         # Corrupt media and optional backend errors are an unverified candidate.
-        return None
+        return None, False
 
 
 def verify_edited_copy(

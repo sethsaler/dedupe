@@ -446,7 +446,7 @@ function prefetchThumbnails(members) {
     const image = new Image();
     image.decoding = "async";
     image.src = withMediaVersion(
-      `/api/thumbnail?path=${encodeURIComponent(member.path)}`,
+      `/api/thumbnail?path=${encodeURIComponent(member.path)}&variant=grid`,
       member.path,
       member.media_version,
     );
@@ -742,7 +742,7 @@ function applyPendingGroupFocus(id) {
 function cardPreviewHtml(g, m, lightboxIndex, { singleReview, isKeep, isSel, deleted, dims, previewDimensions, clickTrash }) {
   const fileName = basename(m.path);
   const thumb = withMediaVersion(
-    `/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : ""}`,
+    `/api/thumbnail?path=${encodeURIComponent(m.path)}${singleReview ? "&variant=preview" : "&variant=grid"}`,
     m.path,
     m.media_version,
   );

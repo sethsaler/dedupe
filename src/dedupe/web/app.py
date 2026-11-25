@@ -5,7 +5,9 @@ from __future__ import annotations
 import atexit
 import copy
 import hmac
+import inspect
 import json
+import logging
 import math
 import os
 import secrets
@@ -183,6 +185,47 @@ def stale_preview_payload(reason: str) -> dict:
 
 
 BULK_SELECT_OPERATIONS = {"select_all", "select_none", "invert", "criteria"}
+
+# Heavy internal hash/signature blobs not needed by the review UI. Stripping
+# them from group_payload shrinks /api/groups and SSE payloads significantly
+# while keeping in-memory FileRecords and review-session.json untouched.
+_STRIPPED_UI_MEMBER_FIELDS = (
+    "tile_phashes",
+    "orientation_phashes",
+    "video_fingerprint",
+    "partial_hash",
+    "sha256",
+    "human_detection_signature",
+    "face_detection_signature",
+    "people_score_signature",
+    "non_person_coverage_signature",
+    "border_signature",
+    "border_levels_signature",
+)
+
+
+def _shallow_clone_match_details(details: dict) -> dict:
+    """Fast clone of JSON-shaped match_details without recursive copy.deepcopy."""
+    if not details:
+        return {}
+    cloned: dict = {}
+    for key, value in details.items():
+        if isinstance(value, dict):
+            cloned[key] = {
+                sub_k: (
+                    dict(sub_v)
+                    if isinstance(sub_v, dict)
+                    else list(sub_v)
+                    if isinstance(sub_v, list)
+                    else sub_v
+                )
+                for sub_k, sub_v in value.items()
+            }
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+        else:
+            cloned[key] = value
+    return cloned
 
 
 def _hash_difference(left: str | None, right: str | None) -> tuple[int, int] | None:
@@ -677,8 +720,12 @@ def create_app(
         # Bumped on every in-place membership change (group streamed, members
         # removed) so the allowed-path set used by media routes can be cached.
         "paths_version": 0,
+        # Bumped only when EXACT or SIMILAR group membership changes, so
+        # streaming/updating independent review groups never triggers O(G^2)
+        # rebuilds of dup_groups_cache under the global lock.
+        "dup_groups_version": 0,
         "allowed_paths_cache": None,  # ((id(result), paths_version), frozenset)
-        "dup_groups_cache": None,  # ((id(result), groups_version, paths_version), dict)
+        "dup_groups_cache": None,  # ((id(result), dup_groups_version), dict)
         # Ids of groups streamed by the active scan, for O(1) replace checks.
         "streamed_group_index": {},
         # Debounced review-session persistence for large results.
@@ -770,7 +817,7 @@ def create_app(
                 reviewed_paths=list(group.reviewed_paths),
                 distinct_participants=list(group.distinct_participants),
                 match_scores=dict(group.match_scores),
-                match_details=copy.deepcopy(group.match_details),
+                match_details=_shallow_clone_match_details(group.match_details),
                 match_explanations=dict(group.match_explanations),
             )
             for group in result.groups
@@ -985,6 +1032,12 @@ def create_app(
 
     def _run_monitor_scan(job_id: str) -> None:
         _cancel_monitor_retry(job_id)
+        # Check busy state BEFORE reading/parsing potentially large job baselines.
+        with lock:
+            busy = state["scanning"] or state["acting"] or state["transitioning"]
+        if busy:
+            _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
+            return
         try:
             with jobs_io_lock:
                 job = jobs.get(job_id)
@@ -1125,7 +1178,7 @@ def create_app(
     def dup_groups_by_path_locked() -> dict[str, tuple[str, ...]]:
         """Map file path -> Exact/Similar group IDs containing it, cached per version."""
         result: ScanResult | None = state["result"]
-        key = (id(result), state["groups_version"], state["paths_version"])
+        key = (id(result), state["dup_groups_version"])
         cached = state.get("dup_groups_cache")
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1140,9 +1193,28 @@ def create_app(
         state["dup_groups_cache"] = (key, frozen)
         return frozen
 
-    def group_payload(group) -> dict:
+    def _snapshot_group_locked(group):
+        """Shallow-clone mutable group containers under lock so serialization runs lock-free."""
+        return replace(
+            group,
+            members=[replace(member) for member in group.members],
+            selected_for_removal=list(group.selected_for_removal),
+            reviewed_paths=list(group.reviewed_paths),
+            distinct_participants=list(group.distinct_participants),
+            match_scores=dict(group.match_scores),
+            match_details=_shallow_clone_match_details(group.match_details),
+            match_explanations=dict(group.match_explanations),
+        )
+
+    def group_payload(
+        group,
+        *,
+        dup_map: dict[str, tuple[str, ...]] | None = None,
+        deleted_files: dict | set | frozenset | None = None,
+    ) -> dict:
         payload = group.to_dict()
-        dup_map = dup_groups_by_path_locked()
+        if dup_map is None:
+            dup_map = dup_groups_by_path_locked()
         for member, member_payload in zip(group.members, payload["members"], strict=True):
             # A score from an older model would sort against current ones.
             if not has_current_people_score(member):
@@ -1153,6 +1225,8 @@ def create_app(
             member_payload["in_duplicate_group"] = [
                 gid for gid in dup_map.get(member.path, ()) if gid != group.id
             ]
+            for internal_field in _STRIPPED_UI_MEMBER_FIELDS:
+                member_payload.pop(internal_field, None)
         if group.kind == GroupKind.SETS:
             for member, member_payload in zip(group.members, payload["members"], strict=True):
                 score = group.match_scores.get(member.path)
@@ -1245,7 +1319,7 @@ def create_app(
                       if m.get("similarity_percent") is not None
                       and m["path"] != group.suggested_keep]
         payload["cleanup"] = cleanup_opportunity(group, agreements)
-        deleted = state["deleted_files"]
+        deleted = state["deleted_files"] if deleted_files is None else deleted_files
         payload["deleted_paths"] = [
             member.path for member in group.members if member.path in deleted
         ]
@@ -1672,94 +1746,126 @@ def create_app(
             last_snapshot = None
             last_status_emit = 0.0
             last_any_emit = 0.0
-            while True:
-                events: list[tuple[str, dict]] = []
-                with lock:
-                    result: ScanResult | None = state["result"]
-                    # id() ints are safe identity tokens here: a replaced
-                    # result stays referenced by the review session, so its
-                    # id cannot be recycled while a connection tracks it.
-                    token = id(result) if result is not None else None
-                    if token != result_token:
-                        # Result object replaced (new scan, completion, resume,
-                        # discard): per-connection append tracking is invalid.
-                        result_token = token
-                        sent_groups = 0
-                        events.append(
-                            (
-                                "reset",
-                                {
-                                    "groups_version": state["groups_version"],
-                                    "scan_id": state["scan_id"],
-                                    "scanning": state["scanning"],
-                                },
+            try:
+                while not app.extensions.get("dedupe_shutting_down"):
+                    events: list[tuple[str, dict]] = []
+                    pending_group_snaps: list = []
+                    dup_map_snap = None
+                    deleted_snap = None
+                    with lock:
+                        result: ScanResult | None = state["result"]
+                        # id() ints are safe identity tokens here: a replaced
+                        # result stays referenced by the review session, so its
+                        # id cannot be recycled while a connection tracks it.
+                        token = id(result) if result is not None else None
+                        if token != result_token:
+                            # Result object replaced (new scan, completion, resume,
+                            # discard): per-connection append tracking is invalid.
+                            result_token = token
+                            sent_groups = 0
+                            events.append(
+                                (
+                                    "reset",
+                                    {
+                                        "groups_version": state["groups_version"],
+                                        "scan_id": state["scan_id"],
+                                        "scanning": state["scanning"],
+                                    },
+                                )
                             )
-                        )
-                        if not state["scanning"]:
-                            # Completion/resume/discard: the client refetches
-                            # the authoritative list on reset, so skip deltas.
-                            sent_groups = len(result.groups) if result is not None else 0
+                            if not state["scanning"]:
+                                # Completion/resume/discard: the client refetches
+                                # the authoritative list on reset, so skip deltas.
+                                sent_groups = len(result.groups) if result is not None else 0
+                                seen_groups_version = state["groups_version"]
+                            # While scanning, leave the seen version stale: groups
+                            # appended since the replacement stream as deltas below.
+                        if (
+                            result is not None
+                            and state["scanning"]
+                            and state["groups_version"] != seen_groups_version
+                        ):
+                            new_slice = result.groups[sent_groups:]
+                            if new_slice:
+                                dup_map_snap = dup_groups_by_path_locked()
+                                deleted_snap = frozenset(state["deleted_files"])
+                                pending_group_snaps = [
+                                    _snapshot_group_locked(group) for group in new_slice
+                                ]
+                            sent_groups = len(result.groups)
                             seen_groups_version = state["groups_version"]
-                        # While scanning, leave the seen version stale: groups
-                        # appended since the replacement stream as deltas below.
-                    if (
-                        result is not None
-                        and state["scanning"]
-                        and state["groups_version"] != seen_groups_version
-                    ):
-                        for group in result.groups[sent_groups:]:
-                            events.append(("group", group_payload(group)))
-                        sent_groups = len(result.groups)
-                        seen_groups_version = state["groups_version"]
 
-                    prog = state["progress"]
-                    scoring = state["people_scoring"]
-                    people_running = bool(scoring["running"])
-                    # Omit high-frequency files_processed/done counts from immediate
-                    # transitions so progress ticks obey the 0.25s throttle.
-                    snapshot = (
-                        state["scanning"],
-                        state["acting"],
-                        prog.phase,
-                        prog.done,
-                        prog.groups_found,
-                        state["last_error"],
-                        state["groups_version"],
-                        state["selected_count"],
-                        len(state["deleted_files"]),
-                        people_running,
-                        scoring["group_id"],
-                        scoring["metric"],
-                        scoring["error"],
-                    )
-                    now = time.monotonic()
-                    transitioned = snapshot != last_snapshot
-                    due = (state["scanning"] or people_running) and now - last_status_emit >= 0.25
-                    if transitioned or due:
-                        events.append(("status", status_payload_locked()))
-                        last_snapshot = snapshot
-                        last_status_emit = now
-                    active_poll = state["scanning"] or people_running
-
-                if events:
-                    lines = []
-                    for name, payload in events:
-                        lines.append(
-                            f"event: {name}\ndata: {_json.dumps(payload)}\n\n"
+                        prog = state["progress"]
+                        scoring = state["people_scoring"]
+                        people_running = bool(scoring["running"])
+                        # Omit high-frequency files_processed/done counts from immediate
+                        # transitions so progress ticks obey the 0.25s throttle.
+                        snapshot = (
+                            state["scanning"],
+                            state["acting"],
+                            prog.phase,
+                            prog.done,
+                            prog.groups_found,
+                            state["last_error"],
+                            state["groups_version"],
+                            state["selected_count"],
+                            len(state["deleted_files"]),
+                            people_running,
+                            scoring["group_id"],
+                            scoring["metric"],
+                            scoring["error"],
                         )
-                    last_any_emit = time.monotonic()
-                    yield "".join(lines)
-                elif time.monotonic() - last_any_emit >= 30.0:
-                    last_any_emit = time.monotonic()
-                    yield ": heartbeat\n\n"
+                        now = time.monotonic()
+                        transitioned = snapshot != last_snapshot
+                        due = (state["scanning"] or people_running) and now - last_status_emit >= 0.25
+                        if transitioned or due:
+                            events.append(("status", status_payload_locked()))
+                            last_snapshot = snapshot
+                            last_status_emit = now
+                        active_poll = state["scanning"] or people_running
 
-                with lock:
-                    # Coalesce per-file progress notifications into one wakeup
-                    # cadence while active; sleep until notified when idle.
-                    state["events"].wait(timeout=0.25 if active_poll else 30.0)
+                    # Build group payloads and encode JSON outside the global lock.
+                    if pending_group_snaps:
+                        group_events = [
+                            (
+                                "group",
+                                group_payload(
+                                    group,
+                                    dup_map=dup_map_snap,
+                                    deleted_files=deleted_snap,
+                                ),
+                            )
+                            for group in pending_group_snaps
+                        ]
+                        # Preserve ordering: reset (if any) -> groups -> status.
+                        status_events = [ev for ev in events if ev[0] == "status"]
+                        other_events = [ev for ev in events if ev[0] != "status"]
+                        events = [*other_events, *group_events, *status_events]
+
+                    if events:
+                        lines = []
+                        for name, payload in events:
+                            lines.append(
+                                f"event: {name}\ndata: {_json.dumps(payload)}\n\n"
+                            )
+                        last_any_emit = time.monotonic()
+                        yield "".join(lines)
+                    elif time.monotonic() - last_any_emit >= 30.0:
+                        last_any_emit = time.monotonic()
+                        yield ": heartbeat\n\n"
+
+                    with lock:
+                        if app.extensions.get("dedupe_shutting_down"):
+                            return
+                        # Coalesce per-file progress notifications into one wakeup
+                        # cadence while active; sleep until notified when idle.
+                        state["events"].wait(timeout=0.25 if active_poll else 30.0)
+            except GeneratorExit:
+                return
 
         response = Response(stream(), mimetype="text/event-stream")
         response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Connection"] = "close"
         return response
 
     @app.get("/api/review-session")
@@ -1817,6 +1923,7 @@ def create_app(
                 state["deleted_files"] = dict(report.deleted_files)
                 state["groups_version"] += 1
                 state["paths_version"] += 1
+                state["dup_groups_version"] += 1
                 state["streamed_group_index"] = {}
                 refresh_selected_count_locked()
                 state["progress"] = ScanProgress(
@@ -1855,6 +1962,7 @@ def create_app(
                 state["scan_id"] = secrets.token_hex(12)
                 state["groups_version"] += 1
                 state["paths_version"] += 1
+                state["dup_groups_version"] += 1
                 state["selected_count"] = 0
                 state["sets_groups"] = 0
                 state["progress"] = ScanProgress()
@@ -1909,15 +2017,22 @@ def create_app(
                 groups = groups[offset : offset + max(0, limit)]
             elif offset:
                 groups = groups[offset:]
-            return jsonify(
-                {
-                    "groups": [group_payload(g) for g in groups],
-                    "total": total,
-                    "offset": offset,
-                    "limit": limit,
-                    "groups_version": state["groups_version"],
-                }
-            )
+            dup_map = dup_groups_by_path_locked()
+            deleted_snap = frozenset(state["deleted_files"])
+            groups_version = state["groups_version"]
+            group_snaps = [_snapshot_group_locked(g) for g in groups]
+        return jsonify(
+            {
+                "groups": [
+                    group_payload(g, dup_map=dup_map, deleted_files=deleted_snap)
+                    for g in group_snaps
+                ],
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "groups_version": groups_version,
+            }
+        )
 
     @app.get("/api/groups/<group_id>")
     def api_group(group_id: str):
@@ -1925,10 +2040,15 @@ def create_app(
             result: ScanResult | None = state["result"]
             if result is None:
                 return jsonify({"error": "no scan"}), 404
-            for g in result.groups:
-                if g.id == group_id:
-                    return jsonify(group_payload(g))
-        return jsonify({"error": "not found"}), 404
+            target = next((g for g in result.groups if g.id == group_id), None)
+            if target is None:
+                return jsonify({"error": "not found"}), 404
+            dup_map = dup_groups_by_path_locked()
+            deleted_snap = frozenset(state["deleted_files"])
+            group_snap = _snapshot_group_locked(target)
+        return jsonify(
+            group_payload(group_snap, dup_map=dup_map, deleted_files=deleted_snap)
+        )
 
     people_queue_lock = threading.Lock()
     people_queue_cond = threading.Condition(people_queue_lock)
@@ -2214,6 +2334,7 @@ def create_app(
                     state["preview_tokens"] = {}
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
+                    state["dup_groups_version"] += 1
                     state["selected_count"] = 0
                     state["sets_groups"] = 0
                     state["streamed_group_index"] = {}
@@ -2249,6 +2370,14 @@ def create_app(
 
                 def on_progress(prog: ScanProgress) -> None:
                     now = time.monotonic()
+                    if prog.done:
+                        # Keep done=False until post-scan finalization completes.
+                        prog = replace(
+                            prog,
+                            phase="finalizing",
+                            done=False,
+                            message="Finalizing results…",
+                        )
                     with lock:
                         if state["scan_id"] == scan_id:
                             state["progress"] = prog
@@ -2258,7 +2387,9 @@ def create_app(
                                 last_progress_notify[0] = now
                                 state["events"].notify_all()
 
-                def on_group(group) -> None:
+                def on_groups(new_groups) -> None:
+                    if not new_groups:
+                        return
                     with lock:
                         if data.get("new_only"):
                             return  # Publish only the focused result after inventory completes.
@@ -2266,20 +2397,32 @@ def create_app(
                         if result is None or state["scan_id"] != scan_id:
                             return
                         index = state["streamed_group_index"]
-                        existing = index.get(group.id)
-                        if existing is not None:
-                            result.groups[existing] = group
+                        replaced_any = False
+                        touched_dup = False
+                        for group in new_groups:
+                            if group.kind in (GroupKind.EXACT, GroupKind.SIMILAR):
+                                touched_dup = True
+                            existing = index.get(group.id)
+                            if existing is not None:
+                                result.groups[existing] = group
+                                replaced_any = True
+                            else:
+                                index[group.id] = len(result.groups)
+                                result.groups.append(group)
+                                note_group_streamed_locked(group)
+                        if replaced_any:
                             result.recompute_stats()
                             refresh_selected_count_locked()
-                        else:
-                            index[group.id] = len(result.groups)
-                            result.groups.append(group)
-                            note_group_streamed_locked(group)
                         state["groups_version"] = state.get("groups_version", 0) + 1
                         state["paths_version"] += 1
+                        if touched_dup:
+                            state["dup_groups_version"] += 1
                         prog = state["progress"]
                         prog.groups_found = len(result.groups)
                         state["events"].notify_all()
+
+                def on_group(group) -> None:
+                    on_groups([group])
 
                 def on_stream_progress(prog: ScanProgress) -> None:
                     with lock:
@@ -2377,16 +2520,39 @@ def create_app(
                     scan_kwargs["baseline"] = job["baseline"]
                     scan_kwargs["new_only"] = True
                 if parallel_streams:
+                    try:
+                        parallel_params = inspect.signature(run_scans_parallel).parameters
+                    except (TypeError, ValueError):
+                        parallel_params = {}
+                    if "on_groups" in parallel_params:
+                        scan_kwargs["on_groups"] = on_groups
+                    if "emit_done" in parallel_params:
+                        scan_kwargs["emit_done"] = False
                     result = run_scans_parallel(
                         paths,
                         on_stream_progress=on_stream_progress,
                         **scan_kwargs,
                     )
                 else:
+                    try:
+                        scan_params = inspect.signature(run_scan).parameters
+                    except (TypeError, ValueError):
+                        scan_params = {}
+                    if "on_groups" in scan_params:
+                        scan_kwargs["on_groups"] = on_groups
+                    if "emit_done" in scan_params:
+                        scan_kwargs["emit_done"] = False
                     result = run_scan(paths, **scan_kwargs)
                 with lock:
                     if state["scan_id"] != scan_id:
                         return
+                    state["progress"] = replace(
+                        state["progress"],
+                        phase="finalizing",
+                        done=False,
+                        message="Finalizing results…",
+                    )
+                    state["events"].notify_all()
                 if not result.roots and result.errors:
                     raise RuntimeError("; ".join(result.errors))
                 result.protected_folders = protected_folders
@@ -2426,12 +2592,20 @@ def create_app(
                             jobs.finish_scan(result)
                     except OSError:
                         pass
+                file_count = max(
+                    len(result.files), sum(len(group.members) for group in result.groups)
+                )
+                async_persist = (
+                    len(result.groups) >= PERSIST_DEBOUNCE_MIN_GROUPS
+                    or file_count >= PERSIST_DEBOUNCE_MIN_FILES
+                )
                 with lock:
                     if state["scan_id"] != scan_id:
                         return
                     state["result"] = result
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
+                    state["dup_groups_version"] += 1
                     state["streamed_group_index"] = {}
                     refresh_selected_count_locked()
                     state["progress"] = replace(
@@ -2449,9 +2623,19 @@ def create_app(
                     )
                     state["scanning"] = False
                     state["cancel_event"] = None
+                    if async_persist:
+                        state["persist_seq"] += 1
+                        state["persist_dirty"] = True
                     state["events"].notify_all()
                 # Keep an already-completed scan in memory even if persisting to disk fails.
-                persist_result()
+                if async_persist:
+                    threading.Thread(
+                        target=persist_result,
+                        name="dedupe-scan-persist",
+                        daemon=True,
+                    ).start()
+                else:
+                    persist_result()
             except Exception as exc:
                 with lock:
                     if state["scan_id"] != scan_id:
@@ -2463,6 +2647,7 @@ def create_app(
                     state["scan_id"] = secrets.token_hex(12)
                     state["groups_version"] += 1
                     state["paths_version"] += 1
+                    state["dup_groups_version"] += 1
                     state["streamed_group_index"] = {}
                     refresh_selected_count_locked()
                     state["preview_tokens"] = {}
@@ -3090,8 +3275,10 @@ def create_app(
         if result is None:
             return
         kept = []
+        changed = False
         for group in result.groups:
             if group.kind == GroupKind.EXACT and any(m.path == path for m in group.members):
+                changed = True
                 remaining = [member for member in group.members if member.path != path]
                 if len(remaining) < 2:
                     continue
@@ -3103,6 +3290,8 @@ def create_app(
                     group.suggested_keep = pick_suggested_keep(remaining)
             kept.append(group)
         result.groups = kept
+        if changed:
+            state["dup_groups_version"] += 1
 
     def store_border_verdict(record, verdict: str) -> None:
         """Remember a crop verdict for this exact file content across scans."""
@@ -4199,6 +4388,7 @@ def create_app(
                 changed = bool(new_groups or updated_groups or updated_fields_by_path)
                 if new_groups or updated_groups:
                     state["groups_version"] += 1
+                    state["dup_groups_version"] += 1
                 if changed:
                     state["paths_version"] += 1
                     state["persist_seq"] += 1
@@ -4408,6 +4598,7 @@ def create_app(
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                state["dup_groups_version"] += 1
                 state["persist_seq"] += 1
                 dissolved = all(
                     candidate.id != group_id for candidate in result.groups
@@ -4550,6 +4741,7 @@ def create_app(
                     refresh_selected_count_locked()
                     state["groups_version"] = state.get("groups_version", 0) + 1
                     state["paths_version"] += 1
+                    state["dup_groups_version"] += 1
                     state["persist_seq"] += 1
                     state["events"].notify_all()
                 payload = group_payload(group) if group is not None else None
@@ -4645,6 +4837,7 @@ def create_app(
                 refresh_selected_count_locked()
                 state["groups_version"] = state.get("groups_version", 0) + 1
                 state["paths_version"] += 1
+                state["dup_groups_version"] += 1
                 state["persist_seq"] += 1
                 payload = group_payload(group)
                 state["events"].notify_all()
@@ -4905,6 +5098,7 @@ def create_app(
                         refresh_selected_count_locked()
                         state["groups_version"] += 1
                         state["paths_version"] += 1
+                        state["dup_groups_version"] += 1
                         state["persist_seq"] += 1
                         state["events"].notify_all()
                 if removed:
@@ -5154,7 +5348,7 @@ def create_app(
         has_version = bool(request.args.get("v"))
         src_etag = f"{src_stat.st_mtime_ns}:{src_stat.st_size}"
         variant_arg = request.args.get("variant")
-        if variant_arg in ("thumb", "preview", "full"):
+        if variant_arg in ("grid", "thumb", "preview", "full"):
             variant = variant_arg
         else:
             variant = "full" if request.args.get("full") == "1" else "thumb"
@@ -5251,11 +5445,15 @@ def create_app(
             import subprocess
 
             if sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", str(p)])
+                proc = subprocess.Popen(["open", "-R", str(p)])
             elif sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", str(p)])
+                proc = subprocess.Popen(["explorer", "/select,", str(p)])
             else:
-                subprocess.Popen(["xdg-open", str(p.parent)])
+                proc = subprocess.Popen(["xdg-open", str(p.parent)])
+            # Reap the short-lived launcher process without blocking the request.
+            wait = getattr(proc, "wait", None)
+            if callable(wait):
+                threading.Thread(target=wait, daemon=True).start()
         return jsonify({"path": path, "exists": exists})
 
     @app.post("/api/shutdown")
@@ -5304,6 +5502,9 @@ def create_app(
                     ):
                         _arm_timer_locked(expected_token)
                 return
+            app.extensions["dedupe_shutting_down"] = True
+            with lock:
+                state["events"].notify_all()
             server = app.extensions.get("dedupe_server")
             if server is not None:
                 server.shutdown()
@@ -5340,7 +5541,17 @@ def run_app(
     clean shutdown, 2 if the start was refused. KeyboardInterrupt (Ctrl+C)
     propagates to the caller.
     """
-    from werkzeug.serving import make_server
+    from werkzeug.serving import WSGIRequestHandler, make_server
+
+    class _DedupeRequestHandler(WSGIRequestHandler):
+        # HTTP/1.1 enables keep-alive connection reuse so WKWebView / browsers
+        # do not churn loopback sockets and TIME_WAIT ports on thumbnail bursts.
+        protocol_version = "HTTP/1.1"
+
+    if os.environ.get("DEDUPE_DEBUG") != "1":
+        # Silence per-request Werkzeug access logs so the macOS shell's stderr
+        # pipe is not flooded on every thumbnail and status request.
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     # Bind candidate ports ourselves (same SO_REUSEADDR semantics as
     # werkzeug) and hand the pre-bound socket fd to make_server, so the
@@ -5375,7 +5586,14 @@ def run_app(
                 f"serving on {actual_port} instead",
                 file=sys.stderr,
             )
-        server = make_server(host, actual_port, app, threaded=True, fd=bound.fileno())
+        server = make_server(
+            host,
+            actual_port,
+            app,
+            threaded=True,
+            request_handler=_DedupeRequestHandler,
+            fd=bound.fileno(),
+        )
     except OSError as exc:
         print(
             f"error: could not start the UI server ({exc.strerror or exc})",
@@ -5394,6 +5612,11 @@ def run_app(
     try:
         server.serve_forever()
     finally:
+        app.extensions["dedupe_shutting_down"] = True
+        state = app.extensions.get("dedupe_state")
+        if isinstance(state, dict) and "events" in state:
+            with state["events"]:
+                state["events"].notify_all()
         app.extensions.pop("dedupe_server", None)
         server.server_close()
     return 0

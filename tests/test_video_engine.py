@@ -212,3 +212,232 @@ def test_media_details_guards_other_type_and_threadsafe_heif(tmp_path, monkeypat
     for t in threads:
         t.join(timeout=5)
     assert calls == 1
+
+
+def test_video_versions_has_separate_progress_budget_and_audio_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Standard video clustering must not peg progress at 100% before excerpts run."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "a.mp4").write_bytes(b"video-a")
+    (media / "b.mp4").write_bytes(b"video-b")
+    (media / "c.mp4").write_bytes(b"video-c")
+
+    snapshots: list[tuple[str, int, int, str, bool]] = []
+    progress_before_versions: list[tuple[int, int]] = []
+
+    def on_progress(prog) -> None:
+        snapshots.append(
+            (prog.phase, prog.files_processed, prog.files_found, prog.message, prog.done)
+        )
+
+    def fake_standard(records, *, progress=None, **_kwargs):
+        for r in records:
+            r.duration = 20.0
+            r.width = r.height = 100
+        if progress:
+            progress("video-hash", len(records), len(records))
+            progress("video-cluster", len(records), len(records), "")
+        return [records[:2]]
+
+    def fake_versions(records, *, progress=None, **_kwargs):
+        # Capture latest processing snapshot right as excerpts start.
+        proc = [(d, t) for ph, d, t, _m, _done in snapshots if ph == "processing"]
+        if proc:
+            progress_before_versions.append(proc[-1])
+        if progress:
+            progress("video-versions", 1, len(records), "Finding video excerpts")
+            progress("video-versions-verify", 1, 1, "Verifying video excerpts")
+        return []
+
+    monkeypatch.setattr("dedupe.engine.PROGRESS_CALLBACK_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr("dedupe.engine.find_similar_video_groups", fake_standard)
+    monkeypatch.setattr("dedupe.engine.find_video_version_matches", fake_versions)
+    monkeypatch.setattr("dedupe.engine.compare_video_audio", lambda *_a, **_k: "same")
+    monkeypatch.setattr("dedupe.engine._verify_video_offset", lambda *_a, **_k: None)
+
+    run_scan(
+        [media],
+        exact=False,
+        similar=True,
+        video_versions=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+        progress=on_progress,
+    )
+
+    assert progress_before_versions
+    done_before, total_before = progress_before_versions[0]
+    assert done_before < total_before, "progress pegged at 100% before video_versions started"
+    assert any("Comparing video audio 1/1" in msg for _ph, _d, _t, msg, _done in snapshots)
+    assert any(ph == "finalizing" for ph, _d, _t, _m, _done in snapshots)
+
+
+def test_run_scan_on_groups_batching_and_emit_done_false(tmp_path: Path, video_pair) -> None:
+    batches: list[list] = []
+    single_calls: list = []
+    progress_events: list = []
+
+    result = run_scan(
+        [video_pair],
+        exact=False,
+        similar=True,
+        video_versions=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+        on_group=single_calls.append,
+        on_groups=batches.append,
+        emit_done=False,
+        progress=progress_events.append,
+    )
+
+    assert len(result.groups) == 1
+    assert len(batches) == 1
+    assert len(batches[0]) == 1
+    assert single_calls == []
+    assert progress_events
+    assert progress_events[-1].phase == "finalizing"
+    assert progress_events[-1].done is False
+    assert all(not ev.done for ev in progress_events)
+
+
+def test_cpu_stage_count_and_late_video_versions_worker_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dedupe.engine as engine_mod
+
+    # Borders blocks image and video, so they do not double-count.
+    assert (
+        engine_mod._concurrent_cpu_stage_count(
+            exact=True,
+            borders=True,
+            image=True,
+            video=False,
+            semantic=False,
+            human=False,
+            faces=False,
+        )
+        == 2
+    )
+    assert (
+        engine_mod._concurrent_cpu_stage_count(
+            exact=False,
+            borders=True,
+            image=True,
+            video=True,
+            semantic=False,
+            human=False,
+            faces=False,
+        )
+        == 2
+    )
+
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "a.mp4").write_bytes(b"video-a")
+    (media / "b.mp4").write_bytes(b"video-b")
+    seen_version_workers: list[int] = []
+
+    def fake_versions(records, *, workers=None, **_kwargs):
+        seen_version_workers.append(workers)
+        return []
+
+    monkeypatch.setattr(engine_mod, "resolve_workers", lambda workers=None, **_k: 8)
+    monkeypatch.setattr(engine_mod, "find_similar_video_groups", lambda *_a, **_k: [])
+    monkeypatch.setattr(engine_mod, "find_video_version_matches", fake_versions)
+
+    run_scan(
+        [media],
+        exact=True,
+        similar=True,
+        video_versions=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+    )
+    # Exact is already done and no other CPU stages remain -> full n_workers (8).
+    assert seen_version_workers == [8]
+
+
+def test_video_versions_index_and_verify_advance_distinct_progress_bands(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Indexing video excerpts must not pin progress at 90% before verification runs."""
+    media = tmp_path / "media"
+    media.mkdir()
+    for i in range(20):
+        (media / f"v{i:02d}.mp4").write_bytes(f"video-{i}".encode())
+
+    seen: list[tuple[str, int, int]] = []
+
+    def on_progress(prog) -> None:
+        if prog.phase == "processing":
+            seen.append((prog.message, prog.files_processed, prog.files_found))
+
+    def fake_versions(records, *, progress=None, **_kwargs):
+        if progress:
+            progress("video-versions", len(records), len(records), "Finding video excerpts")
+            progress("video-versions-index", len(records), len(records), "Indexing video excerpts")
+            progress("video-versions-verify", 1, 2, "Checking video excerpts")
+            progress("video-versions-verify", 2, 2, "Checking video excerpts")
+        return []
+
+    monkeypatch.setattr("dedupe.engine.PROGRESS_CALLBACK_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr("dedupe.engine.find_video_version_matches", fake_versions)
+
+    run_scan(
+        [media],
+        exact=False,
+        similar=False,
+        video_versions=True,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+        progress=on_progress,
+    )
+
+    after_index = [d for msg, d, _t in seen if "Indexing video excerpts" in msg]
+    after_verify = [d for msg, d, _t in seen if "Checking video excerpts" in msg]
+    assert after_index and after_verify
+    assert after_index[-1] < after_verify[-1]
+
+
+def test_run_scans_parallel_emit_done_false_never_emits_done(tmp_path: Path) -> None:
+    from dedupe.engine import run_scans_parallel
+
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    (folder_a / "a.jpg").write_bytes(b"img-a")
+    (folder_b / "b.jpg").write_bytes(b"img-b")
+
+    events: list = []
+    run_scans_parallel(
+        [folder_a, folder_b],
+        exact=False,
+        similar=False,
+        find_low_resolution=False,
+        random_review_count=0,
+        use_cache=False,
+        emit_done=False,
+        progress=events.append,
+    )
+    assert events
+    assert all(not ev.done for ev in events)
+    assert all(ev.phase != "done" for ev in events)
+    assert events[-1].phase == "finalizing"
+
+    empty_events: list = []
+    run_scans_parallel(
+        [tmp_path / "missing"],
+        use_cache=False,
+        emit_done=False,
+        progress=empty_events.append,
+    )
+    assert empty_events
+    assert all(not ev.done for ev in empty_events)
+    assert empty_events[-1].phase == "finalizing"

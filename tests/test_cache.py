@@ -660,17 +660,30 @@ def test_distinct_content_identity_is_not_refreshed_for_a_changed_file(tmp_path:
 
 
 def test_cache_user_version_synchronous_normal_and_skips_ddl_on_reopen(tmp_path: Path) -> None:
+    from dedupe.cache import CACHE_SCHEMA_VERSION
+
     db_path = tmp_path / "hashes.sqlite3"
     cache = HashCache(db_path)
     user_version = cache._conn.execute("PRAGMA user_version").fetchone()[0]
     sync_mode = cache._conn.execute("PRAGMA synchronous").fetchone()[0]
-    assert user_version == 3
+    temp_store = cache._conn.execute("PRAGMA temp_store").fetchone()[0]
+    cache_size = cache._conn.execute("PRAGMA cache_size").fetchone()[0]
+    assert user_version == CACHE_SCHEMA_VERSION
     assert sync_mode == 1  # PRAGMA synchronous=NORMAL
+    assert temp_store == 2  # PRAGMA temp_store=MEMORY
+    assert cache_size == -32000
+    indexes = {
+        row[0]
+        for row in cache._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
+    assert "distinct_similar_pairs_path_b_idx" in indexes
     cache.close()
 
     # Re-opening with matching user_version must not require a schema migration transaction.
     with closing(sqlite3.connect(db_path)) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert check.execute("PRAGMA user_version").fetchone()[0] == CACHE_SCHEMA_VERSION
     reopened = HashCache(db_path)
     assert reopened._conn.in_transaction is False
     reopened.close()
@@ -796,3 +809,46 @@ def test_cache_recorded_pairs_among_batches_over_500_paths(tmp_path: Path) -> No
     }
     assert pairs == expected
     cache.close()
+
+
+def test_cache_suspend_reopen_preserves_dirty_tracking_and_batches_mark_distinct(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "hashes.sqlite3"
+    seed = _record(tmp_path / "photo.jpg", inode=77)
+    seed.sha256 = "deadbeef"
+    cache = HashCache(db_path)
+    cache.store_all([seed])
+    cache.close()
+
+    # Hydrate, suspend (closing SQLite connection), then reopen and store unchanged.
+    session_cache = HashCache(db_path)
+    fresh = _record(tmp_path / "photo.jpg", inode=77)
+    fresh.phash = None
+    assert session_cache.hydrate([fresh]) == 1
+    session_cache.suspend()
+    assert session_cache._closed is True
+    session_cache.reopen()
+    assert session_cache._closed is False
+    before_changes = session_cache._conn.total_changes
+    session_cache.store_all([fresh])
+    assert session_cache._conn.total_changes == before_changes
+
+    # mark_distinct uses executemany rather than per-pair execute.
+    calls: list[int] = []
+    real_conn = session_cache._conn
+
+    class WrapConn:
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+        def executemany(self, sql, rows):
+            rows = list(rows)
+            calls.append(len(rows))
+            return real_conn.executemany(sql, rows)
+
+    monkeypatch.setattr(session_cache, "_conn", WrapConn())
+    recs = [_record(tmp_path / f"d_{i}.jpg", inode=200 + i) for i in range(5)]
+    assert session_cache.mark_distinct(recs) == 10
+    assert calls == [10]
+    session_cache.close()

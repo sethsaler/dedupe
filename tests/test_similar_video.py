@@ -63,20 +63,28 @@ def test_video_fingerprint_extracts_all_frames_in_one_ffmpeg_call(
     calls: list[list[str]] = []
 
     monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
-    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (60.0, 1920, 1080))
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (10.0, 1920, 1080))
     monkeypatch.setattr("dedupe.similar_video.subprocess.run", _piped_batch_runner(calls))
 
     fingerprint, width, height, duration = compute_video_fingerprint(tmp_path / "video.mp4")
 
     assert fingerprint is not None and fingerprint.startswith("v3:")
     assert len(fingerprint[3:].split(",")) == 8
-    assert (width, height, duration) == (1920, 1080, 60.0)
-    # Single-pass sequential pipe for D <= 180s: one process, zero temp files.
+    assert (width, height, duration) == (1920, 1080, 10.0)
+    # Single-pass sequential pipe for D <= SINGLE_PASS_MAX_DURATION (15s): one process, zero temp files.
     assert len(calls) == 1
     command = calls[0]
     assert "pipe:1" in command
     assert command.count("-i") == 1
     assert "-y" not in command
+
+    # Medium/long videos (> 15s) skip full sequential decode and use fast keyframe seeks.
+    calls.clear()
+    monkeypatch.setattr("dedupe.similar_video.probe_video", lambda _path: (60.0, 1920, 1080))
+    fp_med, *_ = compute_video_fingerprint(tmp_path / "medium.mp4", software=True)
+    assert fp_med is not None and fp_med.startswith("v3:")
+    assert len(calls) == 1
+    assert calls[0].count("-ss") == 8
 
 
 def test_video_fingerprint_falls_back_to_per_frame_extraction(
@@ -1119,3 +1127,180 @@ def test_cropped_border_roi_and_horizontally_flipped_videos_match(tmp_path: Path
     flip_records = inventory([orig, flipped])
     flip_groups = find_similar_video_groups(flip_records, workers=1)
     assert [{Path(r.path).name for r in g} for g in flip_groups] == [{"orig.mp4", "flipped.mp4"}]
+
+
+def test_rgb_thumb_cache_unblocks_waiters_on_exception_and_bounds_size(monkeypatch) -> None:
+    import threading
+    import time
+
+    import dedupe.similar_video as module
+
+    started = threading.Event()
+    release = threading.Event()
+    attempts = 0
+
+    def flaky_extract(path, timestamps, *, crop_vf=None, cancelled=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            started.set()
+            release.wait(timeout=2.0)
+            raise RuntimeError("boom")
+        return [bytes(4)]
+
+    monkeypatch.setattr(module, "_extract_rgb_thumbs", flaky_extract)
+    cache = module._RgbThumbCache(maxsize=2)
+    errors: list[BaseException] = []
+
+    def owner():
+        try:
+            cache.get("a.mp4", [1.0], None, None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def waiter():
+        assert started.wait(timeout=2.0)
+        try:
+            cache.get("a.mp4", [1.0], None, None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=owner)
+    t2 = threading.Thread(target=waiter)
+    t1.start()
+    t2.start()
+    assert started.wait(timeout=2.0)
+    time.sleep(0.05)
+    release.set()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert len(errors) == 2 and all(isinstance(e, RuntimeError) for e in errors)
+
+    # Evicted after failure -> retry succeeds; LRU cap bounds stored entries.
+    assert cache.get("a.mp4", [1.0], None, None) == [bytes(4)]
+    assert cache.get("b.mp4", [1.0], None, None) == [bytes(4)]
+    assert cache.get("c.mp4", [1.0], None, None) == [bytes(4)]
+    assert len(cache._entries) <= 2
+
+
+def test_frame_batch_cache_serves_subset_hits_without_redecoding(monkeypatch) -> None:
+    import dedupe.similar_video as module
+
+    calls: list[list[float]] = []
+
+    def fake_batches(path: str, timestamps: list[float], cancelled, *, vf_prefix=None):
+        calls.append(list(timestamps))
+        return [bytes([int(t * 10) % 256]) * (HASH_FRAME_SIZE * HASH_FRAME_SIZE) for t in timestamps]
+
+    monkeypatch.setattr(module, "_version_frame_batches", fake_batches)
+    cache = module._FrameBatchCache(max_frames=16)
+
+    seven = [0.8, 2.2, 3.6, 5.0, 6.4, 7.8, 9.2]
+    first = cache.get("clip.mp4", seven, None)
+    assert len(first) == 7
+    assert len(calls) == 1
+
+    # 3 middle anchors are a strict subset -> served straight from per-frame cache!
+    anchors = [2.2, 5.0, 7.8]
+    second = cache.get("clip.mp4", anchors, None)
+    assert second == [first[1], first[3], first[5]]
+    assert len(calls) == 1
+
+
+def test_run_video_command_does_not_double_communicate_and_bounds_cleanup(monkeypatch) -> None:
+    import dedupe.similar_video as module
+
+    comm_calls: list[float | None] = []
+
+    class NormalProc:
+        returncode = 0
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def communicate(self, timeout=None):
+            comm_calls.append(timeout)
+            return b"ok", b""
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: NormalProc())
+    res = module._run_video_command(["echo", "ok"], timeout=5, cancelled=lambda: False)
+    assert res.stdout == b"ok"
+    assert len(comm_calls) == 1
+
+    # Hung process whose communicate() always raises TimeoutExpired even after kill().
+    events: list[str] = []
+
+    class StuckProc:
+        returncode = None
+
+        class _Pipe:
+            def close(self):
+                events.append("close")
+
+        stdout = _Pipe()
+        stderr = _Pipe()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+        def communicate(self, timeout=None):
+            events.append(f"comm:{timeout}")
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: StuckProc())
+    with pytest.raises(TimeoutError):
+        module._run_video_command(["sleep", "99"], timeout=0.01, cancelled=lambda: False)
+    assert "terminate" in events and "kill" in events
+    assert all(ev != "comm:None" for ev in events)
+    assert events.count("close") == 2
+
+
+def test_fast_dct_phash_matches_imagehash_exactly() -> None:
+    import imagehash
+    import numpy as np
+    from PIL import Image
+
+    import dedupe.similar_video as module
+
+    rng = np.random.default_rng(99)
+    samples = [
+        np.zeros((32, 32), dtype=np.uint8),
+        np.full((32, 32), 255, dtype=np.uint8),
+        np.tile(np.arange(32, dtype=np.uint8), (32, 1)),
+        *(rng.integers(0, 256, size=(32, 32), dtype=np.uint8) for _ in range(50)),
+    ]
+    raws = [arr.tobytes() for arr in samples]
+    expected = tuple(
+        int(str(imagehash.phash(Image.frombytes("L", (32, 32), raw))), 16) for raw in raws
+    )
+    assert module._phash_raw_frames_batch(raws) == expected
+    assert tuple(module._phash_raw_frame(raw) for raw in raws) == expected
+
+
+def test_media_details_ffprobe_sets_analyze_and_probe_caps(tmp_path, monkeypatch) -> None:
+    import json
+
+    from dedupe import media_details
+
+    media_details.comparison_details.cache_clear()
+    clip = tmp_path / "cap.mp4"
+    clip.write_bytes(b"video bytes")
+    seen_cmd: list[str] = []
+
+    def fake_run(cmd, **_kwargs):
+        seen_cmd.extend(cmd)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [], "format": {}}))
+
+    monkeypatch.setattr(media_details.shutil, "which", lambda _n: "/usr/bin/ffprobe")
+    monkeypatch.setattr(media_details.subprocess, "run", fake_run)
+    media_details.comparison_details(clip)
+    assert "-analyzeduration" in seen_cmd and "-probesize" in seen_cmd

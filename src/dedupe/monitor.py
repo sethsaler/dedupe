@@ -86,7 +86,7 @@ class FolderMonitor:
         on_change: Callable[[str], None],
         *,
         debounce_seconds: float = 2.0,
-        health_seconds: float = 2.0,
+        health_seconds: float = 10.0,
     ) -> None:
         self.on_change = on_change
         self.debounce_seconds = debounce_seconds

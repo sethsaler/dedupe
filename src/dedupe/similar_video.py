@@ -48,7 +48,18 @@ VERIFY_DISTANCE_FACTOR = 2
 # Error-kind prefix; engine diagnostics classify on it.
 ERROR_VIDEO_FINGERPRINT_FAILED = "video fingerprint failed"
 MAX_FRAMES = 8  # enough signal; fewer seeks/decodes than 12
-SINGLE_PASS_MAX_DURATION = 180.0
+# Sequential full-timeline decode is only faster than 8 keyframe seeks on short clips;
+# above 15s, 4K/60fps videos otherwise decode thousands of frames on 1 thread.
+SINGLE_PASS_MAX_DURATION = 15.0
+# Cap simultaneous hardware-decoded inputs in one ffmpeg process so concurrent
+# workers do not exhaust Apple Silicon VideoToolbox decoder sessions.
+MAX_HWACCEL_MULTI_INPUTS = 4
+# Dense excerpt sampling prefers a single sequential pass on short/medium videos
+# (1 demuxer, 1 decoder) and smaller multi-input batches on long videos.
+VERSION_BATCH_SIZE = 4
+VERSION_SINGLE_PASS_MAX_DURATION = 90.0
+VERSION_SINGLE_PASS_MAX_STEP = 2.5
+MAX_CONSECUTIVE_SEEK_TIMEOUTS = 2
 FRAME_WIDTH = 320
 HASH_FRAME_SIZE = 32
 # Software-decode fingerprint jobs run beside the hardware-decode ones: one
@@ -80,9 +91,39 @@ _VIDEO_FEATURE_CACHE: OrderedDict[tuple[str, int, int | None], tuple[tuple[int, 
 )
 _VIDEO_FEATURE_LOCK = threading.Lock()
 
+_REAL_SHUTIL_WHICH = shutil.which
+_BINARY_PATH_LOCK = threading.Lock()
+_BINARY_PATH_CACHE: dict[tuple[str, str], str | None] = {}
+
+_AUDIO_PRESENCE_INFLIGHT_LOCK = threading.Lock()
+_AUDIO_PRESENCE_INFLIGHT: dict[str, threading.Event] = {}
+
+
+def _resolve_binary(name: str) -> str | None:
+    """Resolve and cache an executable path, invalidating on PATH change or missing binary."""
+    if shutil.which is not _REAL_SHUTIL_WHICH:
+        return shutil.which(name)
+    key = (name, os.environ.get("PATH", ""))
+    with _BINARY_PATH_LOCK:
+        if key in _BINARY_PATH_CACHE:
+            cached = _BINARY_PATH_CACHE[key]
+            if cached is None or (os.path.isfile(cached) and os.access(cached, os.X_OK)):
+                return cached
+        resolved = shutil.which(name)
+        _BINARY_PATH_CACHE[key] = resolved
+        return resolved
+
+
+def _ffmpeg_bin() -> str:
+    return _resolve_binary("ffmpeg") or "ffmpeg"
+
+
+def _ffprobe_bin() -> str:
+    return _resolve_binary("ffprobe") or "ffprobe"
+
 
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+    return _resolve_binary("ffmpeg") is not None and _resolve_binary("ffprobe") is not None
 
 
 # The hwaccel capability probe must bypass any test-patched subprocess.run so
@@ -102,11 +143,12 @@ def _hwaccel_args() -> tuple[str, ...]:
     """
     if os.environ.get("DEDUPE_DISABLE_HWACCEL"):
         return ()
-    if sys.platform != "darwin" or not shutil.which("ffmpeg"):
+    ffmpeg = _resolve_binary("ffmpeg")
+    if sys.platform != "darwin" or not ffmpeg:
         return ()
     try:
         result = _REAL_SUBPROCESS_RUN(
-            ["ffmpeg", "-hide_banner", "-hwaccels"],
+            [ffmpeg, "-hide_banner", "-hwaccels"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -125,10 +167,11 @@ def probe_video(
     cancelled: Callable[[], bool] | None = None,
 ) -> tuple[float | None, int | None, int | None]:
     """Single ffprobe: (duration, width, height) in display orientation."""
-    if not shutil.which("ffprobe"):
+    ffprobe = _resolve_binary("ffprobe")
+    if not ffprobe:
         return None, None, None
     cmd = [
-        "ffprobe",
+        ffprobe,
         "-v",
         "error",
         "-select_streams",
@@ -212,6 +255,7 @@ def _extract_frames(
     require_complete: bool = True,
     duration: float | None = None,
     frame_width: int = FRAME_WIDTH,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[Path]:
     """
     One ffmpeg pass: evenly spaced low-res JPEGs.
@@ -220,7 +264,9 @@ def _extract_frames(
     (each seek can re-decode from a keyframe).
     """
     if duration is None:
-        duration, _, _ = probe_video(path)
+        duration, _, _ = (
+            probe_video(path, cancelled=cancelled) if cancelled is not None else probe_video(path)
+        )
     pattern = out_dir / "frame_%03d.jpg"
     n = max(3, max_frames)
     output_width = max(1, int(frame_width))
@@ -234,7 +280,7 @@ def _extract_frames(
         vf = f"fps=1,scale={output_width}:-1"
 
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -254,7 +300,7 @@ def _extract_frames(
         "5",
         str(pattern),
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+    result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
     if require_complete and result.returncode != 0:
         return []
     return sorted(out_dir.glob("frame_*.jpg"))
@@ -310,7 +356,7 @@ def _extract_hash_frame_once(
 ) -> bytes | None:
     vf = f"{vf_prefix},{HASH_FRAME_FILTER}" if vf_prefix else HASH_FRAME_FILTER
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -334,7 +380,7 @@ def _extract_hash_frame_once(
         "rawvideo",
         "pipe:1",
     ]
-    result = _run_video_command(cmd, timeout=60, cancelled=cancelled)
+    result = _run_video_command(cmd, timeout=25, cancelled=cancelled)
     expected = HASH_FRAME_SIZE * HASH_FRAME_SIZE
     if result.returncode != 0 or len(result.stdout) != expected:
         return None
@@ -348,17 +394,18 @@ def _extract_sequential_hash_frames(
     software: bool = False,
     cancelled: Callable[[], bool] | None = None,
     vf_prefix: str | None = None,
+    timeout: float = 120,
 ) -> list[bytes]:
     """Decode once sequentially and select frames at ``timestamps`` to stdout."""
     if not timestamps:
         return []
     hwaccel = () if software else _hwaccel_args()
     frames = _extract_sequential_hash_frames_once(
-        path, timestamps, hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
+        path, timestamps, hwaccel, cancelled=cancelled, vf_prefix=vf_prefix, timeout=timeout
     )
     if not frames and hwaccel:
         frames = _extract_sequential_hash_frames_once(
-            path, timestamps, (), cancelled=cancelled, vf_prefix=vf_prefix
+            path, timestamps, (), cancelled=cancelled, vf_prefix=vf_prefix, timeout=timeout
         )
     return frames
 
@@ -370,6 +417,7 @@ def _extract_sequential_hash_frames_once(
     *,
     cancelled: Callable[[], bool] | None = None,
     vf_prefix: str | None = None,
+    timeout: float = 120,
 ) -> list[bytes]:
     expected = HASH_FRAME_SIZE * HASH_FRAME_SIZE
     select_expr = "+".join(
@@ -382,7 +430,7 @@ def _extract_sequential_hash_frames_once(
         filters.append(vf_prefix)
     filters.append(HASH_FRAME_FILTER)
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -404,7 +452,7 @@ def _extract_sequential_hash_frames_once(
         "rawvideo",
         "pipe:1",
     ]
-    result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
+    result = _run_video_command(cmd, timeout=timeout, cancelled=cancelled)
     if result.returncode != 0 or len(result.stdout) != len(timestamps) * expected:
         return []
     return [
@@ -425,7 +473,7 @@ def _extract_unknown_duration_sequential_frames(
     hwaccel = () if software else _hwaccel_args()
     for active_hwaccel in ((hwaccel, ()) if hwaccel else ((),)):
         cmd = [
-            "ffmpeg",
+            _ffmpeg_bin(),
             "-nostdin",
             "-hide_banner",
             "-loglevel",
@@ -445,7 +493,7 @@ def _extract_unknown_duration_sequential_frames(
             "rawvideo",
             "pipe:1",
         ]
-        result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
+        result = _run_video_command(cmd, timeout=120, cancelled=cancelled)
         if (
             result.returncode == 0
             and len(result.stdout) >= expected
@@ -472,12 +520,33 @@ def _extract_hash_frames(
     The same file is opened once per timestamp so each output keeps the exact
     input-side seek of the per-frame extractor, concatenated directly to
     ``pipe:1`` without temp files. Tries hardware decode when available, falling
-    back to software decode; ``software`` skips the hardware attempt. Returns
-    ``[]`` when the pass is incomplete so the caller can fall back.
+    back to software decode; ``software`` skips the hardware attempt. Caps
+    concurrent hardware-decoded inputs per process to avoid exhausting Apple
+    Silicon VideoToolbox sessions. Returns ``[]`` when the pass is incomplete
+    so the caller can fall back.
     """
     if not timestamps:
         return []
     hwaccel = () if software else _hwaccel_args()
+    if hwaccel and len(timestamps) > MAX_HWACCEL_MULTI_INPUTS:
+        frames: list[bytes] = []
+        active_hwaccel: tuple[str, ...] = hwaccel
+        for start in range(0, len(timestamps), MAX_HWACCEL_MULTI_INPUTS):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            chunk = timestamps[start : start + MAX_HWACCEL_MULTI_INPUTS]
+            chunk_frames = _extract_hash_frames_once(
+                path, chunk, active_hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
+            )
+            if not chunk_frames and active_hwaccel:
+                active_hwaccel = ()
+                chunk_frames = _extract_hash_frames_once(
+                    path, chunk, (), cancelled=cancelled, vf_prefix=vf_prefix
+                )
+            if len(chunk_frames) != len(chunk):
+                return []
+            frames.extend(chunk_frames)
+        return frames
     frames = _extract_hash_frames_once(
         path, timestamps, hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
     )
@@ -503,9 +572,12 @@ def _extract_hash_frames_once(
             path, timestamps[0], hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
         )
         return [raw] if raw is not None else []
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    # Never attach VideoToolbox simultaneously to > MAX_HWACCEL_MULTI_INPUTS
+    # parallel inputs inside a single ffmpeg invocation.
+    effective_hwaccel = hwaccel if len(timestamps) <= MAX_HWACCEL_MULTI_INPUTS else ()
+    cmd = [_ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error"]
     for timestamp in timestamps:
-        cmd += [*hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
+        cmd += [*effective_hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
     filter_parts = [
         f"[{index}:v]{vf},setsar=1,trim=end_frame=1,setpts=N/TB[v{index}];"
         for index in range(len(timestamps))
@@ -527,7 +599,8 @@ def _extract_hash_frames_once(
         "rawvideo",
         "pipe:1",
     ]
-    result = _run_video_command(cmd, timeout=180, cancelled=cancelled)
+    batch_timeout = min(120, max(30, 15 * len(timestamps)))
+    result = _run_video_command(cmd, timeout=batch_timeout, cancelled=cancelled)
     if result.returncode != 0 or len(result.stdout) != len(timestamps) * expected:
         return []
     return [
@@ -536,17 +609,28 @@ def _extract_hash_frames_once(
     ]
 
 
+_ORIGINAL_EXTRACT_HASH_FRAMES_ONCE = _extract_hash_frames_once
+
+
 def _extract_seek_frame_ppm(
-    path: str | Path, timestamp: float, *, frame_width: int
+    path: str | Path,
+    timestamp: float,
+    *,
+    frame_width: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bytes | None:
     """Fast-seek to one aspect-preserving frame and return it as PPM bytes.
 
     Tries hardware decode when available, falling back to software decode.
     """
     hwaccel = _hwaccel_args()
-    raw = _extract_seek_frame_ppm_once(path, timestamp, hwaccel, frame_width=frame_width)
+    raw = _extract_seek_frame_ppm_once(
+        path, timestamp, hwaccel, frame_width=frame_width, cancelled=cancelled
+    )
     if raw is None and hwaccel:
-        raw = _extract_seek_frame_ppm_once(path, timestamp, (), frame_width=frame_width)
+        raw = _extract_seek_frame_ppm_once(
+            path, timestamp, (), frame_width=frame_width, cancelled=cancelled
+        )
     return raw
 
 
@@ -556,9 +640,10 @@ def _extract_seek_frame_ppm_once(
     hwaccel: tuple[str, ...],
     *,
     frame_width: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bytes | None:
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -582,14 +667,23 @@ def _extract_seek_frame_ppm_once(
         "image2pipe",
         "pipe:1",
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    try:
+        result = _run_video_command(cmd, timeout=30, cancelled=cancelled)
+    except InterruptedError:
+        raise
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0 or not result.stdout.startswith(b"P6"):
         return None
     return result.stdout
 
 
 def _extract_seek_frames_ppm(
-    path: str | Path, timestamps: list[float], *, frame_width: int
+    path: str | Path,
+    timestamps: list[float],
+    *,
+    frame_width: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[bytes]:
     """Fast-seek every timestamp in a single ffmpeg process; PPM per frame.
 
@@ -604,11 +698,11 @@ def _extract_seek_frames_ppm(
         return []
     hwaccel = _hwaccel_args()
     frames = _extract_seek_frames_ppm_once(
-        path, timestamps, hwaccel, frame_width=frame_width
+        path, timestamps, hwaccel, frame_width=frame_width, cancelled=cancelled
     )
     if not frames and hwaccel:
         frames = _extract_seek_frames_ppm_once(
-            path, timestamps, (), frame_width=frame_width
+            path, timestamps, (), frame_width=frame_width, cancelled=cancelled
         )
     return frames
 
@@ -619,11 +713,13 @@ def _extract_seek_frames_ppm_once(
     hwaccel: tuple[str, ...],
     *,
     frame_width: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[bytes]:
     scale = f"scale={max(1, int(frame_width))}:-2"
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    effective_hwaccel = hwaccel if len(timestamps) <= MAX_HWACCEL_MULTI_INPUTS else ()
+    cmd = [_ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error"]
     for timestamp in timestamps:
-        cmd += [*hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
+        cmd += [*effective_hwaccel, "-ss", f"{timestamp:.6f}", "-threads", "1", "-i", str(path)]
     with tempfile.TemporaryDirectory(prefix="dedupe-vidppm-") as tmp:
         targets = [Path(tmp) / f"frame_{index:03d}.ppm" for index in range(len(timestamps))]
         for index, target in enumerate(targets):
@@ -643,7 +739,13 @@ def _extract_seek_frames_ppm_once(
                 "-y",
                 str(target),
             ]
-        result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        batch_timeout = min(120, max(30, 15 * len(timestamps)))
+        try:
+            result = _run_video_command(cmd, timeout=batch_timeout, cancelled=cancelled)
+        except InterruptedError:
+            raise
+        except (TimeoutError, subprocess.TimeoutExpired):
+            return []
         if result.returncode != 0:
             return []
         frames: list[bytes] = []
@@ -670,26 +772,78 @@ class _VideoFeatures:
     crop_vf: str | None = None
 
 
+@lru_cache(maxsize=1)
+def _dct_phash_tables():
+    """Precompute symmetrized 8×32 DCT-II basis and bit weights matching imagehash.phash."""
+    import numpy as np
+
+    size = HASH_FRAME_SIZE
+    k = np.arange(8, dtype=np.float64)[:, None]
+    n = np.arange(size, dtype=np.float64)[None, :]
+    basis = 2.0 * np.cos(np.pi * k * (2.0 * n + 1.0) / (2.0 * size))
+    for row in range(1, 8):
+        half = basis[row, : size // 2]
+        basis[row, size // 2 :] = half[::-1] if row % 2 == 0 else -half[::-1]
+        if row % 2 == 0:
+            basis[row] -= basis[row].mean()
+    pow2 = (1 << np.arange(63, -1, -1, dtype=np.uint64))
+    return basis, pow2
+
+
+def _phash_raw_frame(raw: bytes, *, flip: bool = False) -> int:
+    """Compute exact 64-bit pHash directly from a 32×32 grayscale buffer."""
+    import numpy as np
+
+    basis, pow2 = _dct_phash_tables()
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)
+    if flip:
+        arr = arr[:, ::-1]
+    dct_low = (basis @ arr.astype(np.float64)) @ basis.T
+    dct_low[np.abs(dct_low) < 1e-9] = 0.0
+    med = np.median(dct_low)
+    bits = (dct_low > med).reshape(64)
+    return int(np.sum(pow2[bits], dtype=np.uint64))
+
+
+def _phash_raw_frames_batch(raw_frames: Sequence[bytes], *, flip: bool = False) -> tuple[int, ...]:
+    """Compute 64-bit pHashes for a batch of 32×32 grayscale buffers via NumPy DCT."""
+    import numpy as np
+
+    if not raw_frames:
+        return ()
+    basis, pow2 = _dct_phash_tables()
+    stack = np.empty((len(raw_frames), HASH_FRAME_SIZE, HASH_FRAME_SIZE), dtype=np.float64)
+    for idx, raw in enumerate(raw_frames):
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)
+        stack[idx] = arr[:, ::-1] if flip else arr
+    dct_low = np.matmul(np.matmul(basis, stack), basis.T)
+    dct_low[np.abs(dct_low) < 1e-9] = 0.0
+    meds = np.median(dct_low.reshape(len(raw_frames), 64), axis=1, keepdims=True)
+    bits = dct_low.reshape(len(raw_frames), 64) > meds
+    hashes = (bits.astype(np.uint64) * pow2[None, :]).sum(axis=1)
+    return tuple(int(v) for v in hashes.tolist())
+
+
 def _analyze_raw_frames(
     raw_frames: Sequence[bytes],
+    *,
+    primary_hashes: Sequence[int] | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...], bool]:
     """Compute primary hashes, horizontally-flipped hashes, and informativeness."""
-    import imagehash
     import numpy as np
-    from PIL import Image
 
-    hashes: list[int] = []
-    flipped_hashes: list[int] = []
-    stds: list[float] = []
-    for raw in raw_frames:
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)
-        stds.append(float(arr.std()))
-        image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
-        flipped_image = Image.frombytes(
-            "L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), np.ascontiguousarray(arr[:, ::-1]).tobytes()
-        )
-        hashes.append(int(str(imagehash.phash(image)), 16))
-        flipped_hashes.append(int(str(imagehash.phash(flipped_image)), 16))
+    if not raw_frames:
+        return (), (), False
+    hashes = (
+        tuple(int(h) for h in primary_hashes)
+        if primary_hashes is not None
+        else _phash_raw_frames_batch(raw_frames, flip=False)
+    )
+    flipped_hashes = _phash_raw_frames_batch(raw_frames, flip=True)
+    stds = [
+        float(np.frombuffer(raw, dtype=np.uint8).std())
+        for raw in raw_frames
+    ]
     non_blank_hashes = [
         hv for hv, std in zip(hashes, stds, strict=True) if std >= MIN_FRAME_LUMA_STD
     ]
@@ -701,7 +855,7 @@ def _analyze_raw_frames(
     informative = len(non_blank_hashes) >= min_non_blank and (
         len(raw_frames) < 4 or len(reps) >= 2
     )
-    return tuple(hashes), tuple(flipped_hashes), informative
+    return hashes, flipped_hashes, informative
 
 
 def _feature_cache_key(record: FileRecord) -> tuple[str, int, int | None]:
@@ -740,7 +894,6 @@ def _compute_video_fingerprint_with_frames(
     if cancelled and cancelled():
         raise InterruptedError("scan cancelled")
 
-    import imagehash
     from PIL import Image
 
     path = Path(path)
@@ -766,23 +919,31 @@ def _compute_video_fingerprint_with_frames(
         if len(raw_frames) != len(timestamps):
             # Per-frame fallback for inputs the single-pass and batched passes cannot satisfy.
             raw_frames = []
+            consecutive_timeouts = 0
             for timestamp in timestamps:
                 if cancelled and cancelled():
                     raise InterruptedError("scan cancelled")
-                raw = _extract_hash_frame(
-                    path, timestamp, software=software, cancelled=cancelled
-                )
+                try:
+                    raw = _extract_hash_frame(
+                        path, timestamp, software=software, cancelled=cancelled
+                    )
+                except InterruptedError:
+                    raise
+                except (TimeoutError, subprocess.TimeoutExpired):
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_SEEK_TIMEOUTS:
+                        return None, width, height, duration, None
+                    return None, width, height, duration, None
                 if raw is None:
                     return None, width, height, duration, None
+                consecutive_timeouts = 0
                 raw_frames.append(raw)
-        hashes = []
-        for i, raw in enumerate(raw_frames):
-            image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
-            hashes.append(imagehash.phash(image))
-            if on_frame:
+        hashes = _phash_raw_frames_batch(raw_frames)
+        if on_frame:
+            for i in range(len(hashes)):
                 on_frame(i + 1, len(timestamps))
         return (
-            "v3:" + ",".join(str(frame_hash) for frame_hash in hashes),
+            "v3:" + ",".join(f"{frame_hash:016x}" for frame_hash in hashes),
             width,
             height,
             duration,
@@ -795,14 +956,12 @@ def _compute_video_fingerprint_with_frames(
         path, software=software, cancelled=cancelled
     )
     if raw_frames:
-        hashes = []
-        for idx, raw in enumerate(raw_frames):
-            image = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
-            hashes.append(imagehash.phash(image))
-            if on_frame:
+        hashes = _phash_raw_frames_batch(raw_frames)
+        if on_frame:
+            for idx in range(len(hashes)):
                 on_frame(idx + 1, len(raw_frames))
         return (
-            "v3:" + ",".join(str(frame_hash) for frame_hash in hashes),
+            "v3:" + ",".join(f"{frame_hash:016x}" for frame_hash in hashes),
             width,
             height,
             duration,
@@ -810,11 +969,15 @@ def _compute_video_fingerprint_with_frames(
         )
 
     with tempfile.TemporaryDirectory(prefix="dedupe-vid-") as tmp:
-        frames = _extract_frames(path, Path(tmp), duration=duration)
+        frames = (
+            _extract_frames(path, Path(tmp), duration=duration, cancelled=cancelled)
+            if cancelled is not None
+            else _extract_frames(path, Path(tmp), duration=duration)
+        )
         if not frames:
             return None, width, height, duration, None
 
-        hashes = []
+        hashes_list: list[int] = []
         fallback_raw: list[bytes] = []
         for idx, fp in enumerate(frames):
             if cancelled and cancelled():
@@ -824,8 +987,9 @@ def _compute_video_fingerprint_with_frames(
                     gray = img.convert("L").resize(
                         (HASH_FRAME_SIZE, HASH_FRAME_SIZE), Image.Resampling.LANCZOS
                     )
-                    fallback_raw.append(gray.tobytes())
-                    hashes.append(imagehash.phash(img.convert("RGB")))
+                    raw_buf = gray.tobytes()
+                    fallback_raw.append(raw_buf)
+                    hashes_list.append(_phash_raw_frame(raw_buf))
             except Exception:
                 # Dropping a frame would shift the remaining sample positions
                 # and allow an incomplete fingerprint to stand for the video.
@@ -834,11 +998,11 @@ def _compute_video_fingerprint_with_frames(
                 if on_frame:
                     on_frame(idx + 1, len(frames))
 
-        if not hashes:
+        if not hashes_list:
             return None, width, height, duration, None
 
         return (
-            "v3:" + ",".join(str(frame_hash) for frame_hash in hashes),
+            "v3:" + ",".join(f"{frame_hash:016x}" for frame_hash in hashes_list),
             width,
             height,
             duration,
@@ -1107,10 +1271,20 @@ def _extract_cropped_roi_features(
         )
     if len(raw_frames) != len(timestamps):
         raw_frames = []
+        consecutive_timeouts = 0
         for ts in timestamps:
-            raw = _extract_hash_frame(record.path, ts, cancelled=cancelled, vf_prefix=crop_vf)
+            try:
+                raw = _extract_hash_frame(record.path, ts, cancelled=cancelled, vf_prefix=crop_vf)
+            except InterruptedError:
+                raise
+            except (TimeoutError, subprocess.TimeoutExpired):
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= MAX_CONSECUTIVE_SEEK_TIMEOUTS:
+                    return None
+                return None
             if raw is None:
                 return None
+            consecutive_timeouts = 0
             raw_frames.append(raw)
     return _analyze_raw_frames(raw_frames)
 
@@ -1138,17 +1312,32 @@ def _ensure_cached_record_features(
         raw_frames = _extract_hash_frames(record.path, timestamps, cancelled=cancelled)
     if len(raw_frames) != len(timestamps):
         return None
-    _hashes, flipped_hashes, informative = _analyze_raw_frames(raw_frames)
+    primary = _fingerprint_hashes(record.video_fingerprint or "")
+    _hashes, flipped_hashes, informative = _analyze_raw_frames(
+        raw_frames,
+        primary_hashes=primary if len(primary) == len(raw_frames) else None,
+    )
     _cached_video_features_put(record, flipped_hashes, informative)
     return flipped_hashes, informative
 
 
 class _RgbThumbCache:
-    """Thread-safe singleflight cache for 32×32 RGB chroma frames."""
+    """Thread-safe bounded singleflight cache for 32×32 RGB chroma frames."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, maxsize: int = 2048) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, str | None, tuple[float, ...]], list] = {}
+        self._maxsize = max(1, int(maxsize))
+        self._entries: OrderedDict[tuple[str, str | None, tuple[float, ...]], list] = OrderedDict()
+
+    def _evict_locked(self) -> None:
+        if len(self._entries) <= self._maxsize:
+            return
+        for old_key in list(self._entries):
+            if len(self._entries) <= self._maxsize:
+                break
+            entry = self._entries[old_key]
+            if entry[0].is_set():
+                self._entries.pop(old_key, None)
 
     def get(
         self,
@@ -1161,19 +1350,32 @@ class _RgbThumbCache:
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
-                entry = [threading.Event(), None]
+                entry = [threading.Event(), None, None]
                 self._entries[key] = entry
                 owner = True
             else:
+                self._entries.move_to_end(key)
                 owner = False
         if not owner:
             event = entry[0]
             while not event.wait(timeout=0.05):
                 if cancelled and cancelled():
                     raise InterruptedError("scan cancelled")
+            if entry[2] is not None:
+                raise entry[2]
             return entry[1] or []
-        frames = _extract_rgb_thumbs(path, timestamps, crop_vf=crop_vf, cancelled=cancelled)
-        entry[1] = frames
+        try:
+            frames = _extract_rgb_thumbs(path, timestamps, crop_vf=crop_vf, cancelled=cancelled)
+        except BaseException as exc:
+            with self._lock:
+                entry[2] = exc
+                self._entries.pop(key, None)
+            entry[0].set()
+            raise
+        with self._lock:
+            entry[1] = frames
+            self._entries.move_to_end(key)
+            self._evict_locked()
         entry[0].set()
         return frames
 
@@ -1193,41 +1395,49 @@ def _extract_rgb_thumbs(
     frame_bytes = HASH_FRAME_SIZE * HASH_FRAME_SIZE * 3
     scale = f"scale={HASH_FRAME_SIZE}:{HASH_FRAME_SIZE}:flags=lanczos,setsar=1,format=rgb24"
     vf = f"{crop_vf},{scale}" if crop_vf else scale
-    if len(timestamps) == 1:
-        cmd = [
-            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{timestamps[0]:.6f}", "-threads", "1", "-i", str(path),
-            "-an", "-sn", "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "pipe:1",
-        ]
-    else:
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
-        for t in timestamps:
-            cmd += ["-ss", f"{t:.6f}", "-threads", "1", "-i", str(path)]
-        fc = "".join(
-            f"[{i}:v]{vf},trim=end_frame=1,setpts=N/TB[v{i}];"
-            for i in range(len(timestamps))
-        )
-        fc += "".join(f"[v{i}]" for i in range(len(timestamps))) + (
-            f"concat=n={len(timestamps)}:v=1:a=0[out]"
-        )
-        cmd += [
-            "-filter_complex", fc, "-map", "[out]", "-an", "-sn",
-            "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
-        ]
-    try:
-        result = _run_video_command(cmd, timeout=60, cancelled=cancelled)
-    except InterruptedError:
-        raise
-    except Exception:
-        return []
-    if result.returncode != 0 or len(result.stdout) != len(timestamps) * frame_bytes:
-        return []
-    return [
-        np.frombuffer(
-            result.stdout[i * frame_bytes : (i + 1) * frame_bytes], dtype=np.uint8
-        ).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE, 3).copy()
-        for i in range(len(timestamps))
-    ]
+    software = bool(getattr(_DECODE_LANE, "software", False))
+    hwaccel = (
+        ()
+        if software or len(timestamps) > MAX_HWACCEL_MULTI_INPUTS
+        else _hwaccel_args()
+    )
+    for active_hwaccel in ((hwaccel, ()) if hwaccel else ((),)):
+        if len(timestamps) == 1:
+            cmd = [
+                _ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error",
+                *active_hwaccel,
+                "-ss", f"{timestamps[0]:.6f}", "-threads", "1", "-i", str(path),
+                "-an", "-sn", "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "pipe:1",
+            ]
+        else:
+            cmd = [_ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error"]
+            for t in timestamps:
+                cmd += [*active_hwaccel, "-ss", f"{t:.6f}", "-threads", "1", "-i", str(path)]
+            fc = "".join(
+                f"[{i}:v]{vf},trim=end_frame=1,setpts=N/TB[v{i}];"
+                for i in range(len(timestamps))
+            )
+            fc += "".join(f"[v{i}]" for i in range(len(timestamps))) + (
+                f"concat=n={len(timestamps)}:v=1:a=0[out]"
+            )
+            cmd += [
+                "-filter_complex", fc, "-map", "[out]", "-an", "-sn",
+                "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
+            ]
+        try:
+            result = _run_video_command(cmd, timeout=45, cancelled=cancelled)
+        except InterruptedError:
+            raise
+        except Exception:
+            continue
+        if result.returncode == 0 and len(result.stdout) == len(timestamps) * frame_bytes:
+            return [
+                np.frombuffer(
+                    result.stdout[i * frame_bytes : (i + 1) * frame_bytes], dtype=np.uint8
+                ).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE, 3).copy()
+                for i in range(len(timestamps))
+            ]
+    return []
 
 
 def _video_chroma_agrees(
@@ -1521,104 +1731,339 @@ def _evaluate_candidate_pairs(
         for v in unknown_indexes[p_idx + 1 :]:
             _check_pair_sequences(u, v, fingerprints[u], fingerprints[v])
 
-    # 2. Secondary variants: horizontally-flipped and border-cropped ROI hashes.
+    # 2. Secondary variants: vectorized horizontally-flipped and border-cropped ROI hashes
+    # across the upper triangle only (no redundant (u, v) and (v, u) double-testing).
     if features is not None and any(
         f is not None and (f.flipped_hashes is not None or f.cropped_hashes is not None)
         for f in features
     ):
-        pos_by_index = (
-            {idx: pos for pos, idx in enumerate(kd_indices)} if known_durations else {}
-        )
-
-        def _compatible_targets(u: int) -> list[int]:
-            if u in pos_by_index:
-                pos = pos_by_index[u]
-                d_u = kd_durations_list[pos]
-                lo = bisect_right(kd_durations_list, d_u * 0.9 - 1e-9)
-                hi = bisect_right(kd_durations_list, d_u / 0.9 + 1e-9)
-                targets = [
-                    kd_indices[c_pos]
-                    for c_pos in range(lo, hi)
-                    if kd_indices[c_pos] != u
-                    and min(d_u, kd_durations_list[c_pos])
-                    / max(d_u, kd_durations_list[c_pos])
-                    >= 0.9
-                ]
-                targets.extend(unknown_indexes)
-                return targets
-            return [idx for idx in range(len(hashed)) if idx != u]
-
-        for u, feat_u in enumerate(features):
-            if cancelled and cancelled():
-                raise InterruptedError("scan cancelled")
-            if feat_u is None:
-                continue
-            has_flip = feat_u.flipped_hashes is not None
-            has_crop = feat_u.cropped_hashes is not None
-            if not has_flip and not has_crop:
-                continue
-            for v in _compatible_targets(u):
+        def _record_vec_hits(
+            u: int,
+            rel_positions,
+            left_arr,
+            right_mat,
+            left_len: int,
+            *,
+            flip_b: bool,
+            crop_u: str | None = None,
+            uses_crop_u: bool = False,
+            use_right_crop: bool = False,
+        ) -> None:
+            dists = _popcount64(right_mat ^ left_arr)
+            means = dists.sum(axis=1) / left_len
+            maxs = dists.max(axis=1)
+            keep = np.flatnonzero(means <= verify_limit)
+            for k_i in keep.tolist():
+                c_pos = int(rel_positions[k_i])
+                d_b = kd_durations_list[c_pos]
+                if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                    continue
+                v = kd_indices[c_pos]
                 pair_key = (u, v) if u < v else (v, u)
                 if pair_key in direct_candidates:
                     continue
-                feat_v = features[v]
-                if has_flip and feat_u.flipped_hashes is not None:
-                    _check_pair_sequences(
-                        u,
-                        v,
-                        feat_u.flipped_hashes,
-                        fingerprints[v],
-                        flip_b=True,
-                    )
-                if has_crop and feat_u.cropped_hashes is not None:
-                    right_seq = (
-                        feat_v.cropped_hashes
-                        if feat_v is not None and feat_v.cropped_hashes is not None
-                        else fingerprints[v]
-                    )
-                    crop_v = (
-                        feat_v.crop_vf
-                        if feat_v is not None and feat_v.cropped_hashes is not None
-                        else None
-                    )
-                    _check_pair_sequences(
-                        u,
-                        v,
-                        feat_u.cropped_hashes,
-                        right_seq,
-                        flip_b=False,
-                        crop_u=feat_u.crop_vf,
-                        crop_v=crop_v,
-                        uses_crop_u=True,
-                        uses_crop_v=crop_v is not None,
-                    )
-                    if feat_u.cropped_flipped_hashes is not None:
+                crop_v = None
+                uses_crop_v = False
+                if use_right_crop:
+                    feat_v = features[v]
+                    if feat_v is not None and feat_v.cropped_hashes is not None:
+                        crop_v = feat_v.crop_vf
+                        uses_crop_v = crop_v is not None
+                _record_pair(
+                    u,
+                    v,
+                    float(means[k_i]),
+                    int(maxs[k_i]),
+                    flip_b=flip_b,
+                    crop_u=crop_u,
+                    crop_v=crop_v,
+                    uses_crop_u=uses_crop_u,
+                    uses_crop_v=uses_crop_v,
+                )
+
+        if known_durations:
+            kd_flip_fps = np.zeros((k_count, width), dtype=np.uint64)
+            kd_flip_len = np.zeros(k_count, dtype=np.int64)
+            kd_crop_fps = np.zeros((k_count, width), dtype=np.uint64)
+            kd_crop_len = np.zeros(k_count, dtype=np.int64)
+            kd_crop_flip_fps = np.zeros((k_count, width), dtype=np.uint64)
+            kd_crop_flip_len = np.zeros(k_count, dtype=np.int64)
+            # Effective right-side matrix for cropped comparisons: cropped if available, else primary.
+            kd_eff_fps = kd_fps.copy()
+            kd_eff_len = kd_lengths.copy()
+            kd_eff_flip_fps = np.zeros((k_count, width), dtype=np.uint64)
+            kd_eff_flip_len = np.zeros(k_count, dtype=np.int64)
+
+            for pos, idx in enumerate(kd_indices):
+                feat = features[idx]
+                if feat is None:
+                    continue
+                if feat.flipped_hashes:
+                    fl = feat.flipped_hashes
+                    kd_flip_fps[pos, : len(fl)] = fl
+                    kd_flip_len[pos] = len(fl)
+                    kd_eff_flip_fps[pos, : len(fl)] = fl
+                    kd_eff_flip_len[pos] = len(fl)
+                if feat.cropped_hashes:
+                    cr = feat.cropped_hashes
+                    kd_crop_fps[pos, : len(cr)] = cr
+                    kd_crop_len[pos] = len(cr)
+                    kd_eff_fps[pos, :] = 0
+                    kd_eff_fps[pos, : len(cr)] = cr
+                    kd_eff_len[pos] = len(cr)
+                if feat.cropped_flipped_hashes:
+                    cf = feat.cropped_flipped_hashes
+                    kd_crop_flip_fps[pos, : len(cf)] = cf
+                    kd_crop_flip_len[pos] = len(cf)
+                    kd_eff_flip_fps[pos, :] = 0
+                    kd_eff_flip_fps[pos, : len(cf)] = cf
+                    kd_eff_flip_len[pos] = len(cf)
+
+            has_any_crop = bool(np.any(kd_crop_len > 0))
+            for pos, d_a in enumerate(kd_durations_list):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                end = bisect_right(kd_durations_list, d_a / 0.9 + 1e-9)
+                if end <= pos + 1:
+                    continue
+                u = kd_indices[pos]
+                feat_u = features[u]
+                rel = np.arange(pos + 1, end, dtype=np.int64)
+
+                # Flipped comparison (symmetric: check flipped[u] vs primary[v],
+                # or primary[u] vs flipped[v] when only v has flipped_hashes).
+                u_flip_len = int(kd_flip_len[pos])
+                if u_flip_len > 0:
+                    same = kd_lengths[rel] == u_flip_len
+                    if np.any(same):
+                        s_rel = rel[same]
+                        _record_vec_hits(
+                            u,
+                            s_rel,
+                            kd_flip_fps[pos : pos + 1, :u_flip_len],
+                            kd_fps[s_rel, :u_flip_len],
+                            u_flip_len,
+                            flip_b=True,
+                        )
+                    if not np.all(same) and feat_u is not None and feat_u.flipped_hashes:
+                        for c_pos in rel[~same].tolist():
+                            d_b = kd_durations_list[c_pos]
+                            if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                                continue
+                            v = kd_indices[c_pos]
+                            if ((u, v) if u < v else (v, u)) not in direct_candidates:
+                                _check_pair_sequences(
+                                    u, v, feat_u.flipped_hashes, fingerprints[v], flip_b=True
+                                )
+                else:
+                    v_has_flip = kd_flip_len[rel] > 0
+                    if np.any(v_has_flip):
+                        f_rel = rel[v_has_flip]
+                        u_len = int(kd_lengths[pos])
+                        same = kd_flip_len[f_rel] == u_len
+                        if np.any(same):
+                            s_rel = f_rel[same]
+                            _record_vec_hits(
+                                u,
+                                s_rel,
+                                kd_fps[pos : pos + 1, :u_len],
+                                kd_flip_fps[s_rel, :u_len],
+                                u_len,
+                                flip_b=True,
+                            )
+                        if not np.all(same):
+                            for c_pos in f_rel[~same].tolist():
+                                d_b = kd_durations_list[c_pos]
+                                if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                                    continue
+                                v = kd_indices[c_pos]
+                                feat_v = features[v]
+                                if (
+                                    feat_v is not None
+                                    and feat_v.flipped_hashes is not None
+                                    and ((u, v) if u < v else (v, u)) not in direct_candidates
+                                ):
+                                    _check_pair_sequences(
+                                        u, v, fingerprints[u], feat_v.flipped_hashes, flip_b=True
+                                    )
+
+                if not has_any_crop:
+                    continue
+
+                # Border-cropped ROI comparisons (upper triangle, handling u-cropped and/or v-cropped).
+                u_crop_len = int(kd_crop_len[pos])
+                if u_crop_len > 0 and feat_u is not None and feat_u.cropped_hashes is not None:
+                    same = kd_eff_len[rel] == u_crop_len
+                    if np.any(same):
+                        s_rel = rel[same]
+                        _record_vec_hits(
+                            u,
+                            s_rel,
+                            kd_crop_fps[pos : pos + 1, :u_crop_len],
+                            kd_eff_fps[s_rel, :u_crop_len],
+                            u_crop_len,
+                            flip_b=False,
+                            crop_u=feat_u.crop_vf,
+                            uses_crop_u=True,
+                            use_right_crop=True,
+                        )
+                    if not np.all(same):
+                        for c_pos in rel[~same].tolist():
+                            d_b = kd_durations_list[c_pos]
+                            if min(d_a, d_b) / max(d_a, d_b) < 0.9:
+                                continue
+                            v = kd_indices[c_pos]
+                            feat_v = features[v]
+                            right_seq = (
+                                feat_v.cropped_hashes
+                                if feat_v is not None and feat_v.cropped_hashes is not None
+                                else fingerprints[v]
+                            )
+                            crop_v = (
+                                feat_v.crop_vf
+                                if feat_v is not None and feat_v.cropped_hashes is not None
+                                else None
+                            )
+                            _check_pair_sequences(
+                                u,
+                                v,
+                                feat_u.cropped_hashes,
+                                right_seq,
+                                flip_b=False,
+                                crop_u=feat_u.crop_vf,
+                                crop_v=crop_v,
+                                uses_crop_u=True,
+                                uses_crop_v=crop_v is not None,
+                            )
+                    u_cf_len = int(kd_crop_flip_len[pos])
+                    if u_cf_len > 0:
+                        same_cf = kd_eff_len[rel] == u_cf_len
+                        if np.any(same_cf):
+                            s_rel = rel[same_cf]
+                            _record_vec_hits(
+                                u,
+                                s_rel,
+                                kd_crop_flip_fps[pos : pos + 1, :u_cf_len],
+                                kd_eff_fps[s_rel, :u_cf_len],
+                                u_cf_len,
+                                flip_b=True,
+                                crop_u=feat_u.crop_vf,
+                                uses_crop_u=True,
+                                use_right_crop=True,
+                            )
+                    else:
+                        v_eff_flip = kd_eff_flip_len[rel] == u_crop_len
+                        if np.any(v_eff_flip):
+                            s_rel = rel[v_eff_flip]
+                            _record_vec_hits(
+                                u,
+                                s_rel,
+                                kd_crop_fps[pos : pos + 1, :u_crop_len],
+                                kd_eff_flip_fps[s_rel, :u_crop_len],
+                                u_crop_len,
+                                flip_b=True,
+                                crop_u=feat_u.crop_vf,
+                                uses_crop_u=True,
+                                use_right_crop=True,
+                            )
+                else:
+                    v_has_crop = kd_crop_len[rel] > 0
+                    if np.any(v_has_crop):
+                        c_rel = rel[v_has_crop]
+                        u_len = int(kd_lengths[pos])
+                        same = kd_crop_len[c_rel] == u_len
+                        if np.any(same):
+                            s_rel = c_rel[same]
+                            _record_vec_hits(
+                                u,
+                                s_rel,
+                                kd_fps[pos : pos + 1, :u_len],
+                                kd_crop_fps[s_rel, :u_len],
+                                u_len,
+                                flip_b=False,
+                                use_right_crop=True,
+                            )
+                        same_cf = kd_crop_flip_len[c_rel] == u_len
+                        if np.any(same_cf):
+                            s_rel = c_rel[same_cf]
+                            _record_vec_hits(
+                                u,
+                                s_rel,
+                                kd_fps[pos : pos + 1, :u_len],
+                                kd_crop_flip_fps[s_rel, :u_len],
+                                u_len,
+                                flip_b=True,
+                                use_right_crop=True,
+                            )
+                        elif u_flip_len > 0:
+                            same_uf = kd_crop_len[c_rel] == u_flip_len
+                            if np.any(same_uf):
+                                s_rel = c_rel[same_uf]
+                                _record_vec_hits(
+                                    u,
+                                    s_rel,
+                                    kd_flip_fps[pos : pos + 1, :u_flip_len],
+                                    kd_crop_fps[s_rel, :u_flip_len],
+                                    u_flip_len,
+                                    flip_b=True,
+                                    use_right_crop=True,
+                                )
+
+        # Secondary variants involving duration-unknown records (typically very small).
+        if unknown_indexes:
+            unknown_set = set(unknown_indexes)
+            for u in range(len(hashed)):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                feat_u = features[u]
+                if feat_u is None or (
+                    feat_u.flipped_hashes is None and feat_u.cropped_hashes is None
+                ):
+                    continue
+                targets = (
+                    [idx for idx in range(u + 1, len(hashed))]
+                    if u in unknown_set
+                    else unknown_indexes
+                )
+                for v in targets:
+                    if v == u:
+                        continue
+                    pair_key = (u, v) if u < v else (v, u)
+                    if pair_key in direct_candidates:
+                        continue
+                    feat_v = features[v]
+                    if feat_u.flipped_hashes is not None:
+                        _check_pair_sequences(
+                            u, v, feat_u.flipped_hashes, fingerprints[v], flip_b=True
+                        )
+                    if feat_u.cropped_hashes is not None:
+                        right_seq = (
+                            feat_v.cropped_hashes
+                            if feat_v is not None and feat_v.cropped_hashes is not None
+                            else fingerprints[v]
+                        )
+                        crop_v = (
+                            feat_v.crop_vf
+                            if feat_v is not None and feat_v.cropped_hashes is not None
+                            else None
+                        )
                         _check_pair_sequences(
                             u,
                             v,
-                            feat_u.cropped_flipped_hashes,
+                            feat_u.cropped_hashes,
                             right_seq,
-                            flip_b=True,
+                            flip_b=False,
                             crop_u=feat_u.crop_vf,
                             crop_v=crop_v,
                             uses_crop_u=True,
                             uses_crop_v=crop_v is not None,
                         )
-                    if feat_v is not None and (
-                        feat_v.cropped_flipped_hashes is not None
-                        or feat_v.flipped_hashes is not None
-                    ):
-                        right_flip = (
-                            feat_v.cropped_flipped_hashes
-                            if feat_v.cropped_flipped_hashes is not None
-                            else feat_v.flipped_hashes
-                        )
-                        if right_flip is not None:
+                        if feat_u.cropped_flipped_hashes is not None:
                             _check_pair_sequences(
                                 u,
                                 v,
-                                feat_u.cropped_hashes,
-                                right_flip,
+                                feat_u.cropped_flipped_hashes,
+                                right_seq,
                                 flip_b=True,
                                 crop_u=feat_u.crop_vf,
                                 crop_v=crop_v,
@@ -1651,11 +2096,22 @@ def _evaluate_candidate_pairs(
 
 
 class _FrameBatchCache:
-    """Thread-safe singleflight cache for extracted verification frame batches."""
+    """Thread-safe bounded per-frame cache with singleflight batch deduplication.
 
-    def __init__(self) -> None:
+    Caches decoded 32×32 grayscale frames individually by ``(path, vf_prefix, rounded_ts)``
+    so subset lookups (such as the 3 middle anchors in ``_refine_and_verify_offset``)
+    hit frames already decoded by a 7-frame verification pass.
+    """
+
+    def __init__(self, *, max_frames: int = 16384) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, str | None, tuple[float, ...]], list] = {}
+        self._max_frames = max(64, int(max_frames))
+        self._frames: OrderedDict[tuple[str, str | None, float], bytes] = OrderedDict()
+        self._inflight: dict[tuple[str, str | None, tuple[float, ...]], list] = {}
+
+    def _evict_locked(self) -> None:
+        while len(self._frames) > self._max_frames:
+            self._frames.popitem(last=False)
 
     def get(
         self,
@@ -1665,15 +2121,48 @@ class _FrameBatchCache:
         *,
         vf_prefix: str | None = None,
     ) -> list[bytes]:
-        key = (path, vf_prefix, tuple(round(float(t), 6) for t in timestamps))
+        if not timestamps:
+            return []
+        rounded = tuple(round(float(t), 4) for t in timestamps)
+        frame_keys = [(path, vf_prefix, rt) for rt in rounded]
+
         with self._lock:
-            entry = self._entries.get(key)
+            if all(k in self._frames for k in frame_keys):
+                out = []
+                for k in frame_keys:
+                    self._frames.move_to_end(k)
+                    out.append(self._frames[k])
+                return out
+
+            # Check if only a strict subset of timestamps is missing; when running the
+            # real extractor, fetch only the missing timestamps and assemble from cache.
+            cached_hits = {
+                idx: self._frames[k]
+                for idx, k in enumerate(frame_keys)
+                if k in self._frames
+            }
+            if (
+                cached_hits
+                and _version_frame_batches is _ORIGINAL_VERSION_FRAME_BATCHES
+            ):
+                missing_indices = [i for i in range(len(timestamps)) if i not in cached_hits]
+                fetch_timestamps = [timestamps[i] for i in missing_indices]
+                fetch_rounded = tuple(rounded[i] for i in missing_indices)
+            else:
+                cached_hits = {}
+                missing_indices = list(range(len(timestamps)))
+                fetch_timestamps = list(timestamps)
+                fetch_rounded = rounded
+
+            batch_key = (path, vf_prefix, fetch_rounded)
+            entry = self._inflight.get(batch_key)
             if entry is None:
                 entry = [threading.Event(), None, None]
-                self._entries[key] = entry
+                self._inflight[batch_key] = entry
                 owner = True
             else:
                 owner = False
+
         if not owner:
             event = entry[0]
             while not event.wait(timeout=0.05):
@@ -1681,23 +2170,40 @@ class _FrameBatchCache:
                     raise InterruptedError("scan cancelled")
             if entry[2] is not None:
                 raise entry[2]
-            return entry[1]
-        try:
-            frames = (
-                _version_frame_batches(path, timestamps, cancelled, vf_prefix=vf_prefix)
-                if vf_prefix is not None
-                else _version_frame_batches(path, timestamps, cancelled)
-            )
-        except BaseException as exc:
+            fetched = entry[1]
+        else:
+            try:
+                fetched = (
+                    _version_frame_batches(
+                        path, fetch_timestamps, cancelled, vf_prefix=vf_prefix
+                    )
+                    if vf_prefix is not None
+                    else _version_frame_batches(path, fetch_timestamps, cancelled)
+                )
+            except BaseException as exc:
+                with self._lock:
+                    entry[2] = exc
+                    self._inflight.pop(batch_key, None)
+                entry[0].set()
+                raise
             with self._lock:
-                entry[2] = exc
-                if isinstance(exc, InterruptedError):
-                    self._entries.pop(key, None)
+                entry[1] = fetched
+                for rt, raw in zip(fetch_rounded, fetched, strict=True):
+                    f_key = (path, vf_prefix, rt)
+                    self._frames[f_key] = raw
+                    self._frames.move_to_end(f_key)
+                self._evict_locked()
+                self._inflight.pop(batch_key, None)
             entry[0].set()
-            raise
-        entry[1] = frames
-        entry[0].set()
-        return frames
+
+        if not cached_hits:
+            return list(fetched)
+        assembled: list[bytes] = [b""] * len(timestamps)
+        for idx, raw in cached_hits.items():
+            assembled[idx] = raw
+        for idx, raw in zip(missing_indices, fetched, strict=True):
+            assembled[idx] = raw
+        return assembled
 
 
 def find_similar_video_groups(
@@ -1794,7 +2300,11 @@ def find_similar_video_groups(
                     if dur is not None:
                         rec.duration = dur
                     if raw_frames:
-                        _hs, flipped_hashes, informative = _analyze_raw_frames(raw_frames)
+                        primary = _fingerprint_hashes(fp or "")
+                        _hs, flipped_hashes, informative = _analyze_raw_frames(
+                            raw_frames,
+                            primary_hashes=primary if len(primary) == len(raw_frames) else None,
+                        )
                         _cached_video_features_put(rec, flipped_hashes, informative)
                         raw_features_by_path[rec.path] = _VideoFeatures(
                             flipped_hashes=flipped_hashes,
@@ -2202,10 +2712,6 @@ def _same_footage_after_reframing(
     # Fallback for slight trims at BOTH ends when neither 0, db-da, nor midpoint aligns.
     if min(da, db) >= 2.0 and Path(a.path).is_file() and Path(b.path).is_file():
         try:
-            import imagehash
-            import numpy as np
-            from PIL import Image
-
             dense_n = 16
             ts_a = [round((i + 0.5) * da / dense_n, 4) for i in range(dense_n)]
             ts_b = [round((i + 0.5) * db / dense_n, 4) for i in range(dense_n)]
@@ -2219,22 +2725,8 @@ def _same_footage_after_reframing(
                 if frame_cache is not None
                 else _version_frame_batches(b.path, ts_b, cancelled, vf_prefix=crop_b)
             )
-            ha = [
-                int(str(imagehash.phash(Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), r))), 16)
-                for r in fa
-            ]
-            hb = []
-            for r in fb:
-                if flip_b:
-                    arr = np.frombuffer(r, dtype=np.uint8).reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)
-                    im = Image.frombytes(
-                        "L",
-                        (HASH_FRAME_SIZE, HASH_FRAME_SIZE),
-                        np.ascontiguousarray(arr[:, ::-1]).tobytes(),
-                    )
-                else:
-                    im = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), r)
-                hb.append(int(str(imagehash.phash(im)), 16))
+            ha = _phash_raw_frames_batch(fa, flip=False)
+            hb = _phash_raw_frames_batch(fb, flip=flip_b)
             max_trim = max(abs(da - db), 0.15 * min(da, db)) + 0.5
             votes: list[tuple[float, float]] = []
             for ta, h_left in zip(ts_a, ha, strict=True):
@@ -2277,7 +2769,9 @@ VERSION_CACHE_VERSION = 2
 
 
 def _run_video_command(
-    command: list[str], *, timeout: float = 90,
+    command: list[str],
+    *,
+    timeout: float = 90,
     cancelled: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess:
     if cancelled is None:
@@ -2286,28 +2780,163 @@ def _run_video_command(
         raise InterruptedError("scan cancelled")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + timeout
+    completed = False
     try:
         while True:
             if cancelled():
                 raise InterruptedError("scan cancelled")
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError("video analysis timed out")
             try:
-                stdout, stderr = process.communicate(timeout=0.1)
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                completed = True
                 return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             except subprocess.TimeoutExpired:
                 pass
     finally:
-        if process.poll() is None:
-            process.kill()
-        process.communicate()
+        if not completed:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        process.communicate(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        for stream in (process.stdout, process.stderr):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except OSError:
+                                    pass
+            else:
+                try:
+                    process.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
 
 
 def _version_timestamps(duration: float) -> list[float]:
     count = min(VERSION_SAMPLE_LIMIT, max(1, math.ceil(duration / VERSION_SAMPLE_STEP)))
     step = duration / count
-    # Stay away from boundary frames which can be black or absent after an edit.
-    return [(i + 0.25) * step for i in range(count)]
+    # Stay away from boundary frames which can be black or absent after an edit,
+    # and clamp slightly inside EOF so truncated/audio-longer tails don't fail seeks.
+    max_ts = max(0.0, duration - 0.5) if duration > 1.0 else max(0.0, duration - 0.05)
+    return [min((i + 0.25) * step, max_ts) for i in range(count)]
+
+
+def _extract_version_frames_with_tolerance(
+    path: str,
+    timestamps: list[float],
+    cancelled: Callable[[], bool] | None,
+    *,
+    vf_prefix: str | None = None,
+    allow_partial: bool = False,
+) -> tuple[list[float], list[bytes]]:
+    """Extract dense version frames, preferring 1 sequential decode on short/medium videos."""
+    if not timestamps:
+        return [], []
+    software = bool(getattr(_DECODE_LANE, "software", False))
+    hwaccel = () if software else _hwaccel_args()
+
+    # On short/medium videos (<= 90s or dense step <= 2.5s), a single sequential
+    # pass uses 1 demuxer + 1 decoder instead of dozens of keyframe seeks/VT sessions.
+    if (
+        _extract_hash_frames_once is _ORIGINAL_EXTRACT_HASH_FRAMES_ONCE
+        and len(timestamps) >= 8
+        and timestamps[-1] <= VERSION_SINGLE_PASS_MAX_DURATION
+        and all(timestamps[i] < timestamps[i + 1] for i in range(len(timestamps) - 1))
+    ):
+        avg_step = (timestamps[-1] - timestamps[0]) / max(1, len(timestamps) - 1)
+        if avg_step <= VERSION_SINGLE_PASS_MAX_STEP:
+            try:
+                seq_frames = _extract_sequential_hash_frames(
+                    path,
+                    timestamps,
+                    software=software,
+                    cancelled=cancelled,
+                    vf_prefix=vf_prefix,
+                    timeout=120,
+                )
+            except InterruptedError:
+                raise
+            except (TimeoutError, subprocess.TimeoutExpired):
+                seq_frames = []
+            if len(seq_frames) == len(timestamps):
+                return list(timestamps), seq_frames
+
+    kept_ts: list[float] = []
+    frames: list[bytes] = []
+    min_required = (
+        max(3, math.ceil(len(timestamps) * 0.9))
+        if allow_partial and len(timestamps) >= 10
+        else len(timestamps)
+    )
+    max_missing = len(timestamps) - min_required
+    missing = 0
+
+    for start in range(0, len(timestamps), VERSION_BATCH_SIZE):
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        chunk = timestamps[start : start + VERSION_BATCH_SIZE]
+        try:
+            chunk_frames = _extract_hash_frames_once(
+                path, chunk, hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
+            )
+        except InterruptedError:
+            raise
+        except (TimeoutError, subprocess.TimeoutExpired):
+            chunk_frames = []
+        if not chunk_frames and hwaccel:
+            hwaccel = ()
+            try:
+                chunk_frames = _extract_hash_frames_once(
+                    path, chunk, (), cancelled=cancelled, vf_prefix=vf_prefix
+                )
+            except InterruptedError:
+                raise
+            except (TimeoutError, subprocess.TimeoutExpired):
+                chunk_frames = []
+        if len(chunk_frames) == len(chunk):
+            kept_ts.extend(chunk)
+            frames.extend(chunk_frames)
+            continue
+
+        consecutive_timeouts = 0
+        for ts in chunk:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            try:
+                raw = _extract_hash_frame(
+                    path, ts, software=True, cancelled=cancelled, vf_prefix=vf_prefix
+                )
+                consecutive_timeouts = 0
+            except InterruptedError:
+                raise
+            except (TimeoutError, subprocess.TimeoutExpired):
+                consecutive_timeouts += 1
+                raw = None
+                if consecutive_timeouts >= MAX_CONSECUTIVE_SEEK_TIMEOUTS:
+                    raise TimeoutError("video analysis timed out") from None
+            if raw is None:
+                missing += 1
+                if missing > max_missing:
+                    raise ValueError("incomplete video version samples")
+                continue
+            kept_ts.append(ts)
+            frames.append(raw)
+
+    if len(frames) < min_required:
+        raise ValueError("incomplete video version samples")
+    return kept_ts, frames
 
 
 def _version_frame_batches(
@@ -2317,34 +2946,13 @@ def _version_frame_batches(
     *,
     vf_prefix: str | None = None,
 ) -> list[bytes]:
-    software = bool(getattr(_DECODE_LANE, "software", False))
-    hwaccel = () if software else _hwaccel_args()
-    frames: list[bytes] = []
-    for start in range(0, len(timestamps), 12):
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        chunk = timestamps[start : start + 12]
-        chunk_frames = _extract_hash_frames_once(
-            path, chunk, hwaccel, cancelled=cancelled, vf_prefix=vf_prefix
-        )
-        if not chunk_frames and hwaccel:
-            hwaccel = ()
-            chunk_frames = _extract_hash_frames_once(
-                path, chunk, (), cancelled=cancelled, vf_prefix=vf_prefix
-            )
-        if len(chunk_frames) != len(chunk):
-            chunk_frames = []
-            for ts in chunk:
-                raw = _extract_hash_frame(
-                    path, ts, software=True, cancelled=cancelled, vf_prefix=vf_prefix
-                )
-                if raw is None:
-                    raise ValueError("incomplete video version samples")
-                chunk_frames.append(raw)
-        frames.extend(chunk_frames)
-    if len(frames) != len(timestamps):
-        raise ValueError("incomplete video version samples")
+    _kept_ts, frames = _extract_version_frames_with_tolerance(
+        path, timestamps, cancelled, vf_prefix=vf_prefix, allow_partial=False
+    )
     return frames
+
+
+_ORIGINAL_VERSION_FRAME_BATCHES = _version_frame_batches
 
 
 def _version_cache_stat(
@@ -2376,9 +2984,7 @@ def _extract_version_samples_uncached(
     record: FileRecord,
     cancelled: Callable[[], bool] | None,
 ) -> tuple[float | None, int | None, int | None, list[tuple[float, int]], str | None]:
-    import imagehash
     import numpy as np
-    from PIL import Image
 
     try:
         duration = record.duration
@@ -2396,14 +3002,25 @@ def _extract_version_samples_uncached(
         if not duration or duration < VERSION_MIN_SECONDS:
             return duration, width, height, [], None
         timestamps = _version_timestamps(duration)
-        frames = _version_frame_batches(record.path, timestamps, cancelled)
-        extracted: list[tuple[float, int]] = []
-        for timestamp, raw in zip(timestamps, frames, strict=True):
+        if _version_frame_batches is _ORIGINAL_VERSION_FRAME_BATCHES:
+            sample_timestamps, frames = _extract_version_frames_with_tolerance(
+                record.path, timestamps, cancelled, allow_partial=True
+            )
+        else:
+            frames = _version_frame_batches(record.path, timestamps, cancelled)
+            sample_timestamps = timestamps
+        keep_ts: list[float] = []
+        keep_raw: list[bytes] = []
+        for timestamp, raw in zip(sample_timestamps, frames, strict=True):
             # Blank frames and nearly uniform fades are not useful candidate evidence.
             if float(np.frombuffer(raw, dtype=np.uint8).std()) < 8:
                 continue
-            im = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw)
-            extracted.append((timestamp, int(str(imagehash.phash(im)), 16)))
+            keep_ts.append(timestamp)
+            keep_raw.append(raw)
+        if not keep_raw:
+            return duration, width, height, [], None
+        hashes = _phash_raw_frames_batch(keep_raw)
+        extracted = list(zip(keep_ts, hashes, strict=True))
         return duration, width, height, extracted, None
     except InterruptedError:
         raise
@@ -2415,24 +3032,238 @@ def _extract_version_samples_uncached(
 # arrays to tens of megabytes however many videos a scan holds.
 _VERSION_JOIN_BATCH_PAIRS = 1 << 21
 VERSION_CANDIDATE_MAX_VIDEOS = 256
+VERSION_CANDIDATE_HAMMING_LIMIT = 10
+MAX_SAME_HASH_PER_VIDEO = 4
+# Exact Multi-Index Hashing partition of 64-bit hashes into 6 disjoint blocks
+# (four 11-bit + two 10-bit = 64 bits). By the pigeonhole principle, any pair
+# within Hamming distance <= 10 must share at least one block with <= 1 differing bit.
+_MIH_BLOCKS: tuple[tuple[int, int, int], ...] = (
+    (0, 11, (1 << 11) - 1),
+    (11, 11, (1 << 11) - 1),
+    (22, 11, (1 << 11) - 1),
+    (33, 11, (1 << 11) - 1),
+    (44, 10, (1 << 10) - 1),
+    (54, 10, (1 << 10) - 1),
+)
 
 
 def _dedupe_timeline_samples(
     timeline: list[tuple[float, int]],
 ) -> list[tuple[float, int]]:
-    """Collapse consecutive near-identical frame hashes within one video."""
+    """Collapse consecutive near-identical hashes and cap alternating repetitions per video."""
     kept: list[tuple[float, int]] = []
+    counts: dict[int, int] = defaultdict(int)
     for timestamp, fingerprint in timeline:
-        if not kept or (fingerprint ^ kept[-1][1]).bit_count() > 2:
-            kept.append((timestamp, fingerprint))
+        if kept and (fingerprint ^ kept[-1][1]).bit_count() <= 2:
+            continue
+        if counts[fingerprint] >= MAX_SAME_HASH_PER_VIDEO:
+            continue
+        counts[fingerprint] += 1
+        kept.append((timestamp, fingerprint))
     return kept
+
+
+def _mih_hamming_neighbors(
+    values,
+    weights,
+    *,
+    max_dist: int = VERSION_CANDIDATE_HAMMING_LIMIT,
+    max_degree_weight: int = VERSION_CANDIDATE_MAX_VIDEOS,
+    query_indices: Sequence[int] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[dict[int, list[int]], list[int]]:
+    """Exact Multi-Index Hashing for 64-bit Hamming search (<= 10 bits).
+
+    Returns ``(neighbors_by_idx, degree_weights_list)`` where ``neighbors_by_idx[r]``
+    contains sorted neighbor key indices ``c`` (ordered by ``(dist, c)``) only for
+    keys whose total matched distinct-video degree weight is ``<= max_degree_weight``.
+    """
+    import numpy as np
+
+    n_keys = len(values)
+    if n_keys == 0:
+        return {}, []
+    popcounts = _popcount64(values).astype(np.int16)
+
+    # Build 6 compact CSR-like bucket tables (one per disjoint 10/11-bit block).
+    tables: list[list[object]] = []
+    for shift, width, mask in _MIH_BLOCKS:
+        sub = ((values >> np.uint64(shift)) & np.uint64(mask)).astype(np.int32)
+        order = np.argsort(sub, kind="mergesort")
+        sorted_sub = sub[order]
+        n_buckets = 1 << width
+        starts = np.searchsorted(sorted_sub, np.arange(n_buckets, dtype=np.int32), side="left")
+        ends = np.searchsorted(sorted_sub, np.arange(n_buckets, dtype=np.int32), side="right")
+        order32 = order.astype(np.int32)
+        table: list[object] = [None] * n_buckets
+        for b in range(n_buckets):
+            s_i, e_i = int(starts[b]), int(ends[b])
+            if e_i > s_i:
+                table[b] = order32[s_i:e_i]
+        tables.append(table)
+
+    full_scan = query_indices is None
+    queries = range(n_keys) if full_scan else sorted(set(query_indices))
+    total_queries = len(queries)
+    degree_weights = np.zeros(n_keys, dtype=np.int64)
+    # Compact neighbor storage: only keep keys that have not exceeded the generic cap.
+    upper_cols: list[object] = [None] * n_keys
+    upper_dists: list[object] = [None] * n_keys
+    # Incremental query mode records directed neighbors for queried keys directly.
+    direct_neighbors: dict[int, list[tuple[int, int]]] = {}
+
+    progress_step = max(256, total_queries // 40) if total_queries else 1
+    for q_pos, r in enumerate(queries):
+        if (q_pos & 255) == 0 and cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        if progress and q_pos and (q_pos % progress_step == 0):
+            progress(q_pos, total_queries)
+
+        val_r = values[r]
+        val_r_int = int(val_r)
+        pc_r = int(popcounts[r])
+        parts = []
+        for table, (shift, width, mask) in zip(tables, _MIH_BLOCKS, strict=True):
+            sub_r = (val_r_int >> shift) & mask
+            bucket = table[sub_r]
+            if bucket is not None:
+                parts.append(bucket)
+            for bit in range(width):
+                nb = table[sub_r ^ (1 << bit)]
+                if nb is not None:
+                    parts.append(nb)
+        if not parts:
+            continue
+        cands = np.concatenate(parts)
+        if full_scan:
+            cands = cands[cands >= r]
+        if not cands.size:
+            continue
+        # Fast popcount-band prefilter before XOR + popcount.
+        band = np.abs(popcounts[cands] - pc_r) <= max_dist
+        if not np.any(band):
+            continue
+        cands = cands[band]
+        dists = _popcount64(values[cands] ^ val_r)
+        hit_mask = dists <= max_dist
+        if not np.any(hit_mask):
+            continue
+        hit_cols = cands[hit_mask]
+        hit_dists = dists[hit_mask]
+        # Deduplicate hits found across multiple MIH blocks (only on small hit set!).
+        if hit_cols.size > 1:
+            uniq_cols, first_idx = np.unique(hit_cols, return_index=True)
+            hit_cols = uniq_cols
+            hit_dists = hit_dists[first_idx]
+
+        if full_scan:
+            w_r = int(weights[r])
+            hit_weight = int(weights[hit_cols].sum())
+            degree_weights[r] += hit_weight
+            off_diag = hit_cols > r
+            if np.any(off_diag):
+                np.add.at(degree_weights, hit_cols[off_diag], w_r)
+            # Prune generic high-degree hubs BEFORE storing tuples in RAM.
+            if int(degree_weights[r]) <= max_degree_weight:
+                upper_cols[r] = hit_cols.astype(np.int32, copy=False)
+                upper_dists[r] = hit_dists.astype(np.uint8, copy=False)
+            elif np.any(off_diag):
+                # Key r itself is generic, but an off-diagonal neighbor c might still
+                # have degree <= max_degree_weight unless r alone exceeds the cap.
+                if w_r <= max_degree_weight and int(hit_cols.size) <= max_degree_weight * 4:
+                    upper_cols[r] = hit_cols[off_diag].astype(np.int32, copy=False)
+                    upper_dists[r] = hit_dists[off_diag].astype(np.uint8, copy=False)
+        else:
+            hit_weight = int(weights[hit_cols].sum())
+            degree_weights[r] = hit_weight
+            if hit_weight <= max_degree_weight:
+                direct_neighbors[r] = sorted(
+                    zip(hit_dists.tolist(), hit_cols.tolist(), strict=True)
+                )
+
+    if progress and total_queries:
+        progress(total_queries, total_queries)
+
+    if not full_scan:
+        out = {
+            r: [c_idx for _d, c_idx in pairs]
+            for r, pairs in direct_neighbors.items()
+        }
+        return out, degree_weights.tolist()
+
+    neighbor_dists: list[list[tuple[int, int]]] = [[] for _ in range(n_keys)]
+    for r in range(n_keys):
+        cols = upper_cols[r]
+        if cols is None:
+            continue
+        dists_r = upper_dists[r]
+        r_ok = int(degree_weights[r]) <= max_degree_weight
+        for c_idx, dist_val in zip(cols.tolist(), dists_r.tolist(), strict=True):
+            if r_ok:
+                neighbor_dists[r].append((dist_val, c_idx))
+            if c_idx != r and int(degree_weights[c_idx]) <= max_degree_weight:
+                neighbor_dists[c_idx].append((dist_val, r))
+
+    neighbors_by_idx: dict[int, list[int]] = {}
+    for r, items in enumerate(neighbor_dists):
+        if items:
+            items.sort(key=lambda pair: (pair[0], pair[1]))
+            neighbors_by_idx[r] = [c_idx for _dist, c_idx in items]
+    return neighbors_by_idx, degree_weights.tolist()
+
+
+def _consistent_offset_votes(
+    votes: list[tuple[float, float]],
+    bin_step: float,
+    *,
+    duration_a: float | None = None,
+    duration_b: float | None = None,
+) -> list[tuple[float, float]]:
+    """Keep only votes belonging to temporally consistent offset clusters (>= 3 distinct ta/tb)."""
+    if len(votes) < 3:
+        return []
+    bins: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for ta, tb in votes:
+        bins[round((tb - ta) / bin_step)].append((ta, tb))
+    good_bins: set[int] = set()
+    for bin_id in bins:
+        # Include immediate neighbor bins so off-grid cuts straddling a bin boundary stay intact.
+        window: list[tuple[float, float]] = []
+        for adj in (bin_id - 1, bin_id, bin_id + 1):
+            if adj in bins:
+                window.extend(bins[adj])
+        if len(window) < 3:
+            continue
+        if len({ta for ta, _tb in window}) < 3 or len({tb for _ta, tb in window}) < 3:
+            continue
+        if duration_a and duration_b and duration_a > 0 and duration_b > 0:
+            offsets_w = sorted(tb - ta for ta, tb in window)
+            med_offset = offsets_w[len(offsets_w) // 2]
+            start = max(0.0, -med_offset)
+            end = min(duration_a, duration_b - med_offset)
+            overlap = end - start
+            min_allowed = min(VERSION_MIN_SECONDS, min(duration_a, duration_b)) * 0.75
+            if overlap < min_allowed or overlap < min(duration_a, duration_b) * 0.65:
+                continue
+        good_bins.add(bin_id)
+    if not good_bins:
+        return []
+    consistent: list[tuple[float, float]] = []
+    for bin_id in good_bins:
+        consistent.extend(bins[bin_id])
+    return consistent
 
 
 def _version_candidate_pairs(
     samples: list[list[tuple[float, int]]],
     cancelled: Callable[[], bool] | None = None,
+    *,
+    durations: Sequence[float | None] | None = None,
+    arrival_indices: set[int] | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[tuple[int, int], list[tuple[float, float]]]:
-    """Index frame hashes once; avoid decoding or testing every pair of videos."""
+    """Index frame hashes with exact MIH and prune temporally inconsistent pairs."""
     import numpy as np
 
     deduped = [_dedupe_timeline_samples(timeline) for timeline in samples]
@@ -2442,9 +3273,8 @@ def _version_candidate_pairs(
             occurrences[fingerprint].append((index, timestamp))
     if not occurrences:
         return {}
-    # Every distinct hash is compared with every other in upper-triangle vectorised batches.
     keys = sorted(occurrences)
-    n_keys = len(keys)
+    key_to_idx = {key: idx for idx, key in enumerate(keys)}
     values = np.array(keys, dtype=np.uint64)
     # Count distinct videos carrying each hash so repeated frames in slow/tripod
     # recordings never trip the library-wide generic-frame cap.
@@ -2452,60 +3282,82 @@ def _version_candidate_pairs(
         [len({idx for idx, _ in occurrences[key]}) for key in keys],
         dtype=np.int64,
     )
-    degree_weights = np.zeros(n_keys, dtype=np.int64)
-    upper_neighbors: list[list[tuple[int, int]]] = [[] for _ in range(n_keys)]
-    rows = max(1, _VERSION_JOIN_BATCH_PAIRS // n_keys)
-    for begin in range(0, n_keys, rows):
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        end_r = min(begin + rows, n_keys)
-        # Off-grid cuts shift samples by a fraction of a second. Candidate
-        # lookup is deliberately looser than the aligned verification.
-        distances = _popcount64(values[begin:end_r, None] ^ values[None, begin:])
-        hits = distances <= 10
-        for local_r in range(end_r - begin):
-            r = begin + local_r
-            offset_base = r - begin
-            row_hits = hits[local_r, offset_base:]
-            cols = np.flatnonzero(row_hits)
-            if not cols.size:
-                continue
-            col_indices = cols + r
-            dists = distances[local_r, offset_base:][cols]
-            degree_weights[r] += int(weights[col_indices].sum())
-            off_diag = col_indices > r
-            if np.any(off_diag):
-                np.add.at(degree_weights, col_indices[off_diag], int(weights[r]))
-            for c_idx, dist_val in zip(col_indices.tolist(), dists.tolist(), strict=True):
-                upper_neighbors[r].append((c_idx, dist_val))
 
-    near: dict[int, list[int]] = {}
-    neighbor_dists: list[list[tuple[int, int]]] = [[] for _ in range(n_keys)]
-    for r, pairs in enumerate(upper_neighbors):
-        for c_idx, dist_val in pairs:
-            if degree_weights[r] <= VERSION_CANDIDATE_MAX_VIDEOS:
-                neighbor_dists[r].append((dist_val, c_idx))
-            if c_idx != r and degree_weights[c_idx] <= VERSION_CANDIDATE_MAX_VIDEOS:
-                neighbor_dists[c_idx].append((dist_val, r))
-    for r, items in enumerate(neighbor_dists):
-        if items:
-            items.sort(key=lambda pair: (pair[0], pair[1]))
-            near[keys[r]] = [keys[c_idx] for _dist, c_idx in items]
+    query_key_indices: list[int] | None = None
+    if arrival_indices is not None:
+        query_set: set[int] = set()
+        for idx in arrival_indices:
+            if 0 <= idx < len(deduped):
+                for _ts, fp in deduped[idx]:
+                    k_idx = key_to_idx.get(fp)
+                    if k_idx is not None:
+                        query_set.add(k_idx)
+        if not query_set:
+            return {}
+        query_key_indices = sorted(query_set)
+
+    neighbors_by_idx, _degree_weights = _mih_hamming_neighbors(
+        values,
+        weights,
+        max_dist=VERSION_CANDIDATE_HAMMING_LIMIT,
+        max_degree_weight=VERSION_CANDIDATE_MAX_VIDEOS,
+        query_indices=query_key_indices,
+        cancelled=cancelled,
+        progress=progress,
+    )
+    near: dict[int, list[int]] = {
+        keys[r]: [keys[c_idx] for c_idx in cols]
+        for r, cols in neighbors_by_idx.items()
+    }
 
     candidates: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
-    for i, timeline in enumerate(deduped):
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        for ta, fingerprint in timeline:
-            for matched in near.get(fingerprint, ()):
-                for j, tb in occurrences[matched]:
-                    if j > i:
-                        candidates[(i, j)].append((ta, tb))
-    return {
-        pair: votes
-        for pair, votes in candidates.items()
-        if len({ta for ta, _tb in votes}) >= 3 and len({tb for _ta, tb in votes}) >= 3
-    }
+    if arrival_indices is None:
+        for i, timeline in enumerate(deduped):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            for ta, fingerprint in timeline:
+                for matched in near.get(fingerprint, ()):
+                    for j, tb in occurrences[matched]:
+                        if j > i:
+                            candidates[(i, j)].append((ta, tb))
+    else:
+        for i in sorted(arrival_indices):
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            if not (0 <= i < len(deduped)):
+                continue
+            for ta, fingerprint in deduped[i]:
+                for matched in near.get(fingerprint, ()):
+                    for j, tb in occurrences[matched]:
+                        if j == i:
+                            continue
+                        if j in arrival_indices and j < i:
+                            continue
+                        if i < j:
+                            candidates[(i, j)].append((ta, tb))
+                        else:
+                            candidates[(j, i)].append((tb, ta))
+
+    filtered: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for (i, j), votes in candidates.items():
+        if len(votes) < 3:
+            continue
+        da = float(durations[i]) if durations is not None and durations[i] else None
+        db = float(durations[j]) if durations is not None and durations[j] else None
+        if da and db:
+            bin_step = max(0.25, max(da, db) / VERSION_SAMPLE_LIMIT)
+        else:
+            max_t = max(
+                deduped[i][-1][0] if deduped[i] else 0.0,
+                deduped[j][-1][0] if deduped[j] else 0.0,
+            )
+            bin_step = max(0.25, max_t / VERSION_SAMPLE_LIMIT)
+        consistent = _consistent_offset_votes(
+            votes, bin_step, duration_a=da, duration_b=db
+        )
+        if consistent:
+            filtered[(i, j)] = consistent
+    return filtered
 
 
 def _popcount64(values):
@@ -2529,6 +3381,37 @@ def _offset_candidates(
     return [sorted(values)[len(values) // 2] for values in ranked[:3]]
 
 
+def _score_verified_frame_pair(
+    ra: bytes,
+    rb: bytes,
+    *,
+    flip_b: bool = False,
+) -> tuple[int, int, bool, bool]:
+    """Compare one aligned 32×32 frame pair -> ``(hash_a, distance, ok, non_blank)``."""
+    import numpy as np
+
+    aa = np.frombuffer(ra, np.uint8).astype(np.float64)
+    ab = np.frombuffer(rb, np.uint8).astype(np.float64)
+    if flip_b:
+        ab = np.ascontiguousarray(ab.reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)[:, ::-1]).reshape(-1)
+    ha = _phash_raw_frame(ra, flip=False)
+    hb = _phash_raw_frame(rb, flip=flip_b)
+    dist = (ha ^ hb).bit_count()
+    std_a, std_b = float(aa.std()), float(ab.std())
+    non_blank = std_a >= MIN_FRAME_LUMA_STD and std_b >= MIN_FRAME_LUMA_STD
+    if std_a < 2.0 and std_b < 2.0:
+        ok = abs(float(aa.mean() - ab.mean())) <= 18.0
+    elif std_a < 2.0 or std_b < 2.0:
+        ok = False
+    else:
+        za = (aa - float(aa.mean())) / std_a
+        zb = (ab - float(ab.mean())) / std_b
+        ncc = float(np.mean(za * zb))
+        z_mad = float(np.mean(np.abs(za - zb)))
+        ok = ncc >= MIN_FRAME_NCC and z_mad <= MAX_FRAME_ZMAD
+    return ha, dist, ok, non_blank
+
+
 def _verify_video_offset(
     a: FileRecord,
     b: FileRecord,
@@ -2547,10 +3430,6 @@ def _verify_video_offset(
     Offset maps an A timestamp onto B. Requires essentially all of the shorter
     clip and genuinely distinct pairwise sample hashes.
     """
-    import imagehash
-    import numpy as np
-    from PIL import Image
-
     da, db = float(a.duration or 0), float(b.duration or 0)
     start = max(0.0, -offset)
     end = min(da, db - offset)
@@ -2559,42 +3438,56 @@ def _verify_video_offset(
         return None
     times = [start + overlap * fraction for fraction in (0.08, 0.22, 0.36, 0.5, 0.64, 0.78, 0.92)]
     right_times = [t + offset for t in times]
-    if frame_cache is not None:
-        left = frame_cache.get(a.path, times, cancelled, vf_prefix=crop_a)
-        right = frame_cache.get(b.path, right_times, cancelled, vf_prefix=crop_b)
+
+    def _fetch(path: str, ts: list[float], crop_vf: str | None) -> list[bytes]:
+        if frame_cache is not None:
+            return frame_cache.get(path, ts, cancelled, vf_prefix=crop_vf)
+        return (
+            _version_frame_batches(path, ts, cancelled, vf_prefix=crop_vf)
+            if crop_vf is not None
+            else _version_frame_batches(path, ts, cancelled)
+        )
+
+    # Exact 3-anchor early-reject when running real decoding: passing requires
+    # >= 6 of 7 frames good AND mean distance <= 7 (sum <= 49), so failing >= 2
+    # of the 3 middle anchors (or sum > 49) makes passing impossible while still
+    # populating the exact 3 anchors that _refine_and_verify_offset reuses on A.
+    if _version_frame_batches is _ORIGINAL_VERSION_FRAME_BATCHES:
+        anchor_idxs = (1, 3, 5)
+        rest_idxs = (0, 2, 4, 6)
+        anchor_left = _fetch(a.path, [times[i] for i in anchor_idxs], crop_a)
+        anchor_right = _fetch(b.path, [right_times[i] for i in anchor_idxs], crop_b)
+        anchor_scored = [
+            _score_verified_frame_pair(ra, rb, flip_b=flip_b)
+            for ra, rb in zip(anchor_left, anchor_right, strict=True)
+        ]
+        anchor_good = sum(1 for _h, d, ok, _nb in anchor_scored if d <= 10 and ok)
+        anchor_dist_sum = sum(d for _h, d, _ok, _nb in anchor_scored)
+        if anchor_good < 2 or anchor_dist_sum > 49:
+            return None
+        rest_left = _fetch(a.path, [times[i] for i in rest_idxs], crop_a)
+        rest_right = _fetch(b.path, [right_times[i] for i in rest_idxs], crop_b)
+        rest_scored = [
+            _score_verified_frame_pair(ra, rb, flip_b=flip_b)
+            for ra, rb in zip(rest_left, rest_right, strict=True)
+        ]
+        scored = [None] * 7
+        for pos, val in zip(anchor_idxs, anchor_scored, strict=True):
+            scored[pos] = val
+        for pos, val in zip(rest_idxs, rest_scored, strict=True):
+            scored[pos] = val
     else:
-        left = _version_frame_batches(a.path, times, cancelled, vf_prefix=crop_a)
-        right = _version_frame_batches(b.path, right_times, cancelled, vf_prefix=crop_b)
-    distances, frame_oks, hashes = [], [], []
-    non_blank = 0
-    for ra, rb in zip(left, right, strict=True):
-        aa = np.frombuffer(ra, np.uint8).astype(np.float64)
-        ab = np.frombuffer(rb, np.uint8).astype(np.float64)
-        if flip_b:
-            ab_2d = ab.reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)[:, ::-1]
-            ab = np.ascontiguousarray(ab_2d).reshape(-1)
-            ib = Image.frombytes(
-                "L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), ab.astype(np.uint8).tobytes()
-            )
-        else:
-            ib = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), rb)
-        ia = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), ra)
-        ha, hb = imagehash.phash(ia), imagehash.phash(ib)
-        hashes.append(int(str(ha), 16))
-        distances.append(ha - hb)
-        std_a, std_b = float(aa.std()), float(ab.std())
-        if std_a >= MIN_FRAME_LUMA_STD and std_b >= MIN_FRAME_LUMA_STD:
-            non_blank += 1
-        if std_a < 2.0 and std_b < 2.0:
-            frame_oks.append(abs(float(aa.mean() - ab.mean())) <= 18.0)
-        elif std_a < 2.0 or std_b < 2.0:
-            frame_oks.append(False)
-        else:
-            za = (aa - float(aa.mean())) / std_a
-            zb = (ab - float(ab.mean())) / std_b
-            ncc = float(np.mean(za * zb))
-            z_mad = float(np.mean(np.abs(za - zb)))
-            frame_oks.append(ncc >= MIN_FRAME_NCC and z_mad <= MAX_FRAME_ZMAD)
+        left = _fetch(a.path, times, crop_a)
+        right = _fetch(b.path, right_times, crop_b)
+        scored = [
+            _score_verified_frame_pair(ra, rb, flip_b=flip_b)
+            for ra, rb in zip(left, right, strict=True)
+        ]
+
+    hashes = [item[0] for item in scored]  # type: ignore[index]
+    distances = [item[1] for item in scored]  # type: ignore[index]
+    frame_oks = [item[2] for item in scored]  # type: ignore[index]
+    non_blank = sum(1 for item in scored if item[3])  # type: ignore[index]
 
     if non_blank < 4:
         return None
@@ -2644,26 +3537,26 @@ def _refine_and_verify_offset(
     crop_a: str | None = None,
     crop_b: str | None = None,
     rgb_cache: _RgbThumbCache | None = None,
+    skip_initial_verify: bool = False,
 ) -> dict | None:
     """Refine ``base_offset`` locally around the bin median before verifying."""
-    import imagehash
     import numpy as np
-    from PIL import Image
 
-    direct = _verify_video_offset(
-        a,
-        b,
-        base_offset,
-        cancelled,
-        frame_cache=frame_cache,
-        min_overlap=min_overlap,
-        flip_b=flip_b,
-        crop_a=crop_a,
-        crop_b=crop_b,
-        rgb_cache=rgb_cache,
-    )
-    if direct is not None:
-        return direct
+    if not skip_initial_verify:
+        direct = _verify_video_offset(
+            a,
+            b,
+            base_offset,
+            cancelled,
+            frame_cache=frame_cache,
+            min_overlap=min_overlap,
+            flip_b=flip_b,
+            crop_a=crop_a,
+            crop_b=crop_b,
+            rgb_cache=rgb_cache,
+        )
+        if direct is not None:
+            return direct
 
     da, db = float(a.duration or 0), float(b.duration or 0)
     start = max(0.0, -base_offset)
@@ -2681,59 +3574,87 @@ def _refine_and_verify_offset(
     if not deltas:
         return None
 
-    # Reuse the 3 middle anchor timestamps from the failed _verify_video_offset call on A.
+    # Reuse the 3 middle anchor timestamps already decoded on A via per-frame _FrameBatchCache.
     anchors = [start + overlap * fraction for fraction in (0.22, 0.5, 0.78)]
     if frame_cache is not None:
         left_frames = frame_cache.get(a.path, anchors, cancelled, vf_prefix=crop_a)
     else:
-        left_frames = _version_frame_batches(a.path, anchors, cancelled, vf_prefix=crop_a)
+        left_frames = (
+            _version_frame_batches(a.path, anchors, cancelled, vf_prefix=crop_a)
+            if crop_a is not None
+            else _version_frame_batches(a.path, anchors, cancelled)
+        )
 
-    left_norms: list[tuple[int, object]] = []
-    for raw in left_frames:
+    left_hashes = _phash_raw_frames_batch(left_frames, flip=False)
+    left_norms: list[tuple[int, object, float]] = []
+    for hv, raw in zip(left_hashes, left_frames, strict=True):
         arr = np.frombuffer(raw, np.uint8).astype(np.float64)
         std = float(arr.std())
         norm = (arr - float(arr.mean())) / std if std >= 2.0 else None
-        hv = int(
-            str(imagehash.phash(Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), raw))),
-            16,
-        )
-        left_norms.append((hv, norm))
+        left_norms.append((hv, norm, std))
 
     valid_deltas = [
         d for d in deltas if all(0.0 <= ta + base_offset + d < db for ta in anchors)
     ]
     if not valid_deltas:
         return None
-    probe_times = [ta + base_offset + d for d in valid_deltas for ta in anchors]
-    probe_frames = (
-        frame_cache.get(b.path, probe_times, cancelled, vf_prefix=crop_b)
-        if frame_cache is not None
-        else _version_frame_batches(b.path, probe_times, cancelled, vf_prefix=crop_b)
-    )
+
+    def _fetch_b(ts: list[float]) -> list[bytes]:
+        if frame_cache is not None:
+            return frame_cache.get(b.path, ts, cancelled, vf_prefix=crop_b)
+        return (
+            _version_frame_batches(b.path, ts, cancelled, vf_prefix=crop_b)
+            if crop_b is not None
+            else _version_frame_batches(b.path, ts, cancelled)
+        )
+
+    # Fast 1-anchor pre-screen across deltas (12 frames instead of 36) when a
+    # non-blank anchor exists, then confirm top 3 candidate deltas with all 3 anchors.
+    probe_deltas = valid_deltas
+    if len(valid_deltas) > 3 and _version_frame_batches is _ORIGINAL_VERSION_FRAME_BATCHES:
+        screen_idx = max(range(len(anchors)), key=lambda i: left_norms[i][2])
+        screen_hv, _screen_norm, screen_std = left_norms[screen_idx]
+        if screen_std >= MIN_FRAME_LUMA_STD:
+            screen_ta = anchors[screen_idx]
+            screen_times = [screen_ta + base_offset + d for d in valid_deltas]
+            screen_frames = _fetch_b(screen_times)
+            screen_hashes = _phash_raw_frames_batch(screen_frames, flip=flip_b)
+            ranked = sorted(
+                (
+                    ((screen_hv ^ hb).bit_count(), abs(d), d)
+                    for d, hb in zip(valid_deltas, screen_hashes, strict=True)
+                )
+            )
+            if ranked and ranked[0][0] > 18:
+                return None
+            probe_deltas = [item[2] for item in ranked[:3]]
+
+    probe_times = [ta + base_offset + d for d in probe_deltas for ta in anchors]
+    probe_frames = _fetch_b(probe_times)
+    probe_hashes = _phash_raw_frames_batch(probe_frames, flip=flip_b)
 
     best_delta: float | None = None
     best_score: tuple[float, float] = (65.0, 1.0)
-    for idx_d, delta in enumerate(valid_deltas):
-        chunk = probe_frames[idx_d * 3 : (idx_d + 1) * 3]
+    for idx_d, delta in enumerate(probe_deltas):
+        base_i = idx_d * 3
+        chunk = probe_frames[base_i : base_i + 3]
+        chunk_hashes = probe_hashes[base_i : base_i + 3]
         dists = []
         nccs = []
-        for (hv_a, norm_a), rb in zip(left_norms, chunk, strict=True):
-            arr_b = np.frombuffer(rb, np.uint8).astype(np.float64)
-            if flip_b:
-                arr_b = np.ascontiguousarray(
-                    arr_b.reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)[:, ::-1]
-                ).reshape(-1)
-                ib = Image.frombytes(
-                    "L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), arr_b.astype(np.uint8).tobytes()
-                )
-            else:
-                ib = Image.frombytes("L", (HASH_FRAME_SIZE, HASH_FRAME_SIZE), rb)
-            hv_b = int(str(imagehash.phash(ib)), 16)
+        for (hv_a, norm_a, _std_a), rb, hv_b in zip(
+            left_norms, chunk, chunk_hashes, strict=True
+        ):
             dists.append((hv_a ^ hv_b).bit_count())
-            std_b = float(arr_b.std())
-            if norm_a is not None and std_b >= 2.0:
-                norm_b = (arr_b - float(arr_b.mean())) / std_b
-                nccs.append(float(np.mean(norm_a * norm_b)))
+            if norm_a is not None:
+                arr_b = np.frombuffer(rb, np.uint8).astype(np.float64)
+                if flip_b:
+                    arr_b = np.ascontiguousarray(
+                        arr_b.reshape(HASH_FRAME_SIZE, HASH_FRAME_SIZE)[:, ::-1]
+                    ).reshape(-1)
+                std_b = float(arr_b.std())
+                if std_b >= 2.0:
+                    norm_b = (arr_b - float(arr_b.mean())) / std_b
+                    nccs.append(float(np.mean(norm_a * norm_b)))
         mean_d = sum(dists) / len(dists)
         mean_ncc = sum(nccs) / len(nccs) if nccs else 0.0
         score = (mean_d, -mean_ncc)
@@ -2757,13 +3678,55 @@ def _refine_and_verify_offset(
     )
 
 
+def _aligned_audio_ranges(
+    keeper: FileRecord,
+    member: FileRecord,
+    cancelled: Callable[[], bool] | None,
+    *,
+    frame_cache: _FrameBatchCache | None = None,
+) -> dict[str, list[float]]:
+    """Compute aligned ``{path: [start, end]}`` windows before audio comparison."""
+    da = float(keeper.duration or 0.0)
+    db = float(member.duration or 0.0)
+    fallback_end = min(da, db)
+    fallback = {keeper.path: [0.0, fallback_end], member.path: [0.0, fallback_end]}
+    if min(da, db) <= 0.0:
+        return fallback
+    offsets = [0.0]
+    if abs(da - db) > 0.5:
+        diff = da - db
+        offsets.extend((diff, diff / 2.0))
+    for offset in offsets:
+        try:
+            evidence = _verify_video_offset(
+                keeper,
+                member,
+                offset,
+                cancelled,
+                frame_cache=frame_cache,
+                min_overlap=min(5.0, min(da, db)),
+            )
+        except InterruptedError:
+            raise
+        except Exception:
+            evidence = None
+        if evidence and isinstance(evidence.get("ranges"), dict):
+            return evidence["ranges"]
+    return fallback
+
+
 def _audio_stream_present(path: str, cancelled: Callable[[], bool] | None) -> bool:
-    if not shutil.which("ffprobe"):
+    ffprobe = _resolve_binary("ffprobe")
+    if not ffprobe:
         raise ValueError("ffprobe unavailable")
-    result = _run_video_command([
-        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
-        "-of", "json", path,
-    ], timeout=15, cancelled=cancelled)
+    result = _run_video_command(
+        [
+            ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+            "-of", "json", path,
+        ],
+        timeout=15,
+        cancelled=cancelled,
+    )
     if result.returncode:
         raise ValueError("audio stream unavailable")
     return bool(json.loads(result.stdout).get("streams"))
@@ -2777,11 +3740,15 @@ def _audio_window(
     *,
     sample_rate: int = AUDIO_SAMPLE_RATE,
 ) -> bytes:
-    result = _run_video_command([
-        "ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.4f}", "-threads", "1",
-        "-i", path, "-t", f"{duration:.4f}", "-vn", "-ac", "1", "-ar", str(sample_rate),
-        "-f", "s16le", "pipe:1",
-    ], timeout=30, cancelled=cancelled)
+    result = _run_video_command(
+        [
+            _ffmpeg_bin(), "-nostdin", "-v", "error", "-ss", f"{start:.4f}", "-threads", "1",
+            "-i", path, "-t", f"{duration:.4f}", "-vn", "-sn", "-dn", "-ac", "1",
+            "-ar", str(sample_rate), "-f", "s16le", "pipe:1",
+        ],
+        timeout=30,
+        cancelled=cancelled,
+    )
     if result.returncode:
         raise ValueError("audio sample unavailable")
     return result.stdout
@@ -2874,31 +3841,51 @@ def _spectral_audio_similarity(left_pcm, right_pcm) -> float:
         return 0.0
 
     if da.shape[0] >= 5 and db.shape[0] >= 5:
-        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
-        da_s = np.apply_along_axis(lambda c: np.convolve(c, kernel, mode="valid"), 0, da)
-        db_s = np.apply_along_axis(lambda c: np.convolve(c, kernel, mode="valid"), 0, db)
+        da_s = 0.25 * da[:-2] + 0.5 * da[1:-1] + 0.25 * da[2:]
+        db_s = 0.25 * db[:-2] + 0.5 * db[1:-1] + 0.25 * db[2:]
     else:
         da_s, db_s = da, db
 
     t_len = min(da_s.shape[0], db_s.shape[0])
     max_lag = min(int(AUDIO_MAX_LAG_SECONDS * AUDIO_SAMPLE_RATE / AUDIO_HOP_SAMPLES), max(1, t_len // 2))
     min_overlap_frames = max(10, t_len // 3)
+    a_mat = da_s[:t_len]
+    b_mat = db_s[:t_len]
+    n_fft = 1 << (2 * t_len - 1).bit_length()
+    cc = np.fft.irfft(
+        np.fft.rfft(a_mat, n=n_fft, axis=0) * np.conj(np.fft.rfft(b_mat, n=n_fft, axis=0)),
+        n=n_fft,
+        axis=0,
+    ).sum(axis=1)
+    sa = np.concatenate(([0.0], np.cumsum(a_mat.sum(axis=1))))
+    sa2 = np.concatenate(([0.0], np.cumsum((a_mat * a_mat).sum(axis=1))))
+    sb = np.concatenate(([0.0], np.cumsum(b_mat.sum(axis=1))))
+    sb2 = np.concatenate(([0.0], np.cumsum((b_mat * b_mat).sum(axis=1))))
+    width = a_mat.shape[1]
     best = -1.0
     for lag in range(-max_lag, max_lag + 1):
-        if lag >= 0:
-            xa = da_s[lag:t_len]
-            xb = db_s[: t_len - lag]
-        else:
-            xa = da_s[: t_len + lag]
-            xb = db_s[-lag:t_len]
-        if xa.shape[0] < min_overlap_frames:
+        n_ov = t_len - abs(lag)
+        if n_ov < min_overlap_frames:
             continue
-        xa_z = xa - float(xa.mean())
-        xb_z = xb - float(xb.mean())
-        denom = float(np.linalg.norm(xa_z) * np.linalg.norm(xb_z))
+        m = n_ov * width
+        if lag >= 0:
+            dot = float(cc[lag])
+            sum_a = float(sa[t_len] - sa[lag])
+            sum_a2 = float(sa2[t_len] - sa2[lag])
+            sum_b = float(sb[t_len - lag])
+            sum_b2 = float(sb2[t_len - lag])
+        else:
+            dot = float(cc[n_fft + lag])
+            sum_a = float(sa[t_len + lag])
+            sum_a2 = float(sa2[t_len + lag])
+            sum_b = float(sb[t_len] - sb[-lag])
+            sum_b2 = float(sb2[t_len] - sb2[-lag])
+        num = dot - (sum_a * sum_b) / m
+        var_a = max(0.0, sum_a2 - (sum_a * sum_a) / m)
+        var_b = max(0.0, sum_b2 - (sum_b * sum_b) / m)
+        denom = math.sqrt(var_a * var_b)
         if denom > 1e-9:
-            corr = float(np.sum(xa_z * xb_z) / denom)
-            best = max(best, corr)
+            best = max(best, num / denom)
     return best
 
 
@@ -2921,19 +3908,39 @@ def compare_video_audio(
     def _has_audio(path: str) -> bool:
         if presence_cache is None:
             return _audio_stream_present(path, cancelled)
-        if presence_lock is not None:
-            with presence_lock:
-                if path in presence_cache:
-                    return presence_cache[path]
-        elif path in presence_cache:
-            return presence_cache[path]
-        present = _audio_stream_present(path, cancelled)
-        if presence_lock is not None:
-            with presence_lock:
-                presence_cache[path] = present
-        else:
-            presence_cache[path] = present
-        return present
+        while True:
+            if presence_lock is not None:
+                with presence_lock:
+                    if path in presence_cache:
+                        return presence_cache[path]
+            elif path in presence_cache:
+                return presence_cache[path]
+            # Singleflight concurrent ffprobes for the same path.
+            with _AUDIO_PRESENCE_INFLIGHT_LOCK:
+                wait_ev = _AUDIO_PRESENCE_INFLIGHT.get(path)
+                if wait_ev is None:
+                    my_ev = threading.Event()
+                    _AUDIO_PRESENCE_INFLIGHT[path] = my_ev
+                    owner = True
+                else:
+                    owner = False
+            if not owner:
+                while not wait_ev.wait(timeout=0.05):
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
+                continue
+            try:
+                present = _audio_stream_present(path, cancelled)
+                if presence_lock is not None:
+                    with presence_lock:
+                        presence_cache[path] = present
+                else:
+                    presence_cache[path] = present
+                return present
+            finally:
+                with _AUDIO_PRESENCE_INFLIGHT_LOCK:
+                    _AUDIO_PRESENCE_INFLIGHT.pop(path, None)
+                my_ev.set()
 
     try:
         presence = [_has_audio(path) for path in (a, b)]
@@ -3030,11 +4037,68 @@ def _serialize_version_payload(
     )
 
 
+def _prescore_offset_in_memory(
+    samples_a: Sequence[tuple[float, int]],
+    samples_b: Sequence[tuple[float, int]],
+    duration_a: float,
+    duration_b: float,
+    offset: float,
+    bin_step: float,
+) -> bool:
+    """Fast in-memory check of a candidate offset against already-decoded dense samples.
+
+    Rejects only clear false-positive offsets that have plenty of overlapping
+    dense samples with almost no hash agreement, avoiding unnecessary ffmpeg calls.
+    """
+    if not samples_a or not samples_b or duration_a <= 0 or duration_b <= 0:
+        return True
+    start = max(0.0, -offset)
+    end = min(duration_a, duration_b - offset)
+    overlap = end - start
+    if overlap < VERSION_MIN_SECONDS or overlap < min(duration_a, duration_b) * 0.7:
+        return False
+    tol = max(bin_step * 1.5, 1.5)
+    b_times = [tb for tb, _hb in samples_b]
+    overlapping = 0
+    matched = 0
+    for ta, ha in samples_a:
+        if ta < start or ta > end:
+            continue
+        target_b = ta + offset
+        pos = bisect_right(b_times, target_b - tol)
+        lo = max(0, pos - 1)
+        checked = False
+        best_dist = 65
+        while lo < len(samples_b):
+            tb, hb = samples_b[lo]
+            if tb > target_b + tol:
+                break
+            if abs(tb - target_b) <= tol:
+                checked = True
+                best_dist = min(best_dist, (ha ^ hb).bit_count())
+            lo += 1
+        if checked:
+            overlapping += 1
+            if best_dist <= 14:
+                matched += 1
+    return not (overlapping >= 8 and matched < 3 and (matched / overlapping) < 0.2)
+
+
+_VERSION_CACHE_FLUSH_BATCH = 32
+_SQLITE_IN_CHUNK = 500
+
+
 def find_video_version_matches(
-    records: list[FileRecord], *, distinct: DistinctReviews | None = None,
-    progress: ProgressCb | None = None, workers: int | None = None,
-    cancelled: Callable[[], bool] | None = None, cache_path: str | Path | None = None,
-    errors: list[str] | None = None, use_cache: bool = True,
+    records: list[FileRecord],
+    *,
+    distinct: DistinctReviews | None = None,
+    progress: ProgressCb | None = None,
+    workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    cache_path: str | Path | None = None,
+    errors: list[str] | None = None,
+    use_cache: bool = True,
+    arrival_paths: set[str] | None = None,
 ) -> list[tuple[list[FileRecord], dict]]:
     """Find manual-review video versions and attach aligned ranges/audio evidence.
 
@@ -3054,6 +4118,63 @@ def find_video_version_matches(
         cache_path = base / "dedupe" / "video-versions.sqlite3"
     connection = None
     cache_errors: list[str] = []
+    to_store: list[tuple[str, str, int | None, int | None, int | None, int | None]] = []
+    completed_lock = threading.Lock()
+    completed_queue: list[
+        tuple[int, float | None, int | None, int | None, list[tuple[float, int]], str | None]
+    ] = []
+    siblings_by_rep: dict[int, list[int]] = defaultdict(list)
+    stat_meta: list[tuple[str, str, int, int, int, int] | None] = [None] * len(videos)
+
+    def _flush_to_store() -> None:
+        nonlocal connection
+        if connection is None or not to_store:
+            return
+        batch = list(to_store)
+        to_store.clear()
+        try:
+            connection.executemany(
+                "INSERT OR REPLACE INTO samples("
+                "identity, samples, device, inode, size, mtime_ns"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                batch,
+            )
+            connection.commit()
+        except sqlite3.Error as exc:
+            cache_errors.append(str(exc))
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+            connection = None
+
+    def _drain_completed_into_store() -> None:
+        with completed_lock:
+            drained = list(completed_queue)
+            completed_queue.clear()
+        if not drained:
+            return
+        for rep_idx, dur, w, h, extracted, err in drained:
+            if err is not None:
+                continue
+            if not (dur and math.isfinite(dur) and dur > 0):
+                continue
+            for idx in (rep_idx, *siblings_by_rep.get(rep_idx, ())):
+                meta = stat_meta[idx]
+                if meta is None:
+                    continue
+                key, resolved_path, dev, ino, size, mtime_ns = meta
+                to_store.append((
+                    key,
+                    _serialize_version_payload(
+                        resolved_path, float(dur), w, h, extracted
+                    ),
+                    dev,
+                    ino,
+                    size,
+                    mtime_ns,
+                ))
+
     try:
         if use_cache:
             try:
@@ -3061,6 +4182,8 @@ def find_video_version_matches(
                 connection = sqlite3.connect(str(cache_path), timeout=30.0)
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA temp_store=MEMORY")
+                connection.execute("PRAGMA cache_size=-32000")
                 connection.execute(
                     "CREATE TABLE IF NOT EXISTS samples("
                     "identity TEXT PRIMARY KEY, samples TEXT, "
@@ -3087,62 +4210,112 @@ def find_video_version_matches(
                     connection = None
 
         samples: list[list[tuple[float, int]]] = [[] for _ in videos]
-        stat_meta: list[tuple[str, str, int, int, int, int] | None] = [None] * len(videos)
         uncached_indices: list[int] = []
         done_count = 0
         rekey_rows: list[tuple[str, str, int, int, int, int]] = []
 
+        # Batch-hydrate cache rows instead of issuing 1-2 sequential SELECTs per video.
+        valid_indices: list[int] = []
         for i, record in enumerate(videos):
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
-            cached_hit = False
             if connection is not None:
                 try:
-                    meta = _version_cache_stat(record)
-                    stat_meta[i] = meta
-                    key, resolved_path, dev, ino, size, mtime_ns = meta
+                    stat_meta[i] = _version_cache_stat(record)
+                    valid_indices.append(i)
                 except OSError as exc:
                     if errors is not None:
                         errors.append(f"video version analysis failed: {record.path}: {exc}")
                     done_count += 1
                     if progress:
-                        progress("video-versions", done_count, len(videos), "Finding video excerpts")
-                    continue
+                        progress(
+                            "video-versions",
+                            done_count,
+                            len(videos),
+                            f"Finding video excerpts ({done_count}/{len(videos)})",
+                        )
+            else:
+                uncached_indices.append(i)
+
+        if connection is not None and valid_indices:
+            cached_by_key: dict[str, str] = {}
+            try:
+                keys_to_query = [stat_meta[i][0] for i in valid_indices]  # type: ignore[index]
+                for chunk_start in range(0, len(keys_to_query), _SQLITE_IN_CHUNK):
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
+                    key_chunk = keys_to_query[chunk_start : chunk_start + _SQLITE_IN_CHUNK]
+                    placeholders = ",".join("?" for _ in key_chunk)
+                    for row_key, row_payload in connection.execute(
+                        f"SELECT identity, samples FROM samples WHERE identity IN ({placeholders})",
+                        key_chunk,
+                    ).fetchall():
+                        cached_by_key[row_key] = row_payload
+            except sqlite3.Error as exc:
+                cache_errors.append(str(exc))
+                connection.close()
+                connection = None
+                cached_by_key.clear()
+
+            # Batch device+inode fallback lookup for videos that missed by exact identity.
+            missed_dev_ino: list[tuple[int, int]] = []
+            for i in valid_indices:
+                meta = stat_meta[i]
+                assert meta is not None
+                key = meta[0]
+                if key not in cached_by_key and meta[3]:
+                    missed_dev_ino.append((meta[2], meta[3]))
+
+            fallback_by_dev_ino: dict[tuple[int, int, int, int], list[str]] = defaultdict(list)
+            if connection is not None and missed_dev_ino:
+                unique_inodes = list({ino for _dev, ino in missed_dev_ino})
                 try:
-                    row = connection.execute(
-                        "SELECT samples FROM samples WHERE identity = ?", (key,),
-                    ).fetchone()
-                    parsed = _parse_cached_version_payload(row[0]) if row else None
-                    if parsed is None and ino:
-                        fallback_row = connection.execute(
-                            "SELECT samples FROM samples "
-                            "WHERE device = ? AND inode = ? AND size = ? AND mtime_ns = ? "
-                            "ORDER BY rowid DESC LIMIT 1",
-                            (dev, ino, size, mtime_ns),
-                        ).fetchone()
-                        if fallback_row:
-                            parsed = _parse_cached_version_payload(
-                                fallback_row[0],
-                                expected_path=resolved_path,
-                                require_path_diff=True,
-                            )
-                            if parsed is not None:
-                                dur_c, w_c, h_c, samp_c = parsed
-                                rekey_rows.append((
-                                    key,
-                                    _serialize_version_payload(
-                                        resolved_path, dur_c, w_c, h_c, samp_c
-                                    ),
-                                    dev,
-                                    ino,
-                                    size,
-                                    mtime_ns,
-                                ))
+                    for chunk_start in range(0, len(unique_inodes), _SQLITE_IN_CHUNK):
+                        if cancelled and cancelled():
+                            raise InterruptedError("scan cancelled")
+                        ino_chunk = unique_inodes[chunk_start : chunk_start + _SQLITE_IN_CHUNK]
+                        placeholders = ",".join("?" for _ in ino_chunk)
+                        for dev_r, ino_r, sz_r, mt_r, payload_r in connection.execute(
+                            "SELECT device, inode, size, mtime_ns, samples FROM samples "
+                            f"WHERE inode IN ({placeholders}) ORDER BY rowid DESC",
+                            ino_chunk,
+                        ).fetchall():
+                            fallback_by_dev_ino[(dev_r, ino_r, sz_r, mt_r)].append(payload_r)
                 except sqlite3.Error as exc:
                     cache_errors.append(str(exc))
                     connection.close()
                     connection = None
-                    parsed = None
+                    fallback_by_dev_ino.clear()
+
+            for i in valid_indices:
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                record = videos[i]
+                meta = stat_meta[i]
+                assert meta is not None
+                key, resolved_path, dev, ino, size, mtime_ns = meta
+                raw_payload = cached_by_key.get(key)
+                parsed = _parse_cached_version_payload(raw_payload) if raw_payload else None
+                if parsed is None and ino:
+                    for fb_payload in fallback_by_dev_ino.get((dev, ino, size, mtime_ns), ()):
+                        parsed = _parse_cached_version_payload(
+                            fb_payload,
+                            expected_path=resolved_path,
+                            require_path_diff=True,
+                        )
+                        if parsed is not None:
+                            dur_c, w_c, h_c, samp_c = parsed
+                            rekey_rows.append((
+                                key,
+                                _serialize_version_payload(
+                                    resolved_path, dur_c, w_c, h_c, samp_c
+                                ),
+                                dev,
+                                ino,
+                                size,
+                                mtime_ns,
+                            ))
+                            break
                 if parsed is not None:
                     duration, cached_w, cached_h, cached_samples = parsed
                     record.duration = duration
@@ -3151,21 +4324,22 @@ def find_video_version_matches(
                     if cached_h:
                         record.height = cached_h
                     samples[i] = cached_samples
-                    cached_hit = True
-            if cached_hit:
-                done_count += 1
-                if progress:
-                    progress("video-versions", done_count, len(videos), "Finding video excerpts")
-            else:
-                uncached_indices.append(i)
+                    done_count += 1
+                    if progress:
+                        progress(
+                            "video-versions",
+                            done_count,
+                            len(videos),
+                            f"Finding video excerpts ({done_count}/{len(videos)})",
+                        )
+                else:
+                    uncached_indices.append(i)
 
         sha_by_idx: dict[int, str] = {
             i: r.sha256 for i, r in enumerate(videos) if r.sha256
         }
 
-        to_store: list[tuple[str, str, int | None, int | None, int | None, int | None]] = list(
-            rekey_rows
-        )
+        to_store.extend(rekey_rows)
 
         if uncached_indices:
             uncached_set = set(uncached_indices)
@@ -3239,7 +4413,6 @@ def find_video_version_matches(
 
             representatives: list[int] = []
             rep_by_sha: dict[tuple[int, str], int] = {}
-            siblings_by_rep: dict[int, list[int]] = defaultdict(list)
 
             for i in uncached_indices:
                 rec = videos[i]
@@ -3280,7 +4453,12 @@ def find_video_version_matches(
                         ))
                     done_count += 1
                     if progress:
-                        progress("video-versions", done_count, len(videos), "Finding video excerpts")
+                        progress(
+                            "video-versions",
+                            done_count,
+                            len(videos),
+                            f"Finding video excerpts ({done_count}/{len(videos)})",
+                        )
                 elif key_sha is not None and key_sha in rep_by_sha:
                     siblings_by_rep[rep_by_sha[key_sha]].append(i)
                 else:
@@ -3292,19 +4470,39 @@ def find_video_version_matches(
                 base_done = done_count
                 remaining_total = len(videos) - base_done
 
+                def _extract_and_record(idx: int):
+                    res = _extract_version_samples_uncached(videos[idx], cancelled)
+                    dur_r, w_r, h_r, ext_r, err_r = res
+                    if connection is not None and err_r is None:
+                        with completed_lock:
+                            completed_queue.append((idx, dur_r, w_r, h_r, ext_r, err_r))
+                    return res
+
                 def sample_progress(done: int, rep_total: int) -> None:
+                    # Runs on the calling thread: incrementally flush completed samples
+                    # to SQLite so cancelling mid-stage preserves completed work.
+                    if connection is not None:
+                        _drain_completed_into_store()
+                        if len(to_store) >= _VERSION_CACHE_FLUSH_BATCH:
+                            _flush_to_store()
                     if progress and rep_total > 0:
                         reported = base_done + (done * remaining_total) // rep_total
-                        progress("video-versions", reported, len(videos), "Finding video excerpts")
+                        progress(
+                            "video-versions",
+                            reported,
+                            len(videos),
+                            f"Finding video excerpts ({reported}/{len(videos)})",
+                        )
 
                 extracted_results = _run_on_video_lanes(
-                    lambda idx: _extract_version_samples_uncached(videos[idx], cancelled),
+                    _extract_and_record,
                     representatives,
                     workers=workers,
                     progress=sample_progress,
                     cancelled=cancelled,
                 )
 
+                _drain_completed_into_store()
                 for rep_idx, (dur, w, h, extracted, err) in zip(
                     representatives, extracted_results, strict=True
                 ):
@@ -3322,42 +4520,54 @@ def find_video_version_matches(
                             if h:
                                 rec.height = h
                             samples[idx] = list(extracted)
-                            meta = stat_meta[idx]
-                            if (
-                                connection is not None
-                                and meta is not None
-                                and dur
-                                and math.isfinite(dur)
-                                and dur > 0
-                            ):
-                                key, resolved_path, dev, ino, size, mtime_ns = meta
-                                to_store.append((
-                                    key,
-                                    _serialize_version_payload(
-                                        resolved_path, float(dur), w, h, extracted
-                                    ),
-                                    dev,
-                                    ino,
-                                    size,
-                                    mtime_ns,
-                                ))
 
                 if progress:
-                    progress("video-versions", len(videos), len(videos), "Finding video excerpts")
+                    progress(
+                        "video-versions",
+                        len(videos),
+                        len(videos),
+                        f"Finding video excerpts ({len(videos)}/{len(videos)})",
+                    )
 
-        if connection is not None and to_store:
-            try:
-                connection.executemany(
-                    "INSERT OR REPLACE INTO samples("
-                    "identity, samples, device, inode, size, mtime_ns"
-                    ") VALUES (?, ?, ?, ?, ?, ?)",
-                    to_store,
+        # Flush all remaining cache entries and close SQLite BEFORE candidate matching
+        # and verification so the DB connection is never held open during verification.
+        _drain_completed_into_store()
+        _flush_to_store()
+        if connection is not None:
+            connection.close()
+            connection = None
+
+        effective_arrivals = arrival_paths
+        if (
+            effective_arrivals is None
+            and distinct is not None
+            and getattr(distinct, "filter_active", False)
+        ):
+            effective_arrivals = getattr(distinct, "arrivals", None)
+        arrival_indices: set[int] | None = None
+        if effective_arrivals is not None:
+            arrival_indices = {
+                idx for idx, rec in enumerate(videos) if rec.path in effective_arrivals
+            }
+            if not arrival_indices:
+                return []
+
+        def index_progress(done: int, total_keys: int) -> None:
+            if progress and total_keys > 0:
+                progress(
+                    "video-versions-index",
+                    done,
+                    total_keys,
+                    f"Indexing video excerpts ({done}/{total_keys})",
                 )
-                connection.commit()
-            except sqlite3.Error as exc:
-                cache_errors.append(str(exc))
 
-        pairs = _version_candidate_pairs(samples, cancelled)
+        pairs = _version_candidate_pairs(
+            samples,
+            cancelled,
+            durations=[r.duration for r in videos],
+            arrival_indices=arrival_indices,
+            progress=index_progress,
+        )
         candidate_items: list[tuple[int, int, list[tuple[float, float]]]] = []
         for (i, j), votes in pairs.items():
             if cancelled and cancelled():
@@ -3388,9 +4598,17 @@ def find_video_version_matches(
         ) -> tuple[list[FileRecord], dict] | None:
             i, j, votes = item
             a, b = videos[i], videos[j]
-            step = max(float(a.duration or 0), float(b.duration or 0)) / VERSION_SAMPLE_LIMIT
+            da = float(a.duration or 0)
+            db = float(b.duration or 0)
+            step = max(da, db) / VERSION_SAMPLE_LIMIT
             bin_step = max(0.25, step)
-            offsets = _offset_candidates(votes, bin_step)
+            offsets = [
+                off
+                for off in _offset_candidates(votes, bin_step)
+                if _prescore_offset_in_memory(samples[i], samples[j], da, db, off, bin_step)
+            ]
+            if not offsets:
+                return None
             evidence = None
             for offset in offsets:
                 try:
@@ -3407,7 +4625,13 @@ def find_video_version_matches(
                 for offset in offsets[:2]:
                     try:
                         evidence = _refine_and_verify_offset(
-                            a, b, offset, bin_step, cancelled, frame_cache=frame_cache
+                            a,
+                            b,
+                            offset,
+                            bin_step,
+                            cancelled,
+                            frame_cache=frame_cache,
+                            skip_initial_verify=True,
                         )
                     except InterruptedError:
                         raise
@@ -3429,15 +4653,40 @@ def find_video_version_matches(
             evidence["manual_review"] = True
             return [a, b], evidence
 
+        def verify_progress(done: int, total_items: int) -> None:
+            if progress and total_items > 0:
+                progress(
+                    "video-versions-verify",
+                    done,
+                    total_items,
+                    f"Checking video excerpts ({done}/{total_items})",
+                )
+
+        if progress:
+            progress(
+                "video-versions-verify",
+                0,
+                len(candidate_items),
+                f"Checking video excerpts (0/{len(candidate_items)})",
+            )
+
         verified = _run_on_video_lanes(
             _verify_candidate,
             candidate_items,
             workers=workers,
+            progress=verify_progress,
             cancelled=cancelled,
         )
         return [match for match in verified if match is not None]
     finally:
+        # Persist any completed dense samples even when cancelled mid-stage.
         if connection is not None:
-            connection.close()
+            _drain_completed_into_store()
+            _flush_to_store()
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
         if cache_errors and errors is not None:
             errors.append(f"video version cache unavailable; continued uncached: {cache_errors[0]}")

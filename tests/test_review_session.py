@@ -360,3 +360,35 @@ def test_unlocatable_and_vanished_deleted_files_are_flagged_not_silently_kept(
     reloaded = load_review_session(session_path)
     assert reloaded.unlocatable_deleted_files == {}
     assert reloaded.deleted_files == {}
+
+
+def test_encode_compact_result_memoizes_intern_by_record_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dedupe.models import DuplicateGroup, FileRecord, GroupKind, MediaType
+    from dedupe.review_session import _encode_compact_result
+
+    result = _result(tmp_path)
+    # Add another group referencing the exact same FileRecord instances.
+    result.groups.append(
+        DuplicateGroup(
+            id="all-files",
+            kind=GroupKind.ALL_FILES,
+            media_type=MediaType.IMAGE,
+            members=list(result.files),
+        )
+    )
+    calls = 0
+    real_to_dict = FileRecord.to_dict
+
+    def counted_to_dict(self, *, compact: bool = False):
+        nonlocal calls
+        calls += 1
+        return real_to_dict(self, compact=compact)
+
+    monkeypatch.setattr(FileRecord, "to_dict", counted_to_dict)
+    file_table, compact = _encode_compact_result(result)
+    assert len(file_table) == len(result.files)
+    assert len(compact["files"]) == len(result.files)
+    # Each shared FileRecord object is serialized once despite appearing in files + 2 groups.
+    assert calls == len(result.files)

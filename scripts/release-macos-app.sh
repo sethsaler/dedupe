@@ -39,9 +39,12 @@ missing=()
 command -v codesign >/dev/null 2>&1 || die 'codesign is unavailable (install Xcode command-line tools)'
 command -v xcrun >/dev/null 2>&1 || die 'xcrun is unavailable (install Xcode command-line tools)'
 command -v file >/dev/null 2>&1 || die 'file is unavailable'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTITLEMENTS="$SCRIPT_DIR/../packaging/macos/entitlements.plist"
+[[ -f "$ENTITLEMENTS" ]] || die "Hardened Runtime entitlements not found: $ENTITLEMENTS"
 
 printf 'Plan:\n'
-printf '  codesign Developer ID bundle: %q\n' "$APP"
+printf '  codesign Developer ID bundle: %q (entitlements: %q)\n' "$APP" "$ENTITLEMENTS"
 printf '  archive the signed bundle for notarization\n'
 printf '  submit with notarytool profile: %q (team %q)\n' "$NOTARYTOOL_PROFILE" "$APPLE_TEAM_ID"
 printf '  staple and verify the accepted ticket\n'
@@ -52,10 +55,10 @@ printf '  staple and verify the accepted ticket\n'
 # documented to visit. Sign every Mach-O there inside out before sealing the app.
 while IFS= read -r -d '' candidate; do
   if file -b "$candidate" | grep -q 'Mach-O'; then
-    codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$candidate"
+    codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$MACOS_SIGN_IDENTITY" "$candidate"
   fi
 done < <(find "$APP/Contents/Resources/backend" -type f -print0)
-codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
+codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$MACOS_SIGN_IDENTITY" "$APP"
 ARCHIVE="${APP%.app}-notarization.zip"
 trap 'rm -f "$ARCHIVE"' EXIT
 /usr/bin/ditto -c -k --keepParent "$APP" "$ARCHIVE"

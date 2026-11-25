@@ -305,3 +305,56 @@ def test_isoluminant_local_patch_rejected_by_edited_copy_verdict(tmp_path: Path)
     patched.save(b)
     clear_image_comparison_cache()
     assert edited_copy_verdict(str(a), str(b)) is False
+
+
+def test_sift_features_cached_and_symmetric_short_circuit_skips_reverse_pass(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unrelated pairs cache SIFT descriptors per file and skip the redundant reverse pass."""
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(cv2, "SIFT_create"):
+        pytest.skip("OpenCV SIFT_create unavailable")
+    import numpy as np
+
+    import dedupe.edited_copy as ec
+
+    rng = np.random.default_rng(123)
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"noise_{i}.png"
+        Image.fromarray(rng.integers(0, 255, size=(192, 192, 3), dtype=np.uint8)).save(p)
+        paths.append(str(p))
+
+    sift_calls = 0
+    real_sift_create = cv2.SIFT_create
+
+    class CountingSift:
+        def __init__(self) -> None:
+            self._inner = real_sift_create()
+
+        def detectAndCompute(self, img, mask):
+            nonlocal sift_calls
+            sift_calls += 1
+            return self._inner.detectAndCompute(img, mask)
+
+    monkeypatch.setattr(cv2, "SIFT_create", lambda: CountingSift())
+
+    align_calls = 0
+    real_align = ec._aligned_verdict_with_match_info
+
+    def counting_align(*args, **kwargs):
+        nonlocal align_calls
+        align_calls += 1
+        return real_align(*args, **kwargs)
+
+    monkeypatch.setattr(ec, "_aligned_verdict_with_match_info", counting_align)
+    clear_image_comparison_cache()
+
+    # Check all 3 unrelated pairs: symmetric short-circuit means 1 align pass per pair (not 2).
+    assert edited_copy_verdict(paths[0], paths[1]) is None
+    assert edited_copy_verdict(paths[0], paths[2]) is None
+    assert edited_copy_verdict(paths[1], paths[2]) is None
+    assert align_calls == 3
+    # SIFT is cached per (file, crop, flip): at most 2 calls per file (upright + flipped)
+    # across all pairs, never 8x per pair (which would be 24 calls).
+    assert sift_calls <= 6

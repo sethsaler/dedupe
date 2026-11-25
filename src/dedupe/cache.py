@@ -13,7 +13,7 @@ from .human_policy import CACHEABLE_HUMAN_STATUSES, MANUALLY_CONFIRMED_HUMAN_STA
 from .models import FileRecord, MediaType
 
 CACHE_ALGORITHM_VERSION = "dedupe-hashes-v2"
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 # Rows per executemany batch when persisting a scan.
 STORE_BATCH_SIZE = 1000
 # Records per hydration query batch; each path is one bind variable and SQLite's
@@ -532,23 +532,42 @@ class HashCache:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path else default_cache_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), timeout=30.0)
-        self._conn.row_factory = sqlite3.Row
-        # WAL + NORMAL sync + busy timeout let independent scan streams share
-        # one cache file concurrently without tripping over "database is locked".
-        try:
-            mode_row = self._conn.execute("PRAGMA journal_mode").fetchone()
-            mode = str(mode_row[0]).lower() if mode_row else ""
-            if mode not in ("wal", "memory"):
-                self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=30000")
-        except sqlite3.DatabaseError:
-            pass
+        self._conn = self._open_connection()
         self._closed = False
         self._hydrated_snapshots: dict[str, tuple] = {}
         self._content_snapshots: dict[tuple[int, str], tuple] = {}
         self._init()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        # WAL + NORMAL sync + busy timeout let independent scan streams share
+        # one cache file concurrently without tripping over "database is locked".
+        try:
+            mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(mode_row[0]).lower() if mode_row else ""
+            if mode not in ("wal", "memory"):
+                conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32000")
+            conn.execute("PRAGMA mmap_size=268435456")
+        except sqlite3.DatabaseError:
+            pass
+        return conn
+
+    def suspend(self) -> None:
+        """Close the SQLite connection while retaining dirty-row snapshots."""
+        if not self._closed:
+            self._conn.close()
+            self._closed = True
+
+    def reopen(self) -> None:
+        """Reopen a suspended SQLite connection without rerunning schema DDL."""
+        if self._closed:
+            self._conn = self._open_connection()
+            self._closed = False
 
     def _init(self) -> None:
         version_row = self._conn.execute("PRAGMA user_version").fetchone()
@@ -740,6 +759,12 @@ class HashCache:
             ON distinct_similar_pairs (recorded_at, path_a, path_b)
             """
         )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS distinct_similar_pairs_path_b_idx
+            ON distinct_similar_pairs (path_b)
+            """
+        )
         content_cols = ", ".join(_CONTENT_COLUMNS)
         self._conn.execute(
             f"""
@@ -884,38 +909,43 @@ class HashCache:
         row to inferred.
         """
         stamp = datetime.now(UTC).isoformat()
-        count = 0
-        for left, right in combinations(sorted(records, key=lambda rec: rec.path), 2):
-            self._conn.execute(
-                """
-                INSERT INTO distinct_similar_pairs (
-                    path_a, identity_a, content_a, path_b, identity_b, content_b,
-                    source, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(path_a, path_b) DO UPDATE SET
-                    identity_a=excluded.identity_a,
-                    content_a=excluded.content_a,
-                    identity_b=excluded.identity_b,
-                    content_b=excluded.content_b,
-                    source=CASE
-                        WHEN excluded.source = 'verified' THEN 'verified'
-                        ELSE distinct_similar_pairs.source END,
-                    recorded_at=excluded.recorded_at
-                """,
-                (
-                    left.path,
-                    self._identity(left),
-                    _content_identity(left),
-                    right.path,
-                    self._identity(right),
-                    _content_identity(right),
-                    source,
-                    stamp,
-                ),
+        ordered = sorted(records, key=lambda rec: rec.path)
+        identities = {rec.path: self._identity(rec) for rec in ordered}
+        contents = {rec.path: _content_identity(rec) for rec in ordered}
+        params = [
+            (
+                left.path,
+                identities[left.path],
+                contents[left.path],
+                right.path,
+                identities[right.path],
+                contents[right.path],
+                source,
+                stamp,
             )
-            count += 1
+            for left, right in combinations(ordered, 2)
+        ]
+        if not params:
+            return 0
+        sql = """
+            INSERT INTO distinct_similar_pairs (
+                path_a, identity_a, content_a, path_b, identity_b, content_b,
+                source, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path_a, path_b) DO UPDATE SET
+                identity_a=excluded.identity_a,
+                content_a=excluded.content_a,
+                identity_b=excluded.identity_b,
+                content_b=excluded.content_b,
+                source=CASE
+                    WHEN excluded.source = 'verified' THEN 'verified'
+                    ELSE distinct_similar_pairs.source END,
+                recorded_at=excluded.recorded_at
+        """
+        for start in range(0, len(params), STORE_BATCH_SIZE):
+            self._conn.executemany(sql, params[start : start + STORE_BATCH_SIZE])
         self._conn.commit()
-        return count
+        return len(params)
 
     def unmark_distinct_pair(
         self,
@@ -1046,39 +1076,43 @@ class HashCache:
         a changed file must not have its decision hardened. Returns the
         number of rows updated.
         """
+        if not records:
+            return 0
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM distinct_similar_pairs LIMIT 1"
+            ).fetchone()
+            is None
+        ):
+            return 0
         by_path: dict[str, FileRecord] = {}
         by_identity: dict[str, FileRecord] = {}
+        identities_by_path: dict[str, str] = {}
         for rec in records:
+            ident = self._identity(rec)
             by_path[rec.path] = rec
-            by_identity.setdefault(self._identity(rec), rec)
+            identities_by_path[rec.path] = ident
+            by_identity.setdefault(ident, rec)
         updates: list[tuple[str | None, str | None, str, str]] = []
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             "SELECT path_a, identity_a, content_a, path_b, identity_b, content_b "
             "FROM distinct_similar_pairs"
-        ).fetchall()
-        for row in rows:
-            fills: dict[str, str] = {}
-            for path_key, identity_key, content_key in (
-                ("path_a", "identity_a", "content_a"),
-                ("path_b", "identity_b", "content_b"),
-            ):
-                rec = by_path.get(row[path_key]) or by_identity.get(row[identity_key])
-                # Renames keep the stored identity; drift does not. Only an
-                # identity match proves the hashes describe the decided file.
-                if rec is None or self._identity(rec) != row[identity_key]:
-                    continue
-                content = _content_identity(rec)
-                if content and content != row[content_key]:
-                    fills[content_key] = content
-            if fills:
-                updates.append(
-                    (
-                        fills.get("content_a"),
-                        fills.get("content_b"),
-                        row["path_a"],
-                        row["path_b"],
-                    )
-                )
+        )
+        for path_a, identity_a, content_a, path_b, identity_b, content_b in cursor:
+            fill_a: str | None = None
+            fill_b: str | None = None
+            rec_a = by_path.get(path_a) or by_identity.get(identity_a)
+            if rec_a is not None and identities_by_path[rec_a.path] == identity_a:
+                content = _content_identity(rec_a)
+                if content and content != content_a:
+                    fill_a = content
+            rec_b = by_path.get(path_b) or by_identity.get(identity_b)
+            if rec_b is not None and identities_by_path[rec_b.path] == identity_b:
+                content = _content_identity(rec_b)
+                if content and content != content_b:
+                    fill_b = content
+            if fill_a is not None or fill_b is not None:
+                updates.append((fill_a, fill_b, path_a, path_b))
         if updates:
             for start in range(0, len(updates), STORE_BATCH_SIZE):
                 self._conn.executemany(
@@ -1088,7 +1122,7 @@ class HashCache:
                     "WHERE path_a = ? AND path_b = ?",
                     updates[start : start + STORE_BATCH_SIZE],
                 )
-            self._conn.commit()
+                self._conn.commit()
         return len(updates)
 
     def distinct_reviews(self, records: list[FileRecord]) -> DistinctReviews:
@@ -1099,45 +1133,68 @@ class HashCache:
         (rename combined with metadata drift — the content check downstream
         still has to confirm before the pair is suppressed).
         """
+        if not records:
+            return DistinctReviews.empty()
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM distinct_similar_pairs LIMIT 1"
+            ).fetchone()
+            is None
+        ):
+            return DistinctReviews.empty()
         by_path: dict[str, FileRecord] = {}
         by_identity: dict[str, FileRecord] = {}
+        identities_by_path: dict[str, str] = {}
         by_inode: dict[tuple[int, int, int], FileRecord] = {}
         for rec in records:
+            ident = self._identity(rec)
             by_path[rec.path] = rec
-            by_identity[self._identity(rec)] = rec
+            by_identity[ident] = rec
+            identities_by_path[rec.path] = ident
             if rec.device is not None and rec.inode is not None:
                 by_inode.setdefault((rec.device, rec.inode, rec.size), rec)
 
         entries: dict[tuple[str, str], list[_DistinctEntry]] = {}
-        for row in self._conn.execute(
+        for (
+            path_a,
+            identity_a,
+            content_a,
+            path_b,
+            identity_b,
+            content_b,
+        ) in self._conn.execute(
             "SELECT path_a, identity_a, content_a, path_b, identity_b, content_b "
             "FROM distinct_similar_pairs"
         ):
-            sides = []
-            for path, identity in (
-                (row["path_a"], row["identity_a"]),
-                (row["path_b"], row["identity_b"]),
-            ):
-                rec = by_path.get(path) or by_identity.get(identity)
-                if rec is None:
-                    parsed = _parse_identity(identity)
-                    if parsed is not None:
-                        rec = by_inode.get(parsed)
-                sides.append((rec, identity))
-            (rec_a, identity_a), (rec_b, identity_b) = sides
-            if rec_a is None or rec_b is None:
+            rec_a = by_path.get(path_a) or by_identity.get(identity_a)
+            if rec_a is None:
+                parsed_a = _parse_identity(identity_a)
+                if parsed_a is not None:
+                    rec_a = by_inode.get(parsed_a)
+            if rec_a is None:
+                continue
+            rec_b = by_path.get(path_b) or by_identity.get(identity_b)
+            if rec_b is None:
+                parsed_b = _parse_identity(identity_b)
+                if parsed_b is not None:
+                    rec_b = by_inode.get(parsed_b)
+            if rec_b is None:
                 continue
             stat_ok = (
-                self._identity(rec_a) == identity_a
-                and self._identity(rec_b) == identity_b
+                identities_by_path[rec_a.path] == identity_a
+                and identities_by_path[rec_b.path] == identity_b
             )
-            key = tuple(sorted((rec_a.path, rec_b.path)))
+            key = (
+                (rec_a.path, rec_b.path)
+                if rec_a.path <= rec_b.path
+                else (rec_b.path, rec_a.path)
+            )
             entries.setdefault(key, []).append(
                 _DistinctEntry(
                     stat_ok,
                     (
-                        (rec_a.path, row["content_a"] or ""),
-                        (rec_b.path, row["content_b"] or ""),
+                        (rec_a.path, content_a or ""),
+                        (rec_b.path, content_b or ""),
                     ),
                 )
             )
@@ -1521,19 +1578,23 @@ class HashCache:
                     content_rows_by_key[ckey] = crow
         if not rows and not content_rows_by_key:
             return
-        # One statement per batch instead of one round trip per record.
+        # One bounded transaction per batch instead of holding a write lock
+        # across the entire library at scan completion.
         for start in range(0, len(rows), STORE_BATCH_SIZE):
-            self._conn.executemany(_UPSERT_SQL, rows[start : start + STORE_BATCH_SIZE])
-        content_rows = list(content_rows_by_key.values())
-        for start in range(0, len(content_rows), STORE_BATCH_SIZE):
+            batch = rows[start : start + STORE_BATCH_SIZE]
+            self._conn.executemany(_UPSERT_SQL, batch)
+            self.commit()
+            for row in batch:
+                self._hydrated_snapshots[row[0]] = row
+        content_items = list(content_rows_by_key.items())
+        for start in range(0, len(content_items), STORE_BATCH_SIZE):
+            batch_items = content_items[start : start + STORE_BATCH_SIZE]
             self._conn.executemany(
-                _CONTENT_UPSERT_SQL, content_rows[start : start + STORE_BATCH_SIZE]
+                _CONTENT_UPSERT_SQL, [crow for _ckey, crow in batch_items]
             )
-        self.commit()
-        for row in rows:
-            self._hydrated_snapshots[row[0]] = row
-        for ckey, crow in content_rows_by_key.items():
-            self._content_snapshots[ckey] = crow
+            self.commit()
+            for ckey, crow in batch_items:
+                self._content_snapshots[ckey] = crow
 
 
 def _copy_record_analysis(donor: FileRecord, target: FileRecord) -> bool:

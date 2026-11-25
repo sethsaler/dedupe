@@ -365,10 +365,12 @@ def classify_pixel_exact_group(
     ``"pixel_exact"`` when every member shares the same JPEG bitstream or
     canonical EXIF-transposed sRGB pixels (and display dimensions + pHash == 0).
     """
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     if len(members) < 2 or any(m.media_type != MediaType.IMAGE for m in members):
         return None, {}
     keeper = next((m for m in members if m.path == keeper_path), members[0])
-    if not (keeper.width and keeper.height and keeper.phash):
+    if not (keeper.width and keeper.height and keeper.width > 0 and keeper.height > 0 and keeper.phash):
         return None, {}
     keeper_dims = (keeper.width, keeper.height)
     keeper_phash = keeper.phash
@@ -383,20 +385,20 @@ def classify_pixel_exact_group(
     if len(candidates) < 2:
         return None, {}
 
+    others = [m for m in candidates if m.path != keeper.path]
+
     # Check fast JPEG bitstream identity first when all candidates are JPEGs.
     if all(_is_jpeg_record(m) for m in candidates):
-        bitstreams: dict[str, str | None] = {}
-        for m in candidates:
-            if cancelled and cancelled():
-                raise InterruptedError("scan cancelled")
-            bitstreams[m.path] = jpeg_bitstream_sha256(m.path)
-        k_digest = bitstreams.get(keeper.path)
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        k_digest = jpeg_bitstream_sha256(keeper.path, cancelled=cancelled)
         if k_digest:
-            matched = [
-                m
-                for m in candidates
-                if m.path != keeper.path and bitstreams.get(m.path) == k_digest
-            ]
+            matched = []
+            for m in others:
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                if jpeg_bitstream_sha256(m.path, cancelled=cancelled) == k_digest:
+                    matched.append(m)
             if matched:
                 explanations = {
                     m.path: "Identical JPEG image bitstream (metadata differs)"
@@ -406,17 +408,18 @@ def classify_pixel_exact_group(
                 return basis, explanations
 
     # Fall back to canonical decoded sRGB pixel SHA-256 (EXIF-transposed).
-    pixels: dict[str, str | None] = {}
-    for m in candidates:
-        if cancelled and cancelled():
-            raise InterruptedError("scan cancelled")
-        pixels[m.path] = canonical_pixel_sha256(m.path)
-    k_pixel = pixels.get(keeper.path)
+    # Decode keeper first so an unreadable/animated keeper skips decoding siblings.
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
+    k_pixel = canonical_pixel_sha256(keeper.path)
     if not k_pixel:
         return None, {}
-    matched = [
-        m for m in candidates if m.path != keeper.path and pixels.get(m.path) == k_pixel
-    ]
+    matched = []
+    for m in others:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        if canonical_pixel_sha256(m.path) == k_pixel:
+            matched.append(m)
     if not matched:
         return None, {}
     explanations = {
@@ -459,7 +462,7 @@ def find_metadata_exact_groups(
             for rec in bucket:
                 if cancelled and cancelled():
                     raise InterruptedError("scan cancelled")
-                digest = jpeg_bitstream_sha256(rec.path)
+                digest = jpeg_bitstream_sha256(rec.path, cancelled=cancelled)
                 if digest:
                     by_bitstream[digest].append(rec)
             for sub in by_bitstream.values():

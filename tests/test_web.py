@@ -4848,3 +4848,319 @@ def test_rapid_review_candidate_delete_and_undo_never_409_and_flush_cleanly(
 
     saved = load_review_session(review_path)
     assert set(saved.deleted_files) == {records[0].path, records[1].path}
+
+
+def test_grid_thumbnail_variant_allowed_and_sized(tmp_path: Path) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    img_path = tmp_path / "large.png"
+    Image.new("RGB", (1024, 768), (40, 120, 200)).save(img_path)
+    st = img_path.stat()
+    rec = FileRecord(
+        path=str(img_path),
+        size=st.st_size,
+        mtime=st.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".png",
+        width=1024,
+        height=768,
+    )
+    app = create_app(ScanResult(roots=[str(tmp_path)], files=[rec], groups=[]))
+    client = app.test_client()
+
+    resp = client.get("/api/thumbnail", query_string={"path": str(img_path), "variant": "grid"})
+    assert resp.status_code == 200
+    assert resp.mimetype == "image/jpeg"
+    with Image.open(BytesIO(resp.data)) as thumb:
+        assert max(thumb.size) <= 512
+        assert thumb.size == (512, 384)
+
+
+def test_media_downscales_before_exif_transpose(tmp_path: Path, monkeypatch) -> None:
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    rot_path = tmp_path / "rotated.jpg"
+    exif_rot = Image.Exif()
+    exif_rot[274] = 6  # 90 degrees CW -> 1200x800 becomes portrait after transpose
+    Image.new("RGB", (1200, 800), (180, 60, 40)).save(rot_path, format="JPEG", exif=exif_rot)
+
+    norm_path = tmp_path / "normal.jpg"
+    exif_norm = Image.Exif()
+    exif_norm[274] = 1
+    Image.new("RGB", (1200, 800), (40, 180, 60)).save(norm_path, format="JPEG", exif=exif_norm)
+
+    transpose_sizes: list[tuple[int, int]] = []
+    real_transpose = ImageOps.exif_transpose
+
+    def spy_transpose(img, *args, **kwargs):
+        transpose_sizes.append(img.size)
+        return real_transpose(img, *args, **kwargs)
+
+    monkeypatch.setattr(ImageOps, "exif_transpose", spy_transpose)
+
+    rot_bytes = web_media.image_thumbnail_bytes(rot_path, variant="grid")
+    assert len(transpose_sizes) == 1
+    assert max(transpose_sizes[0]) <= 512
+    with Image.open(BytesIO(rot_bytes)) as rot_out:
+        assert rot_out.height > rot_out.width
+        assert rot_out.height == 512
+
+    transpose_sizes.clear()
+    norm_bytes = web_media.image_thumbnail_bytes(norm_path, variant="grid")
+    assert transpose_sizes == []
+    with Image.open(BytesIO(norm_bytes)) as norm_out:
+        assert norm_out.width == 512
+        assert norm_out.height < norm_out.width
+
+
+def test_dup_groups_cache_decoupled_batched_on_groups_and_stripped_blobs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    a = tmp_path / "a.jpg"
+    b = tmp_path / "b.jpg"
+    c = tmp_path / "c.jpg"
+    a.write_bytes(b"img-a")
+    b.write_bytes(b"img-b")
+    c.write_bytes(b"img-c")
+    rec_a = FileRecord(
+        path=str(a),
+        size=5,
+        mtime=a.stat().st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        sha256="deadbeef" * 8,
+        partial_hash="abcd",
+        phash="0f0f0f0f0f0f0f0f",
+        tile_phashes="t1:1111,2222",
+        orientation_phashes="o1:3333",
+        video_fingerprint="v1:4444",
+        border_signature="sig-v1",
+    )
+    rec_b = FileRecord(
+        path=str(b),
+        size=5,
+        mtime=b.stat().st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        sha256="deadbeef" * 8,
+        phash="0f0f0f0f0f0f0f0f",
+    )
+    rec_c = FileRecord(
+        path=str(c),
+        size=5,
+        mtime=c.stat().st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+    )
+    similar = DuplicateGroup(
+        id="similar-strip",
+        kind=GroupKind.SIMILAR,
+        media_type=MediaType.IMAGE,
+        members=[rec_a, rec_b],
+        suggested_keep=str(a),
+        selected_for_removal=[str(b)],
+    )
+    app = create_app(
+        ScanResult(roots=[str(tmp_path)], files=[rec_a, rec_b, rec_c], groups=[similar])
+    )
+    client = app.test_client()
+    state = app.extensions["dedupe_state"]
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+
+    groups_resp = client.get("/api/groups").get_json()["groups"]
+    similar_payload = next(g for g in groups_resp if g["id"] == "similar-strip")
+    member_a = next(m for m in similar_payload["members"] if m["path"] == str(a))
+    for hidden in (
+        "tile_phashes",
+        "orientation_phashes",
+        "video_fingerprint",
+        "partial_hash",
+        "sha256",
+        "border_signature",
+    ):
+        assert hidden not in member_a
+    member_b = next(m for m in similar_payload["members"] if m["path"] == str(b))
+    assert member_b["similarity_percent"] == 100
+
+    # dup_groups_cache is keyed by dup_groups_version, NOT paths_version.
+    cached_entry = state["dup_groups_cache"]
+    assert cached_entry is not None
+    state["paths_version"] += 1
+    assert client.get(f"/api/groups/{similar.id}").status_code == 200
+    assert state["dup_groups_cache"] is cached_entry
+
+    # Adding a non-dup group does not invalidate dup_groups_cache;
+    # batched on_groups + emit_done=False updates dup_groups_version cleanly.
+    seen_kwargs: dict = {}
+
+    def fake_run_scan(
+        paths,
+        *,
+        on_progress=None,
+        on_group=None,
+        on_groups=None,
+        emit_done=True,
+        **_kwargs,
+    ):
+        seen_kwargs["emit_done"] = emit_done
+        seen_kwargs["has_on_groups"] = on_groups is not None
+        non_dup = DuplicateGroup(
+            id="nh-1",
+            kind=GroupKind.NO_HUMANS,
+            media_type=MediaType.IMAGE,
+            members=[rec_c],
+            suggested_keep=str(c),
+        )
+        dup2 = DuplicateGroup(
+            id="exact-batch",
+            kind=GroupKind.EXACT,
+            media_type=MediaType.IMAGE,
+            members=[rec_a, rec_b],
+            suggested_keep=str(a),
+            selected_for_removal=[str(b)],
+        )
+        if on_groups is not None:
+            on_groups([non_dup, dup2])
+        elif on_group is not None:
+            on_group(non_dup)
+            on_group(dup2)
+        if on_progress is not None:
+            on_progress(ScanProgress(phase="grouping", current=2, total=2, done=True))
+        return ScanResult(roots=list(paths), files=[rec_a, rec_b, rec_c], groups=[non_dup, dup2])
+
+    monkeypatch.setattr(web_app, "run_scan", fake_run_scan)
+    started = client.post("/api/scan", json={"paths": [str(tmp_path)]}, headers=headers)
+    assert started.status_code == 200
+    deadline = time.monotonic() + 5
+    while client.get("/api/status").get_json()["scanning"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert seen_kwargs == {"emit_done": False, "has_on_groups": True}
+    final_ids = {g["id"] for g in client.get("/api/groups").get_json()["groups"]}
+    assert {"nh-1", "exact-batch"} <= final_ids
+
+
+def test_sse_connection_close_http11_handler_and_quiet_werkzeug(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import logging
+
+    import werkzeug.serving
+
+    app = create_app(_result(tmp_path))
+    state = app.extensions["dedupe_state"]
+    client = app.test_client()
+
+    # SSE sets Connection: close and exits cleanly once dedupe_shutting_down is flagged.
+    sse_resp = client.get("/api/events")
+    assert sse_resp.status_code == 200
+    assert sse_resp.headers.get("Connection") == "close"
+    it = iter(sse_resp.response)
+    first_chunk = next(it)
+    assert b"event: status" in first_chunk
+    app.extensions["dedupe_shutting_down"] = True
+    with state["events"]:
+        state["events"].notify_all()
+    assert list(it) == []
+
+    # run_app wires HTTP/1.1 keep-alive handler and silences Werkzeug INFO logs.
+    captured: dict = {}
+
+    class FakeServer:
+        def serve_forever(self) -> None:
+            captured["served"] = True
+
+        def server_close(self) -> None:
+            captured["closed"] = True
+
+    def fake_make_server(host, port, wsgi_app, *, threaded=False, request_handler=None, fd=None):
+        captured["threaded"] = threaded
+        captured["request_handler"] = request_handler
+        return FakeServer()
+
+    werkzeug_logger = logging.getLogger("werkzeug")
+    prev_level = werkzeug_logger.level
+    werkzeug_logger.setLevel(logging.INFO)
+    monkeypatch.delenv("DEDUPE_DEBUG", raising=False)
+    monkeypatch.setattr(werkzeug.serving, "make_server", fake_make_server)
+    try:
+        rc = web_app.run_app(app, host="127.0.0.1", port=0, open_browser=False)
+        assert rc == 0
+        assert captured["threaded"] is True
+        assert captured["request_handler"].protocol_version == "HTTP/1.1"
+        assert werkzeug_logger.level == logging.WARNING
+    finally:
+        werkzeug_logger.setLevel(prev_level)
+
+
+def test_monitor_scan_checks_busy_before_jobs_get(tmp_path: Path, monkeypatch) -> None:
+    captured_cb: dict = {}
+
+    class FakeMonitor:
+        def __init__(self, on_change, *, debounce_seconds=0.0) -> None:
+            captured_cb["on_change"] = on_change
+
+        def start(self, job_id, roots, settings):
+            return list(roots)
+
+        def stop(self, job_id):
+            return None
+
+        def stop_all(self):
+            return None
+
+        def running(self, job_id):
+            return True
+
+        def watched_jobs(self):
+            return set()
+
+    jobs_get_calls: list[str] = []
+
+    class SpyJobStore(web_app.JobStore):
+        def get(self, job_id: str) -> dict:
+            jobs_get_calls.append(job_id)
+            return super().get(job_id)
+
+    monkeypatch.setattr(web_app, "FolderMonitor", FakeMonitor)
+    monkeypatch.setattr(web_app, "JobStore", SpyJobStore)
+    monkeypatch.setattr(web_app, "MONITOR_BUSY_RETRY_SECONDS", 60.0)
+
+    app = create_app(_result(tmp_path))
+    state = app.extensions["dedupe_state"]
+    state["scanning"] = True
+    jobs_get_calls.clear()
+
+    # Triggering a monitor event while busy must defer BEFORE calling jobs.get().
+    captured_cb["on_change"]("job-busy-test")
+    assert jobs_get_calls == []
+    assert state["monitors"]["job-busy-test"]["pending"] is True
+
+    # Cancel the retry timer so it doesn't linger.
+    app.extensions["dedupe_monitor"].stop_all()
+    state["scanning"] = False
+
+
+def test_macos_backend_entry_thread_limits_and_finder_path(monkeypatch) -> None:
+    import importlib.util
+
+    entry_path = Path(__file__).resolve().parents[1] / "scripts" / "macos_backend_entry.py"
+    spec = importlib.util.spec_from_file_location("macos_backend_entry_test", entry_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_NUM_THREADS"):
+        monkeypatch.delenv(var, raising=False)
+    mod._configure_thread_limits()
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_NUM_THREADS"):
+        assert os.environ[var] == "1"
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    safe_path = mod._finder_safe_path().split(os.pathsep)
+    assert "/opt/homebrew/bin" in safe_path
+    assert "/opt/local/bin" in safe_path
+    assert "/run/current-system/sw/bin" in safe_path

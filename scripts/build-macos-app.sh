@@ -30,7 +30,11 @@ die() { printf 'build-macos-app: %s\n' "$*" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$REPO/build/Dedupe.app"
-PYTHON_BIN="${PYTHON:-python3}"
+PYTHON_BIN="${PYTHON:-}"
+PYTHON_EXPLICIT=0
+if [[ -n "$PYTHON_BIN" ]]; then
+  PYTHON_EXPLICIT=1
+fi
 INCLUDE_HUMAN=1
 SMOKE=1
 ADHOC_SIGN=1
@@ -40,7 +44,7 @@ KEEP_WORK=0
 while (($#)); do
   case "$1" in
     --output) (($# >= 2)) || die '--output requires a path'; OUTPUT="$2"; shift 2 ;;
-    --python) (($# >= 2)) || die '--python requires a path'; PYTHON_BIN="$2"; shift 2 ;;
+    --python) (($# >= 2)) || die '--python requires a path'; PYTHON_BIN="$2"; PYTHON_EXPLICIT=1; shift 2 ;;
     --no-human) INCLUDE_HUMAN=0; shift ;;
     --no-smoke) SMOKE=0; shift ;;
     --no-adhoc-sign) ADHOC_SIGN=0; shift ;;
@@ -62,17 +66,34 @@ command -v plutil >/dev/null 2>&1 || die 'plutil is unavailable'
 python_is_usable() {
   [[ -x "$1" ]] && "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null
 }
-if [[ "$PYTHON_BIN" != */* ]]; then
-  PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
-fi
-if [[ -z "$PYTHON_BIN" ]] || ! python_is_usable "$PYTHON_BIN"; then
-  for candidate in python3.13 python3.12 python3.11; do
-    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+python_is_stable() {
+  [[ -x "$1" ]] && "$1" -c 'import sys; raise SystemExit(not ((3, 11) <= sys.version_info < (3, 15)))' 2>/dev/null
+}
+if ((PYTHON_EXPLICIT)); then
+  if [[ "$PYTHON_BIN" != */* ]]; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
+  fi
+else
+  PYTHON_BIN=""
+  if [[ -x "$REPO/.venv/bin/python" ]] && python_is_stable "$REPO/.venv/bin/python"; then
+    PYTHON_BIN="$REPO/.venv/bin/python"
+  fi
+  if [[ -z "$PYTHON_BIN" ]]; then
+    for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+      resolved="$(command -v "$candidate" 2>/dev/null || true)"
+      if [[ -n "$resolved" ]] && python_is_stable "$resolved"; then
+        PYTHON_BIN="$resolved"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$PYTHON_BIN" ]]; then
+    resolved="$(command -v python3 2>/dev/null || true)"
     if [[ -n "$resolved" ]] && python_is_usable "$resolved"; then
+      printf 'warning: no Python 3.11–3.14 found; falling back to %s\n' "$resolved" >&2
       PYTHON_BIN="$resolved"
-      break
     fi
-  done
+  fi
 fi
 python_is_usable "$PYTHON_BIN" \
   || die 'Python 3.11+ is required; pass one with --python PATH'
@@ -219,6 +240,7 @@ cat > "$OUTPUT/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppSleepDisabled</key><true/>
 </dict></plist>
 EOF
 plutil -lint "$OUTPUT/Contents/Info.plist" >/dev/null
@@ -246,7 +268,15 @@ fi
 
 if ((ADHOC_SIGN)); then
   command -v codesign >/dev/null 2>&1 || die 'codesign is unavailable'
-  codesign --force --deep --sign - "$OUTPUT"
+  command -v file >/dev/null 2>&1 || die 'file is unavailable'
+  # Sign nested Mach-O binaries under Resources/backend inside-out rather than
+  # relying on deprecated `codesign --deep`.
+  while IFS= read -r -d '' candidate; do
+    if file -b "$candidate" | grep -q 'Mach-O'; then
+      codesign --force --sign - "$candidate"
+    fi
+  done < <(find "$OUTPUT/Contents/Resources/backend" -type f -print0)
+  codesign --force --sign - "$OUTPUT"
 fi
 
 if [[ -n "$ZIP_PATH" ]]; then

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 from collections.abc import Callable
@@ -19,7 +20,13 @@ from .human_policy import (
 from .image_frames import animation_frame_count
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
-from .people_score import PEOPLE_MODEL_SHA256, PeopleScorer, verify_model_sha256
+from .people_score import (
+    MAX_CONSECUTIVE_VIDEO_TIMEOUTS,
+    PEOPLE_MODEL_SHA256,
+    PeopleScorer,
+    call_with_cancelled,
+    verify_model_sha256,
+)
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
@@ -393,17 +400,24 @@ def _person_sample_timestamps(duration: float) -> list[float]:
 
 
 def _media_person_evidence(
-    record: FileRecord, detector: PersonDetector
+    record: FileRecord,
+    detector: PersonDetector,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> tuple[bool | None, int, float]:
     """Return (has_person, frames_analyzed, maximum detector score)."""
     frames_analyzed = 0
     max_confidence = 0.0
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     try:
         if record.media_type in (MediaType.IMAGE, MediaType.GIF):
             for frame in _pil_frames(
                 Path(record.path), max_side=DETECT_INPUT_MAX_SIDE,
                 max_frames=HUMAN_VIDEO_MAX_FRAMES,
             ):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
                 frames_analyzed += 1
                 max_confidence = max(max_confidence, detector.score(frame))
                 if max_confidence > 0:
@@ -422,7 +436,9 @@ def _media_person_evidence(
 
             duration = record.duration
             if duration is None or duration <= 0:
-                duration, width, height = probe_video(record.path)
+                duration, width, height = call_with_cancelled(
+                    probe_video, record.path, cancelled=cancelled
+                )
                 record.duration = duration
                 record.width = width or record.width
                 record.height = height or record.height
@@ -438,26 +454,47 @@ def _media_person_evidence(
                 # recall-first and early-exits on positives, so sparse
                 # short-clip sampling would only add miss risk.
                 timestamps = _person_sample_timestamps(duration)
+                consecutive_timeouts = 0
                 for start in range(0, len(timestamps), HUMAN_VIDEO_EXTRACT_CHUNK):
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
                     chunk = timestamps[start : start + HUMAN_VIDEO_EXTRACT_CHUNK]
-                    ppms = _extract_seek_frames_ppm(
-                        record.path,
-                        chunk,
-                        frame_width=HUMAN_VIDEO_FRAME_WIDTH,
-                    )
+                    try:
+                        ppms = call_with_cancelled(
+                            _extract_seek_frames_ppm,
+                            record.path,
+                            chunk,
+                            frame_width=HUMAN_VIDEO_FRAME_WIDTH,
+                            cancelled=cancelled,
+                        )
+                    except (subprocess.TimeoutExpired, TimeoutError):
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts >= MAX_CONSECUTIVE_VIDEO_TIMEOUTS:
+                            return None, frames_analyzed, max_confidence
+                        ppms = []
                     if len(ppms) != len(chunk):
                         # Per-seek fallback when the batched pass fails.
                         ppms = []
                         for timestamp in chunk:
-                            ppm = _extract_seek_frame_ppm(
-                                record.path,
-                                timestamp,
-                                frame_width=HUMAN_VIDEO_FRAME_WIDTH,
-                            )
+                            if cancelled and cancelled():
+                                raise InterruptedError("scan cancelled")
+                            try:
+                                ppm = call_with_cancelled(
+                                    _extract_seek_frame_ppm,
+                                    record.path,
+                                    timestamp,
+                                    frame_width=HUMAN_VIDEO_FRAME_WIDTH,
+                                    cancelled=cancelled,
+                                )
+                            except (subprocess.TimeoutExpired, TimeoutError):
+                                return None, frames_analyzed, max_confidence
                             if ppm is None:
                                 return None, frames_analyzed, max_confidence
                             ppms.append(ppm)
+                    consecutive_timeouts = 0
                     for ppm in ppms:
+                        if cancelled and cancelled():
+                            raise InterruptedError("scan cancelled")
                         with Image.open(BytesIO(ppm)) as image:
                             frames_analyzed += 1
                             max_confidence = max(
@@ -470,16 +507,20 @@ def _media_person_evidence(
 
             # Rare fallback for containers without a probeable duration.
             with tempfile.TemporaryDirectory(prefix="dedupe-human-video-") as tmp:
-                frames = _extract_frames(
+                frames = call_with_cancelled(
+                    _extract_frames,
                     record.path,
                     Path(tmp),
                     max_frames=HUMAN_VIDEO_MAX_FRAMES,
                     frame_width=HUMAN_VIDEO_FRAME_WIDTH,
                     require_complete=True,
+                    cancelled=cancelled,
                 )
                 if not frames:
                     return None, 0, 0.0
                 for path in frames:
+                    if cancelled and cancelled():
+                        raise InterruptedError("scan cancelled")
                     with Image.open(path) as image:
                         frames_analyzed += 1
                         max_confidence = max(
@@ -489,6 +530,8 @@ def _media_person_evidence(
                         if max_confidence > 0:
                             return True, frames_analyzed, max_confidence
                 return False, frames_analyzed, max_confidence
+    except InterruptedError:
+        raise
     except Exception as exc:
         record.error = f"person-candidate detection failed: {exc}"
         record.human_detection_status = "analysis_failed"
@@ -501,13 +544,16 @@ def analyze_person_presence(
     detector: PersonDetector,
     *,
     cache_signature: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bool | None:
     """Analyze one record, update its evidence fields, and return the decision."""
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     # A re-analysis must never retain a stale trusted result if decoding fails.
     record.human_detection_status = None
     record.human_detection_signature = None
     has_person, frames_analyzed, max_confidence = _media_person_evidence(
-        record, detector
+        record, detector, cancelled=cancelled
     )
     record.human_frames_analyzed = frames_analyzed
     record.human_max_confidence = max_confidence
@@ -606,6 +652,7 @@ def find_no_human_files(
                 record,
                 detector,
                 cache_signature=None if for_ensemble else signature,
+                cancelled=cancelled,
             )
             if for_ensemble:
                 if has_person is True:
@@ -685,6 +732,7 @@ def find_no_human_files(
                         record,
                         photon_detector,
                         cache_signature=signature,
+                        cancelled=cancelled,
                     )
                     record.human_detector = f"ensemble:{cv_backend}+{photon_detector.backend}"
                     if progress:
@@ -729,6 +777,7 @@ def find_no_human_files(
                     record,
                     detector,
                     cache_signature=signature,
+                    cancelled=cancelled,
                 )
                 if progress:
                     progress("human-detection", index, len(candidates))

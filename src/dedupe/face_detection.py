@@ -7,6 +7,7 @@ model so files can be filtered by male/female face counts.
 from __future__ import annotations
 
 import math
+import subprocess
 import tempfile
 import threading
 from collections.abc import Callable
@@ -25,7 +26,7 @@ from .human_detection import (
 )
 from .models import FileRecord, MediaType
 from .parallel import DEFAULT_HUMAN_WORKERS_CAP, map_parallel, resolve_workers
-from .people_score import verify_model_sha256
+from .people_score import call_with_cancelled, verify_model_sha256
 from .similar_video import (
     _extract_frames,
     _extract_seek_frame_ppm,
@@ -242,7 +243,10 @@ def _face_video_max_frames(duration: float | None) -> int:
 
 
 def _video_face_frames(
-    record: FileRecord, counter: _YuNetFaceCounter
+    record: FileRecord,
+    counter: _YuNetFaceCounter,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[tuple[int, int, int]]:
     """Analyze faces across sampled video frames.
 
@@ -252,12 +256,16 @@ def _video_face_frames(
     import numpy as np
     from PIL import Image
 
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     if not ffmpeg_available():
         raise RuntimeError("face counting in videos requires ffmpeg on PATH")
 
     duration = record.duration
     if duration is None or duration <= 0:
-        duration, width, height = probe_video(record.path)
+        duration, width, height = call_with_cancelled(
+            probe_video, record.path, cancelled=cancelled
+        )
         record.duration = duration
         record.width = width or record.width
         record.height = height or record.height
@@ -265,22 +273,44 @@ def _video_face_frames(
     frames: list[tuple[int, int, int]] = []
 
     def analyze_ppm(ppm: bytes) -> None:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         with Image.open(BytesIO(ppm)) as image:
             frames.append(counter.analyze_frame(np.asarray(image.convert("RGB"))))
 
     if duration is not None and duration > 0:
         timestamps = _sample_timestamps(duration, _face_video_max_frames(duration))
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         # One ffmpeg process for all sampled frames instead of one per frame.
-        ppms = _extract_seek_frames_ppm(
-            record.path, timestamps, frame_width=FACE_VIDEO_FRAME_WIDTH
-        )
+        try:
+            ppms = call_with_cancelled(
+                _extract_seek_frames_ppm,
+                record.path,
+                timestamps,
+                frame_width=FACE_VIDEO_FRAME_WIDTH,
+                cancelled=cancelled,
+            )
+        except (subprocess.TimeoutExpired, TimeoutError):
+            ppms = []
         if len(ppms) != len(timestamps):
             # Per-frame fallback for inputs the batched pass cannot satisfy.
+            # Face counting fails closed on any missing/timed-out frame, so the
+            # first timeout/failure aborts immediately instead of looping 16x.
             ppms = []
             for timestamp in timestamps:
-                ppm = _extract_seek_frame_ppm(
-                    record.path, timestamp, frame_width=FACE_VIDEO_FRAME_WIDTH
-                )
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                try:
+                    ppm = call_with_cancelled(
+                        _extract_seek_frame_ppm,
+                        record.path,
+                        timestamp,
+                        frame_width=FACE_VIDEO_FRAME_WIDTH,
+                        cancelled=cancelled,
+                    )
+                except (subprocess.TimeoutExpired, TimeoutError) as exc:
+                    raise RuntimeError(f"frame decode timed out at {timestamp:.2f}s") from exc
                 if ppm is None:
                     raise RuntimeError(f"frame decode failed at {timestamp:.2f}s")
                 ppms.append(ppm)
@@ -290,16 +320,20 @@ def _video_face_frames(
 
     # Rare fallback for containers without a probeable duration.
     with tempfile.TemporaryDirectory(prefix="dedupe-face-video-") as tmp:
-        frame_paths = _extract_frames(
+        frame_paths = call_with_cancelled(
+            _extract_frames,
             record.path,
             Path(tmp),
             max_frames=FACE_VIDEO_MAX_FRAMES,
             frame_width=FACE_VIDEO_FRAME_WIDTH,
             require_complete=True,
+            cancelled=cancelled,
         )
         if not frame_paths:
             raise RuntimeError("no video frames could be sampled")
         for frame_path in frame_paths:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             with Image.open(frame_path) as image:
                 frames.append(
                     counter.analyze_frame(np.asarray(image.convert("RGB")))
@@ -312,8 +346,11 @@ def analyze_face_count(
     counter: _YuNetFaceCounter,
     *,
     cache_signature: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> int | None:
     """Count and classify faces for one record, update its fields, return the count."""
+    if cancelled and cancelled():
+        raise InterruptedError("scan cancelled")
     # A re-analysis must never keep a stale trusted count if decoding fails.
     record.face_count = None
     record.male_face_count = None
@@ -324,11 +361,15 @@ def analyze_face_count(
         return None
     try:
         if record.media_type == MediaType.VIDEO:
-            frames = _video_face_frames(record, counter)
+            frames = _video_face_frames(record, counter, cancelled=cancelled)
         else:
-            frames = [
-                counter.analyze_frame(frame) for frame in _pil_frames(Path(record.path))
-            ]
+            frames = []
+            for frame in _pil_frames(Path(record.path)):
+                if cancelled and cancelled():
+                    raise InterruptedError("scan cancelled")
+                frames.append(counter.analyze_frame(frame))
+    except InterruptedError:
+        raise
     except Exception as exc:
         record.error = f"face counting failed: {exc}"
         return None
@@ -384,7 +425,9 @@ def count_faces_in_files(
             if counter is None:
                 counter = _YuNetFaceCounter()
                 local.counter = counter
-            analyze_face_count(record, counter, cache_signature=signature)
+            analyze_face_count(
+                record, counter, cache_signature=signature, cancelled=cancelled
+            )
 
         def parallel_progress(done: int, _total: int) -> None:
             if progress:
@@ -404,7 +447,9 @@ def count_faces_in_files(
         for index, record in enumerate(pending, start=len(cached) + 1):
             if cancelled and cancelled():
                 raise InterruptedError("scan cancelled")
-            analyze_face_count(record, counter, cache_signature=signature)
+            analyze_face_count(
+                record, counter, cache_signature=signature, cancelled=cancelled
+            )
             if progress:
                 progress("face-detection", index, len(candidates))
 

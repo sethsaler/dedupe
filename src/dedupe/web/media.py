@@ -7,9 +7,11 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
@@ -42,8 +44,59 @@ _HEIF_REGISTERED = False
 
 VIDEO_FAIL_TTL_SECONDS = 30.0
 VIDEO_FAIL_CACHE_MAX = 512
+VIDEO_THUMB_TIMEOUT_SECONDS = 10
 _video_fail_lock = threading.Lock()
 _video_fail_cache: dict[tuple[str, int | None, int | None, str], float] = {}
+
+_ORIGINAL_SHUTIL_WHICH = shutil.which
+_REAL_SUBPROCESS_RUN = subprocess.run
+_ffmpeg_cache_lock = threading.Lock()
+_ffmpeg_cache: tuple[str, str | None] | None = None
+
+
+def _resolve_ffmpeg() -> str | None:
+    """Resolve and cache the ffmpeg executable path for the current PATH."""
+    global _ffmpeg_cache
+    if shutil.which is not _ORIGINAL_SHUTIL_WHICH:
+        return shutil.which("ffmpeg")
+    current_path = os.environ.get("PATH", "")
+    with _ffmpeg_cache_lock:
+        cached = _ffmpeg_cache
+        if (
+            cached is not None
+            and cached[0] == current_path
+            and (cached[1] is None or os.access(cached[1], os.X_OK))
+        ):
+            return cached[1]
+    resolved = shutil.which("ffmpeg")
+    with _ffmpeg_cache_lock:
+        _ffmpeg_cache = (current_path, resolved)
+    return resolved
+
+
+@lru_cache(maxsize=1)
+def _video_thumb_hwaccel() -> tuple[str, ...]:
+    """Enable VideoToolbox hardware decode for macOS video thumbnails when supported."""
+    if os.environ.get("DEDUPE_DISABLE_HWACCEL"):
+        return ()
+    if sys.platform != "darwin":
+        return ()
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return ()
+    try:
+        result = _REAL_SUBPROCESS_RUN(
+            [ffmpeg, "-hide_banner", "-hwaccels"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and "videotoolbox" in (result.stdout or ""):
+            return ("-hwaccel", "videotoolbox")
+    except Exception:
+        pass
+    return ()
 
 
 def _ensure_heif_registered() -> None:
@@ -123,9 +176,17 @@ def image_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes:
             # Decode JPEGs at a reduced DCT scale instead of full resolution;
             # PIL ignores draft() for formats that do not support it.
             img.draft("RGB", (max_side, max_side))
-        img = ImageOps.exif_transpose(img)
+        try:
+            orientation = img.getexif().get(274, 1)
+        except Exception:
+            orientation = 1
         if max_side is not None:
+            # Downscale before EXIF transpose: the square (max_side, max_side)
+            # bounding box is rotation-invariant, avoiding full-resolution copies
+            # of large HEIC/PNG photos before shrinking.
             img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS, reducing_gap=3.0)
+        if orientation not in (None, 1):
+            img = ImageOps.exif_transpose(img)
         # Composite resized pixels to avoid full-resolution RGB/RGBA copies.
         img = _flatten_to_rgb(img)
         output = BytesIO()
@@ -174,13 +235,21 @@ def _clear_video_failure(key: tuple[str, int | None, int | None, str]) -> None:
 
 
 def _run_ffmpeg_frame(
-    path: Path, output_path: Path, *, seek: str, vf: str | None
+    path: Path,
+    output_path: Path,
+    *,
+    seek: str,
+    vf: str | None,
+    ffmpeg_bin: str = "ffmpeg",
+    hwaccel: tuple[str, ...] = (),
 ) -> bytes:
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
+        "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
+        *hwaccel,
         "-threads",
         "1",
         "-ss",
@@ -198,12 +267,13 @@ def _run_ffmpeg_frame(
     if vf:
         cmd.extend(["-vf", vf])
     cmd.extend(["-q:v", "2", "-y", str(output_path)])
-    subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+    subprocess.run(cmd, capture_output=True, timeout=VIDEO_THUMB_TIMEOUT_SECONDS, check=False)
     return output_path.read_bytes()
 
 
 def video_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes | None:
-    if not shutil.which("ffmpeg"):
+    ffmpeg_bin = _resolve_ffmpeg()
+    if not ffmpeg_bin:
         return None
     fail_key = _video_fail_key(path, variant)
     if _is_video_negatively_cached(fail_key):
@@ -216,13 +286,26 @@ def video_thumbnail_bytes(path: Path, *, variant: str = "thumb") -> bytes | None
         if max_side is not None
         else None
     )
+    hwaccel = _video_thumb_hwaccel()
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         output_path = Path(tmp.name)
     try:
-        data = _run_ffmpeg_frame(path, output_path, seek="1", vf=vf)
+        data = _run_ffmpeg_frame(
+            path, output_path, seek="1", vf=vf, ffmpeg_bin=ffmpeg_bin, hwaccel=hwaccel
+        )
+        if not data and hwaccel:
+            data = _run_ffmpeg_frame(
+                path, output_path, seek="1", vf=vf, ffmpeg_bin=ffmpeg_bin, hwaccel=()
+            )
         if not data:
             # Clips shorter than 1s (e.g. Live Photos) produce 0 bytes at -ss 1.
-            data = _run_ffmpeg_frame(path, output_path, seek="0", vf=vf)
+            data = _run_ffmpeg_frame(
+                path, output_path, seek="0", vf=vf, ffmpeg_bin=ffmpeg_bin, hwaccel=hwaccel
+            )
+            if not data and hwaccel:
+                data = _run_ffmpeg_frame(
+                    path, output_path, seek="0", vf=vf, ffmpeg_bin=ffmpeg_bin, hwaccel=()
+                )
         if data:
             _clear_video_failure(fail_key)
             return data

@@ -266,3 +266,58 @@ def test_map_parallel_chunk_size_preserves_order_and_cancels() -> None:
             chunk_size=2,
             cancelled=cancel_midway,
         )
+
+
+def test_map_parallel_process_cancel_kills_unresponsive_worker(monkeypatch) -> None:
+    import pytest
+
+    from dedupe import parallel
+
+    events: list[str] = []
+
+    class StubProc:
+        def __init__(self) -> None:
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def join(self, timeout=None) -> None:
+            events.append("join")
+
+        def kill(self) -> None:
+            events.append("kill")
+            self.alive = False
+
+    class StubFuture:
+        def cancel(self) -> bool:
+            return True
+
+    class StubExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self._processes = {1: StubProc()}
+
+        def submit(self, *_args, **_kwargs):
+            return StubFuture()
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            events.append(f"shutdown:wait={wait}")
+
+    monkeypatch.setattr(parallel, "ProcessPoolExecutor", StubExecutor)
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        map_parallel(
+            lambda x: x,
+            [1, 2, 3, 4],
+            workers=2,
+            backend="process",
+            cancelled=lambda: True,
+        )
+
+    assert "shutdown:wait=False" in events
+    assert "terminate" in events
+    assert "kill" in events
+    assert events.index("terminate") < events.index("kill")

@@ -563,16 +563,47 @@ function appendPickedPaths(paths, targetEl = $("paths"), { multiline = false } =
   targetEl.focus();
 }
 
+const pendingNativePicks = new Map();
+let nextNativePickId = 0;
+
+window.__dedupeResolvePick = (id, payload) => {
+  const resolve = pendingNativePicks.get(id);
+  if (!resolve) return;
+  pendingNativePicks.delete(id);
+  resolve(payload || { cancelled: true, path: null, paths: [] });
+};
+
+function pickNativeShellPaths(kind) {
+  const handler = window.webkit?.messageHandlers?.pickPaths;
+  if (!handler) return null;
+  const id = `pick-${++nextNativePickId}`;
+  return new Promise((resolve) => {
+    pendingNativePicks.set(id, resolve);
+    try {
+      handler.postMessage({ id, kind });
+    } catch {
+      pendingNativePicks.delete(id);
+      resolve(null);
+    }
+  });
+}
+
 async function pickPaths(kind, button, targetEl = $("paths"), { multiline = false } = {}) {
   const originalLabel = button.textContent;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   button.textContent = "Opening…";
   try {
-    const data = await api("/api/pick-folder", {
-      method: "POST",
-      body: JSON.stringify({ kind }),
-    });
+    const nativePromise = pickNativeShellPaths(kind);
+    const data = nativePromise
+      ? (await nativePromise) || (await api("/api/pick-folder", {
+          method: "POST",
+          body: JSON.stringify({ kind }),
+        }))
+      : await api("/api/pick-folder", {
+          method: "POST",
+          body: JSON.stringify({ kind }),
+        });
     const paths = data.paths || (data.path ? [data.path] : []);
     if (paths.length) {
       appendPickedPaths(paths, targetEl, { multiline });

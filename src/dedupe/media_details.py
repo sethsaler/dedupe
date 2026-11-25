@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -14,8 +15,27 @@ from .models import MediaType, classify_media
 _HEIF_LOCK = threading.Lock()
 _HEIF_REGISTERED = False
 
+_REAL_SHUTIL_WHICH = shutil.which
+_BINARY_PATH_LOCK = threading.Lock()
+_BINARY_PATH_CACHE: dict[tuple[str, str], str | None] = {}
+
 _HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
 _HDR_SIDE_DATA_HINTS = ("dovi", "dolby vision", "mastering display", "content light")
+
+
+def _resolve_ffprobe() -> str | None:
+    """Resolve and cache ``ffprobe`` path, invalidating on PATH change or missing binary."""
+    if shutil.which is not _REAL_SHUTIL_WHICH:
+        return shutil.which("ffprobe")
+    key = ("ffprobe", os.environ.get("PATH", ""))
+    with _BINARY_PATH_LOCK:
+        if key in _BINARY_PATH_CACHE:
+            cached = _BINARY_PATH_CACHE[key]
+            if cached is None or (os.path.isfile(cached) and os.access(cached, os.X_OK)):
+                return cached
+        resolved = shutil.which("ffprobe")
+        _BINARY_PATH_CACHE[key] = resolved
+        return resolved
 
 
 def ensure_heif_registered() -> None:
@@ -106,13 +126,18 @@ def _find_tag_ci(tags: object, name: str) -> str | None:
 
 
 def _probe_video_details(path: Path) -> dict:
-    if not shutil.which("ffprobe"):
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe:
         raise RuntimeError("ffprobe is not available")
     result = subprocess.run(
         [
-            "ffprobe",
+            ffprobe,
             "-v",
             "error",
+            "-analyzeduration",
+            "2000000",
+            "-probesize",
+            "5000000",
             "-show_entries",
             (
                 "stream=codec_type,codec_name,channels,width,height,bit_rate,"

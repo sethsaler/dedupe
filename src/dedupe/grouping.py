@@ -6,6 +6,7 @@ import hashlib
 import random
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from .cache import DistinctReviews
@@ -51,23 +52,24 @@ def _has_capture_metadata(rec: FileRecord) -> bool:
         return bool(rec.capture_metadata)
     has_meta = False
     if rec.media_type == MediaType.IMAGE:
-        try:
-            from PIL import Image
+        from .similar_image import ensure_heif_registered, get_cached_capture_metadata
 
+        cached_meta = get_cached_capture_metadata(rec)
+        if cached_meta is not None:
+            has_meta = cached_meta
+        else:
             try:
-                from pillow_heif import register_heif_opener
+                from PIL import Image
 
-                register_heif_opener()
+                ensure_heif_registered()
+                with Image.open(rec.path) as image:
+                    exif = image.getexif()
+                    capture = exif.get(36867)
+                    if not capture and exif.get(34665):
+                        capture = exif.get_ifd(34665).get(36867)
+                    has_meta = bool(capture and (exif.get(271) or exif.get(272)))
             except Exception:
                 pass
-            with Image.open(rec.path) as image:
-                exif = image.getexif()
-                capture = exif.get(36867)
-                if not capture and exif.get(34665):
-                    capture = exif.get_ifd(34665).get(36867)
-                has_meta = bool(capture and (exif.get(271) or exif.get(272)))
-        except Exception:
-            pass
     with _keeper_metadata_lock:
         if rec.capture_metadata is None:
             rec.capture_metadata = has_meta
@@ -161,6 +163,8 @@ def cluster_around_best(
     records: list[FileRecord],
     adjacency: dict[str, set[str]],
     distinct: DistinctReviews | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[list[FileRecord]]:
     """Build disjoint groups whose members all directly match the best-ranked member.
 
@@ -174,9 +178,18 @@ def cluster_around_best(
     # library that is mostly unique files this skips nearly every file open.
     linked = {path for path, matches in adjacency.items() if matches}
     linked.update(path for matches in adjacency.values() for path in matches)
+    sort_keys: dict[str, tuple] = {}
+    linked_records: list[FileRecord] = []
+    for record in records:
+        if record.path not in linked:
+            continue
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+        sort_keys[record.path] = _keep_sort_key(record)
+        linked_records.append(record)
     ordered = sorted(
-        (record for record in records if record.path in linked),
-        key=_keep_sort_key,
+        linked_records,
+        key=lambda record: sort_keys[record.path],
         reverse=True,
     )
     by_path = {record.path: record for record in records}
@@ -184,6 +197,8 @@ def cluster_around_best(
 
     groups: list[list[FileRecord]] = []
     for keeper in ordered:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
         if keeper.path not in remaining:
             continue
         matches = [
@@ -195,7 +210,7 @@ def cluster_around_best(
             remaining.remove(keeper.path)
             continue
         matches.sort(
-            key=_keep_sort_key,
+            key=lambda record: sort_keys[record.path],
             reverse=True,
         )
         members = [keeper]

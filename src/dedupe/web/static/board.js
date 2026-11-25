@@ -191,7 +191,7 @@ function tileHtml(g, member, index, selected, rowFocused, liveMembers, keeperMem
   const keptOthers = liveMembers.some((other) => other.path !== member.path && !selected.has(other.path));
   const state_ = remove ? "marked for removal, press to keep" : "kept, press to mark for removal";
   const thumbSrc = withMediaVersion(
-    `/api/thumbnail?path=${encodeURIComponent(member.path)}`,
+    `/api/thumbnail?path=${encodeURIComponent(member.path)}&variant=grid`,
     member.path,
     member.media_version,
   );

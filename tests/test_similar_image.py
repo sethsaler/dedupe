@@ -1344,3 +1344,175 @@ def test_jpeg_bitstream_and_canonical_pixel_sha256(tmp_path: Path) -> None:
     second_frame = Image.new("RGB", src.size, (10, 20, 30))
     src.save(gif, save_all=True, append_images=[second_frame], duration=100, loop=0)
     assert module.canonical_pixel_sha256(gif) is None
+
+
+def test_group_runs_by_first_chunks_skewed_buckets_and_emits_cluster_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Skewed buckets split into <= MAX_VERIFY_RUN_SIZE chunks with smooth progress."""
+    import dedupe.similar_image as module
+
+    items = [(0, i) for i in range(75)] + [(1, i) for i in range(5)]
+    runs = module._group_runs_by_first(items, lambda item: item[0], max_run_size=32)
+    assert [len(run) for run in runs] == [32, 32, 11, 5]
+
+    # End-to-end: 6 identical-pHash images -> 15 pairs -> with max_run_size=2 emits
+    # multiple cluster progress events before completion.
+    monkeypatch.setattr(module, "MAX_VERIFY_RUN_SIZE", 2)
+    monkeypatch.setattr(module, "VERIFY_PROGRESS_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr(module, "is_near_identical", lambda *_a, **_kw: True)
+    monkeypatch.setattr(module, "is_dense_match", lambda *_a, **_kw: True)
+
+    records = []
+    for i in range(6):
+        p = tmp_path / f"img_{i}.png"
+        _make_image(p, (40, 80, 120))
+        rec = _rec_for(p)
+        rec.phash = "1" * 16
+        rec.dhash = "1" * 16
+        rec.tile_phashes = f"{module.TILE_HASH_VERSION}:" + ",".join(["1" * 16] * 5)
+        rec.orientation_phashes = module.encode_orientation_phashes(("2" * 16,) * 7)
+        rec.width = rec.height = 64
+        records.append(rec)
+
+    events: list[tuple[str, int, int]] = []
+    groups = find_similar_image_groups(
+        records, workers=2, progress=lambda phase, done, total: events.append((phase, done, total))
+    )
+    cluster_events = [e for e in events if e[0] == "image-cluster"]
+    assert len(groups) == 1
+    assert len(cluster_events) >= 3
+    assert cluster_events[-1] == ("image-cluster", 6, 6)
+
+
+def test_cropped_roi_hashes_honors_cancellation(tmp_path: Path, monkeypatch) -> None:
+    """Parallel border-crop ROI hashing checks cancellation and raises InterruptedError."""
+    import dedupe.similar_image as module
+
+    base_img = Image.open(ASTRONAUT).convert("RGB")
+    records = []
+    for i in range(4):
+        p = tmp_path / f"shot_{i}.png"
+        base_img.save(p)
+        rec = _rec_for(p)
+        rec.phash = f"{i + 1:016x}"
+        rec.dhash = f"{i + 1:016x}"
+        rec.tile_phashes = f"{module.TILE_HASH_VERSION}:" + ",".join(["1" * 16] * 5)
+        rec.orientation_phashes = module.encode_orientation_phashes(("2" * 16,) * 7)
+        rec.width, rec.height = base_img.size
+        rec.border_crop = f"10,10,{base_img.width - 10},{base_img.height - 10},{base_img.width},{base_img.height}"
+        records.append(rec)
+
+    calls = 0
+    real_roi = module._cropped_roi_hashes
+
+    def cancelling_roi(path, crop_rect):
+        nonlocal calls
+        calls += 1
+        return real_roi(path, crop_rect)
+
+    monkeypatch.setattr(module, "_cropped_roi_hashes", cancelling_roi)
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        find_similar_image_groups(
+            records,
+            workers=1,
+            cancelled=lambda: calls >= 1,
+        )
+    assert calls == 1
+
+
+def test_byte_identical_pair_skips_near_miss_and_dense_decode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Pairs with identical size and sha256 match immediately without pixel decoding."""
+    import dedupe.similar_image as module
+
+    p1 = tmp_path / "copy1.png"
+    p2 = tmp_path / "copy2.png"
+    _make_image(p1, (10, 20, 30))
+    _make_image(p2, (10, 20, 30))
+    r1, r2 = _rec_for(p1), _rec_for(p2)
+    for rec in (r1, r2):
+        rec.sha256 = "deadbeef" * 8
+        rec.phash = "1" * 16
+        rec.dhash = "1" * 16
+        rec.tile_phashes = f"{module.TILE_HASH_VERSION}:" + ",".join(["1" * 16] * 5)
+        rec.orientation_phashes = module.encode_orientation_phashes(("2" * 16,) * 7)
+        rec.width = rec.height = 64
+
+    def forbid(*_a, **_kw):
+        raise AssertionError("byte-identical pair must not decode pixels")
+
+    monkeypatch.setattr(module, "is_near_identical", forbid)
+    monkeypatch.setattr(module, "is_dense_match", forbid)
+
+    groups = find_similar_image_groups([r1, r2], workers=1)
+    assert len(groups) == 1
+    assert {r.path for r in groups[0]} == {r1.path, r2.path}
+
+
+def test_jpeg_bitstream_sha256_streaming_chunk_boundaries_and_cancel(tmp_path: Path) -> None:
+    """Streamed JPEG bitstream hashing matches tiny chunk sizes and honors cancellation."""
+    import dedupe.similar_image as module
+
+    src = Image.open(ASTRONAUT).convert("RGB")
+    jpg = tmp_path / "stream.jpg"
+    src.save(jpg, quality=92)
+    raw = jpg.read_bytes()
+    # Inject APP1 + COM segments and trailing garbage to exercise skip + EOI boundaries.
+    app1 = b"\xff\xe1" + (40).to_bytes(2, "big") + (b"X" * 38)
+    com = b"\xff\xfe" + (12).to_bytes(2, "big") + (b"C" * 10)
+    jpg_meta = tmp_path / "stream_meta.jpg"
+    jpg_meta.write_bytes(raw[:2] + app1 + com + raw[2:] + b"trailing-junk")
+
+    full = module.jpeg_bitstream_sha256(jpg)
+    assert full is not None
+    # Tiny chunk sizes force 0xFF/marker/stuffing sequences across read boundaries.
+    for size in (16, 17, 31, 64, 257):
+        assert module.jpeg_bitstream_sha256(jpg, chunk_size=size) == full
+        assert module.jpeg_bitstream_sha256(jpg_meta, chunk_size=size) == full
+
+    checks = 0
+
+    def cancel_mid_stream() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        module.jpeg_bitstream_sha256(jpg, chunk_size=32, cancelled=cancel_mid_stream)
+
+
+def test_hashing_captures_exif_metadata_so_grouping_skips_reopen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Hashing records EXIF capture_metadata so cluster_around_best never re-opens files."""
+    from PIL import Image as PILImage
+
+    from dedupe.grouping import _has_capture_metadata
+
+    src = PILImage.open(ASTRONAUT).convert("RGB")
+    exif = PILImage.Exif()
+    exif[271] = "Canon"
+    exif[36867] = "2024:01:02 03:04:05"
+    p_cam = tmp_path / "cam.jpg"
+    p_plain = tmp_path / "plain.jpg"
+    src.save(p_cam, quality=92, exif=exif)
+    src.save(p_plain, quality=85)
+
+    r_cam = _rec_for(p_cam)
+    r_plain = _rec_for(p_plain)
+    assert r_cam.capture_metadata is None
+    assert r_plain.capture_metadata is None
+
+    groups = find_similar_image_groups([r_cam, r_plain], workers=1)
+    assert len(groups) == 1
+    assert r_cam.capture_metadata is True
+    assert r_plain.capture_metadata is False
+
+    def forbid_open(*_a, **_kw):
+        raise AssertionError("grouping should not re-open files after hashing populated metadata")
+
+    monkeypatch.setattr(PILImage, "open", forbid_open)
+    assert _has_capture_metadata(r_cam) is True
+    assert _has_capture_metadata(r_plain) is False

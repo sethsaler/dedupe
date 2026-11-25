@@ -217,6 +217,18 @@ $("btnDismissSession").addEventListener("click", () => {
 });
 
 let statusSeq = 0;
+let lastNativeBusy = null;
+
+function notifyNativeBusyState(busy) {
+  const normalized = Boolean(busy);
+  if (normalized === lastNativeBusy) return;
+  lastNativeBusy = normalized;
+  try {
+    window.webkit?.messageHandlers?.busyState?.postMessage({ busy: normalized });
+  } catch {
+    /* ignore when not running inside WKWebView */
+  }
+}
 
 async function refreshStatus(payload = null, { handleGroups = true } = {}) {
   // With no payload this is the polling path; SSE status events pass theirs
@@ -258,6 +270,7 @@ async function refreshStatus(payload = null, { handleGroups = true } = {}) {
 
   state.scanning = !!s.scanning;
   state.acting = !!s.acting;
+  notifyNativeBusyState(state.scanning || state.acting);
   // The folded scan bar shows the full progress bar and per-folder streams
   // only while a scan runs; afterwards the one-line summary is enough.
   $("scanPanel").classList.toggle("scanning", state.scanning);

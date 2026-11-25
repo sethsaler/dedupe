@@ -398,6 +398,8 @@ def test_verify_video_offset_survives_hdr_sdr_luma_shift_and_rejects_two_frame_d
 
 
 def test_version_frame_batches_clears_hwaccel_after_chunk_zero_failure(monkeypatch):
+    import math
+
     import dedupe.similar_video as module
 
     hw_calls = []
@@ -414,8 +416,9 @@ def test_version_frame_batches_clears_hwaccel_after_chunk_zero_failure(monkeypat
     frames = module._version_frame_batches("clip.mp4", [float(i) for i in range(25)], None)
 
     assert len(frames) == 25
-    # Chunk 0 tried hwaccel and fell back; chunks 1 and 2 skipped hwaccel immediately.
-    assert hw_calls == [("-hwaccel", "videotoolbox"), (), (), ()]
+    expected_chunks = math.ceil(25 / module.VERSION_BATCH_SIZE)
+    # Chunk 0 tried hwaccel and fell back; remaining chunks skipped hwaccel immediately.
+    assert hw_calls == [("-hwaccel", "videotoolbox")] + [()] * expected_chunks
 
 
 def test_refine_and_verify_offset_recovers_subsecond_drift_around_bin_median(
@@ -569,3 +572,126 @@ def test_version_cache_uses_wal_device_inode_rename_fallback_and_persists_short_
     short_rec = next(r for r in warm_records if r.path == str(short_clip))
     assert short_rec.duration == pytest.approx(1.2, abs=0.1)
     assert (short_rec.width, short_rec.height) == (128, 96)
+
+
+def test_version_candidate_pairs_prunes_temporally_inconsistent_votes():
+    # Three matching hashes at completely unrelated timestamps (offsets +50s, -25s, +80s)
+    # must NOT survive temporal offset consistency filtering.
+    h1, h2, h3 = 0x1010101010101010, 0x2020202020202020, 0x3030303030303030
+    video_a = [(1.0, h1), (30.0, h2), (10.0, h3)]
+    video_b = [(51.0, h1), (5.0, h2), (90.0, h3)]
+    assert _version_candidate_pairs([video_a, video_b], durations=[100.0, 100.0]) == {}
+
+    # Three matching hashes at a consistent +2.0s offset DO pass.
+    consistent_b = [(3.0, h1), (32.0, h2), (12.0, h3)]
+    kept = _version_candidate_pairs([video_a, consistent_b], durations=[100.0, 100.0])
+    assert (0, 1) in kept and len(kept[(0, 1)]) == 3
+
+
+def test_mih_hamming_neighbors_matches_bruteforce_exactly():
+    import random
+
+    import numpy as np
+
+    import dedupe.similar_video as module
+
+    rng = random.Random(12345)
+    # Mix random hashes with perturbed clusters at Hamming distances 0..12.
+    bases = [rng.getrandbits(64) for _ in range(40)]
+    keys_set: set[int] = set(bases)
+    for base in bases[:20]:
+        for bits in (1, 3, 7, 10, 11, 12):
+            mask = 0
+            for pos in rng.sample(range(64), bits):
+                mask |= 1 << pos
+            keys_set.add(base ^ mask)
+    keys = sorted(keys_set)
+    values = np.array(keys, dtype=np.uint64)
+    weights = np.array([rng.randint(1, 5) for _ in keys], dtype=np.int64)
+
+    mih_neighbors, mih_deg = module._mih_hamming_neighbors(
+        values, weights, max_dist=10, max_degree_weight=256
+    )
+
+    # Independent O(K^2) reference.
+    n = len(keys)
+    ref_deg = [0] * n
+    ref_pairs: list[list[tuple[int, int]]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            d = (keys[i] ^ keys[j]).bit_count()
+            if d <= 10:
+                ref_deg[i] += int(weights[j])
+                ref_pairs[i].append((d, j))
+    ref_neighbors = {
+        i: [j for _d, j in sorted(ref_pairs[i])]
+        for i in range(n)
+        if ref_deg[i] <= 256 and ref_pairs[i]
+    }
+
+    assert mih_deg == ref_deg
+    assert mih_neighbors == ref_neighbors
+
+    # Incremental arrival query parity.
+    arrival = [0, 5, 17, 42]
+    inc_neighbors, _ = module._mih_hamming_neighbors(
+        values, weights, max_dist=10, max_degree_weight=256, query_indices=arrival
+    )
+    assert inc_neighbors == {i: ref_neighbors[i] for i in arrival if i in ref_neighbors}
+
+
+def test_version_cache_flushes_completed_samples_on_cancellation(tmp_path, monkeypatch):
+    import sqlite3
+
+    import dedupe.similar_video as module
+    from dedupe.models import FileRecord, MediaType
+
+    cache = tmp_path / "cancel-cache.sqlite3"
+    records = []
+    for idx in range(4):
+        p = tmp_path / f"v{idx}.mp4"
+        p.write_bytes(f"video-{idx}".encode())
+        records.append(
+            FileRecord(
+                path=str(p), size=p.stat().st_size, mtime=1.0,
+                media_type=MediaType.VIDEO, extension=".mp4", duration=10.0,
+            )
+        )
+
+    calls = 0
+
+    def fake_extract(record, cancelled):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise InterruptedError("scan cancelled")
+        return 10.0, 640, 480, [(1.0, 0x1111111111111111 + calls)], None
+
+    monkeypatch.setattr(module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(module, "_extract_version_samples_uncached", fake_extract)
+
+    with pytest.raises(InterruptedError):
+        find_video_version_matches(records, workers=1, cache_path=cache)
+
+    with sqlite3.connect(cache) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    assert rows == 2
+
+
+def test_version_matches_emits_live_sampling_and_verification_progress(version_media, tmp_path):
+    events: list[tuple[str, int, int, str | None]] = []
+
+    def on_progress(phase: str, done: int, total: int, msg: str | None) -> None:
+        events.append((phase, done, total, msg))
+
+    matches = find_video_version_matches(
+        inventory([version_media / "original.mp4", version_media / "trim.mp4"]),
+        cache_path=tmp_path / "prog.sqlite3",
+        progress=on_progress,
+    )
+    assert len(matches) == 1
+    phases = {phase for phase, _, _, _ in events}
+    assert "video-versions" in phases
+    assert "video-versions-index" in phases
+    assert "video-versions-verify" in phases
+    assert any(msg and "Checking video excerpts (" in msg for _, _, _, msg in events)

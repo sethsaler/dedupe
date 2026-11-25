@@ -862,3 +862,17 @@ def test_cleanup_opportunity_curve_smoothness_and_exact_reasons() -> None:
     t_hi1.capture_metadata = t_hi2.capture_metadata = t_lo.capture_metadata = False
     tie_group = build_one_group(GroupKind.SIMILAR, [t_hi1, t_hi2, t_lo])
     assert "matches highest resolution among copies" in cleanup_opportunity(tie_group)["keeper_reason"]
+
+
+def test_cluster_around_best_honors_cancellation() -> None:
+    import pytest
+
+    a = _rec("/a.jpg", 100, 1, w=100, h=100)
+    b = _rec("/b.jpg", 100, 2, w=100, h=100)
+    a.capture_metadata = b.capture_metadata = False
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        cluster_around_best(
+            [a, b],
+            {a.path: {b.path}, b.path: {a.path}},
+            cancelled=lambda: True,
+        )

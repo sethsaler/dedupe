@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from collections.abc import Callable
@@ -66,7 +67,6 @@ from .semantic import (
     embed_records,
     group_semantic_vectors,
     semantic_available,
-    semantic_neighbors,
 )
 from .semantic import VERIFY_WORKERS as SEMANTIC_VERIFY_WORKERS
 from .similar_image import DEFAULT_THRESHOLD as IMG_THRESHOLD
@@ -89,10 +89,42 @@ from .similar_video import (
 
 ProgressCb = Callable[[ScanProgress], None]
 GroupCb = Callable[[DuplicateGroup], None]
+GroupsCb = Callable[[list[DuplicateGroup]], None]
 StreamProgressCb = Callable[[ScanProgress], None]
 
 # Minimum seconds between mid-stage progress callback invocations.
 PROGRESS_CALLBACK_MIN_INTERVAL = 0.1
+
+
+def _accepts_kwarg(fn: Callable, name: str) -> bool:
+    """Return True when ``fn`` accepts ``name`` as a keyword argument."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in sig.parameters.values()
+    )
+
+
+def _concurrent_cpu_stage_count(
+    *,
+    exact: bool,
+    borders: bool,
+    image: bool,
+    video: bool,
+    semantic: bool,
+    human: bool,
+    faces: bool,
+) -> int:
+    """Peak number of CPU-bound stages that can run at the same time.
+
+    ``borders`` runs strictly before ``image`` and ``video`` (both wait on
+    ``borders_done``), so they never compete for CPU cores simultaneously.
+    """
+    border_or_media = max(int(borders), int(image) + int(video))
+    return int(exact) + border_or_media + int(semantic) + int(human) + int(faces)
 
 
 def _configure_media_runtime() -> None:
@@ -135,7 +167,13 @@ def _in_same_exact_group(members: list, exact_path_to_group: dict[str, int]) -> 
     return all(exact_path_to_group.get(m.path) == first_id for m in members[1:])
 
 
-def _aligned_audio_ranges(keeper, member, cancelled: Callable[[], bool] | None) -> dict[str, list[float]]:
+def _aligned_audio_ranges(
+    keeper,
+    member,
+    cancelled: Callable[[], bool] | None,
+    *,
+    frame_cache=None,
+) -> dict[str, list[float]]:
     """Compute aligned ``{path: [start, end]}`` windows before audio comparison."""
     da = float(keeper.duration or 0.0)
     db = float(member.duration or 0.0)
@@ -147,6 +185,9 @@ def _aligned_audio_ranges(keeper, member, cancelled: Callable[[], bool] | None) 
     if abs(da - db) > 0.5:
         diff = da - db
         offsets.extend((diff, diff / 2.0))
+    verify_kwargs: dict[str, object] = {"min_overlap": min(5.0, min(da, db))}
+    if frame_cache is not None and _accepts_kwarg(_verify_video_offset, "frame_cache"):
+        verify_kwargs["frame_cache"] = frame_cache
     for offset in offsets:
         try:
             evidence = _verify_video_offset(
@@ -154,7 +195,7 @@ def _aligned_audio_ranges(keeper, member, cancelled: Callable[[], bool] | None) 
                 member,
                 offset,
                 cancelled,
-                min_overlap=min(5.0, min(da, db)),
+                **verify_kwargs,
             )
         except InterruptedError:
             raise
@@ -227,12 +268,17 @@ def _populate_missing_dimensions(
     if not missing:
         return []
 
+    probe_accepts_cancelled = _accepts_kwarg(probe_video, "cancelled")
+
     def probe(record):
         if cancelled and cancelled():
             raise InterruptedError("scan cancelled")
         try:
             if record.media_type == MediaType.VIDEO:
-                duration, width, height = probe_video(record.path)
+                if cancelled is not None and probe_accepts_cancelled:
+                    duration, width, height = probe_video(record.path, cancelled=cancelled)
+                else:
+                    duration, width, height = probe_video(record.path)
                 if duration is not None:
                     record.duration = duration
             else:
@@ -242,6 +288,8 @@ def _populate_missing_dimensions(
             record.width = width
             record.height = height
             return None
+        except InterruptedError:
+            raise
         except Exception as exc:
             return f"resolution probe failed for {record.path}: {exc}"
 
@@ -298,6 +346,8 @@ def run_scan(
     cancelled: Callable[[], bool] | None = None,
     progress: ProgressCb | None = None,
     on_group: GroupCb | None = None,
+    on_groups: GroupsCb | None = None,
+    emit_done: bool = True,
     baseline: dict[str, list] | None = None,
     new_only: bool | None = None,
     _build_review_groups: bool = True,
@@ -428,11 +478,15 @@ def run_scan(
     arrival_paths: set[str] | None = None
 
     def _stream_groups(built: list[DuplicateGroup]) -> None:
-        if not on_group or not built:
+        if not built:
             return
-        with callback_lock:
-            for group in built:
-                on_group(group)
+        if on_groups is not None:
+            with callback_lock:
+                on_groups(list(built))
+        elif on_group is not None:
+            with callback_lock:
+                for group in built:
+                    on_group(group)
 
     def publish(kind: GroupKind, member_lists: list[list]) -> int:
         """Build groups for one phase and stream them via on_group. Returns count added."""
@@ -689,6 +743,10 @@ def run_scan(
             if ((run_similar or run_semantic) and cache is not None)
             else DistinctReviews.empty()
         )
+        # Release the SQLite connection while multi-minute scan stages run so
+        # WAL checkpointing and concurrent streams are never pinned open.
+        if cache is not None:
+            cache.suspend()
         image_count = len(
             [r for r in records if r.media_type in (MediaType.IMAGE, MediaType.GIF)]
         )
@@ -697,6 +755,18 @@ def run_scan(
         face_candidates = [
             record for record in independent_records if record.media_type in FACE_MEDIA_TYPES
         ]
+        dims_candidates_count = (
+            len(
+                [
+                    record
+                    for record in independent_records
+                    if record.media_type in set(low_resolution_bounds)
+                    and record.extension not in RAW_IMAGE_EXTS
+                ]
+            )
+            if run_dimensions
+            else 0
+        )
         normalized_human_backend = human_backend.strip().lower()
 
         active_exact = 1 if run_exact else 0
@@ -709,14 +779,14 @@ def run_scan(
         active_human = 1 if run_human and normalized_human_backend == "opencv" else 0
         active_faces = 1 if run_faces else 0
         active_borders = 1 if run_borders else 0
-        cpu_stage_count = (
-            active_exact
-            + active_image
-            + active_video
-            + active_semantic
-            + active_human
-            + active_faces
-            + active_borders
+        cpu_stage_count = _concurrent_cpu_stage_count(
+            exact=bool(active_exact),
+            borders=bool(active_borders),
+            image=bool(active_image),
+            video=bool(active_video),
+            semantic=bool(active_semantic),
+            human=bool(active_human),
+            faces=bool(active_faces),
         )
         cpu_workers = split_cpu_budget(n_workers, cpu_stage_count)
         exact_workers = (
@@ -743,8 +813,30 @@ def run_scan(
         borders_done = threading.Event()
         image_done = threading.Event()
         video_done = threading.Event()
+        semantic_done = threading.Event()
         dims_done = threading.Event()
         human_done = threading.Event()
+        face_done = threading.Event()
+
+        def _wait_event(event: threading.Event) -> None:
+            while not event.wait(timeout=0.1):
+                check_cancelled()
+
+        def _late_video_versions_workers() -> int:
+            """Reclaim CPU budget from already-finished stages for video excerpts."""
+            other_running = sum(
+                1
+                for active, done_ev in (
+                    (active_image, image_done),
+                    (active_semantic, semantic_done),
+                    (active_human, human_done),
+                    (active_faces, face_done),
+                )
+                if active and not done_ev.is_set()
+            )
+            if other_running == 0:
+                return n_workers
+            return split_cpu_budget(n_workers, 1 + other_running)
 
         def _emit_stages_locked() -> None:
             processed = sum(done for done, _total in stage_counts.values())
@@ -756,6 +848,7 @@ def run_scan(
                     stage_text.get("borders"),
                     stage_text.get("image"),
                     stage_text.get("video"),
+                    stage_text.get("video_versions"),
                     stage_text.get("semantic"),
                     stage_text.get("dims"),
                     stage_text.get("human"),
@@ -821,6 +914,9 @@ def run_scan(
                         first_duplicate_seconds = max(0.0, time.monotonic() - started)
             _stream_groups(new_groups)
 
+        run_video_similar = similar and run_similar_videos and bool(video_count)
+        run_video_versions = video_versions and run_similar_videos and bool(video_count)
+
         with stage_lock:
             if run_exact:
                 stage_text["exact"] = "Finding exact duplicates…"
@@ -831,9 +927,12 @@ def run_scan(
             if run_similar_images and image_count:
                 stage_text["image"] = f"Hashing {image_count} images…"
                 stage_counts["image"] = (0, image_count)
-            if run_similar_videos and video_count:
+            if run_video_similar:
                 stage_text["video"] = f"Fingerprinting {video_count} videos…"
                 stage_counts["video"] = (0, video_count)
+            if run_video_versions:
+                stage_text["video_versions"] = f"Finding video excerpts ({video_count} videos)…"
+                stage_counts["video_versions"] = (0, video_count)
             if run_semantic and semantic_count:
                 stage_text["semantic"] = (
                     f"Embedding {semantic_count} images (EmbeddingGemma)…"
@@ -841,6 +940,8 @@ def run_scan(
                 stage_counts["semantic"] = (0, semantic_count)
             if run_dimensions:
                 stage_text["dims"] = "Reading media dimensions…"
+                if dims_candidates_count:
+                    stage_counts["dims"] = (0, dims_candidates_count)
             if run_human:
                 stage_text["human"] = (
                     f"Looking for media without people ({human_backend})…"
@@ -889,6 +990,48 @@ def run_scan(
             text = message or f"Videos {label}: {processed}/{total}"
             _two_pass_progress(
                 "video", text, video_count, "hash" not in phase, processed, total
+            )
+
+        def vid_versions_progress(
+            phase: str, processed: int, total: int, message: str = ""
+        ) -> None:
+            """Map video-excerpt sampling, verification, and audio onto their own stage budget."""
+            lowered = phase.lower()
+            if "audio" in lowered:
+                lo, hi = 0.90, 0.99
+                default_label = "Comparing video audio"
+            elif "index" in lowered:
+                lo, hi = 0.55, 0.65
+                default_label = "Indexing video excerpts"
+            elif any(
+                token in lowered
+                for token in ("verify", "match", "cluster", "candidate")
+            ):
+                lo, hi = 0.65, 0.90
+                default_label = "Verifying video excerpts"
+            else:
+                lo, hi = 0.0, 0.55
+                default_label = "Finding video excerpts"
+            if message:
+                text = (
+                    message
+                    if (total <= 0 or f"{processed}/{total}" in message)
+                    else f"{message} ({processed}/{total})"
+                )
+            elif total > 0:
+                text = f"{default_label}: {processed}/{total}"
+            else:
+                text = default_label
+            if total <= 0 or video_count <= 0:
+                _stage_progress("video_versions", text, 0, 0)
+                return
+            frac = min(1.0, max(0.0, processed / total))
+            scaled = int(video_count * (lo + (hi - lo) * frac))
+            _stage_progress(
+                "video_versions",
+                text,
+                min(max(0, video_count - 1), scaled),
+                video_count,
             )
 
         def _exact_stage() -> float:
@@ -963,7 +1106,7 @@ def run_scan(
             started_at = time.monotonic()
             try:
                 if run_borders:
-                    borders_done.wait()
+                    _wait_event(borders_done)
                     check_cancelled()
                     started_at = time.monotonic()
                 img_distinct = _ArrivalDistinctFilter(distinct, arrival_paths)
@@ -981,7 +1124,7 @@ def run_scan(
                     workers=image_workers,
                     cancelled=is_cancelled,
                 )
-                exact_done.wait()
+                _wait_event(exact_done)
                 check_cancelled()
                 count = publish(GroupKind.SIMILAR, img_groups)
                 stage_errors["similar_image"] = list(
@@ -1007,7 +1150,7 @@ def run_scan(
             version_errors: list[str] = []
             try:
                 if run_borders:
-                    borders_done.wait()
+                    _wait_event(borders_done)
                     check_cancelled()
                     started_at = time.monotonic()
                 if similar:
@@ -1034,11 +1177,18 @@ def run_scan(
                         cancelled=is_cancelled,
                         exact_done=exact_done,
                     )
+                    if video_versions:
+                        _stage_finished(
+                            "video",
+                            f"Fingerprinted {video_count} "
+                            f"video{'s' if video_count != 1 else ''}",
+                        )
                 else:
                     vid_groups = []
-                exact_done.wait()
+                _wait_event(exact_done)
                 check_cancelled()
                 if video_versions:
+                    version_workers = _late_video_versions_workers()
                     version_distinct = (
                         _ArrivalDistinctFilter(distinct, arrival_paths)
                         if arrival_paths is not None
@@ -1047,8 +1197,8 @@ def run_scan(
                     versions = find_video_version_matches(
                         records,
                         distinct=version_distinct,
-                        progress=vid_progress,
-                        workers=video_workers,
+                        progress=vid_versions_progress,
+                        workers=version_workers,
                         cancelled=is_cancelled,
                         use_cache=use_cache,
                         cache_path=(
@@ -1085,12 +1235,29 @@ def run_scan(
                                 continue
                             audio_pairs.append((key, keeper, member))
                     if audio_pairs:
+                        from . import similar_video as _sv_mod
+
+                        frame_cache_cls = getattr(_sv_mod, "_FrameBatchCache", None)
+                        audio_frame_cache = frame_cache_cls() if frame_cache_cls else None
                         audio_presence_cache: dict[str, bool] = {}
                         audio_presence_lock = threading.Lock()
 
+                        def _audio_progress(done: int, total_pairs: int) -> None:
+                            vid_versions_progress(
+                                "video-versions-audio",
+                                done,
+                                total_pairs,
+                                f"Comparing video audio {done}/{total_pairs}",
+                            )
+
                         def _audio_job(item):
                             _, keeper_rec, member_rec = item
-                            ranges = _aligned_audio_ranges(keeper_rec, member_rec, is_cancelled)
+                            ranges = _aligned_audio_ranges(
+                                keeper_rec,
+                                member_rec,
+                                is_cancelled,
+                                frame_cache=audio_frame_cache,
+                            )
                             audio = compare_video_audio(
                                 keeper_rec.path,
                                 member_rec.path,
@@ -1104,8 +1271,9 @@ def run_scan(
                         audio_results = map_parallel(
                             _audio_job,
                             audio_pairs,
-                            workers=resolve_workers(video_workers, cap=DEFAULT_VIDEO_WORKERS_CAP),
+                            workers=max(1, min(_late_video_versions_workers(), len(audio_pairs))),
                             backend="thread",
+                            progress=_audio_progress,
                             cancelled=is_cancelled,
                         )
                         for (key, keeper, member), (ranges, audio) in zip(
@@ -1142,8 +1310,16 @@ def run_scan(
                         built_versions.append(group)
                     publish_prebuilt(built_versions)
                     count = len(built_versions)
+                    _stage_finished(
+                        "video_versions",
+                        f"Found {count} video version group{'s' if count != 1 else ''}",
+                    )
                 else:
                     count = publish(GroupKind.SIMILAR, vid_groups)
+                    _stage_finished(
+                        "video",
+                        f"Found {count} similar video group{'s' if count != 1 else ''}",
+                    )
                 video_fp_errors = [
                     record.error
                     for record in records
@@ -1154,164 +1330,168 @@ def run_scan(
                 stage_errors["similar_video"] = list(
                     dict.fromkeys([*version_errors, *video_fp_errors])
                 )
-                _stage_finished(
-                    "video",
-                    f"Found {count} similar video group{'s' if count != 1 else ''}",
-                )
                 return time.monotonic() - started_at
             finally:
                 # Always unblock dimension probing, even on cancel/error.
                 video_done.set()
 
         def semantic_progress(phase: str, processed: int, total: int) -> None:
-            if "cluster" in phase:
-                label = "clustering"
+            if "judge" in phase:
+                label = "judging"
+                lo, hi = 0.92, 0.99
+            elif "verify" in phase:
+                label = "verifying"
+                lo, hi = 0.85, 0.92
+            elif "cluster" in phase:
+                label = "matching"
+                lo, hi = 0.70, 0.85
             elif "cooling" in phase:
                 label = "paused while the Mac cools"
+                lo, hi = 0.0, 0.70
             else:
                 label = "embedding"
-            done = semantic_count if "cluster" in phase else processed
+                lo, hi = 0.0, 0.70
+            if total <= 0 or semantic_count <= 0:
+                _stage_progress(
+                    "semantic", f"Look-alikes {label}: {processed}/{total}", 0, 0
+                )
+                return
+            frac = min(1.0, max(0.0, processed / total))
+            done = int(semantic_count * (lo + (hi - lo) * frac))
             _stage_progress(
                 "semantic",
                 f"Look-alikes {label}: {processed}/{total}",
-                done,
+                min(max(0, semantic_count - 1), done),
                 semantic_count,
             )
 
         def _semantic_stage() -> float:
             started_at = time.monotonic()
             try:
-                vectors, errors = embed_records(
-                    records,
-                    use_cache=use_cache,
-                    cache_path=cache_path,
-                    workers=semantic_prepare_workers,
-                    progress=semantic_progress,
-                    cancelled=is_cancelled,
-                    background=not semantic_full_speed,
-                )
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
-                _stage_finished("semantic", "Look-alikes unavailable")
-                return time.monotonic() - started_at
-            waiting_since = time.monotonic()
-            exact_done.wait()
-            image_done.wait()
-            check_cancelled()
-            # The recorded duration leaves out the wait for the hash stages.
-            started_at += time.monotonic() - waiting_since
-            with publish_lock:
-                excluded_edges = {
-                    (a.path, b.path) if a.path < b.path else (b.path, a.path)
-                    for group in groups
-                    if group.kind == GroupKind.SIMILAR and group.match_basis != "video_version"
-                    for idx, a in enumerate(group.members)
-                    for b in group.members[idx + 1 :]
-                }
-                exact_sets = [set(paths) for paths in exact_path_sets]
-                exact_lookup = dict(exact_path_to_group)
-            if arrival_paths is not None and vectors:
-                same_set = {
-                    path: idx for idx, paths in enumerate(exact_sets) for path in paths
-                }
-                _, cand_scores = semantic_neighbors(
-                    vectors,
-                    semantic_duplicate_threshold,
-                    same_set=same_set,
-                    cancelled=is_cancelled,
-                    use_cache=use_cache,
-                    cache_path=cache_path,
-                )
-                for a_path, b_path in cand_scores:
-                    if a_path not in arrival_paths and b_path not in arrival_paths:
-                        excluded_edges.add(
-                            (a_path, b_path) if a_path < b_path else (b_path, a_path)
-                        )
-            judge: DeciderJudge | None = None
-            if decider:
                 try:
-                    judge = DeciderJudge(
+                    vectors, errors = embed_records(
+                        records,
                         use_cache=use_cache,
                         cache_path=cache_path,
+                        workers=semantic_prepare_workers,
+                        progress=semantic_progress,
                         cancelled=is_cancelled,
+                        background=not semantic_full_speed,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as exc:
-                    stage_errors["decider"].append(f"Decider verification skipped: {exc}")
-            try:
-                set_lists, duplicate_lists = group_semantic_vectors(
-                    records,
-                    vectors,
-                    set_threshold=semantic_threshold,
-                    duplicate_threshold=semantic_duplicate_threshold,
-                    distinct=distinct,
-                    excluded_pairs=excluded_edges,
-                    exact_path_sets=exact_sets,
-                    use_cache=use_cache,
-                    cache_path=cache_path,
-                    progress=semantic_progress,
-                    cancelled=is_cancelled,
-                    judge=judge,
-                    workers=semantic_verify_workers,
+                    stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
+                    _stage_finished("semantic", "Look-alikes unavailable")
+                    return time.monotonic() - started_at
+                waiting_since = time.monotonic()
+                _wait_event(exact_done)
+                _wait_event(image_done)
+                check_cancelled()
+                # The recorded duration leaves out the wait for the hash stages.
+                started_at += time.monotonic() - waiting_since
+                with publish_lock:
+                    excluded_edges = {
+                        (a.path, b.path) if a.path < b.path else (b.path, a.path)
+                        for group in groups
+                        if group.kind == GroupKind.SIMILAR and group.match_basis != "video_version"
+                        for idx, a in enumerate(group.members)
+                        for b in group.members[idx + 1 :]
+                    }
+                    exact_sets = [set(paths) for paths in exact_path_sets]
+                    exact_lookup = dict(exact_path_to_group)
+                judge: DeciderJudge | None = None
+                if decider:
+                    try:
+                        judge = DeciderJudge(
+                            use_cache=use_cache,
+                            cache_path=cache_path,
+                            cancelled=is_cancelled,
+                        )
+                    except Exception as exc:
+                        stage_errors["decider"].append(f"Decider verification skipped: {exc}")
+                group_kwargs: dict[str, object] = {
+                    "set_threshold": semantic_threshold,
+                    "duplicate_threshold": semantic_duplicate_threshold,
+                    "distinct": distinct,
+                    "excluded_pairs": excluded_edges,
+                    "exact_path_sets": exact_sets,
+                    "use_cache": use_cache,
+                    "cache_path": cache_path,
+                    "progress": semantic_progress,
+                    "cancelled": is_cancelled,
+                    "judge": judge,
+                    "workers": semantic_verify_workers,
+                }
+                if arrival_paths is not None and _accepts_kwarg(
+                    group_semantic_vectors, "arrival_paths"
+                ):
+                    group_kwargs["arrival_paths"] = arrival_paths
+                try:
+                    set_lists, duplicate_lists = group_semantic_vectors(
+                        records,
+                        vectors,
+                        **group_kwargs,
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
+                    _stage_finished("semantic", "Look-alikes unavailable")
+                    return time.monotonic() - started_at
+                finally:
+                    if judge is not None:
+                        judge.close()
+                        if judge.failure:
+                            stage_errors["decider"].append(judge.failure)
+                stage_errors["semantic"].extend(errors)
+
+                built_semantic: list[DuplicateGroup] = []
+                duplicate_count = 0
+                set_count = 0
+                for members, scores in duplicate_lists:
+                    if all(m.protected for m in members):
+                        continue
+                    if arrival_paths is not None and not any(m.path in arrival_paths for m in members):
+                        continue
+                    if _in_same_exact_group(members, exact_lookup):
+                        continue
+                    group = build_one_group(
+                        GroupKind.SIMILAR,
+                        members,
+                        match_basis="semantic",
+                        match_scores=scores,
+                    )
+                    if group is None:
+                        continue
+                    built_semantic.append(group)
+                    duplicate_count += 1
+                for members, scores in set_lists:
+                    if (
+                        arrival_paths is not None
+                        and (len(members) < 2 or not any(m.path in arrival_paths for m in members))
+                    ):
+                        continue
+                    group = build_set_group(members, scores)
+                    if group is None:
+                        continue
+                    built_semantic.append(group)
+                    set_count += 1
+                publish_prebuilt(built_semantic)
+                _stage_finished(
+                    "semantic",
+                    f"Found {set_count} set{'s' if set_count != 1 else ''} and "
+                    f"{duplicate_count} look-alike duplicate group"
+                    f"{'s' if duplicate_count != 1 else ''}",
                 )
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                stage_errors["semantic"].append(f"semantic look-alikes skipped: {exc}")
-                _stage_finished("semantic", "Look-alikes unavailable")
                 return time.monotonic() - started_at
             finally:
-                if judge is not None:
-                    judge.close()
-                    if judge.failure:
-                        stage_errors["decider"].append(judge.failure)
-            stage_errors["semantic"].extend(errors)
-
-            built_semantic: list[DuplicateGroup] = []
-            duplicate_count = 0
-            set_count = 0
-            for members, scores in duplicate_lists:
-                if all(m.protected for m in members):
-                    continue
-                if arrival_paths is not None and not any(m.path in arrival_paths for m in members):
-                    continue
-                if _in_same_exact_group(members, exact_lookup):
-                    continue
-                group = build_one_group(
-                    GroupKind.SIMILAR,
-                    members,
-                    match_basis="semantic",
-                    match_scores=scores,
-                )
-                if group is None:
-                    continue
-                built_semantic.append(group)
-                duplicate_count += 1
-            for members, scores in set_lists:
-                if (
-                    arrival_paths is not None
-                    and (len(members) < 2 or not any(m.path in arrival_paths for m in members))
-                ):
-                    continue
-                group = build_set_group(members, scores)
-                if group is None:
-                    continue
-                built_semantic.append(group)
-                set_count += 1
-            publish_prebuilt(built_semantic)
-            _stage_finished(
-                "semantic",
-                f"Found {set_count} set{'s' if set_count != 1 else ''} and "
-                f"{duplicate_count} look-alike duplicate group"
-                f"{'s' if duplicate_count != 1 else ''}",
-            )
-            return time.monotonic() - started_at
+                semantic_done.set()
 
         def _dimensions_stage() -> float:
             try:
-                image_done.wait()
-                video_done.wait()
+                _wait_event(image_done)
+                _wait_event(video_done)
                 check_cancelled()
                 started_at = time.monotonic()
 
@@ -1337,7 +1517,7 @@ def run_scan(
                 dims_done.set()
 
         def _review_stage() -> float:
-            dims_done.wait()
+            _wait_event(dims_done)
             check_cancelled()
             started_at = time.monotonic()
             review_groups: list[DuplicateGroup] = []
@@ -1416,49 +1596,52 @@ def run_scan(
 
         def _face_stage() -> float:
             started_at = time.monotonic()
+            try:
 
-            def face_progress(phase: str, processed: int, total: int) -> None:
-                _stage_progress(
-                    "face",
-                    f"Face counting {processed}/{total}",
-                    processed,
-                    total,
+                def face_progress(phase: str, processed: int, total: int) -> None:
+                    _stage_progress(
+                        "face",
+                        f"Face counting {processed}/{total}",
+                        processed,
+                        total,
+                    )
+
+                count_faces_in_files(
+                    independent_records if arrival_paths is not None else records,
+                    workers=cpu_workers,
+                    progress=face_progress,
+                    cancelled=is_cancelled,
                 )
-
-            count_faces_in_files(
-                independent_records if arrival_paths is not None else records,
-                workers=cpu_workers,
-                progress=face_progress,
-                cancelled=is_cancelled,
-            )
-            stage_errors["face_detection"] = [
-                record.error or "face counting failed"
-                for record in face_candidates
-                if record.face_count is None
-            ]
-            files_with_faces = sum(
-                1 for record in face_candidates if (record.face_count or 0) > 0
-            )
-            _stage_finished(
-                "face",
-                f"Found faces in {files_with_faces} "
-                f"file{'s' if files_with_faces != 1 else ''}",
-            )
-            duration = time.monotonic() - started_at
-            publish_prebuilt(build_faces_groups(face_candidates))
-            if find_no_humans:
-                human_done.wait()
-                check_cancelled()
-                confirmed = build_no_human_groups(human_records)
-                confirmed_count = sum(len(group.members) for group in confirmed)
-                publish_prebuilt(confirmed)
+                stage_errors["face_detection"] = [
+                    record.error or "face counting failed"
+                    for record in face_candidates
+                    if record.face_count is None
+                ]
+                files_with_faces = sum(
+                    1 for record in face_candidates if (record.face_count or 0) > 0
+                )
                 _stage_finished(
-                    "human",
-                    f"Found {confirmed_count} file"
-                    f"{'' if confirmed_count == 1 else 's'} "
-                    "without detected people",
+                    "face",
+                    f"Found faces in {files_with_faces} "
+                    f"file{'s' if files_with_faces != 1 else ''}",
                 )
-            return duration
+                duration = time.monotonic() - started_at
+                publish_prebuilt(build_faces_groups(face_candidates))
+                if find_no_humans:
+                    _wait_event(human_done)
+                    check_cancelled()
+                    confirmed = build_no_human_groups(human_records)
+                    confirmed_count = sum(len(group.members) for group in confirmed)
+                    publish_prebuilt(confirmed)
+                    _stage_finished(
+                        "human",
+                        f"Found {confirmed_count} file"
+                        f"{'' if confirmed_count == 1 else 's'} "
+                        "without detected people",
+                    )
+                return duration
+            finally:
+                face_done.set()
 
         stage_jobs: dict[str, Callable[[], float]] = {}
         if run_exact:
@@ -1479,6 +1662,8 @@ def run_scan(
             video_done.set()
         if run_semantic:
             stage_jobs["semantic"] = _semantic_stage
+        else:
+            semantic_done.set()
         if run_dimensions:
             stage_jobs["dims"] = _dimensions_stage
         else:
@@ -1489,6 +1674,8 @@ def run_scan(
             human_done.set()
         if run_faces:
             stage_jobs["face"] = _face_stage
+        else:
+            face_done.set()
         if _build_review_active:
             stage_jobs["review"] = _review_stage
 
@@ -1503,7 +1690,13 @@ def run_scan(
                 }
                 pending = set(futures)
                 while pending:
-                    finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    finished, pending = wait(
+                        pending, timeout=0.1, return_when=FIRST_COMPLETED
+                    )
+                    if is_cancelled() and not cancel_internal.is_set():
+                        cancel_internal.set()
+                        for remaining in pending:
+                            remaining.cancel()
                     for fut in finished:
                         name = futures[fut]
                         try:
@@ -1522,6 +1715,7 @@ def run_scan(
             # stage threads when storing partial analysis on cancellation/failure.
             if cache is not None:
                 try:
+                    cache.reopen()
                     share_exact_sibling_analysis(records)
                     cache.reuse_content_analysis(records)
                     cache.store_all(records)
@@ -1550,6 +1744,13 @@ def run_scan(
 
     live_warnings: list[str] = []
     if not incremental_empty:
+        emit(
+            "finalizing",
+            len(records),
+            len(records),
+            "Checking Live Photos…",
+            eta_zero=True,
+        )
         share_exact_sibling_analysis(records)
         live_pairs = detect_live_photo_pairs(records)
         live_warnings = _annotate_live_photo_groups(groups, live_pairs)
@@ -1558,7 +1759,15 @@ def run_scan(
 
     cache_errors: list[str] = []
     if cache is not None:
+        emit(
+            "finalizing",
+            len(records),
+            len(records),
+            "Saving analysis cache…",
+            eta_zero=True,
+        )
         try:
+            cache.reopen()
             if run_similar:
                 # Distinct rows recorded before a file was hashed are
                 # stat-only; now that the scan re-hashed everything, give
@@ -1813,12 +2022,17 @@ def run_scan(
         + f" ({len(records)} files)"
     )
     with prog_lock:
-        prog.done = True
-        prog.phase = "done"
         prog.groups_found = len(groups)
-        prog.message = done_message
         prog.elapsed_seconds = total_duration
         prog.eta_seconds = 0.0
+        if emit_done:
+            prog.done = True
+            prog.phase = "done"
+            prog.message = done_message
+        else:
+            prog.done = False
+            prog.phase = "finalizing"
+            prog.message = "Finalizing results…"
         if progress:
             progress(replace(prog))
 
@@ -1959,6 +2173,8 @@ def run_scans_parallel(
     progress: ProgressCb | None = None,
     on_stream_progress: StreamProgressCb | None = None,
     on_group: GroupCb | None = None,
+    on_groups: GroupsCb | None = None,
+    emit_done: bool = True,
     baseline: dict[str, list] | None = None,
     new_only: bool | None = None,
 ) -> ScanResult:
@@ -1987,7 +2203,11 @@ def run_scans_parallel(
         result.recompute_stats()
         if progress:
             done = ScanProgress(
-                phase="done", done=True, message="No valid folders to scan"
+                phase="done" if emit_done else "finalizing",
+                done=emit_done,
+                message=(
+                    "No valid folders to scan" if emit_done else "Finalizing results…"
+                ),
             )
             progress(done)
         return result
@@ -2035,20 +2255,27 @@ def run_scans_parallel(
             return
         last_agg["t"] = now
         last_agg["done"] = done_count
+        agg_done = all_done and emit_done
+        agg_phase = "done" if agg_done else ("finalizing" if all_done else "scanning")
+        agg_message = (
+            f"Scanning {n_streams} folder{'s' if n_streams != 1 else ''} "
+            f"in parallel — {done_count}/{n_streams} done"
+            if not all_done
+            else (
+                f"Done — {done_count}/{n_streams} folders, {groups_found} groups"
+                if emit_done
+                else "Finalizing results…"
+            )
+        )
         agg = ScanProgress(
-            phase="done" if all_done else "scanning",
+            phase=agg_phase,
             files_found=files_found,
             files_processed=files_processed,
             groups_found=groups_found,
             bytes_scanned=bytes_scanned,
-            done=all_done,
+            done=agg_done,
             elapsed_seconds=max(0.0, now - started),
-            message=(
-                f"Scanning {n_streams} folder{'s' if n_streams != 1 else ''} "
-                f"in parallel — {done_count}/{n_streams} done"
-                if not all_done
-                else f"Done — {done_count}/{n_streams} folders, {groups_found} groups"
-            ),
+            message=agg_message,
         )
         progress(agg)
 
@@ -2061,65 +2288,78 @@ def run_scans_parallel(
                     on_stream_progress(tagged)
                 emit_aggregate()
 
-        def stream_group_cb(group: DuplicateGroup) -> None:
+        def stream_groups_cb(batch: list[DuplicateGroup]) -> None:
+            fresh: list[DuplicateGroup] = []
             with lock:
-                if group.id in group_roots:
-                    group.root = group_roots[group.id]
-                    return
-                group.root = str(root)
-                group_roots[group.id] = group.root
-                if on_group:
-                    on_group(group)
+                for group in batch:
+                    if group.id in group_roots:
+                        group.root = group_roots[group.id]
+                        continue
+                    group.root = str(root)
+                    group_roots[group.id] = group.root
+                    fresh.append(group)
+            if not fresh:
+                return
+            if on_groups is not None:
+                with lock:
+                    on_groups(fresh)
+            elif on_group is not None:
+                with lock:
+                    for group in fresh:
+                        on_group(group)
 
         extra_kwargs: dict[str, object] = {}
         if baseline is not None or new_only is not None:
             extra_kwargs["baseline"] = baseline
             extra_kwargs["new_only"] = new_only
 
-        return run_scan(
-            [root],
-            preferred_folders=preferred_folders,
-            protected_folders=protected_folders,
-            video_versions=video_versions,
-            exact=exact,
-            similar=similar,
-            semantic=semantic,
-            semantic_threshold=semantic_threshold,
-            semantic_duplicate_threshold=semantic_duplicate_threshold,
-            semantic_full_speed=semantic_full_speed,
-            decider=decider,
-            find_no_humans=find_no_humans,
-            count_faces=count_faces,
-            find_black_borders=find_black_borders,
-            crop_aggressiveness=crop_aggressiveness,
-            find_low_resolution=find_low_resolution,
-            low_resolution_images=low_resolution_images,
-            low_resolution_gifs=low_resolution_gifs,
-            low_resolution_videos=low_resolution_videos,
-            low_resolution_max_pixels=low_resolution_max_pixels,
-            low_resolution_image_max_pixels=low_resolution_image_max_pixels,
-            low_resolution_gif_max_pixels=low_resolution_gif_max_pixels,
-            low_resolution_video_max_pixels=low_resolution_video_max_pixels,
-            random_review_count=random_review_count,
-            human_backend=human_backend,
-            photon_model=photon_model,
-            include_images=include_images,
-            include_gifs=include_gifs,
-            include_videos=include_videos,
-            include_hidden=include_hidden,
-            image_threshold=image_threshold,
-            video_threshold=video_threshold,
-            use_cache=use_cache,
-            cache_path=cache_path,
-            workers=per_stream_workers,
-            _workers_chosen=bool(workers and workers > 0),
-            exclusions=exclusions,
-            cancelled=is_cancelled,
-            progress=stream_progress_cb,
-            on_group=stream_group_cb,
-            _build_review_groups=False,
+        run_scan_kwargs: dict[str, object] = {
+            "preferred_folders": preferred_folders,
+            "protected_folders": protected_folders,
+            "video_versions": video_versions,
+            "exact": exact,
+            "similar": similar,
+            "semantic": semantic,
+            "semantic_threshold": semantic_threshold,
+            "semantic_duplicate_threshold": semantic_duplicate_threshold,
+            "semantic_full_speed": semantic_full_speed,
+            "decider": decider,
+            "find_no_humans": find_no_humans,
+            "count_faces": count_faces,
+            "find_black_borders": find_black_borders,
+            "crop_aggressiveness": crop_aggressiveness,
+            "find_low_resolution": find_low_resolution,
+            "low_resolution_images": low_resolution_images,
+            "low_resolution_gifs": low_resolution_gifs,
+            "low_resolution_videos": low_resolution_videos,
+            "low_resolution_max_pixels": low_resolution_max_pixels,
+            "low_resolution_image_max_pixels": low_resolution_image_max_pixels,
+            "low_resolution_gif_max_pixels": low_resolution_gif_max_pixels,
+            "low_resolution_video_max_pixels": low_resolution_video_max_pixels,
+            "random_review_count": random_review_count,
+            "human_backend": human_backend,
+            "photon_model": photon_model,
+            "include_images": include_images,
+            "include_gifs": include_gifs,
+            "include_videos": include_videos,
+            "include_hidden": include_hidden,
+            "image_threshold": image_threshold,
+            "video_threshold": video_threshold,
+            "use_cache": use_cache,
+            "cache_path": cache_path,
+            "workers": per_stream_workers,
+            "_workers_chosen": bool(workers and workers > 0),
+            "exclusions": exclusions,
+            "cancelled": is_cancelled,
+            "progress": stream_progress_cb,
+            "on_group": on_group,
+            "_build_review_groups": False,
             **extra_kwargs,
-        )
+        }
+        if on_groups is not None or on_group is not None:
+            run_scan_kwargs["on_groups"] = stream_groups_cb
+            run_scan_kwargs["on_group"] = None
+        return run_scan([root], **run_scan_kwargs)
 
     interrupted = False
     with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
@@ -2205,9 +2445,12 @@ def run_scans_parallel(
             build_random_review_groups(independent_pool, count=max(0, int(random_review_count)))
         )
     all_groups.extend(review_groups)
-    if on_group:
-        for group in review_groups:
-            on_group(group)
+    if review_groups:
+        if on_groups is not None:
+            on_groups(list(review_groups))
+        elif on_group is not None:
+            for group in review_groups:
+                on_group(group)
 
     live_warnings: list[str] = []
     if not (incremental and not independent_pool):
@@ -2235,21 +2478,25 @@ def run_scans_parallel(
 
     if progress:
         final = ScanProgress(
-            phase="done",
-            done=True,
+            phase="done" if emit_done else "finalizing",
+            done=emit_done,
             files_found=len(all_files),
             groups_found=len(all_groups),
             bytes_scanned=sum(r.size for r in all_files),
             elapsed_seconds=total_duration,
             eta_seconds=0.0,
             message=(
-                f"Done — {result.exact_groups} exact, "
-                f"{result.similar_groups} similar groups, "
-                f"{result.low_resolution_files} low-resolution, "
-                f"{result.random_review_files} random review, "
-                f"{result.no_human_files} non-human, "
-                f"{result.faces_files} faces "
-                f"across {n_streams} folder{'s' if n_streams != 1 else ''}"
+                (
+                    f"Done — {result.exact_groups} exact, "
+                    f"{result.similar_groups} similar groups, "
+                    f"{result.low_resolution_files} low-resolution, "
+                    f"{result.random_review_files} random review, "
+                    f"{result.no_human_files} non-human, "
+                    f"{result.faces_files} faces "
+                    f"across {n_streams} folder{'s' if n_streams != 1 else ''}"
+                )
+                if emit_done
+                else "Finalizing results…"
             ),
         )
         progress(final)

@@ -4111,3 +4111,36 @@ def test_video_batched_decode_colour_blurred_ui_hdr_and_mkv_webm(
     assert hdr_probe is not None
     assert hdr_probe["color_primaries"] == "bt2020"
     assert hdr_probe["color_trc"] == "smpte2084"
+
+
+def test_probe_video_stream_honors_cancellation_and_cached_dims_skip_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """_probe_video_stream uses cancellable execution; cached video dims skip ffprobe."""
+    dummy = tmp_path / "clip.mp4"
+    dummy.write_bytes(b"mp4")
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        borders._probe_video_stream(dummy, cancelled=lambda: True)
+
+    def forbid_probe(*_args, **_kwargs):
+        raise AssertionError("_probe_video_stream should not run when duration/width/height cached")
+
+    monkeypatch.setattr(borders, "_ffmpeg_available", lambda: True)
+    monkeypatch.setattr(borders, "_probe_video_stream", forbid_probe)
+    monkeypatch.setattr(borders, "_decode_video_sample_frames", lambda *_a, **_kw: [None] * 5)
+
+    res = borders.detect_video_crop_levels(dummy, duration=10.0, width=640, height=360)
+    assert res == {name: None for name in borders.CROP_LEVELS}
+
+    rec = FileRecord(
+        path=str(dummy),
+        size=3,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=10.0,
+        width=640,
+        height=360,
+    )
+    assert borders.analyze_borders([rec], workers=1) == []

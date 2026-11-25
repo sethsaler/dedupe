@@ -140,16 +140,23 @@ def _encode_compact_result(result: ScanResult) -> tuple[list[dict], dict]:
     """Encode a ScanResult with a deduplicated top-level FileRecord table."""
     result.recompute_stats()
     file_table: list[dict] = []
+    by_id: dict[int, int] = {}
     by_path: dict[str, list[tuple[dict, int]]] = {}
 
     def _intern(record: FileRecord) -> int:
+        rid = id(record)
+        cached = by_id.get(rid)
+        if cached is not None:
+            return cached
         rec_dict = record.to_dict(compact=True)
         for existing_dict, idx in by_path.get(record.path, ()):
             if existing_dict == rec_dict:
+                by_id[rid] = idx
                 return idx
         idx = len(file_table)
         file_table.append(rec_dict)
         by_path.setdefault(record.path, []).append((rec_dict, idx))
+        by_id[rid] = idx
         return idx
 
     compact_groups: list[dict] = []

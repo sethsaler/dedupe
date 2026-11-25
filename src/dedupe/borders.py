@@ -3293,7 +3293,11 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
-def _probe_video_stream(path: str | Path) -> dict | None:
+def _probe_video_stream(
+    path: str | Path,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict | None:
     """The first video stream's facts, in display orientation.
 
     ``width``/``height`` are the displayed size: a quarter-turn in the
@@ -3302,21 +3306,22 @@ def _probe_video_stream(path: str | Path) -> dict | None:
     the video counterpart of an image's EXIF transpose. Also reports color
     signaling tags so HDR / wide-gamut streams keep their transfer metadata.
     """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries",
+        ("format=duration:stream=duration,width,height,codec_name,pix_fmt,"
+         "color_primaries,color_transfer,color_space,color_range"
+         ":stream_tags=rotate:stream_side_data=rotation"),
+        "-of", "json", str(path),
+    ]
     try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries",
-                ("format=duration:stream=duration,width,height,codec_name,pix_fmt,"
-                 "color_primaries,color_transfer,color_space,color_range"
-                 ":stream_tags=rotate:stream_side_data=rotation"),
-                "-of", "json", str(path),
-            ],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-        if result.returncode != 0:
+        rc, out, _err = _run_cancellable_command(cmd, cancelled=cancelled, timeout=60.0)
+        if rc != 0:
             return None
-        data = json.loads(result.stdout or "{}")
+        text = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else (out or "")
+        data = json.loads(text or "{}")
+    except InterruptedError:
+        raise
     except Exception:
         return None
     streams = data.get("streams") or []
@@ -4060,6 +4065,9 @@ def detect_video_crop_levels(
     path: str | Path,
     *,
     cancelled: Callable[[], bool] | None = None,
+    duration: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict[str, CropBox | None]:
     """Suggest the crop for a video at every level: majority bars per level.
 
@@ -4077,11 +4085,28 @@ def detect_video_crop_levels(
         raise InterruptedError("scan cancelled")
     if not _ffmpeg_available():
         return empty
-    probe = _probe_video_stream(path)
-    if probe is None or not probe["duration"]:
-        return empty
-    width, height = probe["width"], probe["height"]
-    timestamps = [probe["duration"] * fraction for fraction in VIDEO_SAMPLE_FRACTIONS]
+    if (
+        duration is not None
+        and duration > 0
+        and width is not None
+        and width > 0
+        and height is not None
+        and height > 0
+    ):
+        video_duration = float(duration)
+        width = int(width)
+        height = int(height)
+    else:
+        probe = (
+            _probe_video_stream(path, cancelled=cancelled)
+            if cancelled is not None
+            else _probe_video_stream(path)
+        )
+        if probe is None or not probe["duration"]:
+            return empty
+        video_duration = float(probe["duration"])
+        width, height = probe["width"], probe["height"]
+    timestamps = [video_duration * fraction for fraction in VIDEO_SAMPLE_FRACTIONS]
 
     custom_video_frames = (
         _video_frame_luma is not _DEFAULT_VIDEO_FRAME_LUMA
@@ -4110,18 +4135,13 @@ def detect_video_crop_levels(
     fh, fw = first_shape
 
     loose_allowed = _human_guard_available()
-    screened_lumas = [
-        _screened(frame) if frame is not None and not custom_video_frames else (
-            _screened(frame) if frame is not None else None
-        )
-        for frame in frames
-    ]
     if batched_rgbs is not None:
         screened_rgbs = batched_rgbs
         level_bars, details = _frame_level_bars(
             frames, loose_allowed=loose_allowed, rgbs=batched_rgbs, return_details=True
         )
     else:
+        screened_lumas = [_screened(frame) if frame is not None else None for frame in frames]
         screened_bars = _frame_level_bars(screened_lumas, loose_allowed=loose_allowed)
         level_bars, details = _frame_level_bars(
             frames, loose_allowed=loose_allowed, rgbs=None, return_details=True
@@ -4357,11 +4377,21 @@ def analyze_borders(
             raise InterruptedError("scan cancelled")
         try:
             if record.media_type == MediaType.VIDEO:
-                boxes = (
-                    detect_video_crop_levels(record.path, cancelled=cancelled)
-                    if cancelled is not None
-                    else detect_video_crop_levels(record.path)
-                )
+                video_kwargs: dict[str, Any] = {}
+                if cancelled is not None:
+                    video_kwargs["cancelled"] = cancelled
+                if (
+                    record.duration
+                    and record.duration > 0
+                    and record.width
+                    and record.width > 0
+                    and record.height
+                    and record.height > 0
+                ):
+                    video_kwargs["duration"] = record.duration
+                    video_kwargs["width"] = record.width
+                    video_kwargs["height"] = record.height
+                boxes = detect_video_crop_levels(record.path, **video_kwargs)
             else:
                 boxes = (
                     detect_crop_levels(record.path, cancelled=cancelled)

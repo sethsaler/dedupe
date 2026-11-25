@@ -374,3 +374,32 @@ def test_pixel_exact_classifies_metadata_only_jpeg_duplicates(tmp_path: Path) ->
 
     meta_groups = find_metadata_exact_groups([rec_a, rec_b])
     assert [{r.path for r in g} for g in meta_groups] == [{rec_a.path, rec_b.path}]
+
+
+def test_classify_pixel_exact_group_honors_cancel_and_skips_siblings_on_failed_keeper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dedupe.exact as exact_mod
+
+    p_a = tmp_path / "a.png"
+    p_b = tmp_path / "b.png"
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(p_a)
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(p_b)
+    rec_a = _write(p_a, p_a.read_bytes())
+    rec_b = _write(p_b, p_b.read_bytes())
+    rec_a.width = rec_b.width = 32
+    rec_a.height = rec_b.height = 32
+    rec_a.phash = rec_b.phash = "1" * 16
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        classify_pixel_exact_group([rec_a, rec_b], keeper_path=rec_a.path, cancelled=lambda: True)
+
+    called: list[str] = []
+
+    def fail_keeper(path):
+        called.append(str(path))
+
+    monkeypatch.setattr(exact_mod, "canonical_pixel_sha256", fail_keeper)
+    basis, explanations = classify_pixel_exact_group([rec_a, rec_b], keeper_path=rec_a.path)
+    assert basis is None and explanations == {}
+    assert called == [rec_a.path]

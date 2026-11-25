@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import sys
 import threading
+import time
 from bisect import bisect_right
 from collections.abc import Callable
 from functools import lru_cache
@@ -61,9 +64,9 @@ MONOCHROME_BALANCE_MAX = 3.0
 # Pillow's storage; keep the worst-case thumbnail cache near 64 MB.
 DENSE_CACHE_SIZE = 128
 # Fine verification is lazy: only hash candidates decode these frames. The
-# bounded grayscale cache uses at most 72 MiB for eight-frame animations.
+# bounded grayscale cache stays light in RAM while avoiding cross-thread thrash.
 DETAIL_MAX_SIDE = 768
-DETAIL_CACHE_SIZE = 16
+DETAIL_CACHE_SIZE = 32
 
 # pHash/dHash only need ~32×32 DCT input; anything larger is wasted decode/RAM.
 # 512 keeps edge structure for rescaled/quality variants without loading full HEIC/JPEG.
@@ -118,12 +121,21 @@ SAMPLE_CACHE_SIZE = 16
 # A process pool sidesteps GIL contention in the pHash/dHash/tile math (small
 # numpy/scipy ops hold the GIL even though Pillow's decoder releases it), but
 # costs an interpreter spawn plus Pillow/imagehash imports per worker. Only
-# batches at least this large amortize that startup; smaller ones use threads.
-PROCESS_POOL_MIN_IMAGES = 512
+# batches at least this large amortize that startup; frozen macOS app bundles
+# pay a higher spawn cost so they keep threads for larger batches.
+PROCESS_POOL_MIN_IMAGES = 2048 if getattr(sys, "frozen", False) else 512
+# Max candidate pairs packed into a single worker task so skewed hash buckets
+# do not stall one straggler thread at 99%.
+MAX_VERIFY_RUN_SIZE = 32
+VERIFY_PROGRESS_MIN_INTERVAL = 0.1
+JPEG_BITSTREAM_CHUNK_SIZE = 64 * 1024
+CAPTURE_METADATA_CACHE_MAX = 65536
 
 _HEIF_LOCK = threading.Lock()
 _HEIF_REGISTERED = False
 _LAST_DENSE_FAILURE = threading.local()
+_CAPTURE_METADATA_LOCK = threading.Lock()
+_CAPTURE_METADATA_CACHE: dict[tuple[str, int, int, int], bool] = {}
 
 
 def _ensure_image_deps() -> None:
@@ -283,6 +295,43 @@ def compute_image_hashes_with_tiles(
     return phash, dhash, width, height, tiles
 
 
+def _extract_capture_metadata(img) -> bool:
+    """Return True when ``img`` carries EXIF DateTimeOriginal + camera Make/Model."""
+    try:
+        exif = img.getexif()
+        capture = exif.get(36867)
+        if not capture and exif.get(34665):
+            capture = exif.get_ifd(34665).get(36867)
+        return bool(capture and (exif.get(271) or exif.get(272)))
+    except Exception:
+        return False
+
+
+def _store_capture_metadata(path: Path, has_meta: bool) -> None:
+    key = _stat_key(str(path))
+    if key is None:
+        return
+    with _CAPTURE_METADATA_LOCK:
+        if len(_CAPTURE_METADATA_CACHE) >= CAPTURE_METADATA_CACHE_MAX:
+            _CAPTURE_METADATA_CACHE.clear()
+        _CAPTURE_METADATA_CACHE[key] = has_meta
+
+
+def get_cached_capture_metadata(record: FileRecord) -> bool | None:
+    """Look up EXIF capture-metadata flag captured during image hashing, if valid."""
+    if (
+        record.mtime_ns is not None
+        and record.ctime_ns is not None
+    ):
+        key = (record.path, int(record.size), int(record.mtime_ns), int(record.ctime_ns))
+    else:
+        key = _stat_key(record.path)
+        if key is None:
+            return None
+    with _CAPTURE_METADATA_LOCK:
+        return _CAPTURE_METADATA_CACHE.get(key)
+
+
 def _compute_image_fingerprint_full(
     path: str | Path, *, with_tiles: bool = True, with_orientations: bool = True
 ) -> tuple[
@@ -303,6 +352,8 @@ def _compute_image_fingerprint_full(
 
     path = Path(path)
     with Image.open(path) as img:
+        has_capture_meta = False if is_animated_image(img) else _extract_capture_metadata(img)
+        _store_capture_metadata(path, has_capture_meta)
         img, width, height, animated = _upright_hash_source(img)
 
         frames = _hash_frames(img)
@@ -1220,15 +1271,33 @@ def _cropped_roi_hashes(
     return int(str(imagehash.phash(roi)), 16), _orientation_phashes(roi)
 
 
-def _group_runs_by_first(items: list, key_fn: Callable) -> list[list]:
+def _group_runs_by_first(
+    items: list,
+    key_fn: Callable,
+    *,
+    max_run_size: int = MAX_VERIFY_RUN_SIZE,
+) -> list[list]:
+    """Group consecutive items sharing ``key_fn`` into bounded chunks for work balance."""
+    limit = max(1, int(max_run_size))
     runs: list[list] = []
     for item in items:
         key = key_fn(item)
-        if runs and key_fn(runs[-1][0]) == key:
+        if runs and key_fn(runs[-1][0]) == key and len(runs[-1]) < limit:
             runs[-1].append(item)
         else:
             runs.append([item])
     return runs
+
+
+def _is_byte_identical_pair(a: FileRecord, b: FileRecord) -> bool:
+    """True when both records already carry matching non-empty SHA-256 & size."""
+    return bool(
+        a.size > 0
+        and a.size == b.size
+        and a.sha256
+        and a.sha256 == b.sha256
+        and a.media_type == b.media_type
+    )
 
 
 def find_similar_image_groups(
@@ -1302,14 +1371,18 @@ def find_similar_image_groups(
             if n_workers > 1 and len(need) >= PROCESS_POOL_MIN_IMAGES
             else "thread"
         )
+        hash_chunk = (
+            min(16, max(1, len(need) // max(1, n_workers))) if n_workers > 1 else 1
+        )
         results = map_parallel(
             _image_hash_job,
             [r.path for r in need],
             workers=n_workers,
             backend=backend,
             progress=hash_progress,
-            progress_every=1,
+            progress_every=8,
             cancelled=cancelled,
+            chunk_size=hash_chunk,
         )
         for path, ph, dh, w, h, tiles, orientations, err in results:
             rec = by_path[path]
@@ -1329,6 +1402,10 @@ def find_similar_image_groups(
                 rec.width = w
             if h:
                 rec.height = h
+            if rec.capture_metadata is None:
+                cached_meta = get_cached_capture_metadata(rec)
+                if cached_meta is not None:
+                    rec.capture_metadata = cached_meta
 
     if progress:
         progress("image-hash", total, total)
@@ -1346,6 +1423,7 @@ def find_similar_image_groups(
     crop_orientations: dict[int, tuple[str, ...]] = {}
     # Each pHash maps to (record_idx, is_cropped, is_midpoint)
     by_phash: dict[int, list[tuple[int, bool, bool]]] = {}
+    crop_targets: list[tuple[int, str, tuple[int, int, int, int]]] = []
     for idx, record in enumerate(hashed):
         by_phash.setdefault(int(record.phash or "0", 16), []).append((idx, False, False))
         mid_phash = decode_animation_midpoint_phash(record.orientation_phashes)
@@ -1354,13 +1432,39 @@ def find_similar_image_groups(
         if record.media_type == MediaType.IMAGE:
             parsed_crop = _parse_border_crop(record.border_crop, (record.width, record.height))
             if parsed_crop is not None:
-                crop_rect = parsed_crop[:4]
-                roi_hashes = _cropped_roi_hashes(record.path, crop_rect)
-                if roi_hashes is not None:
-                    crop_phash, crop_turns = roi_hashes
-                    crop_rects[record.path] = crop_rect
-                    crop_orientations[idx] = crop_turns
-                    by_phash.setdefault(crop_phash, []).append((idx, True, False))
+                crop_targets.append((idx, record.path, parsed_crop[:4]))
+
+    if crop_targets:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+
+        def _crop_roi_job(
+            item: tuple[int, str, tuple[int, int, int, int]],
+        ) -> tuple[int, str, tuple[int, int, int, int], tuple[int, tuple[str, ...]] | None]:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
+            idx, path, crop_rect = item
+            return idx, path, crop_rect, _cropped_roi_hashes(path, crop_rect)
+
+        def _crop_roi_progress(done: int, roi_total: int) -> None:
+            if progress:
+                progress("image-crop-hash", done, roi_total)
+
+        roi_results = map_parallel(
+            _crop_roi_job,
+            crop_targets,
+            workers=n_workers,
+            backend="thread",
+            progress=_crop_roi_progress,
+            progress_every=4,
+            cancelled=cancelled,
+        )
+        for idx, path, crop_rect, roi_hashes in roi_results:
+            if roi_hashes is not None:
+                crop_phash, crop_turns = roi_hashes
+                crop_rects[path] = crop_rect
+                crop_orientations[idx] = crop_turns
+                by_phash.setdefault(crop_phash, []).append((idx, True, False))
 
     tree = HammingIndex(by_phash, threshold)
     adjacency: dict[str, set[str]] = {record.path: set() for record in hashed}
@@ -1510,6 +1614,8 @@ def find_similar_image_groups(
 
     def verify_pair(job) -> tuple[bool, bool]:
         _i, rec, other, modes = job
+        if _is_byte_identical_pair(rec, other):
+            return True, False
         crop_a = crop_rects.get(rec.path)
         crop_b = crop_rects.get(other.path)
         near_miss = False
@@ -1541,9 +1647,19 @@ def find_similar_image_groups(
         return out
 
     job_runs = _group_runs_by_first(jobs, lambda job: job[0])
+    last_cluster_emit = [0.0]
 
     def cluster_progress(done: int, run_total: int, *, second_pass: bool = False) -> None:
-        if progress and run_total and (done % 10 == 0 or done == run_total):
+        if not (progress and run_total):
+            return
+        now = time.monotonic()
+        if (
+            done == run_total
+            or done == 1
+            or done % 4 == 0
+            or now - last_cluster_emit[0] >= VERIFY_PROGRESS_MIN_INTERVAL
+        ):
+            last_cluster_emit[0] = now
             half = len(hashed) // 2
             position = half * done // run_total + (half if second_pass else 0)
             progress("image-cluster", min(position, len(hashed) - 1), len(hashed))
@@ -1562,7 +1678,7 @@ def find_similar_image_groups(
                 if matched:
                     adjacency[rec.path].add(other.path)
                     adjacency[other.path].add(rec.path)
-                elif near_miss:
+                elif near_miss and not _is_byte_identical_pair(rec, other):
                     near_misses.append(
                         (rec, other, crop_rects.get(rec.path), crop_rects.get(other.path))
                     )
@@ -1608,7 +1724,7 @@ def find_similar_image_groups(
         # Records retain hashes for this run and the disk cache; free path cache.
         clear_image_comparison_cache()
 
-    return cluster_around_best(hashed, adjacency, distinct)
+    return cluster_around_best(hashed, adjacency, distinct, cancelled=cancelled)
 
 
 def clear_image_comparison_cache() -> None:
@@ -1616,10 +1732,11 @@ def clear_image_comparison_cache() -> None:
     _verification_frames_cached.cache_clear()
     _tile_phashes_cached.cache_clear()
     _dense_thumbs_cached.cache_clear()
-    from .edited_copy import _color_frame, _features
+    with _CAPTURE_METADATA_LOCK:
+        _CAPTURE_METADATA_CACHE.clear()
+    from .edited_copy import clear_edited_copy_cache
 
-    _features.cache_clear()
-    _color_frame.cache_clear()
+    clear_edited_copy_cache()
 
 
 def _bruteforce_groups(
@@ -1678,32 +1795,133 @@ def _bruteforce_groups(
     return cluster_around_best(hashed, adjacency, distinct)
 
 
-def jpeg_bitstream_sha256(path: str | Path) -> str | None:
+def jpeg_bitstream_sha256(
+    path: str | Path,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    chunk_size: int = JPEG_BITSTREAM_CHUNK_SIZE,
+) -> str | None:
     """SHA-256 of JPEG image bitstream (SOI..EOI), skipping APP0..APP15/COM/post-EOI.
 
+    Streams the file in chunks instead of loading the entire JPEG into RAM.
     Returns ``None`` for non-JPEG files, unreadable paths, or malformed streams.
     """
+    step = max(16, int(chunk_size))
     try:
-        data = Path(path).read_bytes()
+        with open(path, "rb") as stream:
+            return _jpeg_bitstream_sha256_stream(stream, step=step, cancelled=cancelled)
+    except InterruptedError:
+        raise
     except OSError:
         return None
-    n = len(data)
-    if n < 4 or data[:2] != b"\xff\xd8":
+
+
+def _jpeg_bitstream_sha256_stream(
+    stream,
+    *,
+    step: int,
+    cancelled: Callable[[], bool] | None,
+) -> str | None:
+    file_size = os.fstat(stream.fileno()).st_size
+    if file_size < 4:
+        return None
+
+    buf = b""
+    pos = 0
+
+    def check_cancel() -> None:
+        if cancelled and cancelled():
+            raise InterruptedError("scan cancelled")
+
+    def refill() -> bool:
+        nonlocal buf, pos
+        check_cancel()
+        chunk = stream.read(step)
+        if not chunk:
+            return False
+        buf = chunk
+        pos = 0
+        return True
+
+    def read_byte() -> int | None:
+        nonlocal pos
+        if pos >= len(buf) and not refill():
+            return None
+        val = buf[pos]
+        pos += 1
+        return val
+
+    def read_exact(count: int) -> bytes | None:
+        nonlocal buf, pos
+        if count == 0:
+            return b""
+        avail = len(buf) - pos
+        if avail >= count:
+            out = buf[pos : pos + count]
+            pos += count
+            return out
+        parts = [buf[pos:]] if avail else []
+        need = count - avail
+        buf = b""
+        pos = 0
+        while need > 0:
+            check_cancel()
+            chunk = stream.read(max(step, need))
+            if not chunk:
+                return None
+            if len(chunk) >= need:
+                parts.append(chunk[:need])
+                buf = chunk[need:]
+                pos = 0
+                need = 0
+            else:
+                parts.append(chunk)
+                need -= len(chunk)
+        return b"".join(parts)
+
+    def skip_bytes(count: int) -> bool:
+        nonlocal buf, pos
+        avail = len(buf) - pos
+        if avail >= count:
+            pos += count
+            return True
+        remaining = count - avail
+        buf = b""
+        pos = 0
+        target = stream.tell() + remaining
+        if target > file_size:
+            return False
+        stream.seek(target, os.SEEK_SET)
+        return True
+
+    def hash_bytes(hasher_obj, count: int) -> bool:
+        nonlocal buf, pos
+        remaining = count
+        while remaining > 0:
+            if pos >= len(buf) and not refill():
+                return False
+            take = min(remaining, len(buf) - pos)
+            hasher_obj.update(buf[pos : pos + take])
+            pos += take
+            remaining -= take
+        return True
+
+    soi = read_exact(2)
+    if soi != b"\xff\xd8":
         return None
     hasher = hashlib.sha256()
     hasher.update(b"\xff\xd8")
-    pos = 2
     saw_sos = False
-    while pos < n:
-        if data[pos] != 0xFF:
+
+    while True:
+        check_cancel()
+        lead = read_byte()
+        if lead != 0xFF:
             return None
-        while pos < n and data[pos] == 0xFF:
-            pos += 1
-        if pos >= n:
-            return None
-        marker = data[pos]
-        pos += 1
-        if marker in (0x00, 0xD8):
+        marker = read_byte()
+        while marker == 0xFF:
+            marker = read_byte()
+        if marker is None or marker in (0x00, 0xD8):
             return None
         if marker == 0xD9:  # EOI
             if not saw_sos:
@@ -1713,45 +1931,53 @@ def jpeg_bitstream_sha256(path: str | Path) -> str | None:
         if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # TEM or RST0..RST7
             hasher.update(bytes((0xFF, marker)))
             continue
-        if pos + 2 > n:
+        len_bytes = read_exact(2)
+        if len_bytes is None:
             return None
-        seg_len = int.from_bytes(data[pos : pos + 2], "big")
-        if seg_len < 2 or pos + seg_len > n:
+        seg_len = int.from_bytes(len_bytes, "big")
+        if seg_len < 2:
             return None
+        payload_len = seg_len - 2
         if 0xE0 <= marker <= 0xEF or marker == 0xFE:  # APP0..APP15 or COM
-            pos += seg_len
+            if not skip_bytes(payload_len):
+                return None
             continue
         hasher.update(bytes((0xFF, marker)))
-        hasher.update(data[pos : pos + seg_len])
-        pos += seg_len
+        hasher.update(len_bytes)
+        if not hash_bytes(hasher, payload_len):
+            return None
         if marker == 0xDA:  # SOS: scan entropy-coded data up to next marker
             saw_sos = True
-            cursor = pos
             while True:
-                idx = data.find(b"\xff", cursor)
-                if idx == -1 or idx + 1 >= n:
+                if pos >= len(buf) and not refill():
                     return None
-                nxt = data[idx + 1]
-                if nxt == 0x00 or (0xD0 <= nxt <= 0xD7):
-                    cursor = idx + 2
+                idx = buf.find(b"\xff", pos)
+                if idx == -1:
+                    hasher.update(buf[pos:])
+                    pos = len(buf)
                     continue
-                if nxt == 0xFF:
-                    fill_end = idx + 1
-                    while fill_end < n and data[fill_end] == 0xFF:
-                        fill_end += 1
-                    if fill_end >= n:
-                        return None
-                    after_fill = data[fill_end]
-                    if after_fill == 0x00 or (0xD0 <= after_fill <= 0xD7):
-                        cursor = fill_end + 1
-                        continue
-                    hasher.update(data[pos:idx])
-                    pos = fill_end - 1
-                    break
-                hasher.update(data[pos:idx])
-                pos = idx
+                if idx > pos:
+                    hasher.update(buf[pos:idx])
+                pos = idx + 1
+                ff_count = 1
+                nxt = read_byte()
+                while nxt == 0xFF:
+                    ff_count += 1
+                    nxt = read_byte()
+                if nxt is None:
+                    return None
+                if nxt == 0x00 or (0xD0 <= nxt <= 0xD7):
+                    # Byte-stuffing or restart marker inside entropy stream.
+                    if ff_count == 1:
+                        hasher.update(bytes((0xFF, nxt)))
+                    else:
+                        hasher.update(b"\xff" * ff_count)
+                        hasher.update(bytes((nxt,)))
+                    continue
+                # Push back the marker (0xFF + nxt) for the outer marker loop.
+                buf = bytes((0xFF, nxt)) + buf[pos:]
+                pos = 0
                 break
-    return None
 
 
 def canonical_pixel_sha256(path: str | Path) -> str | None:

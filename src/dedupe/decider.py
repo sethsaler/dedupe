@@ -53,7 +53,8 @@ DEFAULT_MIN_PROBABILITY = 0.8
 # without separating edits from other photos any better.
 PREPARE_MAX_SIDE = 768
 PROMPT_VERSION = "q2"
-HEALTH_TIMEOUT = 2.0
+HEALTH_TIMEOUT = 0.3
+MODEL_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 120.0
 CRITERIA = {
     "same": (
@@ -90,7 +91,7 @@ def decider_available(url: str | None = None) -> bool:
 
 def _model_id(url: str) -> str:
     """The pinned model id (``pplx-decider-flash-v1.2``), not a ``latest`` alias."""
-    listing = _get_json(f"{url}/v1/models", HEALTH_TIMEOUT)
+    listing = _get_json(f"{url}/v1/models", MODEL_TIMEOUT)
     ids = [str(item.get("id", "")) for item in listing.get("data") or []]
     pinned = [i for i in ids if "/" not in i and "latest" not in i]
     if not (pinned or ids):
@@ -127,13 +128,20 @@ def _safe_ctime_ns(path: str) -> int | None:
 class VerdictCache:
     """P(same picture) by pair identity and model signature, in the hash cache file."""
 
+    COMMIT_BATCH_SIZE = 16
+
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path else default_cache_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), timeout=30.0)
         try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            mode_row = self._conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(mode_row[0]).lower() if mode_row else ""
+            if mode not in ("wal", "memory"):
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
         except sqlite3.DatabaseError:
             pass
         self._conn.execute(
@@ -147,6 +155,7 @@ class VerdictCache:
             """
         )
         self._conn.commit()
+        self._pending_writes = 0
 
     @staticmethod
     def _key(a: FileRecord, b: FileRecord) -> tuple[str, str]:
@@ -168,17 +177,35 @@ class VerdictCache:
             return float(row[2])
         return None
 
-    def put(self, a: FileRecord, b: FileRecord, signature: str, probability: float) -> None:
+    def put(
+        self,
+        a: FileRecord,
+        b: FileRecord,
+        signature: str,
+        probability: float,
+        *,
+        commit: bool = True,
+    ) -> None:
         pair, identity = self._key(a, b)
         self._conn.execute(
             "INSERT OR REPLACE INTO decider_verdicts (pair, identity, signature, probability) "
             "VALUES (?, ?, ?, ?)",
             (pair, identity, signature, probability),
         )
-        self._conn.commit()
+        self._pending_writes += 1
+        if commit or self._pending_writes >= self.COMMIT_BATCH_SIZE:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._pending_writes:
+            self._conn.commit()
+            self._pending_writes = 0
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self.flush()
+        finally:
+            self._conn.close()
 
 
 class DeciderJudge:
@@ -351,7 +378,7 @@ class DeciderJudge:
             # Do not cache a low score or veto a mirrored copy verified locally.
             return None
         if self.cache is not None:
-            self.cache.put(a, b, self.signature, probability)
+            self.cache.put(a, b, self.signature, probability, commit=False)
         return probability
 
     def close(self) -> None:

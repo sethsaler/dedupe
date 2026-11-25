@@ -948,3 +948,85 @@ def test_onnx_sha256_verified_once_per_process(monkeypatch) -> None:
     create_person_detector("opencv")
     # Once for YuNet + once for YOLOX across both detector creations.
     assert digests == 2
+
+
+def test_video_person_detection_cancels_and_bails_on_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import subprocess
+
+    record = FileRecord(
+        path=str(tmp_path / "slow.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=60.0,
+    )
+
+    class DummyDetector:
+        backend = "test"
+
+        def score(self, _frame):
+            return 0.0
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("dedupe.human_detection.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.human_detection._extract_seek_frames_ppm", lambda *_a, **_kw: [])
+
+    seek_calls = 0
+
+    def timeout_seek(*_a, **_kw):
+        nonlocal seek_calls
+        seek_calls += 1
+        raise subprocess.TimeoutExpired(["ffmpeg"], 60)
+
+    monkeypatch.setattr("dedupe.human_detection._extract_seek_frame_ppm", timeout_seek)
+    assert _media_person_evidence(record, DummyDetector()) == (None, 0, 0.0)
+    assert seek_calls == 1
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        _media_person_evidence(record, DummyDetector(), cancelled=lambda: True)
+
+
+def test_video_face_detection_cancels_and_aborts_on_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import subprocess
+
+    from dedupe import face_detection as fd
+
+    record = FileRecord(
+        path=str(tmp_path / "slow.mp4"),
+        size=1,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=60.0,
+    )
+
+    class DummyCounter:
+        backend = "test"
+
+        def analyze_frame(self, _frame):
+            return (0, 0, 0)
+
+    monkeypatch.setattr(fd, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(fd, "_extract_seek_frames_ppm", lambda *_a, **_kw: [])
+
+    seek_calls = 0
+
+    def timeout_seek(*_a, **_kw):
+        nonlocal seek_calls
+        seek_calls += 1
+        raise subprocess.TimeoutExpired(["ffmpeg"], 60)
+
+    monkeypatch.setattr(fd, "_extract_seek_frame_ppm", timeout_seek)
+    assert fd.analyze_face_count(record, DummyCounter()) is None
+    assert seek_calls == 1
+    assert record.error and "timed out" in record.error
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        fd.analyze_face_count(record, DummyCounter(), cancelled=lambda: True)

@@ -48,6 +48,7 @@ from .edited_copy import (
 )
 from .grouping import cluster_around_best
 from .models import FileRecord, MediaType
+from .parallel import map_parallel
 
 if TYPE_CHECKING:
     from .cache import DistinctReviews
@@ -79,6 +80,8 @@ MAX_REPLY_BYTES = 8 * 1024 * 1024
 PREPARE_WORKERS = 2
 # Threads verifying look-alike candidates against the image evidence.
 VERIFY_WORKERS = 3
+# Bound each verification task so a large burst cluster cannot strand one worker.
+VERIFY_RUN_MAX_PAIRS = 32
 # macOS: start the helper under the darwin background policy. Its GPU and CPU
 # work then yields to the apps in use and runs at a lower power state. On an
 # M3 Max that embeds ~1.5x slower (120 vs 80 ms per image), but cooler.
@@ -314,8 +317,14 @@ class EmbeddingCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), timeout=30.0)
         try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            mode_row = self._conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(mode_row[0]).lower() if mode_row else ""
+            if mode not in ("wal", "memory"):
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn.execute("PRAGMA cache_size=-32000")
         except sqlite3.DatabaseError:
             pass
         self._conn.execute(
@@ -335,6 +344,10 @@ class EmbeddingCache:
                 vector BLOB NOT NULL,
                 PRIMARY KEY (content_hash, signature)
             )"""
+        )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS semantic_content_embeddings_sig_idx
+            ON semantic_content_embeddings (signature)"""
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS semantic_helper_signatures (
@@ -417,16 +430,28 @@ class EmbeddingCache:
                         found[record.path] = bytes(row[0])
                         renamed.append((record, bytes(row[0])))
                 if renamed:
-                    self.put_many(renamed, signature)
+                    self.put_many(renamed, signature, cancelled=cancelled)
         return found
 
-    def put_many(self, items: list[tuple[FileRecord, bytes]], signature: str) -> None:
+    def put_many(
+        self,
+        items: list[tuple[FileRecord, bytes]],
+        signature: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         for record, vector in items:
+            if cancelled and cancelled():
+                raise InterruptedError("scan cancelled")
             try:
                 identity = self._identity(record)
                 if record.path in self._identities and identity != self._identities[record.path]:
                     continue
-                digest = self._digests.get(record.path) or record.sha256 or self._digest(record)
+                digest = (
+                    self._digests.get(record.path)
+                    or record.sha256
+                    or self._digest(record, cancelled)
+                )
                 if identity != self._identity(record):
                     continue
             except OSError:
@@ -651,58 +676,63 @@ def embed_records(
                 # the GPU never waits on Pillow.
                 upcoming = submit(0) if pending else []
                 consecutive_failures = 0
-                for start in starts:
-                    check_cancelled()
-                    batch = pending[start : start + REQUEST_BATCH]
-                    prepared = [future.result() for future in upcoming]
-                    following = start + REQUEST_BATCH
-                    upcoming = submit(following) if following < len(pending) else []
-                    ready = [(r, p) for r, p in zip(batch, prepared, strict=True) if p]
-                    batch_started = time.monotonic()
-                    if ready:
-                        fresh: list[tuple[FileRecord, bytes]] = []
-                        try:
-                            embed_with_isolation(ready, fresh)
-                            if fresh and cache is not None:
-                                cache.put_many(fresh, signature)
-                        except _WorkerStartupError as exc:
-                            # Errors for ready items not yet recorded are added if missing.
-                            seen_err = {
-                                e.split(": ", 2)[1]
-                                for e in errors
-                                if e.count(": ") >= 2
-                            }
-                            for r, _p in ready:
-                                if r.path not in vectors and r.path not in seen_err:
-                                    errors.append(
-                                        f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
-                                    )
-                            errors.extend(
-                                f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
-                                for r in pending[start + len(batch) :]
+                try:
+                    for start in starts:
+                        check_cancelled()
+                        batch = pending[start : start + REQUEST_BATCH]
+                        prepared = [future.result() for future in upcoming]
+                        following = start + REQUEST_BATCH
+                        upcoming = submit(following) if following < len(pending) else []
+                        ready = [(r, p) for r, p in zip(batch, prepared, strict=True) if p]
+                        batch_started = time.monotonic()
+                        if ready:
+                            fresh: list[tuple[FileRecord, bytes]] = []
+                            try:
+                                embed_with_isolation(ready, fresh)
+                                if fresh and cache is not None:
+                                    cache.put_many(fresh, signature, cancelled=cancelled)
+                            except _WorkerStartupError as exc:
+                                # Errors for ready items not yet recorded are added if missing.
+                                seen_err = {
+                                    e.split(": ", 2)[1]
+                                    for e in errors
+                                    if e.count(": ") >= 2
+                                }
+                                for r, _p in ready:
+                                    if r.path not in vectors and r.path not in seen_err:
+                                        errors.append(
+                                            f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
+                                        )
+                                errors.extend(
+                                    f"{ERROR_SEMANTIC_FAILED}: {r.path}: {exc}"[:300]
+                                    for r in pending[start + len(batch) :]
+                                )
+                                break
+                            finally:
+                                for _rec, prepared_path in ready:
+                                    try:
+                                        os.unlink(prepared_path)
+                                    except OSError:
+                                        pass
+                            if consecutive_failures >= MAX_CONSECUTIVE_WORKER_FAILURES:
+                                remaining_records = pending[start + len(batch) :]
+                                errors.extend(
+                                    f"{ERROR_SEMANTIC_FAILED}: {r.path}: worker failed repeatedly"[:300]
+                                    for r in remaining_records
+                                )
+                                break
+                        done += len(batch)
+                        if progress:
+                            progress("semantic-embed", done, total)
+                        if ready and done < total:
+                            _cool_down(
+                                time.monotonic() - batch_started, done, total,
+                                progress, check_cancelled,
                             )
-                            break
-                        finally:
-                            for _rec, prepared_path in ready:
-                                try:
-                                    os.unlink(prepared_path)
-                                except OSError:
-                                    pass
-                        if consecutive_failures >= MAX_CONSECUTIVE_WORKER_FAILURES:
-                            remaining_records = pending[start + len(batch) :]
-                            errors.extend(
-                                f"{ERROR_SEMANTIC_FAILED}: {r.path}: worker failed repeatedly"[:300]
-                                for r in remaining_records
-                            )
-                            break
-                    done += len(batch)
-                    if progress:
-                        progress("semantic-embed", done, total)
-                    if ready and done < total:
-                        _cool_down(
-                            time.monotonic() - batch_started, done, total,
-                            progress, check_cancelled,
-                        )
+                except BaseException:
+                    for future in upcoming:
+                        future.cancel()
+                    raise
         finally:
             if worker_box[0] is not None:
                 worker_box[0].close()
@@ -861,8 +891,14 @@ class NeighborCache:
         target.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(target), timeout=30.0)
         try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            mode_row = self._conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(mode_row[0]).lower() if mode_row else ""
+            if mode not in ("wal", "memory"):
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn.execute("PRAGMA cache_size=-32000")
         except sqlite3.DatabaseError:
             pass
         self._conn.execute(
@@ -1102,6 +1138,7 @@ def group_semantic_vectors(
     exclude_from_duplicates: set[str] | None = None,
     excluded_pairs: set[tuple[str, str]] | None = None,
     exact_path_sets: list[set[str]] | None = None,
+    arrival_paths: set[str] | None = None,
     use_cache: bool = True,
     cache_path: str | Path | None = None,
     progress: ProgressCb | None = None,
@@ -1189,14 +1226,16 @@ def group_semantic_vectors(
         and pair[0] not in excluded
         and pair[1] not in excluded
         and pair not in excluded_edges
+        and (arrival_paths is None or pair[0] in arrival_paths or pair[1] in arrival_paths)
     )
     # Sorted pairs come in runs that share their first file. A run is verified
     # by one thread, so that file's decoded pixels and features stay in the
     # bounded comparison caches (sorted order alone was ~25% faster than
     # arbitrary order; threads add OpenCV/Pillow work that releases the GIL).
+    # Cap each run so huge clusters still distribute across worker threads.
     runs: list[list[tuple[str, str]]] = []
     for pair in candidates:
-        if runs and runs[-1][0][0] == pair[0]:
+        if runs and runs[-1][0][0] == pair[0] and len(runs[-1]) < VERIFY_RUN_MAX_PAIRS:
             runs[-1].append(pair)
         else:
             runs.append([pair])
@@ -1206,31 +1245,42 @@ def group_semantic_vectors(
     clear_image_comparison_cache()
     try:
         verdicts: dict[tuple[str, str], bool] = dict.fromkeys(scores, False)
-        with ThreadPoolExecutor(
-            max_workers=max(1, min(workers, len(runs) or 1)),
-            thread_name_prefix="semantic-verify",
-        ) as pool:
-            futures = [pool.submit(verify_run, run) for run in runs]
-            try:
-                for run, future in zip(runs, futures, strict=True):
-                    for pair, verdict in zip(run, future.result(), strict=True):
-                        if verdict is None:
-                            # Aligned, but only ordinary evidence. Decider runs
-                            # on this thread (its verdict cache is a sqlite
-                            # connection) and may veto; it can never approve
-                            # a pair the local checks rejected.
-                            verdict = True
-                            if judge is not None:
-                                if cancelled and cancelled():
-                                    raise InterruptedError("scan cancelled")
-                                probability = judge(by_path[pair[0]], by_path[pair[1]])
-                                if probability is not None:
-                                    verdict = probability >= judge_min
+        if runs:
+            def verify_progress(done: int, run_total: int) -> None:
+                if progress:
+                    progress("semantic-verify", done, run_total)
+
+            run_results = map_parallel(
+                verify_run,
+                runs,
+                workers=max(1, min(workers, len(runs))),
+                backend="thread",
+                progress=verify_progress,
+                cancelled=cancelled,
+            )
+            undecided: list[tuple[str, str]] = []
+            for run, outcomes in zip(runs, run_results, strict=True):
+                for pair, verdict in zip(run, outcomes, strict=True):
+                    if verdict is None:
+                        undecided.append(pair)
+                    else:
                         verdicts[pair] = verdict
-            except BaseException:
-                for future in futures:
-                    future.cancel()
-                raise
+            if undecided:
+                total_judge = len(undecided)
+                for idx, pair in enumerate(undecided, start=1):
+                    # Aligned, but only ordinary evidence. Decider runs on this
+                    # thread (its verdict cache is a sqlite connection) and may
+                    # veto; it can never approve a pair the local checks rejected.
+                    verdict = True
+                    if judge is not None:
+                        if cancelled and cancelled():
+                            raise InterruptedError("scan cancelled")
+                        probability = judge(by_path[pair[0]], by_path[pair[1]])
+                        if probability is not None:
+                            verdict = probability >= judge_min
+                    verdicts[pair] = verdict
+                    if judge is not None and progress:
+                        progress("semantic-judge", idx, total_judge)
         duplicates = build(restrict(lambda a, b, _score: verdicts[(a, b)]), distinct)
     finally:
         clear_image_comparison_cache()

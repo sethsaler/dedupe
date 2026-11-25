@@ -577,3 +577,37 @@ def test_score_people_caps_workers_with_human_cap(tmp_path: Path, monkeypatch) -
     score_people(records, workers=64)
 
     assert seen_workers == [DEFAULT_HUMAN_WORKERS_CAP]
+
+
+def test_video_people_score_bails_early_on_consecutive_timeouts_and_honors_cancel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dedupe.people_score import _video_frames
+
+    video = tmp_path / "slow.mp4"
+    video.write_bytes(b"video")
+    record = FileRecord(
+        path=str(video),
+        size=5,
+        mtime=1.0,
+        media_type=MediaType.VIDEO,
+        extension=".mp4",
+        duration=20.0,
+    )
+    monkeypatch.setattr("dedupe.similar_video.ffmpeg_available", lambda: True)
+    monkeypatch.setattr("dedupe.similar_video._extract_seek_frames_ppm", lambda *_a, **_kw: [])
+
+    calls = 0
+
+    def timeout_seek(*_a, **_kw):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(["ffmpeg"], 60)
+
+    monkeypatch.setattr("dedupe.similar_video._extract_seek_frame_ppm", timeout_seek)
+    with pytest.raises(RuntimeError, match="no video frames"):
+        list(_video_frames(record))
+    assert calls == 2
+
+    with pytest.raises(InterruptedError, match="scan cancelled"):
+        list(_video_frames(record, cancelled=lambda: True))
