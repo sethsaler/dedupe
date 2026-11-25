@@ -3496,6 +3496,43 @@ def test_shutdown_stops_server_after_grace_and_new_request_cancels(
     assert fake.shutdown_calls == 1
 
 
+def test_native_shell_marker_is_rendered_only_in_native_mode(monkeypatch) -> None:
+    monkeypatch.delenv("DEDUPE_NATIVE_SHELL", raising=False)
+    browser_app = create_app()
+    browser_html = browser_app.test_client().get("/").get_data(as_text=True)
+    assert 'name="dedupe-native-shell" content="false"' in browser_html
+
+    monkeypatch.setenv("DEDUPE_NATIVE_SHELL", "1")
+    native_app = create_app()
+    native_html = native_app.test_client().get("/").get_data(as_text=True)
+    assert 'name="dedupe-native-shell" content="true"' in native_html
+
+
+def test_native_shell_shutdown_accepts_only_scoped_native_token(monkeypatch) -> None:
+    monkeypatch.setenv("DEDUPE_NATIVE_SHELL", "1")
+    monkeypatch.setenv("DEDUPE_NATIVE_TOKEN", "native-test-token")
+    app = create_app()
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    fake = FakeServer()
+    app.extensions["dedupe_server"] = fake
+    client = app.test_client()
+
+    native_headers = {"X-Dedupe-Native-Token": "native-test-token"}
+    assert client.post("/api/scan/cancel", json={}, headers=native_headers).status_code == 403
+    assert client.post("/api/shutdown", json={}).status_code == 403
+    response = client.post("/api/shutdown", json={}, headers=native_headers)
+    assert response.status_code == 200
+    client.get("/api/status")  # cancel the timer so the test never stops the server
+    assert fake.shutdown_calls == 0
+
+
 def test_review_session_resume_and_discard_endpoints(tmp_path: Path) -> None:
     from dedupe.review_session import save_review_session
 

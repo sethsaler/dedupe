@@ -290,7 +290,7 @@ dedupe scan ~/Downloads --action trash --smart automatic --dry-run
 
 - Python/Ruff/package CI and a real Chromium workflow test
 
-- Credential-free macOS app-bundle scaffold plus gated signing/notarization helper
+- Self-contained native macOS app bundle plus gated signing/notarization helper
 
 - Remaining: collect representative private benchmark corpora and publish measured targets
 

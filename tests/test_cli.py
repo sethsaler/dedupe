@@ -345,6 +345,16 @@ def test_ui_reroutes_when_port_is_taken_by_a_foreign_process(capsys) -> None:
         blocker.close()
 
 
+def test_ui_port_zero_uses_an_os_chosen_port(capsys) -> None:
+    _serve_ui_in_thread(0)
+    captured = _wait_for_line(capsys, "Dedupe UI:")
+    assert "instead" not in captured.err
+    url = captured.out.split("Dedupe UI: ")[1].splitlines()[0]
+    assert not url.endswith(":0/")
+    with urllib.request.urlopen(url, timeout=5) as response:
+        assert response.status == 200
+
+
 def test_ui_refuses_start_when_port_is_taken_by_another_dedupe_ui(capsys) -> None:
     # Find a free port for the first UI, then release it for the bind.
     probe = socket.socket()

@@ -46,7 +46,7 @@ printf '  submit with notarytool profile: %q (team %q)\n' "$NOTARYTOOL_PROFILE" 
 printf '  staple and verify the accepted ticket\n'
 ((EXECUTE)) || { printf 'Dry run only; pass --execute to perform these operations.\n'; exit 0; }
 
-codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
+codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
 ARCHIVE="${APP%.app}-notarization.zip"
 trap 'rm -f "$ARCHIVE"' EXIT
 /usr/bin/ditto -c -k --keepParent "$APP" "$ARCHIVE"
