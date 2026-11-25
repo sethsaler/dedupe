@@ -75,8 +75,10 @@ and protected folders are debounced and start an incremental scan automatically;
 an active scan or file action is never interrupted. Monitoring catches up once
 when it starts, then reacts to later changes. Automatic monitor scans preserve
 unfinished review groups and merge later arrivals into them instead of erasing
-the saved review. It does not run after the Mac app is closed. Choose
-**Stop monitoring** to disable it.
+the saved review. If a folder or removable drive is temporarily missing,
+monitoring waits rather than saving an incomplete review and reattaches when it
+returns. It does not run after the Mac app is closed. Choose **Stop monitoring**
+to disable it.
 
 **Delete job** removes the saved settings and review, stops its folder monitor,
 and leaves media untouched.
