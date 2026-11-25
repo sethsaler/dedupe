@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -220,3 +221,166 @@ def focus_new_arrivals(result: ScanResult, baseline: dict) -> int:
     result.groups = groups
     result.recompute_stats()
     return len(arrivals)
+
+
+def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[str, FileRecord],
+                              arrivals: set[str]):
+    """Union same-kind old/new keep-one groups connected through shared members."""
+    parent = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    owner: dict[str, int] = {}
+    for index, (group, _is_new) in enumerate(entries):
+        for member in group.members:
+            if member.path in owner:
+                union(index, owner[member.path])
+            else:
+                owner[member.path] = index
+
+    components: dict[int, list[tuple[object, bool]]] = {}
+    for index, entry in enumerate(entries):
+        components.setdefault(find(index), []).append(entry)
+
+    merged_groups = []
+    for component in components.values():
+        # New groups come first in ``entries`` and therefore own the id/template.
+        new_paths = {
+            member.path
+            for group, is_new in component
+            if is_new
+            for member in group.members
+        }
+        ordered_members = []
+        seen = set()
+        for group, _is_new in component:
+            for member in group.members:
+                if member.path in seen or member.path not in records:
+                    continue
+                # A changed file's old membership is evidence only when the fresh
+                # scan still connects it to this component.
+                if member.path in arrivals and member.path not in new_paths:
+                    continue
+                seen.add(member.path)
+                ordered_members.append(records[member.path])
+        if len(ordered_members) < 2:
+            continue
+        member_paths = {member.path for member in ordered_members}
+        merged = copy.deepcopy(component[0][0])
+        merged.members = ordered_members
+        merged.selected_for_removal = sorted({
+            path
+            for group, _is_new in component
+            for path in group.selected_for_removal
+        } & member_paths)
+        merged.reviewed_paths = sorted({
+            path
+            for group, _is_new in component
+            for path in group.reviewed_paths
+        } & member_paths)
+        merged.distinct_participants = sorted({
+            path
+            for group, _is_new in component
+            for path in group.distinct_participants
+        })
+        merged.reviewed = all(group.reviewed for group, _is_new in component)
+        merged.suggested_keep = next(
+            (
+                group.suggested_keep
+                for group, _is_new in component
+                if group.suggested_keep in member_paths
+            ),
+            None,
+        )
+        merged.match_scores = {}
+        merged.match_details = {}
+        merged.match_explanations = {}
+        for group, _is_new in reversed(component):
+            merged.match_scores.update(group.match_scores)
+            merged.match_details.update(group.match_details)
+            merged.match_explanations.update(group.match_explanations)
+        merged_groups.append(merged)
+    return merged_groups
+
+
+def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, baseline: dict) -> None:
+    """Carry unchanged pending review groups into an incremental arrival result.
+
+    Incremental scans intentionally do not re-verify old-vs-old pairs. The prior
+    review is therefore the positive evidence for pairs among unchanged files:
+    unchanged non-overlapping groups are carried forward, and same-kind groups
+    connected through an arrival are unioned instead of dropping older copies.
+    """
+    if previous is None or not previous.groups:
+        return
+    arrivals = new_arrival_paths(result, baseline)
+    records = {record.path: record for record in result.files}
+    groups = list(result.groups)
+
+    for kind in (GroupKind.EXACT, GroupKind.SIMILAR):
+        entries = [(group, True) for group in groups if group.kind == kind]
+        entries.extend(
+            (group, False) for group in previous.groups if group.kind == kind
+        )
+        if not entries:
+            continue
+        merged = _merge_cluster_components(entries, records, arrivals)
+        groups = [group for group in groups if group.kind != kind] + merged
+
+    # Independent review tabs are often one group per kind. Preserve unchanged
+    # candidates in the matching fresh group when one exists, otherwise carry
+    # the old group forward with only the members that still have current records.
+    for old in previous.groups:
+        if old.kind in (GroupKind.ALL_FILES, GroupKind.EXACT, GroupKind.SIMILAR):
+            continue
+        target = next((group for group in groups if group.kind == old.kind), None)
+        target_paths = {
+            member.path for group in groups if group.kind == old.kind
+            for member in group.members
+        }
+        carried = []
+        seen = set()
+        for member in old.members:
+            if member.path in seen or member.path not in records:
+                continue
+            if member.path in arrivals and member.path not in target_paths:
+                continue
+            if target is not None and any(m.path == member.path for m in target.members):
+                continue
+            seen.add(member.path)
+            carried.append(records[member.path])
+        minimum = 2 if old.kind == GroupKind.SETS else 1
+        if len(carried) < minimum:
+            continue
+        carried_paths = {member.path for member in carried}
+        if target is not None:
+            target.members.extend(carried)
+            target.selected_for_removal = sorted(
+                set(target.selected_for_removal)
+                | (set(old.selected_for_removal) & carried_paths)
+            )
+            target.reviewed_paths = sorted(
+                set(target.reviewed_paths) | (set(old.reviewed_paths) & carried_paths)
+            )
+        else:
+            kept = copy.deepcopy(old)
+            kept.members = carried
+            kept.selected_for_removal = [
+                path for path in old.selected_for_removal if path in carried_paths
+            ]
+            kept.reviewed_paths = [
+                path for path in old.reviewed_paths if path in carried_paths
+            ]
+            groups.append(kept)
+
+    result.groups = groups
+    result.recompute_stats()

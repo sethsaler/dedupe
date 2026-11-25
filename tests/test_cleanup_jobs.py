@@ -623,3 +623,45 @@ def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, mon
     assert {m["path"] for m in group["members"]} == {str(original), str(arrival)}
 
     client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_preserves_unfinished_review_and_merges_arrival_group(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    first = _image(inbox / "first.png")
+    second = _image(inbox / "second.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second)}
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second)}
+
+    third = _image(inbox / "third.png")
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if not status["scanning"] and "1 new or changed files" in status["progress"]["message"]:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"monitor scan did not finish: {client.get('/api/status').get_json()}")
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second), str(third)}
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))

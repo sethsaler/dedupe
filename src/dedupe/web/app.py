@@ -81,7 +81,7 @@ from ..grouping import (
 )
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
-from ..jobs import JobStore, focus_new_arrivals
+from ..jobs import JobStore, focus_new_arrivals, merge_new_arrival_review
 from ..keep_decisions import update_keep_decisions
 from ..media_details import comparison_details
 from ..models import (
@@ -942,7 +942,7 @@ def create_app(
         if not job.get("monitor"):
             _stop_job_monitor(job_id)
             return
-        payload = {"job_id": job_id, "new_only": True}
+        payload = {"job_id": job_id, "new_only": True, "_preserve_review": True}
         try:
             # Invoke the same view as the browser so locking, persistence,
             # validation, streaming, and scan completion stay in one code path.
@@ -2035,6 +2035,7 @@ def create_app(
     @app.post("/api/scan")
     def api_scan():
         data = request.get_json(silent=True) or {}
+        preserve_review = bool(data.pop("_preserve_review", False))
         job = None
         if data.get("job_id") is not None:
             try:
@@ -2310,6 +2311,23 @@ def create_app(
                 arrivals = None
                 if data.get("new_only"):
                     arrivals = focus_new_arrivals(result, job["baseline"])
+                    prior_result = (
+                        previous_result
+                        if previous_result is not None and previous_result.job_id == job["id"]
+                        else None
+                    )
+                    if prior_result is None:
+                        try:
+                            prior_load = load_review_session(jobs.session_path(job["id"]))
+                            if prior_load.result is not None and prior_load.result.job_id == job["id"]:
+                                prior_result = prior_load.result
+                        except (OSError, ValueError, TypeError):
+                            prior_result = None
+                    # Positive old-vs-old evidence lives in the prior review, not
+                    # in the baseline. Carrying it forward preserves unfinished
+                    # work and keeps older similar copies clustered with arrivals.
+                    if preserve_review:
+                        merge_new_arrival_review(result, prior_result, job["baseline"])
                 if job:
                     # The scan is not complete from the client's perspective until
                     # its new baseline is durable; otherwise a follow-up arrival
