@@ -75,12 +75,19 @@ class FolderMonitor:
         on_change: Callable[[str], None],
         *,
         debounce_seconds: float = 2.0,
+        health_seconds: float = 2.0,
     ) -> None:
         self.on_change = on_change
         self.debounce_seconds = debounce_seconds
+        self.health_seconds = health_seconds
         self._lock = threading.RLock()
         self._observers: dict[str, Observer] = {}
         self._timers: dict[str, threading.Timer] = {}
+        self._specs: dict[str, tuple[tuple[str, ...], dict]] = {}
+        self._watch_identities: dict[str, dict[str, tuple[int, int]]] = {}
+        self._stopped = threading.Event()
+        self._health_thread = threading.Thread(target=self._health_loop, daemon=True)
+        self._health_thread.start()
 
     def start(
         self,
@@ -97,6 +104,8 @@ class FolderMonitor:
         include_gifs = bool(settings.get("include_gifs", True))
         include_videos = bool(settings.get("include_videos", True))
         include_hidden = bool(settings.get("include_hidden", False))
+        with self._lock:
+            self._specs[job_id] = (tuple(str(root) for root in roots), dict(settings))
         observer = Observer()
         watched: list[str] = []
         seen: set[str] = set()
@@ -121,14 +130,24 @@ class FolderMonitor:
         if not watched:
             raise ValueError("No existing folders to monitor")
         observer.start()
+        identities = {}
+        for key in watched:
+            try:
+                stat = Path(key).stat()
+                identities[key] = (stat.st_dev, stat.st_ino)
+            except OSError:
+                pass
         with self._lock:
             self._observers[job_id] = observer
+            self._watch_identities[job_id] = identities
         return watched
 
     def stop(self, job_id: str) -> None:
         with self._lock:
             observer = self._observers.pop(job_id, None)
             timer = self._timers.pop(job_id, None)
+            self._specs.pop(job_id, None)
+            self._watch_identities.pop(job_id, None)
         if timer is not None:
             timer.cancel()
         if observer is not None:
@@ -136,6 +155,9 @@ class FolderMonitor:
             observer.join(timeout=2.0)
 
     def stop_all(self) -> None:
+        self._stopped.set()
+        if self._health_thread.is_alive():
+            self._health_thread.join(timeout=2.0)
         with self._lock:
             job_ids = list(self._observers) + [
                 job_id for job_id in self._timers if job_id not in self._observers
@@ -165,6 +187,42 @@ class FolderMonitor:
             timer.daemon = True
             self._timers[job_id] = timer
             timer.start()
+
+    def refresh(self, job_id: str) -> None:
+        """Reattach watches when a watched directory was replaced."""
+        with self._lock:
+            spec = self._specs.get(job_id)
+            identities = dict(self._watch_identities.get(job_id, {}))
+        if spec is None or not identities:
+            return
+        missing = False
+        changed = False
+        for raw_path, identity in identities.items():
+            try:
+                stat = Path(raw_path).stat()
+            except OSError:
+                missing = True
+                break
+            if (stat.st_dev, stat.st_ino) != identity:
+                changed = True
+        # Do not detach the other watches while one root is absent. Once every
+        # root exists again, any changed inode means the replacement directory
+        # is not covered by the old recursive watch.
+        if missing or not changed:
+            return
+        roots, settings = spec
+        try:
+            self.start(job_id, roots, settings)
+        except (OSError, ValueError):
+            return
+        self._debounce(job_id)
+
+    def _health_loop(self) -> None:
+        while not self._stopped.wait(self.health_seconds):
+            with self._lock:
+                job_ids = list(self._specs)
+            for job_id in job_ids:
+                self.refresh(job_id)
 
     def _fire(self, job_id: str) -> None:
         with self._lock:

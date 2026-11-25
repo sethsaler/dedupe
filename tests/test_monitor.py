@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from dedupe.monitor import _JobEventHandler
+from dedupe.monitor import FolderMonitor, _JobEventHandler
 
 
 def _handler(root: Path, **overrides) -> _JobEventHandler:
@@ -50,3 +52,29 @@ def test_media_type_toggles_filter_events_like_scan_inventory(tmp_path: Path) ->
     assert not handler.relevant(_event(root / "photo.jpg"))
     assert not handler.relevant(_event(root / "animation.gif"))
     assert handler.relevant(_event(root / "clip.mp4"))
+
+
+def test_recreated_watch_root_is_reattached(tmp_path) -> None:
+    events = []
+    root = tmp_path / "watch"
+    root.mkdir()
+    monitor = FolderMonitor(
+        lambda job_id: events.append(job_id), debounce_seconds=0.02, health_seconds=0.02
+    )
+    try:
+        monitor.start("job", [root], {})
+        shutil.rmtree(root)
+        root.mkdir()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            monitor.refresh("job")
+            if monitor.running("job"):
+                break
+            time.sleep(0.01)
+        (root / "arrival.jpg").write_bytes(b"jpg")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not events:
+            time.sleep(0.01)
+        assert events == ["job"]
+    finally:
+        monitor.stop_all()
