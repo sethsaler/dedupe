@@ -285,6 +285,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func cancelBusyTermination(_ sender: NSApplication) {
+        // Closing the last window has already happened when AppKit asks to quit;
+        // vetoing that quit must put the review back on screen.
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         isTerminating = false
         sender.reply(toApplicationShouldTerminate: false)
         let alert = NSAlert()
