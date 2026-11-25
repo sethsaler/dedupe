@@ -474,10 +474,14 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
         if target is not None:
             target.members.extend(carried)
             saved_deselections = set(old.reviewed_paths) - set(old.selected_for_removal)
+            # ``-`` binds tighter than ``|``: the union needs its own parentheses
+            # or a saved Keep decision is re-selected by the fresh group.
             target.selected_for_removal = sorted((
-                set(target.selected_for_removal)
-                | (set(old.selected_for_removal) & unchanged_preserved_paths)
-                - saved_deselections
+                (
+                    set(target.selected_for_removal)
+                    | (set(old.selected_for_removal) & unchanged_preserved_paths)
+                )
+                - (saved_deselections & unchanged_preserved_paths)
             ) & {member.path for member in target.members})
             target.reviewed_paths = sorted(
                 set(target.reviewed_paths) | (set(old.reviewed_paths) & unchanged_preserved_paths)

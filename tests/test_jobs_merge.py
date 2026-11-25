@@ -205,3 +205,26 @@ def test_undo_restored_crop_keeps_custom_adjustment() -> None:
     assert crop.match_details["adjusted_crops"] == {
         restored.path: "10,10,100,100,1200,800"
     }
+
+
+def test_independent_merge_keeps_a_saved_keep_decision_unselected() -> None:
+    kept = _record("/kept.jpg", 1)
+    pending = _record("/pending.jpg", 2)
+    arrival = _record("/arrival.jpg", 3)
+    previous = ScanResult(
+        roots=["/"], files=[kept, pending], groups=[
+            _group(GroupKind.LOW_RESOLUTION, [kept, pending], reviewed_paths=[kept.path])
+        ],
+    )
+    result = ScanResult(
+        roots=["/"], files=[kept, pending, arrival], groups=[
+            _group(GroupKind.LOW_RESOLUTION, [kept, arrival],
+                   selected_for_removal=[kept.path, arrival.path])
+        ],
+    )
+
+    merge_new_arrival_review(result, previous, _baseline(kept, pending))
+
+    (group,) = result.groups
+    assert group.selected_for_removal == [arrival.path]
+    assert kept.path in group.reviewed_paths

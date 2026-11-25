@@ -739,3 +739,89 @@ def test_monitor_recovery_after_missing_drive_marks_runtime_active(
     assert payload.get("monitor_last_scan_at")
     assert payload["monitor_active"] is True
     assert payload["monitor_error"] is None
+
+
+def test_monitor_leaves_review_and_undo_alone_after_in_app_delete(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    """The app's own Trash and undo raise folder events but add nothing new."""
+    from PIL import ImageDraw
+
+    from dedupe import actions as actions_module
+
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    trash = tmp_path / "trash"
+
+    def fake_send_to_trash(src: Path, batch=None) -> Path:
+        trash.mkdir(exist_ok=True)
+        target = trash / src.name
+        src.rename(target)
+        return target
+
+    monkeypatch.setattr(actions_module, "_send_to_trash", fake_send_to_trash)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    base = Image.new("RGB", (512, 512), (240, 240, 240))
+    draw = ImageDraw.Draw(base)
+    draw.ellipse((60, 80, 300, 420), fill=(200, 30, 30))
+    draw.rectangle((280, 40, 480, 200), fill=(20, 60, 180))
+    draw.polygon([(100, 480), (400, 300), (500, 500)], fill=(10, 150, 60))
+    base.save(inbox / "a.png")
+    base.resize((400, 400)).save(inbox / "b.png")
+    base.resize((300, 300)).save(inbox / "c.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", {**_settings(inbox), "similar": True})
+    _run_job(client, app, job_id)
+    (group,) = _groups(client, "similar")
+    scan_id = _scan_id(client)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    state = app.extensions["dedupe_state"]
+    checks = []
+    real_inventory = web.inventory
+
+    def counting_inventory(*args, **kwargs):
+        records = real_inventory(*args, **kwargs)
+        checks.append(len(records))
+        return records
+
+    monkeypatch.setattr(web, "inventory", counting_inventory)
+
+    def wait_for_check(expected_files: int) -> None:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if expected_files in checks:
+                # Let the check that saw this inventory finish deciding.
+                time.sleep(0.3)
+                return
+            time.sleep(0.02)
+        pytest.fail(f"monitor never checked the folder: {checks}")
+
+    wait_for_check(3)  # the catch-up pass after enabling
+    assert _scan_id(client) == scan_id
+
+    victim = group["members"][0]["path"]
+    deleted = client.post("/api/review-candidate/delete", headers=_headers(app), json={
+        "scan_id": scan_id, "group_id": group["id"], "path": victim, "dry_run": False,
+    })
+    assert deleted.status_code == 200, deleted.get_json()
+    wait_for_check(2)
+    status = client.get("/api/status").get_json()
+    assert status["scan_id"] == scan_id
+    assert status["trash_undo_cleared"] == 0
+    assert victim in state["deleted_files"]
+
+    checks.clear()
+    restored = client.post("/api/review-candidate/undo", headers=_headers(app), json={
+        "scan_id": scan_id, "group_id": group["id"], "path": victim,
+    })
+    assert restored.status_code == 200, restored.get_json()
+    assert Path(victim).exists()
+    wait_for_check(3)
+    assert _scan_id(client) == scan_id
+    (group,) = _groups(client, "similar")
+    assert len(group["members"]) == 3
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))

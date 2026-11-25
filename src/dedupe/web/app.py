@@ -81,7 +81,7 @@ from ..grouping import (
 )
 from ..human_detection import DEFAULT_PHOTON_MODEL, HUMAN_BACKENDS
 from ..human_policy import MANUALLY_CONFIRMED_HUMAN_STATUS
-from ..jobs import JobStore, focus_new_arrivals, merge_new_arrival_review
+from ..jobs import JobStore, file_identity, focus_new_arrivals, merge_new_arrival_review
 from ..keep_decisions import update_keep_decisions
 from ..media_details import comparison_details
 from ..models import (
@@ -109,6 +109,7 @@ from ..review_session import (
     peek_review_session,
     save_review_session,
 )
+from ..scanner import inventory
 from ..semantic import DEFAULT_DUPLICATE_THRESHOLD as SEMANTIC_DUPLICATE_THRESHOLD
 from ..semantic import semantic_available
 from ..similar_image import (
@@ -931,6 +932,57 @@ def create_app(
         timer.start()
         _set_monitor_runtime(job_id, pending=True)
 
+    def _monitor_has_arrivals(job: dict) -> bool:
+        """Whether the job's folders hold a file the app has not already seen.
+
+        A real arrival scan replaces the open review and ends in-app Trash
+        undo, so it must not run for filesystem events that add nothing new:
+        the app's own Trash, quarantine, crop, and undo actions all raise
+        events in the folders they touch. A file counts as already seen when
+        its on-disk identity matches the job baseline or the open review's
+        in-memory record of it. Any doubt answers True and lets the scan decide.
+        """
+        baseline = job.get("baseline")
+        if not isinstance(baseline, dict):
+            return True
+        settings = job.get("settings") or {}
+        exclusions = settings.get("exclusions") or []
+        if isinstance(exclusions, str):
+            exclusions = exclusions.split(",")
+        try:
+            roots = [
+                str(Path(str(raw)).expanduser().resolve())
+                for raw in (
+                    *(settings.get("paths") or []),
+                    *(settings.get("protected_folders") or []),
+                )
+                if str(raw).strip()
+            ]
+            records = inventory(
+                list(dict.fromkeys(roots)),
+                include_images=bool(settings.get("include_images", True)),
+                include_gifs=bool(settings.get("include_gifs", True)),
+                include_videos=bool(settings.get("include_videos", True)),
+                include_hidden=bool(settings.get("include_hidden", False)),
+                exclusions=[str(e).strip() for e in exclusions if str(e).strip()],
+            )
+        except (OSError, ValueError, TypeError):
+            return True
+        with lock:
+            result: ScanResult | None = state["result"]
+            known: dict[str, list] = {}
+            if result is not None and result.job_id == job["id"]:
+                for record in (
+                    *result.files,
+                    *(member for group in result.groups for member in group.members),
+                ):
+                    known[record.path] = file_identity(record)
+        for record in records:
+            identity = file_identity(record)
+            if baseline.get(record.path) != identity and known.get(record.path) != identity:
+                return True
+        return False
+
     def _run_monitor_scan(job_id: str) -> None:
         _cancel_monitor_retry(job_id)
         try:
@@ -959,6 +1011,22 @@ def create_app(
                 active=monitor_service.running(job_id),
                 pending=False,
                 error="Waiting for missing folder: " + ", ".join(missing),
+            )
+            return
+        with lock:
+            busy = state["scanning"] or state["acting"] or state["transitioning"]
+        if busy:
+            _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
+            return
+        if not _monitor_has_arrivals(job):
+            # Nothing new: leave the open review, its scan session, and Trash
+            # undo untouched instead of replacing them with an identical result.
+            _set_monitor_runtime(
+                job_id,
+                active=monitor_service.running(job_id),
+                pending=False,
+                error=None,
+                last_scan_at=datetime.now(UTC).isoformat(),
             )
             return
         payload = {"job_id": job_id, "new_only": True, "_preserve_review": True}

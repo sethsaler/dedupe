@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -114,6 +115,11 @@ class FolderMonitor:
             except OSError:
                 # An unreadable mount point is missing for watch purposes; the
                 # health retry must not kill recovery for every other job.
+                continue
+            # Newer Pythons report an unreadable location as "not a directory"
+            # instead of raising, which would fall back to watching a parent
+            # the observer cannot look inside.
+            if not os.access(watch_root, os.R_OK | os.X_OK):
                 continue
             key = str(watch_root)
             if key in seen or is_in_photos_library(watch_root):

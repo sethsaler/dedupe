@@ -75,7 +75,10 @@ and protected folders are debounced and start an incremental scan automatically;
 an active scan or file action is never interrupted. Monitoring catches up once
 when it starts, then reacts to later changes. Automatic monitor scans preserve
 unfinished review groups and merge later arrivals into them instead of erasing
-the saved review. If a folder or removable drive is temporarily missing,
+the saved review. A change that adds nothing new — including Dedupe's own
+Trash, quarantine, crop, and undo actions — does not start a scan, so the
+open review and in-app Trash undo stay as they are. If a folder or removable
+drive is temporarily missing,
 monitoring waits rather than saving an incomplete review and reattaches when it
 returns. It does not run after the Mac app is closed. Choose **Stop monitoring**
 to disable it.
