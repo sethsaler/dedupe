@@ -63,14 +63,19 @@ def test_recreated_watch_root_is_reattached(tmp_path) -> None:
     )
     try:
         monitor.start("job", [root], {})
+        original_observer = monitor._observers["job"]
         shutil.rmtree(root)
         root.mkdir()
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             monitor.refresh("job")
-            if monitor.running("job"):
+            if monitor._observers.get("job") is not original_observer:
                 break
             time.sleep(0.01)
+        assert monitor._observers.get("job") is not original_observer
+        # Deleting the watched root is itself a relevant event. Only a creation
+        # after reattachment proves that the replacement directory is watched.
+        events.clear()
         (root / "arrival.jpg").write_bytes(b"jpg")
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline and not events:

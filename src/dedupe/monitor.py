@@ -25,9 +25,11 @@ class _JobEventHandler(FileSystemEventHandler):
         include_videos: bool,
         include_hidden: bool,
         exclusions: Iterable[str],
+        root_event_callback: Callable[[], None] | None = None,
     ) -> None:
         self.root = root
         self.callback = callback
+        self.root_event_callback = root_event_callback
         self.extensions = media_extensions(include_images, include_gifs, include_videos)
         self.include_hidden = include_hidden
         patterns = {e.strip().lower() for e in exclusions if str(e).strip()}
@@ -37,6 +39,13 @@ class _JobEventHandler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         if self.relevant(event):
             self.callback()
+        if (
+            self.root_event_callback is not None
+            and event.is_directory
+            and event.event_type in {"deleted", "moved"}
+            and Path(event.src_path) == self.root
+        ):
+            self.root_event_callback()
 
     def relevant(self, event: FileSystemEvent) -> bool:
         # Watchdog also reports read-only open/close events on some platforms.
@@ -85,28 +94,13 @@ class FolderMonitor:
         self._timers: dict[str, threading.Timer] = {}
         self._specs: dict[str, tuple[tuple[str, ...], dict]] = {}
         self._watch_identities: dict[str, dict[str, tuple[int, int]]] = {}
+        self._root_losses: dict[str, set[str]] = {}
         self._stopped = threading.Event()
         self._health_thread = threading.Thread(target=self._health_loop, daemon=True)
         self._health_thread.start()
 
-    def start(
-        self,
-        job_id: str,
-        roots: Iterable[str],
-        settings: dict,
-    ) -> list[str]:
-        """Start watching a job and return the watched directory paths."""
-        self.stop(job_id)
-        exclusions = settings.get("exclusions") or []
-        if isinstance(exclusions, str):
-            exclusions = exclusions.split(",")
-        include_images = bool(settings.get("include_images", True))
-        include_gifs = bool(settings.get("include_gifs", True))
-        include_videos = bool(settings.get("include_videos", True))
-        include_hidden = bool(settings.get("include_hidden", False))
-        with self._lock:
-            self._specs[job_id] = (tuple(str(root) for root in roots), dict(settings))
-        observer = Observer()
+    @staticmethod
+    def _watch_roots(roots: Iterable[str]) -> list[str]:
         watched: list[str] = []
         seen: set[str] = set()
         for raw_root in roots:
@@ -116,9 +110,30 @@ class FolderMonitor:
             if key in seen or not watch_root.is_dir() or is_in_photos_library(watch_root):
                 continue
             seen.add(key)
+            watched.append(key)
+        return watched
+
+    def _make_observer(
+        self,
+        job_id: str,
+        watched: list[str],
+        settings: dict,
+    ) -> Observer:
+        exclusions = settings.get("exclusions") or []
+        if isinstance(exclusions, str):
+            exclusions = exclusions.split(",")
+        include_images = bool(settings.get("include_images", True))
+        include_gifs = bool(settings.get("include_gifs", True))
+        include_videos = bool(settings.get("include_videos", True))
+        include_hidden = bool(settings.get("include_hidden", False))
+        observer = Observer()
+        for key in watched:
             handler = _JobEventHandler(
-                watch_root,
+                Path(key),
                 lambda job_id=job_id: self._debounce(job_id),
+                root_event_callback=lambda job_id=job_id, key=key: self._mark_root_lost(
+                    job_id, key
+                ),
                 include_images=include_images,
                 include_gifs=include_gifs,
                 include_videos=include_videos,
@@ -126,9 +141,24 @@ class FolderMonitor:
                 exclusions=exclusions,
             )
             observer.schedule(handler, key, recursive=True)
-            watched.append(key)
+        return observer
+
+    def start(
+        self,
+        job_id: str,
+        roots: Iterable[str],
+        settings: dict,
+    ) -> list[str]:
+        """Start watching a job and return the watched directory paths."""
+        self._stop_runtime(job_id)
+        roots = tuple(str(root) for root in roots)
+        with self._lock:
+            self._specs[job_id] = (roots, dict(settings))
+            self._root_losses.pop(job_id, None)
+        watched = self._watch_roots(roots)
         if not watched:
             raise ValueError("No existing folders to monitor")
+        observer = self._make_observer(job_id, watched, settings)
         observer.start()
         identities = {}
         for key in watched:
@@ -142,11 +172,10 @@ class FolderMonitor:
             self._watch_identities[job_id] = identities
         return watched
 
-    def stop(self, job_id: str) -> None:
+    def _stop_runtime(self, job_id: str) -> None:
         with self._lock:
             observer = self._observers.pop(job_id, None)
             timer = self._timers.pop(job_id, None)
-            self._specs.pop(job_id, None)
             self._watch_identities.pop(job_id, None)
         if timer is not None:
             timer.cancel()
@@ -154,14 +183,18 @@ class FolderMonitor:
             observer.stop()
             observer.join(timeout=2.0)
 
+    def stop(self, job_id: str) -> None:
+        self._stop_runtime(job_id)
+        with self._lock:
+            self._specs.pop(job_id, None)
+            self._root_losses.pop(job_id, None)
+
     def stop_all(self) -> None:
         self._stopped.set()
         if self._health_thread.is_alive():
             self._health_thread.join(timeout=2.0)
         with self._lock:
-            job_ids = list(self._observers) + [
-                job_id for job_id in self._timers if job_id not in self._observers
-            ]
+            job_ids = set(self._observers) | set(self._timers) | set(self._specs)
         for job_id in job_ids:
             self.stop(job_id)
 
@@ -188,33 +221,63 @@ class FolderMonitor:
             self._timers[job_id] = timer
             timer.start()
 
+    def _mark_root_lost(self, job_id: str, root: str) -> None:
+        with self._lock:
+            self._root_losses.setdefault(job_id, set()).add(root)
+
     def refresh(self, job_id: str) -> None:
-        """Reattach watches when a watched directory was replaced."""
+        """Reconfigure watches after roots disappear or are replaced."""
         with self._lock:
             spec = self._specs.get(job_id)
             identities = dict(self._watch_identities.get(job_id, {}))
-        if spec is None or not identities:
+            lost = set(self._root_losses.get(job_id, set()))
+        if spec is None:
             return
-        missing = False
+        roots, settings = spec
+        desired = self._watch_roots(roots)
         changed = False
+        missing = set()
         for raw_path, identity in identities.items():
             try:
                 stat = Path(raw_path).stat()
             except OSError:
-                missing = True
-                break
+                missing.add(raw_path)
+                continue
             if (stat.st_dev, stat.st_ino) != identity:
                 changed = True
-        # Do not detach the other watches while one root is absent. Once every
-        # root exists again, any changed inode means the replacement directory
-        # is not covered by the old recursive watch.
-        if missing or not changed:
+        lost |= missing
+        needs_restart = (
+            bool(lost)
+            or changed
+            or set(desired) != set(identities)
+        )
+        if not needs_restart:
             return
-        roots, settings = spec
+
+        self._stop_runtime(job_id)
+        with self._lock:
+            self._root_losses.pop(job_id, None)
+        if not desired:
+            return
         try:
-            self.start(job_id, roots, settings)
+            observer = self._make_observer(job_id, desired, settings)
+            observer.start()
         except (OSError, ValueError):
             return
+        new_identities = {}
+        for key in desired:
+            try:
+                stat = Path(key).stat()
+                new_identities[key] = (stat.st_dev, stat.st_ino)
+            except OSError:
+                pass
+        with self._lock:
+            if self._specs.get(job_id) != spec:
+                observer.stop()
+                observer.join(timeout=2.0)
+                return
+            self._observers[job_id] = observer
+            self._watch_identities[job_id] = new_identities
         self._debounce(job_id)
 
     def _health_loop(self) -> None:
