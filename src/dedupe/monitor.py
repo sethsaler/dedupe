@@ -39,6 +39,11 @@ class _JobEventHandler(FileSystemEventHandler):
             self.callback()
 
     def relevant(self, event: FileSystemEvent) -> bool:
+        # Watchdog also reports read-only open/close events on some platforms.
+        # Those cannot change the media inventory and scanning them would make
+        # the monitor re-scan its own analysis reads.
+        if event.event_type not in {"created", "modified", "deleted", "moved"}:
+            return False
         paths = [event.src_path]
         dest_path = getattr(event, "dest_path", "")
         if dest_path:

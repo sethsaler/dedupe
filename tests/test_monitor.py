@@ -20,11 +20,12 @@ def _handler(root: Path, **overrides) -> _JobEventHandler:
     return _JobEventHandler(root, lambda: None, **options)
 
 
-def _event(path: Path, *, directory: bool = False, dest_path: str = ""):
+def _event(path: Path, *, directory: bool = False, dest_path: str = "", event_type: str = "modified"):
     return SimpleNamespace(
         src_path=str(path),
         dest_path=dest_path,
         is_directory=directory,
+        event_type=event_type,
     )
 
 
@@ -38,6 +39,8 @@ def test_media_events_are_relevant_but_noise_is_filtered(tmp_path: Path) -> None
     assert not handler.relevant(_event(root / "notes.txt"))
     assert not handler.relevant(_event(root / ".hidden" / "photo.jpg"))
     assert not handler.relevant(_event(root / "ignored-photo.jpg"))
+    assert not handler.relevant(_event(root / "photo.jpg", event_type="opened"))
+    assert not handler.relevant(_event(root / "photo.jpg", event_type="closed_no_write"))
 
 
 def test_media_type_toggles_filter_events_like_scan_inventory(tmp_path: Path) -> None:
