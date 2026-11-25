@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -152,14 +153,15 @@ class FolderMonitor:
         """Start watching a job and return the watched directory paths."""
         self._stop_runtime(job_id)
         roots = tuple(str(root) for root in roots)
-        with self._lock:
-            self._specs[job_id] = (roots, dict(settings))
-            self._root_losses.pop(job_id, None)
         watched = self._watch_roots(roots)
         if not watched:
             raise ValueError("No existing folders to monitor")
         observer = self._make_observer(job_id, watched, settings)
-        observer.start()
+        try:
+            observer.start()
+        except (OSError, ValueError):
+            self._shutdown_observer(observer)
+            raise
         identities = {}
         for key in watched:
             try:
@@ -168,9 +170,17 @@ class FolderMonitor:
             except OSError:
                 pass
         with self._lock:
+            self._specs[job_id] = (roots, dict(settings))
+            self._root_losses.pop(job_id, None)
             self._observers[job_id] = observer
             self._watch_identities[job_id] = identities
         return watched
+
+    @staticmethod
+    def _shutdown_observer(observer: Observer) -> None:
+        observer.stop()
+        with contextlib.suppress(RuntimeError):
+            observer.join(timeout=2.0)
 
     def _stop_runtime(self, job_id: str) -> None:
         with self._lock:
@@ -180,8 +190,7 @@ class FolderMonitor:
         if timer is not None:
             timer.cancel()
         if observer is not None:
-            observer.stop()
-            observer.join(timeout=2.0)
+            self._shutdown_observer(observer)
 
     def stop(self, job_id: str) -> None:
         self._stop_runtime(job_id)
@@ -259,10 +268,13 @@ class FolderMonitor:
             self._root_losses.pop(job_id, None)
         if not desired:
             return
+        observer = None
         try:
             observer = self._make_observer(job_id, desired, settings)
             observer.start()
         except (OSError, ValueError):
+            if observer is not None:
+                self._shutdown_observer(observer)
             return
         new_identities = {}
         for key in desired:
@@ -273,8 +285,7 @@ class FolderMonitor:
                 pass
         with self._lock:
             if self._specs.get(job_id) != spec:
-                observer.stop()
-                observer.join(timeout=2.0)
+                self._shutdown_observer(observer)
                 return
             self._observers[job_id] = observer
             self._watch_identities[job_id] = new_identities

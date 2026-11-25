@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from dedupe.monitor import FolderMonitor, _JobEventHandler
 
 
@@ -81,5 +83,42 @@ def test_recreated_watch_root_is_reattached(tmp_path) -> None:
         while time.monotonic() < deadline and not events:
             time.sleep(0.01)
         assert events == ["job"]
+    finally:
+        monitor.stop_all()
+
+
+def test_start_failure_shuts_down_partial_observer(tmp_path, monkeypatch) -> None:
+    import dedupe.monitor as monitor_module
+
+    stopped = []
+
+    class FailingObserver:
+        def __init__(self):
+            self.running = False
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            self.running = True
+            raise OSError("emitter failed")
+
+        def stop(self):
+            stopped.append(True)
+            self.running = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self.running
+
+    monkeypatch.setattr(monitor_module, "Observer", FailingObserver)
+    monitor = FolderMonitor(lambda _job: None)
+    try:
+        with pytest.raises(OSError, match="emitter failed"):
+            monitor.start("job", [tmp_path], {})
+        assert stopped == [True]
+        assert not monitor.running("job")
     finally:
         monitor.stop_all()
