@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -223,6 +224,17 @@ def focus_new_arrivals(result: ScanResult, baseline: dict) -> int:
     return len(arrivals)
 
 
+def _fuse_saved_analysis(current: FileRecord, previous: FileRecord | None) -> FileRecord:
+    """Fresh identity/stat fields with saved analysis filled in when missing."""
+    if previous is None:
+        return current
+    merged = copy.deepcopy(current)
+    for field in dataclasses.fields(FileRecord):
+        if getattr(merged, field.name) is None:
+            setattr(merged, field.name, getattr(previous, field.name))
+    return merged
+
+
 def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[str, FileRecord],
                               arrivals: set[str]):
     """Union same-kind old/new keep-one groups connected through shared members."""
@@ -240,8 +252,12 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
             parent[rb] = ra
 
     owner: dict[str, int] = {}
-    for index, (group, _is_new) in enumerate(entries):
+    for index, (group, is_new) in enumerate(entries):
         for member in group.members:
+            # A replaced path is not evidence that its old byte-identical group
+            # and its new group are the same duplicate set.
+            if not is_new and member.path in arrivals:
+                continue
             if member.path in owner:
                 union(index, owner[member.path])
             else:
@@ -251,6 +267,12 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
     for index, entry in enumerate(entries):
         components.setdefault(find(index), []).append(entry)
 
+    old_members = {
+        member.path: member
+        for group, is_new in entries
+        if not is_new
+        for member in group.members
+    }
     merged_groups = []
     for component in components.values():
         # New groups come first in ``entries`` and therefore own the id/template.
@@ -262,7 +284,7 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
         }
         ordered_members = []
         seen = set()
-        for group, _is_new in component:
+        for group, is_new in component:
             for member in group.members:
                 if member.path in seen or member.path not in records:
                     continue
@@ -271,17 +293,30 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
                 if member.path in arrivals and member.path not in new_paths:
                     continue
                 seen.add(member.path)
-                ordered_members.append(records[member.path])
+                if is_new or member.path in arrivals:
+                    ordered_members.append(
+                        _fuse_saved_analysis(records[member.path], old_members.get(member.path))
+                    )
+                else:
+                    # Unchanged files keep their saved analysis (crop metadata,
+                    # detector verdicts, hashes) instead of inventory-only records.
+                    ordered_members.append(member)
         if len(ordered_members) < 2:
             continue
         member_paths = {member.path for member in ordered_members}
         merged = copy.deepcopy(component[0][0])
         merged.members = ordered_members
-        merged.selected_for_removal = sorted({
+        saved_deselections = {
+            path
+            for group, is_new in component
+            if not is_new
+            for path in set(group.reviewed_paths) - set(group.selected_for_removal)
+        }
+        merged.selected_for_removal = sorted(({
             path
             for group, _is_new in component
             for path in group.selected_for_removal
-        } & member_paths)
+        } - saved_deselections) & member_paths)
         merged.reviewed_paths = sorted({
             path
             for group, _is_new in component
@@ -310,6 +345,22 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
             merged.match_explanations.update(group.match_explanations)
         merged_groups.append(merged)
     return merged_groups
+
+
+def _merge_match_metadata(target, source) -> None:
+    """Carry saved per-member analysis metadata that the fresh group lacks."""
+    for key, value in source.match_details.items():
+        existing = target.match_details.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged = copy.deepcopy(value)
+            merged.update(existing)
+            target.match_details[key] = merged
+        elif key not in target.match_details:
+            target.match_details[key] = copy.deepcopy(value)
+    for mapping_name in ("match_scores", "match_explanations"):
+        target_mapping = getattr(target, mapping_name)
+        for key, value in getattr(source, mapping_name).items():
+            target_mapping.setdefault(key, value)
 
 
 def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, baseline: dict) -> None:
@@ -347,30 +398,39 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
             member.path for group in groups if group.kind == old.kind
             for member in group.members
         }
+        preserved = []
         carried = []
         seen = set()
+        target_member_paths = (
+            {member.path for member in target.members} if target is not None else set()
+        )
         for member in old.members:
             if member.path in seen or member.path not in records:
                 continue
             if member.path in arrivals and member.path not in target_paths:
                 continue
-            if target is not None and any(m.path == member.path for m in target.members):
-                continue
             seen.add(member.path)
-            carried.append(records[member.path])
+            kept_member = records[member.path] if member.path in arrivals else member
+            preserved.append(kept_member)
+            if member.path not in target_member_paths:
+                carried.append(kept_member)
         minimum = 2 if old.kind == GroupKind.SETS else 1
-        if len(carried) < minimum:
+        if target is None and len(carried) < minimum:
             continue
+        preserved_paths = {member.path for member in preserved}
         carried_paths = {member.path for member in carried}
         if target is not None:
             target.members.extend(carried)
-            target.selected_for_removal = sorted(
+            saved_deselections = set(old.reviewed_paths) - set(old.selected_for_removal)
+            target.selected_for_removal = sorted((
                 set(target.selected_for_removal)
-                | (set(old.selected_for_removal) & carried_paths)
-            )
+                | (set(old.selected_for_removal) & preserved_paths)
+                - saved_deselections
+            ) & {member.path for member in target.members})
             target.reviewed_paths = sorted(
-                set(target.reviewed_paths) | (set(old.reviewed_paths) & carried_paths)
+                set(target.reviewed_paths) | (set(old.reviewed_paths) & preserved_paths)
             )
+            _merge_match_metadata(target, old)
         else:
             kept = copy.deepcopy(old)
             kept.members = carried
