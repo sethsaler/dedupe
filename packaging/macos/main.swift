@@ -53,14 +53,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         isTerminating = true
 
         DispatchQueue.global(qos: .userInitiated).async {
+            if self.backendIsBusy() {
+                DispatchQueue.main.async {
+                    self.cancelBusyTermination(sender)
+                }
+                return
+            }
             self.requestBackendShutdown()
             // The endpoint deliberately waits through the browser shutdown grace
             // period. Give that clean path a moment, then stop the embedded server.
-            Thread.sleep(forTimeInterval: 2.2)
-            if process.isRunning {
-                process.terminate()
+            let deadline = Date().addingTimeInterval(2.2)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
             }
-            Thread.sleep(forTimeInterval: 0.4)
+            if process.isRunning {
+                // A scan or file action can have started after the shutdown POST.
+                // Never kill it halfway through a batch of file mutations.
+                if self.backendIsBusy() {
+                    DispatchQueue.main.async {
+                        self.cancelBusyTermination(sender)
+                    }
+                    return
+                }
+                process.terminate()
+                Thread.sleep(forTimeInterval: 0.4)
+            }
             DispatchQueue.main.async {
                 sender.reply(toApplicationShouldTerminate: true)
             }
@@ -247,6 +264,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             semaphore.signal()
         }.resume()
         _ = semaphore.wait(timeout: .now() + 0.8)
+    }
+
+    private func backendIsBusy() -> Bool {
+        guard let serverURL else { return false }
+        let endpoint = serverURL.appendingPathComponent("api/status")
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 0.5
+        let semaphore = DispatchSemaphore(value: 0)
+        var busy = false
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data,
+               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                busy = (payload["scanning"] as? Bool == true) || (payload["acting"] as? Bool == true)
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 0.7)
+        return busy
+    }
+
+    private func cancelBusyTermination(_ sender: NSApplication) {
+        isTerminating = false
+        sender.reply(toApplicationShouldTerminate: false)
+        let alert = NSAlert()
+        alert.messageText = "Dedupe is busy"
+        alert.informativeText = "Wait for the current scan or file action to finish, then quit again."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private func showLoading() {
