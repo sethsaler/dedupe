@@ -75,19 +75,60 @@ for (const id of ["main", "scanPanel", "actionBar"]) stageObserver.observe($(id)
 window.addEventListener("resize", fitReviewStage);
 
 let activeVideo = null;
+let hoverVideoTimer = null;
+let activeMembersPointerId = null;
+let deferredSelectGroupId = null;
+
+function cancelInlineVideoHover() {
+  if (hoverVideoTimer !== null) {
+    clearTimeout(hoverVideoTimer);
+    hoverVideoTimer = null;
+  }
+}
+
 function stopInlineVideo() {
+  cancelInlineVideoHover();
   if (!activeVideo) return;
   activeVideo.pause();
   activeVideo.removeAttribute("src");
   activeVideo.load(); // Cancel buffering and restore the poster.
   activeVideo = null;
 }
+
+function unloadCardVideos(root) {
+  if (!root) return;
+  cancelInlineVideoHover();
+  if (activeVideo && root.contains(activeVideo)) stopInlineVideo();
+  root.querySelectorAll("video").forEach((video) => {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  });
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     stopInlineVideo();
     $("members").querySelectorAll("video").forEach((video) => video.pause());
   }
 });
+$("members").addEventListener("pointerdown", (event) => {
+  activeMembersPointerId = event.pointerId;
+  if (event.target.closest(".thumb-wrap[data-click-trash]")) {
+    stopInlineVideo();
+  }
+}, true);
+for (const evt of ["pointerup", "pointercancel"]) {
+  window.addEventListener(evt, (event) => {
+    if (activeMembersPointerId !== event.pointerId) return;
+    activeMembersPointerId = null;
+    if (deferredSelectGroupId !== null && state.currentId === deferredSelectGroupId) {
+      const id = deferredSelectGroupId;
+      deferredSelectGroupId = null;
+      selectGroup(id, { silent: true, preservePlayback: true }).catch(() => {});
+    }
+  });
+}
 $("members").addEventListener("click", (event) => {
   if (!event.target.closest("video")) stopInlineVideo();
 }, true);
@@ -270,7 +311,7 @@ async function ensurePeopleScores(g) {
       if (failure) toast(failure, "error");
       const open = currentGroup();
       if (refresh && open && (open.id === g.id || peopleMetricsFor(open.kind).length)) {
-        await selectGroup(open.id, { silent: true }).catch((error) => toast(error.message, "error"));
+        await selectGroup(open.id, { silent: true, preservePlayback: true }).catch((error) => toast(error.message, "error"));
       }
     }
   }
@@ -553,10 +594,11 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   if (!preserveMemberFocus) restartMemberList();
   ensureGroupVisible(id);
   markGroupListActive(id);
-  const g = await api(`/api/groups/${id}`);
+  const rawGroup = await api(`/api/groups/${id}`);
   // A newer selection (or a cleared one) supersedes this fetch: bail out
   // rather than paint a stale group into the detail pane.
-  if (state.selectToken !== myToken || g.id !== state.currentId) return;
+  if (state.selectToken !== myToken || rawGroup.id !== state.currentId) return;
+  const g = applyPendingReviewOps(rawGroup);
   syncScanningLock(g);
   // Preserve unchanged media during silent background refreshes of the same group
   // so video playback, image scroll position, and appended gallery cards survive.
@@ -564,6 +606,13 @@ async function selectGroup(id, { silent = false, preservePlayback = false } = {}
   if (preservePlayback && preserveMemberFocus && groupRenderSignature(g) === renderedGroupSnapshot
     && $("members").querySelector(".card, .swipe-review")) {
     applyPendingGroupFocus(id);
+    return;
+  }
+  // Never tear down #members while a pointer button is pressed on a card.
+  if (preservePlayback && preserveMemberFocus && activeMembersPointerId !== null
+    && $("members").querySelector(".card, .swipe-review")) {
+    patchGroup(g);
+    deferredSelectGroupId = id;
     return;
   }
   // A scan-completion refresh can finish while the user is moving through
@@ -705,8 +754,8 @@ function cardPreviewHtml(g, m, lightboxIndex, { singleReview, isKeep, isSel, del
         ? '<span class="thumb-badge keep">Keep</span>'
         : "";
   const mediaPreview = m.media_type === "video"
-    ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${escapeHtml(thumb)}" ${singleReview ? "controls src" : "data-src"}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" aria-label="Play ${escapeHtml(fileName)}"></video>`
-    : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${escapeHtml(m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb)}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${escapeHtml(thumb)}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" />`;
+    ? `<video class="${singleReview ? "review-video" : "hover-video"}" poster="${escapeHtml(thumb)}" ${singleReview ? "controls src" : "data-src"}="/api/media?path=${encodeURIComponent(m.path)}" muted loop playsinline preload="${singleReview ? "metadata" : "none"}" draggable="false" aria-label="Play ${escapeHtml(fileName)}"></video>`
+    : `<img class="thumb-image ${m.media_type === "gif" && !singleReview ? "hover-gif" : ""}" src="${escapeHtml(m.media_type === "gif" && singleReview ? `/api/media?path=${encodeURIComponent(m.path)}` : thumb)}" ${m.media_type === "gif" && !singleReview ? `data-thumbnail="${escapeHtml(thumb)}" data-src="/api/media?path=${encodeURIComponent(m.path)}"` : ""} alt="Preview of ${escapeHtml(fileName)}" loading="lazy" decoding="async" draggable="false" />`;
   const overlayEnlarge = clickTrash
     ? `<button class="thumb-enlarge inspect-media" data-index="${lightboxIndex}" type="button" title="Enlarge in the lightbox" aria-label="Enlarge ${escapeHtml(fileName)}">Enlarge</button>`
     : "";
@@ -868,6 +917,7 @@ function patchTriageCardDeleted(card, g, path, isDeleted) {
 
   const oldPreview = card.querySelector(":scope > .thumb-stack, :scope > .deleted-preview");
   if (oldPreview) {
+    unloadCardVideos(oldPreview);
     const temp = document.createElement("div");
     temp.innerHTML = cardPreviewHtml(g, member, lightboxIndex, opts).trim();
     const freshPreview = temp.firstElementChild;
@@ -1404,15 +1454,26 @@ function flushListSelection(id) {
   box.addEventListener("pointerover", (event) => {
     const wrap = event.target.closest?.("#members > .card:not(.copy-row):not(.crop-card) .thumb-wrap");
     if (!wrap || wrap.contains(event.relatedTarget)) return;
+    const card = wrap.closest(".card");
+    const path = wrap.dataset.path;
+    if (!card || card.classList.contains("deleted") || (path && state.deleteBusy.has(path))) return;
     const video = wrap.querySelector(".hover-video");
     if (video) {
       stopInlineVideo();
-      activeVideo = video;
-      video.muted = true;
-      if (!video.src) video.src = video.dataset.src;
-      video.play().catch(() => {
-        /* The static poster remains when the browser cannot play this codec. */
-      });
+      // Brief hover-intent delay prevents rapid sweeps or quick delete clicks
+      // from starting /api/media fetches that 404 right after Trash.
+      hoverVideoTimer = setTimeout(() => {
+        hoverVideoTimer = null;
+        if (!wrap.isConnected || card.classList.contains("deleted") || (path && state.deleteBusy.has(path))) {
+          return;
+        }
+        activeVideo = video;
+        video.muted = true;
+        if (!video.src) video.src = video.dataset.src;
+        video.play().catch(() => {
+          /* The static poster remains when the browser cannot play this codec. */
+        });
+      }, 100);
     }
     const gif = wrap.querySelector(".hover-gif");
     if (gif?.dataset.src) gif.src = gif.dataset.src;
@@ -1422,7 +1483,10 @@ function flushListSelection(id) {
     const wrap = event.target.closest?.("#members > .card:not(.copy-row):not(.crop-card) .thumb-wrap");
     if (!wrap || wrap.contains(event.relatedTarget)) return;
     const video = wrap.querySelector(".hover-video");
-    if (video && activeVideo === video) stopInlineVideo();
+    if (video) {
+      cancelInlineVideoHover();
+      if (activeVideo === video) stopInlineVideo();
+    }
     const gif = wrap.querySelector(".hover-gif");
     if (gif?.dataset.thumbnail) gif.src = gif.dataset.thumbnail;
   });
@@ -1543,18 +1607,36 @@ function optimisticTrashGroup(group, path) {
   };
 }
 
-function mergeInFlightDeletes(group, finishedPath) {
-  const stillBusy = new Set(
-    [...state.deleteBusy].filter((item) => item !== finishedPath),
-  );
-  if (!stillBusy.size) return group;
+const reviewCandidateQueue = [];
+let activeReviewCandidateOp = null;
+let reviewCandidateDraining = false;
+const pendingUndoBusy = new Set();
+
+function syncDeleteBusyFromQueue() {
+  const next = new Set();
+  if (activeReviewCandidateOp?.type === "delete") next.add(activeReviewCandidateOp.path);
+  for (const op of reviewCandidateQueue) {
+    if (op.type === "delete") next.add(op.path);
+  }
+  state.deleteBusy.clear();
+  for (const path of next) state.deleteBusy.add(path);
+}
+
+function applyPendingReviewOps(group) {
+  if (!group) return group;
+  const pendingDeletes = new Set();
+  if (activeReviewCandidateOp?.type === "delete") pendingDeletes.add(activeReviewCandidateOp.path);
+  for (const op of reviewCandidateQueue) {
+    if (op.type === "delete") pendingDeletes.add(op.path);
+  }
+  if (!pendingDeletes.size) return group;
   const memberPaths = new Set((group.members || []).map((m) => m.path));
-  const extraDeletes = [...stillBusy].filter((item) => memberPaths.has(item));
+  const extraDeletes = [...pendingDeletes].filter((item) => memberPaths.has(item));
   if (!extraDeletes.length) return group;
   return {
     ...group,
     deleted_paths: [...new Set([...(group.deleted_paths || []), ...extraDeletes])],
-    selected_for_removal: (group.selected_for_removal || []).filter((item) => !stillBusy.has(item)),
+    selected_for_removal: (group.selected_for_removal || []).filter((item) => !pendingDeletes.has(item)),
     reviewed_paths: [...new Set([...(group.reviewed_paths || []), ...extraDeletes])],
   };
 }
@@ -1599,6 +1681,159 @@ function refreshSidebarAndFooter(updated) {
   scheduleRender({ selection: true });
 }
 
+function syncOpenGroupMetadata(merged, { forceRender = false } = {}) {
+  if (currentGroup()?.id !== merged.id) return;
+  if (!forceRender && groupRenderSignature(merged) === renderedGroupSnapshot) {
+    updateDetailMeta(merged);
+    updateGroupSelectionText(merged);
+    syncDeletedToggle(merged);
+    syncLightboxItemsAndIndices(merged);
+    renderedGroupSnapshot = groupRenderSignature(merged);
+    return;
+  }
+  renderMembers(merged);
+}
+
+async function executeQueuedDelete(op) {
+  const { groupId, fallbackGroup, path, wasSelected, wasReviewed, inPlace, fromLightbox } = op;
+  const box = $("members");
+  try {
+    const updated = await requestWithLockRetry("/api/review-candidate/delete", {
+      group_id: groupId,
+      path,
+      scan_id: state.scanId,
+      dry_run: false,
+    });
+    activeReviewCandidateOp = null;
+    syncDeleteBusyFromQueue();
+    const merged = applyPendingReviewOps(updated);
+    patchGroup(merged);
+    if (currentGroup()?.id === merged.id) {
+      const card = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+      if (inPlace && card) {
+        updateDetailMeta(merged);
+        updateGroupSelectionText(merged);
+        syncDeletedToggle(merged);
+        syncLightboxItemsAndIndices(merged);
+        renderedGroupSnapshot = groupRenderSignature(merged);
+      } else {
+        syncOpenGroupMetadata(merged);
+      }
+    }
+    refreshSidebarAndFooter(merged);
+    toast(`Moved ${basename(path)} to Trash`, "ok", {
+      actionLabel: "Undo",
+      onAction: () => undoReviewCandidate(merged, path, { fromLightbox }),
+    });
+  } catch (error) {
+    activeReviewCandidateOp = null;
+    syncDeleteBusyFromQueue();
+    state.trashedInPlace.delete(path);
+    const latest = state.allGroups.find((item) => item.id === groupId) || fallbackGroup;
+    const reverted = applyPendingReviewOps(
+      revertSingleOptimisticTrash(latest, path, { wasSelected, wasReviewed }),
+    );
+    patchGroup(reverted);
+    if (currentGroup()?.id === reverted.id) {
+      const currentCard = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+      if (currentCard && patchTriageCardDeleted(currentCard, reverted, path, false)) {
+        updateDetailMeta(reverted);
+        updateGroupSelectionText(reverted);
+        syncDeletedToggle(reverted);
+        renderedGroupSnapshot = groupRenderSignature(reverted);
+      } else {
+        renderMembers(reverted);
+      }
+    }
+    refreshSidebarAndFooter(reverted);
+    if (fromLightbox && lightboxOpen()) {
+      const failedMember = (reverted.members || []).find((member) => member.path === path);
+      state.lightboxItems = [
+        failedMember
+          ? lightboxItemFor(failedMember, reverted)
+          : { path, mediaType: undefined, keeper: reverted.suggested_keep, kind: reverted.kind },
+        ...state.lightboxItems,
+      ];
+      updateLightbox();
+    }
+    toast(error.message || "Could not move that file to Trash", "error");
+  }
+}
+
+async function executeQueuedUndo(op) {
+  const { groupId, path, fromLightbox } = op;
+  const latest = state.allGroups.find((item) => item.id === groupId) || op.fallbackGroup;
+  try {
+    if (latest && !(latest.deleted_paths || []).includes(path)) {
+      return;
+    }
+    const updated = await requestWithLockRetry("/api/review-candidate/undo", {
+      group_id: groupId,
+      path,
+      scan_id: state.scanId,
+    });
+    const merged = applyPendingReviewOps(updated);
+    patchGroup(merged);
+    state.trashedInPlace.delete(path);
+    const box = $("members");
+    const card = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
+    if (currentGroup()?.id === merged.id) {
+      if (!boardActive() && renderedGroupId === merged.id && card && patchTriageCardDeleted(card, merged, path, false)) {
+        updateDetailMeta(merged);
+        updateGroupSelectionText(merged);
+        syncDeletedToggle(merged);
+        renderedGroupSnapshot = groupRenderSignature(merged);
+      } else {
+        renderMembers(merged);
+      }
+    }
+    refreshSidebarAndFooter(merged);
+    // Lightbox list now includes the restored file at its sorted position;
+    // when the overlay is open, jump back to it.
+    if (fromLightbox && lightboxOpen()) {
+      const restoredIndex = state.lightboxItems.findIndex((item) => item.path === path);
+      if (restoredIndex >= 0) {
+        state.lightboxIndex = restoredIndex;
+        updateLightbox();
+      }
+    }
+    toast("Image restored", "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    pendingUndoBusy.delete(path);
+  }
+}
+
+async function drainReviewCandidateQueue() {
+  if (reviewCandidateDraining) return;
+  reviewCandidateDraining = true;
+  try {
+    while (reviewCandidateQueue.length) {
+      const op = reviewCandidateQueue.shift();
+      activeReviewCandidateOp = op;
+      syncDeleteBusyFromQueue();
+      if (op.type === "delete") {
+        await executeQueuedDelete(op);
+      } else if (op.type === "undo") {
+        await executeQueuedUndo(op);
+      }
+      activeReviewCandidateOp = null;
+      syncDeleteBusyFromQueue();
+    }
+  } finally {
+    activeReviewCandidateOp = null;
+    syncDeleteBusyFromQueue();
+    reviewCandidateDraining = false;
+  }
+}
+
+function enqueueReviewCandidateOp(op) {
+  reviewCandidateQueue.push(op);
+  syncDeleteBusyFromQueue();
+  return drainReviewCandidateQueue();
+}
+
 async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) {
   const liveGroup = state.allGroups.find((item) => item.id === group?.id) || group;
   if (!liveGroup || !path || (liveGroup.deleted_paths || []).includes(path) || state.deleteBusy.has(path)) {
@@ -1639,62 +1874,16 @@ async function trashReviewCandidate(group, path, { fromLightbox = false } = {}) 
       updateLightbox();
     }
   }
-  try {
-    const updated = await requestWithLockRetry("/api/review-candidate/delete", {
-      group_id: liveGroup.id,
-      path,
-      scan_id: state.scanId,
-      dry_run: false,
-    });
-    const merged = mergeInFlightDeletes(updated, path);
-    patchGroup(merged);
-    if (currentGroup()?.id === merged.id) {
-      if (inPlace && box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`)) {
-        updateDetailMeta(merged);
-        updateGroupSelectionText(merged);
-        syncDeletedToggle(merged);
-        syncLightboxItemsAndIndices(merged);
-        renderedGroupSnapshot = groupRenderSignature(merged);
-      } else {
-        renderMembers(merged);
-      }
-    }
-    refreshSidebarAndFooter(merged);
-    toast(`Moved ${basename(path)} to Trash`, "ok", {
-      actionLabel: "Undo",
-      onAction: () => undoReviewCandidate(merged, path, { fromLightbox }),
-    });
-  } catch (error) {
-    state.trashedInPlace.delete(path);
-    const latest = state.allGroups.find((item) => item.id === liveGroup.id) || liveGroup;
-    const reverted = revertSingleOptimisticTrash(latest, path, { wasSelected, wasReviewed });
-    patchGroup(reverted);
-    if (currentGroup()?.id === reverted.id) {
-      const currentCard = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
-      if (currentCard && patchTriageCardDeleted(currentCard, reverted, path, false)) {
-        updateDetailMeta(reverted);
-        updateGroupSelectionText(reverted);
-        syncDeletedToggle(reverted);
-        renderedGroupSnapshot = groupRenderSignature(reverted);
-      } else {
-        renderMembers(reverted);
-      }
-    }
-    refreshSidebarAndFooter(reverted);
-    if (fromLightbox && lightboxOpen()) {
-      const failedMember = (reverted.members || []).find((member) => member.path === path);
-      state.lightboxItems = [
-        failedMember
-          ? lightboxItemFor(failedMember, reverted)
-          : { path, mediaType: undefined, keeper: reverted.suggested_keep, kind: reverted.kind },
-        ...state.lightboxItems,
-      ];
-      updateLightbox();
-    }
-    toast(error.message || "Could not move that file to Trash", "error");
-  } finally {
-    state.deleteBusy.delete(path);
-  }
+  await enqueueReviewCandidateOp({
+    type: "delete",
+    groupId: liveGroup.id,
+    fallbackGroup: liveGroup,
+    path,
+    wasSelected,
+    wasReviewed,
+    inPlace: Boolean(inPlace),
+    fromLightbox,
+  });
 }
 
 async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
@@ -1703,43 +1892,16 @@ async function undoReviewCandidate(group, path, { fromLightbox = false } = {}) {
     toast("Undo unlocks when the scan finishes", "error");
     return;
   }
-  while (state.deleteBusy.has(path)) await sleep(40);
+  if (pendingUndoBusy.has(path)) return;
+  pendingUndoBusy.add(path);
   const live = currentGroup()?.id === group.id ? currentGroup() : group;
-  try {
-    const updated = await requestWithLockRetry("/api/review-candidate/undo", {
-      group_id: live.id,
-      path,
-      scan_id: state.scanId,
-    });
-    const merged = mergeInFlightDeletes(updated, null);
-    patchGroup(merged);
-    state.trashedInPlace.delete(path);
-    const box = $("members");
-    const card = box.querySelector(`:scope > .card[data-path="${CSS.escape(path)}"]`);
-    if (currentGroup()?.id === merged.id) {
-      if (!boardActive() && renderedGroupId === merged.id && card && patchTriageCardDeleted(card, merged, path, false)) {
-        updateDetailMeta(merged);
-        updateGroupSelectionText(merged);
-        syncDeletedToggle(merged);
-        renderedGroupSnapshot = groupRenderSignature(merged);
-      } else {
-        renderMembers(merged);
-      }
-    }
-    refreshSidebarAndFooter(merged);
-    // Lightbox list now includes the restored file at its sorted position;
-    // when the overlay is open, jump back to it.
-    if (fromLightbox && lightboxOpen()) {
-      const restoredIndex = state.lightboxItems.findIndex((item) => item.path === path);
-      if (restoredIndex >= 0) {
-        state.lightboxIndex = restoredIndex;
-        updateLightbox();
-      }
-    }
-    toast("Image restored", "ok");
-  } catch (error) {
-    toast(error.message, "error");
-  }
+  await enqueueReviewCandidateOp({
+    type: "undo",
+    groupId: live.id,
+    fallbackGroup: live,
+    path,
+    fromLightbox,
+  });
 }
 
 // Toggle one member's removal selection from outside the card grid (the

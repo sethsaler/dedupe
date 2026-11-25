@@ -2473,6 +2473,7 @@ def create_app(
         group_id = data.get("group_id")
         path = data.get("path")
         dry_run = bool(data.get("dry_run", True))
+        preview_token = data.get("preview_token")
         with lock:
             if state["scanning"] or state["acting"]:
                 return jsonify({"error": "file actions are locked during active work"}), 409
@@ -2494,6 +2495,49 @@ def create_app(
                 return jsonify({"error": "This file is in a protected library"}), 400
             if path in state["deleted_files"]:
                 return jsonify(group_payload(group))
+            overlapping = [
+                candidate
+                for candidate in result.groups
+                if candidate.id != group.id
+                and any(member.path == path for member in candidate.members)
+            ]
+            if not dry_run and not preview_token:
+                if any(
+                    m.path == path and m.protected
+                    for candidate in overlapping
+                    for m in candidate.members
+                ):
+                    return jsonify({"error": "This file is in a protected library"}), 400
+                # A reviewed-but-kept decision in any other independent review
+                # vetoes the trash; name the review so the user knows where to
+                # revise it instead of facing a bare refusal.
+                veto = next(
+                    (
+                        candidate
+                        for candidate in overlapping
+                        if candidate.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
+                        and candidate.kind != GroupKind.CROP
+                        and path
+                        in set(candidate.reviewed_paths)
+                        - set(candidate.selected_for_removal)
+                    ),
+                    None,
+                )
+                if veto is not None:
+                    label = {
+                        "low_resolution": "Low-res",
+                        "random_review": "Random",
+                        "no_humans": "Non-Human",
+                        "faces": "Faces",
+                        "all_files": "Files",
+                        "sets": "Sets",
+                    }[veto.kind.value]
+                    return jsonify(
+                        {
+                            "error": f"Kept in the {label} review — "
+                            "revise that decision before trashing it here"
+                        }
+                    ), 400
             state["acting"] = True
             original_selected = list(group.selected_for_removal)
             original_reviewed = list(group.reviewed_paths)
@@ -2505,85 +2549,63 @@ def create_app(
             roots = list(result.roots)
             # An explicit one-click trash must not be vetoed by a prior Keep on
             # this same candidate (reviewed + unselected after an earlier trash).
+            # Snapshot overlapping groups so concurrent selection edits cannot
+            # mutate them while preflight/actions run outside the lock.
             safety_groups = [
-                action_group if candidate.id == group.id else candidate
-                for candidate in result.groups
+                action_group,
+                *[
+                    replace(
+                        candidate,
+                        selected_for_removal=list(candidate.selected_for_removal),
+                        reviewed_paths=list(candidate.reviewed_paths),
+                    )
+                    for candidate in overlapping
+                ],
             ]
             scan_id = state["scan_id"]
 
+        acting_held = True
         try:
-            preview = apply_actions(
-                [action_group],
-                action="trash",
-                dry_run=True,
-                roots=roots,
-                safety_groups=safety_groups,
-                verify_hashes=dry_run,
-            )
-            manifest = (scan_id, "trash", group.kind.value, None, tuple(sorted(
-                item.path for item in preview.items if item.ok
-            )))
-            if dry_run:
-                payload = preview.to_dict()
-                with lock:
-                    payload["preview_token"] = issue_preview_token(manifest)
-                payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
-                return jsonify(payload)
-            preview_token = data.get("preview_token")
-            if preview_token:
+            if dry_run or preview_token:
+                preview = apply_actions(
+                    [action_group],
+                    action="trash",
+                    dry_run=True,
+                    roots=roots,
+                    safety_groups=safety_groups,
+                    verify_hashes=dry_run,
+                )
+                manifest = (
+                    scan_id,
+                    "trash",
+                    group.kind.value,
+                    None,
+                    tuple(sorted(item.path for item in preview.items if item.ok)),
+                )
+                if dry_run:
+                    payload = preview.to_dict()
+                    with lock:
+                        payload["preview_token"] = issue_preview_token(manifest)
+                    payload["preview_expires_in"] = PREVIEW_TOKEN_TTL_SECONDS
+                    return jsonify(payload)
                 with lock:
                     verdict = consume_preview_token(preview_token, manifest)
                     if verdict != "valid":
                         return jsonify(stale_preview_payload(verdict)), 409
-            else:
-                eligible = next(
-                    (item for item in preview.items if item.path == path and item.ok),
-                    None,
-                )
-                if eligible is None:
-                    # A reviewed-but-kept decision in any independent review
-                    # vetoes the trash; name the review so the user knows
-                    # where to revise it instead of facing a bare refusal.
-                    veto = next(
-                        (
-                            candidate
-                            for candidate in (result.groups if result else [])
-                            if candidate.id != group.id
-                            and candidate.policy == ReviewPolicy.INDEPENDENT_CANDIDATES
-                            and path in {member.path for member in candidate.members}
-                            and path
-                            in set(candidate.reviewed_paths)
-                            - set(candidate.selected_for_removal)
-                        ),
-                        None,
-                    )
-                    if veto is not None:
-                        label = {
-                            "low_resolution": "Low-res",
-                            "random_review": "Random",
-                            "no_humans": "Non-Human",
-                            "faces": "Faces",
-                            "all_files": "Files",
-                            "sets": "Sets",
-                        }[veto.kind.value]
-                        return jsonify(
-                            {
-                                "error": f"Kept in the {label} review — "
-                                "revise that decision before trashing it here"
-                            }
-                        ), 400
-                    error = next(
-                        (item.error for item in preview.items if item.path == path),
-                        "This file is not safely eligible for deletion",
-                    )
-                    return jsonify({"error": error}), 400
             action_result = apply_actions(
-                [action_group], action="trash", dry_run=False, roots=roots,
+                [action_group],
+                action="trash",
+                dry_run=False,
+                roots=roots,
                 safety_groups=safety_groups,
             )
             item = next((item for item in action_result.items if item.path == path), None)
             if item is None or not item.ok:
-                error = item.error if item else "delete did not complete"
+                error = (
+                    item.error
+                    if item is not None
+                    else "This file is not safely eligible for deletion"
+                )
                 return jsonify({"error": error}), 400
             with lock:
                 state["deleted_files"][path] = item.destination
@@ -2607,13 +2629,19 @@ def create_app(
                     result.recompute_stats()
                     refresh_selected_count_locked()
                 state["persist_seq"] += 1
+                state["persist_dirty"] = True
+                # Clear acting before notifying SSE and before disk persistence
+                # so rapid clicks don't collide on 409 or flicker acting=true.
+                state["acting"] = False
+                acting_held = False
                 state["events"].notify_all()
                 payload = group_payload(group)
-            persist_result()
-            return jsonify(payload)
         finally:
-            with lock:
-                state["acting"] = False
+            if acting_held:
+                with lock:
+                    state["acting"] = False
+        schedule_persist()
+        return jsonify(payload)
 
     @app.post("/api/review-candidate/undo")
     def api_undo_review_candidate():
@@ -2645,6 +2673,7 @@ def create_app(
             )
             state["acting"] = True
 
+        acting_held = True
         try:
             if not destination or destination == "Trash":
                 return jsonify({
@@ -2697,15 +2726,19 @@ def create_app(
                 state["paths_version"] += 1
                 state["groups_version"] += 1
                 state["persist_seq"] += 1
+                state["persist_dirty"] = True
+                state["acting"] = False
+                acting_held = False
                 state["events"].notify_all()
                 payload = group_payload(group)
-            persist_result()
-            return jsonify(payload)
         except OSError as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
-            with lock:
-                state["acting"] = False
+            if acting_held:
+                with lock:
+                    state["acting"] = False
+        schedule_persist()
+        return jsonify(payload)
 
     # --- Crop review: black-border suggestions applied one file at a time ---
 

@@ -994,13 +994,14 @@ def test_clicking_a_triage_picture_trashes_it_and_its_trash_button_enlarges(
         assert page.locator("#members .card").count() == 3
 
         # The picture trashes rather than enlarges, so hovering it shows the
-        # plain click pointer, not the zoom-in magnifying glass.
+        # custom SVG delete target cursor, not the zoom-in magnifying glass.
         thumb_cursor = page.evaluate(
             "getComputedStyle("
             "document.querySelector('#members .thumb-wrap[data-click-trash]')"
             ").cursor"
         )
-        assert thumb_cursor == "pointer"
+        assert 'url("data:image/svg+xml,' in thumb_cursor
+        assert thumb_cursor.endswith("pointer")
 
         # The former Trash button is now the way to enlarge a picture.
         expect(page.locator("#members .card-actions .enlarge-candidate")).to_have_count(3)
@@ -1566,6 +1567,7 @@ def test_results_scroll_batches_and_single_group_next(page, tmp_path: Path, kind
         if kind == "similar":
             page.locator("#members .thumb-wrap").nth(100).click()
         else:
+            page.locator("#members .card").nth(100).hover()
             page.locator("#members .card-actions .enlarge-candidate").nth(100).click()
         expect(page.locator("#lbCounter")).to_have_text("101 / 105")
         page.keyboard.press("Escape")
@@ -3678,3 +3680,362 @@ def test_post_scan_setup_ergonomics_and_switching_scan_types(
 
     assert page_errors == []
     assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_triage_delete_cursor_targets_and_non_delete_controls(
+    page, tmp_path: Path
+) -> None:
+    """Custom SVG delete cursor applies strictly to delete targets on photos & videos."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is required for the video fixture")
+
+    media = tmp_path / "media"
+    media.mkdir()
+    photo = media / "a_sample.png"
+    Image.new("RGB", (320, 240), (42, 104, 168)).save(photo)
+    video = media / "b_clip.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+            "-i", "testsrc=size=320x240:rate=12", "-t", "1", "-pix_fmt", "yuv420p",
+            str(video),
+        ],
+        check=True,
+    )
+    records = []
+    for path, mtype, ext in (
+        (photo, MediaType.IMAGE, ".png"),
+        (video, MediaType.VIDEO, ".mp4"),
+    ):
+        stat = path.stat()
+        records.append(
+            FileRecord(
+                path=str(path),
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                media_type=mtype,
+                extension=ext,
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                width=320,
+                height=240,
+            )
+        )
+    app = create_app(
+        ScanResult(roots=[str(media)], files=records, groups=[]),
+        review_session_path=tmp_path / "review.json",
+    )
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    page.set_viewport_size({"width": 1440, "height": 900})
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator(".group-item").first.click()
+        page.locator("#members .triage-card").first.wait_for(state="visible")
+
+        gallery_cursors = page.evaluate(
+            """() => {
+                const cards = [...document.querySelectorAll('#members .triage-card')];
+                const photoCard = cards.find(c => !c.querySelector('video'));
+                const videoCard = cards.find(c => !!c.querySelector('video'));
+                const c = (el) => el ? getComputedStyle(el).cursor : null;
+                return {
+                    photoThumb: c(photoCard.querySelector('.thumb-wrap[data-click-trash]')),
+                    videoThumb: c(videoCard.querySelector('.thumb-wrap[data-click-trash]')),
+                    enlarge: c(photoCard.querySelector('.enlarge-candidate')),
+                    reveal: c(photoCard.querySelector('.reveal')),
+                };
+            }"""
+        )
+        assert 'url("data:image/svg+xml,' in gallery_cursors["photoThumb"]
+        assert 'url("data:image/svg+xml,' in gallery_cursors["videoThumb"]
+        assert gallery_cursors["enlarge"] == "zoom-in"
+        assert gallery_cursors["reveal"] == "pointer"
+
+        # Trash photo and check deleted placeholder + Undo cursors.
+        page.locator('#members .triage-card:not(:has(video)) .thumb-wrap').first.click()
+        deleted_card = page.locator("#members .triage-card.deleted").first
+        deleted_card.wait_for(state="visible")
+        deleted_cursors = page.evaluate(
+            """() => {
+                const card = document.querySelector('#members .triage-card.deleted');
+                return {
+                    placeholder: getComputedStyle(card.querySelector('.deleted-preview')).cursor,
+                    undo: getComputedStyle(card.querySelector('.undo-delete')).cursor,
+                };
+            }"""
+        )
+        assert deleted_cursors["placeholder"] == "default"
+        assert deleted_cursors["undo"] == "pointer"
+        deleted_card.locator(".undo-delete").click()
+        expect(page.locator("#members .triage-card.deleted")).to_have_count(0)
+
+        # Switch to Focus view: photo thumb still uses delete cursor, while
+        # Focus video container is default and its Trash button uses delete cursor.
+        page.locator("#btnFocusView").click()
+        expect(page.locator("#members.focus-review")).to_be_visible()
+        focus_photo_cursor = page.evaluate(
+            "getComputedStyle(document.querySelector('#members .triage-card .thumb-wrap[data-click-trash]')).cursor"
+        )
+        assert 'url("data:image/svg+xml,' in focus_photo_cursor
+
+        page.locator("#memberPagination .member-next").click()
+        page.locator("#members .triage-card video.review-video").wait_for(state="visible")
+        focus_video_cursors = page.evaluate(
+            """() => {
+                const card = document.querySelector('#members .triage-card');
+                return {
+                    videoWrap: getComputedStyle(card.querySelector('div.thumb-wrap')).cursor,
+                    deleteBtn: getComputedStyle(card.querySelector('.delete-candidate')).cursor,
+                };
+            }"""
+        )
+        assert focus_video_cursors["videoWrap"] == "default"
+        assert 'url("data:image/svg+xml,' in focus_video_cursors["deleteBtn"]
+
+
+@pytest.mark.e2e
+def test_all_files_rapid_click_mixed_photos_videos_and_hover_delete(
+    page, tmp_path: Path
+) -> None:
+    """Rapid-clicking 6+ mixed photos & videos, unhovered overlay clicks, and
+    hovered video clicks all delete reliably with zero 409s or /api/media 404s."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is required for the video fixture")
+
+    media = tmp_path / "media"
+    media.mkdir()
+    records: list[FileRecord] = []
+    colors = [(42, 104, 168), (168, 72, 58), (54, 140, 92), (150, 112, 38)]
+    sources = [
+        "testsrc=size=320x240:rate=12",
+        "smptebars=size=320x240:rate=12",
+        "testsrc2=size=320x240:rate=12",
+        "rgbtestsrc=size=320x240:rate=12",
+    ]
+    for i in range(4):
+        p = media / f"item_{i * 2 + 1:02d}_photo.png"
+        Image.new("RGB", (320, 240), colors[i]).save(p)
+        st = p.stat()
+        records.append(
+            FileRecord(
+                path=str(p), size=st.st_size, mtime=st.st_mtime,
+                media_type=MediaType.IMAGE, extension=".png",
+                device=st.st_dev, inode=st.st_ino, mtime_ns=st.st_mtime_ns,
+                width=320, height=240,
+            )
+        )
+        v = media / f"item_{i * 2 + 2:02d}_video.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                "-i", sources[i], "-t", "1", "-pix_fmt", "yuv420p", str(v),
+            ],
+            check=True,
+        )
+        sv = v.stat()
+        records.append(
+            FileRecord(
+                path=str(v), size=sv.st_size, mtime=sv.st_mtime,
+                media_type=MediaType.VIDEO, extension=".mp4",
+                device=sv.st_dev, inode=sv.st_ino, mtime_ns=sv.st_mtime_ns,
+                width=320, height=240,
+            )
+        )
+
+    app = create_app(
+        ScanResult(roots=[str(media)], files=records, groups=[]),
+        review_session_path=tmp_path / "review.json",
+    )
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    delete_statuses: list[int] = []
+    media_404s: list[str] = []
+    page.on("pageerror", lambda err: page_errors.append(str(err)))
+    page.on(
+        "console",
+        lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+    )
+    page.on(
+        "response",
+        lambda resp: (
+            delete_statuses.append(resp.status)
+            if "/api/review-candidate/delete" in resp.url
+            else media_404s.append(resp.url)
+            if "/api/media" in resp.url and resp.status == 404
+            else None
+        ),
+    )
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator(".group-item").first.click()
+        expect(page.locator("#members .triage-card")).to_have_count(8)
+
+        # 1. Clicking over the hidden .card-actions region on an unhovered card
+        #    must hit .thumb-wrap and trash the card rather than opening Lightbox.
+        unhovered_pt = page.evaluate(
+            """() => {
+                const card = document.querySelectorAll('#members .triage-card')[2];
+                const b1 = card.querySelector('.enlarge-candidate').getBoundingClientRect();
+                const b2 = card.querySelector('.reveal').getBoundingClientRect();
+                return {
+                    x: (b1.right + b2.left) / 2,
+                    y: (b1.top + b1.bottom) / 2,
+                    path: card.dataset.path,
+                };
+            }"""
+        )
+        page.mouse.click(unhovered_pt["x"], unhovered_pt["y"])
+        expect(
+            page.locator(f'#members .triage-card.deleted[data-path="{unhovered_pt["path"]}"]')
+        ).to_have_count(1)
+        expect(page.locator("#lightbox")).to_be_hidden()
+
+        # 2. Hover a video until inline hover preview plays, then click center to delete.
+        hovered_video_card = page.locator("#members .triage-card:not(.deleted):has(video)").first
+        hovered_video_path = hovered_video_card.get_attribute("data-path")
+        hovered_wrap = hovered_video_card.locator(".thumb-wrap")
+        hovered_wrap.hover()
+        page.wait_for_function(
+            """(p) => {
+                const vid = document.querySelector(
+                    `#members .triage-card[data-path=${JSON.stringify(p)}] video.hover-video`
+                );
+                return !!vid && (vid.getAttribute('src') || '').includes('/api/media') && !vid.paused;
+            }""",
+            arg=hovered_video_path,
+            timeout=5_000,
+        )
+        vbox = hovered_wrap.bounding_box()
+        assert vbox is not None
+        page.mouse.click(vbox["x"] + vbox["width"] / 2, vbox["y"] + vbox["height"] / 2)
+        expect(
+            page.locator(f'#members .triage-card.deleted[data-path="{hovered_video_path}"]')
+        ).to_have_count(1)
+
+        # 3. Rapid-fire click all 6 remaining mixed photos & videos back-to-back.
+        remaining_paths = page.evaluate(
+            """() => {
+                const wraps = [
+                    ...document.querySelectorAll(
+                        '#members .triage-card:not(.deleted) .thumb-wrap[data-click-trash]'
+                    ),
+                ];
+                wraps.forEach((w) => w.click());
+                return wraps.map((w) => w.dataset.path);
+            }"""
+        )
+        assert len(remaining_paths) == 6
+        expect(page.locator("#members .triage-card.deleted")).to_have_count(8, timeout=10_000)
+
+        for rec in records:
+            expect(
+                page.locator(f'#members .triage-card.deleted[data-path="{rec.path}"]')
+            ).to_be_visible()
+        # Allow any trailing async response callbacks to finish.
+        page.wait_for_timeout(400)
+
+        assert len(delete_statuses) == 8
+        assert all(status == 200 for status in delete_statuses)
+        assert media_404s == []
+        assert page_errors == []
+        assert console_errors == []
+        assert all(not Path(rec.path).exists() for rec in records)
+
+        # 4. Undo restores cleanly (from per-card Undo and restores all fixtures).
+        first_undo = page.locator("#members .undo-delete").first
+        first_undo_path = first_undo.get_attribute("data-path")
+        first_undo.click()
+        expect(page.locator("#members .triage-card.deleted")).to_have_count(7, timeout=5_000)
+        assert Path(first_undo_path).exists()
+
+        while page.locator("#members .undo-delete").count() > 0:
+            page.locator("#members .undo-delete").first.click()
+            page.wait_for_timeout(80)
+        expect(page.locator("#members .triage-card.deleted")).to_have_count(0, timeout=5_000)
+        assert all(Path(rec.path).exists() for rec in records)
+
+
+@pytest.mark.e2e
+def test_triage_optimistic_delete_and_server_refusal_rollback(
+    page, tmp_path: Path
+) -> None:
+    """Optimistic delete renders immediately before a delayed server reply and
+    rolls back cleanly with an error toast when the server refuses."""
+    media = tmp_path / "media"
+    media.mkdir()
+    p1 = media / "delayed.png"
+    p2 = media / "refused.png"
+    Image.new("RGB", (240, 180), (42, 104, 168)).save(p1)
+    Image.new("RGB", (240, 180), (168, 72, 58)).save(p2)
+    records = [
+        FileRecord(
+            path=str(p), size=p.stat().st_size, mtime=p.stat().st_mtime,
+            media_type=MediaType.IMAGE, extension=".png",
+            device=p.stat().st_dev, inode=p.stat().st_ino, mtime_ns=p.stat().st_mtime_ns,
+            width=240, height=180,
+        )
+        for p in (p1, p2)
+    ]
+    app = create_app(
+        ScanResult(roots=[str(media)], files=records, groups=[]),
+        review_session_path=tmp_path / "review.json",
+    )
+    app.config["DEDUPE_CACHE_PATH"] = str(tmp_path / "hash-cache.sqlite3")
+
+    gate = threading.Event()
+    mode = {"refuse": False}
+
+    def handle_delete(route):
+        if mode["refuse"]:
+            route.fulfill(
+                status=400,
+                content_type="application/json",
+                body=json.dumps({
+                    "error": "Kept in the Non-Human review — revise that decision before trashing it here"
+                }),
+            )
+            return
+        gate.wait(timeout=5)
+        route.continue_()
+
+    page.route("**/api/review-candidate/delete", handle_delete)
+
+    with _serve_app(app) as url:
+        page.goto(url, wait_until="domcontentloaded")
+        page.locator("#results").wait_for(state="visible", timeout=10_000)
+        page.locator(".group-item").first.click()
+        expect(page.locator("#members .triage-card")).to_have_count(2)
+
+        # Card 1 becomes .deleted immediately while server response is still blocked.
+        page.locator(f'#members .triage-card[data-path="{p1}"] .thumb-wrap').click()
+        expect(page.locator(f'#members .triage-card.deleted[data-path="{p1}"]')).to_be_visible(
+            timeout=500
+        )
+        assert p1.exists()  # server has not completed yet
+
+        gate.set()
+        page.locator("#toast").filter(has_text="Moved delayed.png to Trash").wait_for()
+        assert not p1.exists()
+
+        # Card 2 is optimistically marked deleted, then rolled back with an error toast.
+        mode["refuse"] = True
+        page.locator(f'#members .triage-card[data-path="{p2}"] .thumb-wrap').click()
+        page.locator("#toast.error").filter(has_text="Kept in the Non-Human review").wait_for(
+            timeout=5_000
+        )
+        expect(page.locator(f'#members .triage-card.deleted[data-path="{p2}"]')).to_have_count(0)
+        assert p2.exists()
+
+        # Undo card 1 cleanly.
+        page.locator(f'#members .triage-card[data-path="{p1}"] .undo-delete').click()
+        expect(page.locator("#members .triage-card.deleted")).to_have_count(0, timeout=5_000)
+        assert p1.exists()
