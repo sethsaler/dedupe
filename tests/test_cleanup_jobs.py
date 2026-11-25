@@ -665,3 +665,40 @@ def test_monitor_preserves_unfinished_review_and_merges_arrival_group(
     (group,) = _groups(client)
     assert {m["path"] for m in group["members"]} == {str(first), str(second), str(third)}
     client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_waits_instead_of_scanning_when_a_folder_is_missing(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    side = tmp_path / "side"
+    _image(inbox / "one.png")
+    _image(side / "two.png")
+    settings = _settings(inbox)
+    settings["paths"].append(str(side))
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", settings)
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+
+    moved = tmp_path / "side-away"
+    side.rename(moved)
+    app.extensions["dedupe_monitor"].on_change(job_id)
+
+    payload = client.get("/api/jobs").get_json()["jobs"][0]
+    assert "Waiting for missing folder" in payload["monitor_error"]
+    assert str(side) in payload["monitor_error"]
+    assert not client.get("/api/status").get_json()["scanning"]
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))

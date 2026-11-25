@@ -942,6 +942,24 @@ def create_app(
         if not job.get("monitor"):
             _stop_job_monitor(job_id)
             return
+        settings = job.get("settings") or {}
+        configured_roots = [
+            *(settings.get("paths") or []),
+            *(settings.get("protected_folders") or []),
+        ]
+        missing = [
+            str(raw) for raw in configured_roots
+            if not Path(str(raw)).expanduser().exists()
+        ]
+        if missing:
+            # Scanning now would save a review/baseline with the missing folder's
+            # files removed. The parent watch fires again when the folder returns.
+            _set_monitor_runtime(
+                job_id,
+                pending=False,
+                error="Waiting for missing folder: " + ", ".join(missing),
+            )
+            return
         payload = {"job_id": job_id, "new_only": True, "_preserve_review": True}
         try:
             # Invoke the same view as the browser so locking, persistence,
