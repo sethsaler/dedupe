@@ -122,3 +122,20 @@ def test_start_failure_shuts_down_partial_observer(tmp_path, monkeypatch) -> Non
         assert not monitor.running("job")
     finally:
         monitor.stop_all()
+
+
+def test_missing_drive_is_retried_and_attached_when_it_returns(tmp_path) -> None:
+    missing_root = tmp_path / "drive" / "inbox"
+    monitor = FolderMonitor(lambda _job: None, health_seconds=60.0)
+    try:
+        with pytest.raises(ValueError, match="No existing folders"):
+            monitor.start("job", [missing_root], {})
+        assert "job" in monitor._specs
+        assert not monitor.running("job")
+
+        missing_root.mkdir(parents=True)
+        monitor.refresh("job")
+
+        assert monitor.running("job")
+    finally:
+        monitor.stop_all()

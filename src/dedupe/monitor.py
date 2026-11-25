@@ -94,6 +94,7 @@ class FolderMonitor:
         self._observers: dict[str, Observer] = {}
         self._timers: dict[str, threading.Timer] = {}
         self._specs: dict[str, tuple[tuple[str, ...], dict]] = {}
+        self._runtime_locks: dict[str, threading.Lock] = {}
         self._watch_identities: dict[str, dict[str, tuple[int, int]]] = {}
         self._root_losses: dict[str, set[str]] = {}
         self._stopped = threading.Event()
@@ -144,6 +145,10 @@ class FolderMonitor:
             observer.schedule(handler, key, recursive=True)
         return observer
 
+    def _runtime_lock(self, job_id: str) -> threading.Lock:
+        with self._lock:
+            return self._runtime_locks.setdefault(job_id, threading.Lock())
+
     def start(
         self,
         job_id: str,
@@ -151,30 +156,36 @@ class FolderMonitor:
         settings: dict,
     ) -> list[str]:
         """Start watching a job and return the watched directory paths."""
-        self._stop_runtime(job_id)
         roots = tuple(str(root) for root in roots)
-        watched = self._watch_roots(roots)
-        if not watched:
-            raise ValueError("No existing folders to monitor")
-        observer = self._make_observer(job_id, watched, settings)
-        try:
-            observer.start()
-        except (OSError, ValueError):
-            self._shutdown_observer(observer)
-            raise
-        identities = {}
-        for key in watched:
+        spec = (roots, dict(settings))
+        runtime_lock = self._runtime_lock(job_id)
+        with runtime_lock:
+            self._stop_runtime(job_id)
+            with self._lock:
+                # Keep the spec even when a removable drive is fully absent. The
+                # health loop uses it to attach a watcher when the drive returns.
+                self._specs[job_id] = spec
+                self._root_losses.pop(job_id, None)
+            watched = self._watch_roots(roots)
+            if not watched:
+                raise ValueError("No existing folders to monitor")
+            observer = self._make_observer(job_id, watched, settings)
             try:
-                stat = Path(key).stat()
-                identities[key] = (stat.st_dev, stat.st_ino)
-            except OSError:
-                pass
-        with self._lock:
-            self._specs[job_id] = (roots, dict(settings))
-            self._root_losses.pop(job_id, None)
-            self._observers[job_id] = observer
-            self._watch_identities[job_id] = identities
-        return watched
+                observer.start()
+            except (OSError, ValueError):
+                self._shutdown_observer(observer)
+                raise
+            identities = {}
+            for key in watched:
+                try:
+                    stat = Path(key).stat()
+                    identities[key] = (stat.st_dev, stat.st_ino)
+                except OSError:
+                    pass
+            with self._lock:
+                self._observers[job_id] = observer
+                self._watch_identities[job_id] = identities
+            return watched
 
     @staticmethod
     def _shutdown_observer(observer: Observer) -> None:
@@ -236,60 +247,62 @@ class FolderMonitor:
 
     def refresh(self, job_id: str) -> None:
         """Reconfigure watches after roots disappear or are replaced."""
-        with self._lock:
-            spec = self._specs.get(job_id)
-            identities = dict(self._watch_identities.get(job_id, {}))
-            lost = set(self._root_losses.get(job_id, set()))
-        if spec is None:
-            return
-        roots, settings = spec
-        desired = self._watch_roots(roots)
-        changed = False
-        missing = set()
-        for raw_path, identity in identities.items():
-            try:
-                stat = Path(raw_path).stat()
-            except OSError:
-                missing.add(raw_path)
-                continue
-            if (stat.st_dev, stat.st_ino) != identity:
-                changed = True
-        lost |= missing
-        needs_restart = (
-            bool(lost)
-            or changed
-            or set(desired) != set(identities)
-        )
-        if not needs_restart:
-            return
-
-        self._stop_runtime(job_id)
-        with self._lock:
-            self._root_losses.pop(job_id, None)
-        if not desired:
-            return
-        observer = None
-        try:
-            observer = self._make_observer(job_id, desired, settings)
-            observer.start()
-        except (OSError, ValueError):
-            if observer is not None:
-                self._shutdown_observer(observer)
-            return
-        new_identities = {}
-        for key in desired:
-            try:
-                stat = Path(key).stat()
-                new_identities[key] = (stat.st_dev, stat.st_ino)
-            except OSError:
-                pass
-        with self._lock:
-            if self._specs.get(job_id) != spec:
-                self._shutdown_observer(observer)
+        runtime_lock = self._runtime_lock(job_id)
+        with runtime_lock:
+            with self._lock:
+                spec = self._specs.get(job_id)
+                identities = dict(self._watch_identities.get(job_id, {}))
+                lost = set(self._root_losses.get(job_id, set()))
+            if spec is None:
                 return
-            self._observers[job_id] = observer
-            self._watch_identities[job_id] = new_identities
-        self._debounce(job_id)
+            roots, settings = spec
+            desired = self._watch_roots(roots)
+            changed = False
+            missing = set()
+            for raw_path, identity in identities.items():
+                try:
+                    stat = Path(raw_path).stat()
+                except OSError:
+                    missing.add(raw_path)
+                    continue
+                if (stat.st_dev, stat.st_ino) != identity:
+                    changed = True
+            lost |= missing
+            needs_restart = (
+                bool(lost)
+                or changed
+                or set(desired) != set(identities)
+            )
+            if not needs_restart:
+                return
+
+            self._stop_runtime(job_id)
+            with self._lock:
+                self._root_losses.pop(job_id, None)
+            if not desired:
+                return
+            observer = None
+            try:
+                observer = self._make_observer(job_id, desired, settings)
+                observer.start()
+            except (OSError, ValueError):
+                if observer is not None:
+                    self._shutdown_observer(observer)
+                return
+            new_identities = {}
+            for key in desired:
+                try:
+                    stat = Path(key).stat()
+                    new_identities[key] = (stat.st_dev, stat.st_ino)
+                except OSError:
+                    pass
+            with self._lock:
+                if self._specs.get(job_id) != spec:
+                    self._shutdown_observer(observer)
+                    return
+                self._observers[job_id] = observer
+                self._watch_identities[job_id] = new_identities
+            self._debounce(job_id)
 
     def _health_loop(self) -> None:
         while not self._stopped.wait(self.health_seconds):
