@@ -32,6 +32,9 @@ def make_app(tmp_path: Path, monkeypatch):
         timer = app.extensions["dedupe_state"].get("persist_timer")
         if timer:
             timer.cancel()
+        monitor = app.extensions.get("dedupe_monitor")
+        if monitor:
+            monitor.stop_all()
 
 
 def _image(path: Path, color=(30, 80, 140)) -> Path:
@@ -268,6 +271,7 @@ def test_invalid_job_ids_are_rejected_without_touching_files(
     for route, payload in (
         ("/api/jobs", {"id": bad_id, "name": "Invalid", "settings": _settings(original.parent)}),
         ("/api/jobs/delete", {"id": bad_id}),
+        ("/api/jobs/monitor", {"id": bad_id, "enabled": True}),
         ("/api/scan", {"job_id": bad_id, **_settings(original.parent)}),
         ("/api/review-session/resume", {"job_id": bad_id}),
     ):
@@ -518,3 +522,104 @@ def test_focus_new_arrivals_preserves_multi_member_sets_and_excludes_protected_i
     assert {m.path for m in by_id["set-touching-arrival"].members} == {old.path, arrival.path}
     assert [m.path for m in by_id["lowres"].members] == [arrival.path]
     assert {m.path for m in by_id["exact"].members} == {prot_arrival.path, arrival.path}
+
+
+def test_new_arrivals_scan_passes_baseline_to_engine(tmp_path: Path, make_app, monkeypatch) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    calls = []
+    real_run_scan = web.run_scan
+
+    def spy_run_scan(*args, **kwargs):
+        calls.append(kwargs)
+        return real_run_scan(*args, **kwargs)
+
+    monkeypatch.setattr(web, "run_scan", spy_run_scan)
+    _run_job(client, app, job_id)
+    _run_job(client, app, job_id, new_only=True)
+
+    assert len(calls) == 2
+    assert calls[1]["new_only"] is True
+    stored = JobStore(tmp_path / "review.json").get(job_id)
+    assert calls[1]["baseline"] == stored["baseline"]
+
+
+def test_monitor_requires_a_baseline_and_can_be_disabled(tmp_path: Path, make_app) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 400
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["monitor"] is True
+    assert response.get_json()["monitor_active"] is True
+    assert app.extensions["dedupe_monitor"].running(job_id)
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["monitor"] is False
+    assert not app.extensions["dedupe_monitor"].running(job_id)
+
+
+def test_monitor_setting_is_restored_when_the_app_restarts(tmp_path: Path, make_app) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    # Simulate the first backend exiting before the replacement app starts.
+    app.extensions["dedupe_monitor"].stop(job_id)
+
+    restarted = make_app()
+    assert restarted.extensions["dedupe_monitor"].running(job_id)
+    jobs_payload = restarted.test_client().get("/api/jobs").get_json()["jobs"]
+    assert jobs_payload[0]["monitor"] is True
+    assert jobs_payload[0]["monitor_active"] is True
+    restarted.test_client().post(
+        "/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(restarted)
+    )
+
+
+def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, monkeypatch) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    original = _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+
+    arrival = inbox / "arrival.png"
+    arrival.write_bytes(original.read_bytes())
+    deadline = time.monotonic() + 6
+    seen_done = False
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if not status["scanning"] and "1 new or changed files" in status["progress"]["message"]:
+            seen_done = True
+            break
+        time.sleep(0.02)
+    assert seen_done, client.get("/api/status").get_json()
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(original), str(arrival)}
+
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))

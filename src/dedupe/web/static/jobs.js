@@ -45,6 +45,8 @@ function syncJobButtons(busy = state.scanning || state.acting) {
   $("btnSaveJob").disabled = busy;
   $("btnResumeJob").disabled = busy || !job?.last_scan_at;
   $("btnNewArrivals").disabled = busy || !job?.last_scan_at;
+  $("btnMonitorJob").disabled = !job || (!job.monitor && (busy || !job.last_scan_at));
+  $("btnMonitorJob").textContent = job?.monitor ? "Stop monitoring" : "Monitor folders";
   $("btnDeleteJob").disabled = busy || !job;
 }
 
@@ -61,8 +63,18 @@ function updateJobHint() {
       `Unsaved changes for "${job.name}" — click Save job or Scan to overwrite (or choose "New cleanup" to keep it unchanged).`;
     return;
   }
+  if (job.monitor) {
+    if (job.monitor_error) {
+      hint.textContent = `Monitoring issue for "${job.name}": ${job.monitor_error}`;
+    } else if (job.monitor_pending) {
+      hint.textContent = `Monitoring "${job.name}" — an automatic new-arrivals scan is waiting or running.`;
+    } else {
+      hint.textContent = `Monitoring "${job.name}" while Dedupe is open. New or changed media starts an incremental scan automatically.`;
+    }
+    return;
+  }
   hint.textContent = job.last_scan_at
-    ? `Last scanned ${new Date(job.last_scan_at).toLocaleString()}. Resume your review or check new arrivals.`
+    ? `Last scanned ${new Date(job.last_scan_at).toLocaleString()}. Resume your review, check new arrivals, or monitor its folders.`
     : `Saved job "${job.name}" — run Scan to build its baseline and review progress.`;
 }
 
@@ -168,6 +180,22 @@ $("btnNewArrivals").addEventListener("click", async () => {
   startScan({ ...job.settings, job_id: job.id, new_only: true });
 });
 
+$("btnMonitorJob").addEventListener("click", async () => {
+  const job = chosenJob();
+  if (!job) return;
+  const enabled = !job.monitor;
+  try {
+    const updated = await api("/api/jobs/monitor", {
+      method: "POST",
+      body: JSON.stringify({ id: job.id, enabled }),
+    });
+    await refreshJobs(updated.id);
+    toast(enabled
+      ? `Monitoring ${updated.name} while Dedupe is open`
+      : `Stopped monitoring ${updated.name}`, "ok");
+  } catch (error) { toast(error.message, "error"); }
+});
+
 $("btnDeleteJob").addEventListener("click", async () => {
   const job = chosenJob();
   if (!job) return;
@@ -185,8 +213,19 @@ $("btnDeleteJob").addEventListener("click", async () => {
 refreshJobs().catch((error) => toast(error.message, "error"));
 
 window.addEventListener("dedupe:work-state", (event) => {
-  const { busy, scanId, done } = event.detail;
+  const { busy, scanId, done, monitors } = event.detail;
   syncJobButtons(busy);
+  if (monitors) {
+    for (const job of jobs) {
+      const runtime = monitors[job.id] || {};
+      job.monitor_active = Boolean(runtime.active);
+      job.monitor_pending = Boolean(runtime.pending);
+      job.monitor_error = runtime.error || null;
+      job.monitor_last_event_at = runtime.last_event_at || null;
+      job.monitor_last_scan_at = runtime.last_scan_at || null;
+    }
+    updateJobHint();
+  }
   if (!busy && done && scanId !== lastCompletedScan) {
     lastCompletedScan = scanId;
     refreshJobs().catch((error) => toast(error.message, "error"));

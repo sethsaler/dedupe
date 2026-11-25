@@ -137,6 +137,7 @@ class JobStore:
             # A changed scope must receive a full pass before using a baseline.
             data.pop("baseline", None)
             data.pop("last_scan_at", None)
+            data["monitor"] = False
             self.baseline_path(data["id"]).unlink(missing_ok=True)
         elif (
             isinstance(legacy_baseline, dict)
@@ -145,6 +146,15 @@ class JobStore:
             self._write_json(
                 self.baseline_path(data["id"]), legacy_baseline, prefix=".baseline-"
             )
+        self._write(data)
+        return {key: value for key, value in data.items() if key != "baseline"}
+
+    def set_monitor(self, job_id: str, enabled: bool) -> dict:
+        data = self._read_metadata(job_id)
+        if enabled and self._read_baseline(job_id) is None:
+            raise ValueError("Run this saved job once before monitoring it")
+        data["monitor"] = bool(enabled)
+        data["updated_at"] = datetime.now(UTC).isoformat()
         self._write(data)
         return {key: value for key, value in data.items() if key != "baseline"}
 

@@ -64,11 +64,20 @@ Switching jobs does not replace another job's saved progress.
 After the job has completed a scan, **Check new arrivals** compares the current
 library and focuses review on new or changed files. Duplicate groups retain
 their older matching copies, so a new download can still be compared with the
-archive. This is a focused review backed by cached analysis, not a filesystem
-watcher: the scan still inventories the selected folders. Changing a job's
-settings requires a full scan before checking new arrivals again.
+archive. This focused review is backed by cached analysis: unchanged files reuse
+their hashes and detection results while the scan inventories the selected
+folders. Changing a job's settings requires a full scan before checking new
+arrivals again.
 
-**Delete job** removes the saved settings and review, leaving media untouched.
+**Monitor folders** turns the same new-arrivals review into an opt-in watcher
+for that saved job. While Dedupe is open, filesystem events in the job's scan
+and protected folders are debounced and start an incremental scan automatically;
+an active scan or file action is never interrupted. Monitoring catches up once
+when it starts, then reacts to later changes. It does not run after the Mac app
+is closed. Choose **Stop monitoring** to disable it.
+
+**Delete job** removes the saved settings and review, stops its folder monitor,
+and leaves media untouched.
 The ordinary **Resume saved review** banner remains available for the last review.
 
 ## Compare details

@@ -20,7 +20,7 @@ Point it at a folder, scan recursively, review groups in a browser UI, then move
 - **Safe actions** — Trash (macOS-recoverable) or move to a quarantine folder; dry-run previews; act on Exact, Similar, or Non-Human separately or all at once
 - **Scan cache** — `~/.cache/dedupe/hashes.sqlite3` reuses hashes and completed OpenCV person checks for unchanged media, hydrated in batched queries so large libraries start fast
 - **Thumbnail cache** — previews are kept on disk under `~/.cache/dedupe/thumbnails/` and pruned least-recently-used against a size budget
-- **Saved cleanup jobs** — named folders/settings with separate resumable reviews and **Check new arrivals**, which focuses results on new or changed files while comparing against the full library
+- **Saved cleanup jobs** — named folders/settings with separate resumable reviews, **Check new arrivals**, and optional **Monitor folders**, which watches scan/protected folders while the app is open and focuses incremental results on new or changed files while comparing against the full library
 - **Resumable reviews** — the last completed review and each saved job's selections are saved atomically under `~/.local/state/dedupe/` and revalidated when resumed
 - **Scan quality report** — stage timings, cache hits, failures, skips, and dependency warnings make incomplete analysis visible
 - **Local web UI** — search/sort/filter, advanced filters, bulk selection, similarity presets and explanations, a lightbox with metadata, keeper overlay/flicker comparison, full-resolution zoom, and in-place selection, keyboard navigation, native picker, dependency-gated scan options, light and dark themes (follows the OS), and isolate
@@ -129,9 +129,12 @@ For recurring work, use **Saved cleanup jobs** in Scan setup: enter a name, and 
 Selecting a job restores its folders and settings; **Resume review** restores its
 own saved progress. **Check new arrivals** compares against all current files but
 shows duplicate groups involving new or changed files and new independent review
-candidates. It requires an initial completed scan. Changed job settings require
-another full scan before checking arrivals. **Delete job** removes only that job
-and its saved review, not media.
+candidates. It requires an initial completed scan. **Monitor folders** uses the
+same incremental scan automatically while Dedupe is open: events in scan and
+protected folders are debounced, unchanged media reuses cached hashes and
+analysis, and active scans or file actions are never interrupted. Changed job
+settings require another full scan before checking arrivals or monitoring.
+**Delete job** removes only that job and its saved review, not media.
 
 Open **History** to browse completed or interrupted cleanups, even before loading
 a scan. **Restore files…** verifies the recorded destinations and original paths,
@@ -535,6 +538,7 @@ src/dedupe/
   similarity_benchmark.py # labeled near-duplicate pair benchmark
   review_session.py  # atomic resumable review storage
   jobs.py            # named cleanup jobs and new-arrival review
+  monitor.py         # per-job filesystem watching and debounced scan triggers
   parallel.py        # thread-pool map for hashing stages
   grouping.py        # ranking + smart select
   actions.py         # trash / quarantine

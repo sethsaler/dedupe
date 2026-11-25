@@ -17,6 +17,7 @@ dependencies = [
     "pybktree>=1.1",
     "send2trash>=1.8.2",
     "flask>=3.0.0",
+    "watchdog>=4.0.0",
 ]
 
 [project.optional-dependencies]

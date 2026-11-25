@@ -1308,6 +1308,12 @@ def test_incremental_new_only_short_circuits_and_isolates_arrivals(tmp_path: Pat
         str((lib / "old_master.jpg").resolve()),
         str(arrival.resolve()),
     }
+    # Cached identity/analysis is hydrated for the two unchanged baseline
+    # files, while an unchanged file that cannot match an arrival is not
+    # rehashed merely because it was present in the inventory.
+    assert inc.diagnostics.cache_hits == len(baseline)
+    old_small = next(record for record in inc.files if record.path.endswith("old_small.jpg"))
+    assert old_small.sha256 is None
     low_res = next(g for g in inc.groups if g.kind == GroupKind.LOW_RESOLUTION)
     rand_rev = next(g for g in inc.groups if g.kind == GroupKind.RANDOM_REVIEW)
     assert [m.path for m in low_res.members] == [str(arrival.resolve())]
