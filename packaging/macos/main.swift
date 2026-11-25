@@ -1,7 +1,7 @@
 import Cocoa
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var backendProcess: Process?
@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         )
         window.title = "Dedupe"
         window.minSize = NSSize(width: 900, height: 620)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
         window.setFrameAutosaveName("DedupeMainWindow")
         window.center()
 
@@ -284,13 +286,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         return busy
     }
 
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard backendIsBusy() else { return true }
+        showBusyAlert()
+        return false
+    }
+
     private func cancelBusyTermination(_ sender: NSApplication) {
-        // Closing the last window has already happened when AppKit asks to quit;
-        // vetoing that quit must put the review back on screen.
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         isTerminating = false
         sender.reply(toApplicationShouldTerminate: false)
+        // Let AppKit finish any vetoed close/termination pass before restoring
+        // the reusable window and presenting modal UI.
+        DispatchQueue.main.async {
+            self.window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            self.showBusyAlert()
+        }
+    }
+
+    private func showBusyAlert() {
         let alert = NSAlert()
         alert.messageText = "Dedupe is busy"
         alert.informativeText = "Wait for the current scan or file action to finish, then quit again."
