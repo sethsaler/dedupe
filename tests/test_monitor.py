@@ -45,6 +45,7 @@ def test_media_events_are_relevant_but_noise_is_filtered(tmp_path: Path) -> None
     assert not handler.relevant(_event(root / "notes.txt"))
     assert not handler.relevant(_event(root / ".hidden" / "photo.jpg"))
     assert not handler.relevant(_event(root / "ignored-photo.jpg"))
+    assert not handler.relevant(_event(root / "ignored" / "photo.jpg"))
     assert not handler.relevant(_event(root / "photo.jpg", event_type="opened"))
     assert not handler.relevant(_event(root / "photo.jpg", event_type="closed_no_write"))
 

@@ -104,7 +104,16 @@ class _JobEventHandler(FileSystemEventHandler):
                 part.startswith(".") for part in relative.parts if part not in (".", "")
             ):
                 continue
-            if self.excluded(path.name, relative):
+            excluded = False
+            current = Path()
+            for part in relative.parts:
+                if part in (".", ""):
+                    continue
+                current /= part
+                if self.excluded(part, current):
+                    excluded = True
+                    break
+            if excluded:
                 continue
             # A directory event can represent many media files moving at once;
             # file events are cheap to filter by the scan's enabled extensions.
