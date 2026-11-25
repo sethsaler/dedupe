@@ -89,7 +89,9 @@ What remains is installed as the current scan result exactly as if it had just b
 
 ## Named cleanup jobs
 
-Saved cleanup jobs retain their folders, protection rules, scan settings, and separate review progress. Switching jobs flushes pending review choices first. After one full scan, Check new arrivals compares the inventory with that job's baseline and shows groups containing new or changed files. Existing files remain available as comparison references. Changing job settings requires another full scan. See [the current cleanup workflow](../../cleanup-workflow.md).
+Saved cleanup jobs retain their folders, protection rules, scan settings, and separate review progress. Switching jobs flushes pending review choices first. After one full scan, Check new arrivals compares the inventory with that job's baseline and shows groups containing new or changed files. Existing files remain available as comparison references. Changing job settings requires another full scan. A job with a baseline can also opt into Monitor folders; while the app is open, relevant filesystem events debounce into the same incremental arrival scan rather than interrupting active work. Those automatic scans carry forward
+unfinished review groups instead of replacing them with only the latest batch.
+See [the current cleanup workflow](../../cleanup-workflow.md).
 
 ## Open questions and verification
 

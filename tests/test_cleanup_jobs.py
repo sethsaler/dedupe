@@ -32,6 +32,9 @@ def make_app(tmp_path: Path, monkeypatch):
         timer = app.extensions["dedupe_state"].get("persist_timer")
         if timer:
             timer.cancel()
+        monitor = app.extensions.get("dedupe_monitor")
+        if monitor:
+            monitor.stop_all()
 
 
 def _image(path: Path, color=(30, 80, 140)) -> Path:
@@ -268,6 +271,7 @@ def test_invalid_job_ids_are_rejected_without_touching_files(
     for route, payload in (
         ("/api/jobs", {"id": bad_id, "name": "Invalid", "settings": _settings(original.parent)}),
         ("/api/jobs/delete", {"id": bad_id}),
+        ("/api/jobs/monitor", {"id": bad_id, "enabled": True}),
         ("/api/scan", {"job_id": bad_id, **_settings(original.parent)}),
         ("/api/review-session/resume", {"job_id": bad_id}),
     ):
@@ -518,3 +522,306 @@ def test_focus_new_arrivals_preserves_multi_member_sets_and_excludes_protected_i
     assert {m.path for m in by_id["set-touching-arrival"].members} == {old.path, arrival.path}
     assert [m.path for m in by_id["lowres"].members] == [arrival.path]
     assert {m.path for m in by_id["exact"].members} == {prot_arrival.path, arrival.path}
+
+
+def test_new_arrivals_scan_passes_baseline_to_engine(tmp_path: Path, make_app, monkeypatch) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    calls = []
+    real_run_scan = web.run_scan
+
+    def spy_run_scan(*args, **kwargs):
+        calls.append(kwargs)
+        return real_run_scan(*args, **kwargs)
+
+    monkeypatch.setattr(web, "run_scan", spy_run_scan)
+    _run_job(client, app, job_id)
+    _run_job(client, app, job_id, new_only=True)
+
+    assert len(calls) == 2
+    assert calls[1]["new_only"] is True
+    stored = JobStore(tmp_path / "review.json").get(job_id)
+    assert calls[1]["baseline"] == stored["baseline"]
+
+
+def test_monitor_requires_a_baseline_and_can_be_disabled(tmp_path: Path, make_app) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 400
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["monitor"] is True
+    assert response.get_json()["monitor_active"] is True
+    assert app.extensions["dedupe_monitor"].running(job_id)
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["monitor"] is False
+    assert not app.extensions["dedupe_monitor"].running(job_id)
+
+
+def test_monitor_setting_is_restored_when_the_app_restarts(tmp_path: Path, make_app) -> None:
+    inbox = tmp_path / "inbox"
+    _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    # Simulate the first backend exiting before the replacement app starts.
+    app.extensions["dedupe_monitor"].stop(job_id)
+
+    restarted = make_app()
+    assert restarted.extensions["dedupe_monitor"].running(job_id)
+    jobs_payload = restarted.test_client().get("/api/jobs").get_json()["jobs"]
+    assert jobs_payload[0]["monitor"] is True
+    assert jobs_payload[0]["monitor_active"] is True
+    restarted.test_client().post(
+        "/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(restarted)
+    )
+
+
+def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, monkeypatch) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    original = _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+
+    arrival = inbox / "arrival.png"
+    arrival.write_bytes(original.read_bytes())
+    deadline = time.monotonic() + 6
+    seen_done = False
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if not status["scanning"] and "1 new or changed files" in status["progress"]["message"]:
+            seen_done = True
+            break
+        time.sleep(0.02)
+    assert seen_done, client.get("/api/status").get_json()
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(original), str(arrival)}
+
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_preserves_unfinished_review_and_merges_arrival_group(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    first = _image(inbox / "first.png")
+    second = _image(inbox / "second.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second)}
+
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second)}
+
+    third = _image(inbox / "third.png")
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if not status["scanning"] and "1 new or changed files" in status["progress"]["message"]:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"monitor scan did not finish: {client.get('/api/status').get_json()}")
+    (group,) = _groups(client)
+    assert {m["path"] for m in group["members"]} == {str(first), str(second), str(third)}
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_waits_instead_of_scanning_when_a_folder_is_missing(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    inbox = tmp_path / "inbox"
+    side = tmp_path / "side"
+    _image(inbox / "one.png")
+    _image(side / "two.png")
+    settings = _settings(inbox)
+    settings["paths"].append(str(side))
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", settings)
+    _run_job(client, app, job_id)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+
+    moved = tmp_path / "side-away"
+    side.rename(moved)
+    app.extensions["dedupe_monitor"].on_change(job_id)
+
+    payload = client.get("/api/jobs").get_json()["jobs"][0]
+    assert "Waiting for missing folder" in payload["monitor_error"]
+    assert str(side) in payload["monitor_error"]
+    assert not client.get("/api/status").get_json()["scanning"]
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_recovery_after_missing_drive_marks_runtime_active(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    drive = tmp_path / "drive"
+    inbox = drive / "inbox"
+    _image(inbox / "one.png")
+    store = JobStore(tmp_path / "review.json")
+    job = store.save("Drive", _settings(inbox))
+    result = _scan(inbox)
+    result.job_id = job["id"]
+    store.finish_scan(result)
+    store.set_monitor(job["id"], True)
+
+    moved = tmp_path / "drive-away"
+    drive.rename(moved)
+    app = make_app()
+    client = app.test_client()
+    payload = client.get("/api/jobs").get_json()["jobs"][0]
+    assert payload["monitor"] is True
+    assert payload["monitor_active"] is False
+    assert "No existing folders" in payload["monitor_error"]
+
+    moved.rename(drive)
+    app.extensions["dedupe_monitor"].refresh(job["id"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+    assert payload["monitor_active"] is True
+    assert payload["monitor_error"] is None
+
+
+def test_monitor_leaves_review_and_undo_alone_after_in_app_delete(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    """The app's own Trash and undo raise folder events but add nothing new."""
+    from PIL import ImageDraw
+
+    from dedupe import actions as actions_module
+
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    trash = tmp_path / "trash"
+
+    def fake_send_to_trash(src: Path, batch=None) -> Path:
+        trash.mkdir(exist_ok=True)
+        target = trash / src.name
+        src.rename(target)
+        return target
+
+    monkeypatch.setattr(actions_module, "_send_to_trash", fake_send_to_trash)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    base = Image.new("RGB", (512, 512), (240, 240, 240))
+    draw = ImageDraw.Draw(base)
+    draw.ellipse((60, 80, 300, 420), fill=(200, 30, 30))
+    draw.rectangle((280, 40, 480, 200), fill=(20, 60, 180))
+    draw.polygon([(100, 480), (400, 300), (500, 500)], fill=(10, 150, 60))
+    base.save(inbox / "a.png")
+    base.resize((400, 400)).save(inbox / "b.png")
+    base.resize((300, 300)).save(inbox / "c.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", {**_settings(inbox), "similar": True})
+    _run_job(client, app, job_id)
+    (group,) = _groups(client, "similar")
+    scan_id = _scan_id(client)
+    response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
+                           headers=_headers(app))
+    assert response.status_code == 200, response.get_json()
+    state = app.extensions["dedupe_state"]
+    checks = []
+    real_inventory = web.inventory
+
+    def counting_inventory(*args, **kwargs):
+        records = real_inventory(*args, **kwargs)
+        checks.append(len(records))
+        return records
+
+    monkeypatch.setattr(web, "inventory", counting_inventory)
+
+    def wait_for_check(expected_files: int) -> None:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if expected_files in checks:
+                # Let the check that saw this inventory finish deciding.
+                time.sleep(0.3)
+                return
+            time.sleep(0.02)
+        pytest.fail(f"monitor never checked the folder: {checks}")
+
+    wait_for_check(3)  # the catch-up pass after enabling
+    assert _scan_id(client) == scan_id
+
+    victim = group["members"][0]["path"]
+    deleted = client.post("/api/review-candidate/delete", headers=_headers(app), json={
+        "scan_id": scan_id, "group_id": group["id"], "path": victim, "dry_run": False,
+    })
+    assert deleted.status_code == 200, deleted.get_json()
+    wait_for_check(2)
+    status = client.get("/api/status").get_json()
+    assert status["scan_id"] == scan_id
+    assert status["trash_undo_cleared"] == 0
+    assert victim in state["deleted_files"]
+
+    checks.clear()
+    restored = client.post("/api/review-candidate/undo", headers=_headers(app), json={
+        "scan_id": scan_id, "group_id": group["id"], "path": victim,
+    })
+    assert restored.status_code == 200, restored.get_json()
+    assert Path(victim).exists()
+    wait_for_check(3)
+    assert _scan_id(client) == scan_id
+    (group,) = _groups(client, "similar")
+    assert len(group["members"]) == 3
+    client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))

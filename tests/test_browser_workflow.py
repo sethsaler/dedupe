@@ -53,6 +53,9 @@ def live_dedupe_server(tmp_path: Path):
             assert response.status == 200
         yield url
     finally:
+        monitor = app.extensions.get("dedupe_monitor")
+        if monitor:
+            monitor.stop_all()
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
@@ -146,6 +149,33 @@ def test_local_review_workflow(page, live_dedupe_server: str, duplicate_images: 
     ]
     assert page_errors == []
     assert console_errors == []
+
+
+@pytest.mark.e2e
+def test_saved_job_monitor_control_enables_and_disables(
+    page, live_dedupe_server: str, duplicate_images: Path,
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.goto(live_dedupe_server, wait_until="domcontentloaded")
+
+    page.locator("#paths").fill(str(duplicate_images))
+    page.locator("#cleanupJobName").fill("Inbox watch")
+    page.locator("#btnSaveJob").click()
+    page.locator("#toast").filter(has_text="Saved Inbox watch").wait_for(state="visible")
+    page.locator("#btnScan").click()
+    page.locator("#actionBar").wait_for(state="visible", timeout=20_000)
+    page.locator("#toast").filter(has_text="Done").wait_for(state="visible")
+    page.locator("#scanCollapse").click()
+
+    expect(page.locator("#btnMonitorJob")).to_be_enabled()
+    page.locator("#btnMonitorJob").click()
+    expect(page.locator("#btnMonitorJob")).to_have_text("Stop monitoring")
+    expect(page.locator("#jobHint")).to_contain_text("Monitoring")
+
+    page.locator("#btnMonitorJob").click()
+    expect(page.locator("#btnMonitorJob")).to_have_text("Monitor folders")
+    assert page_errors == []
 
 
 @pytest.mark.e2e

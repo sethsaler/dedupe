@@ -102,7 +102,7 @@ The progress line becomes the final summary — the folded scan bar drops the fi
 
 ## Saved jobs and protected libraries
 
-The setup includes Saved cleanup jobs and Compare against a protected library. Protected folders join the comparison but never supply removal candidates, even with bulk rules. The folder protection survives saved reviews and rescans. Video clips & versions adds manual review of matched video sections and sampled audio. See [the current cleanup workflow](../../cleanup-workflow.md) for the controls and limitations.
+The setup includes Saved cleanup jobs and Compare against a protected library. Protected folders join the comparison but never supply removal candidates, even with bulk rules. The folder protection survives saved reviews and rescans. After a completed scan, a job can opt into **Monitor folders**: while Dedupe is open, debounced filesystem events in scan and protected folders start incremental new-arrivals scans that reuse cached analysis. Video clips & versions adds manual review of matched video sections and sampled audio. See [the current cleanup workflow](../../cleanup-workflow.md) for the controls and limitations.
 
 ## Open questions and verification
 

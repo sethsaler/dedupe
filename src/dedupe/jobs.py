@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import json
 import os
 import re
@@ -137,6 +139,7 @@ class JobStore:
             # A changed scope must receive a full pass before using a baseline.
             data.pop("baseline", None)
             data.pop("last_scan_at", None)
+            data["monitor"] = False
             self.baseline_path(data["id"]).unlink(missing_ok=True)
         elif (
             isinstance(legacy_baseline, dict)
@@ -145,6 +148,15 @@ class JobStore:
             self._write_json(
                 self.baseline_path(data["id"]), legacy_baseline, prefix=".baseline-"
             )
+        self._write(data)
+        return {key: value for key, value in data.items() if key != "baseline"}
+
+    def set_monitor(self, job_id: str, enabled: bool) -> dict:
+        data = self._read_metadata(job_id)
+        if enabled and self._read_baseline(job_id) is None:
+            raise ValueError("Run this saved job once before monitoring it")
+        data["monitor"] = bool(enabled)
+        data["updated_at"] = datetime.now(UTC).isoformat()
         self._write(data)
         return {key: value for key, value in data.items() if key != "baseline"}
 
@@ -210,3 +222,281 @@ def focus_new_arrivals(result: ScanResult, baseline: dict) -> int:
     result.groups = groups
     result.recompute_stats()
     return len(arrivals)
+
+
+def _default_keep_one_selection(group) -> set[str]:
+    """The automatic selection a freshly built exact/similar group would have."""
+    if group.match_basis in ("semantic", "video_version"):
+        return set()
+    keep = group.suggested_keep or group.anchor_path
+    if keep is None and group.members:
+        keep = max((member.path for member in group.members), default=None)
+    return {
+        member.path
+        for member in group.members
+        if member.path != keep and not member.protected
+    }
+
+
+def _fuse_saved_analysis(current: FileRecord, previous: FileRecord | None) -> FileRecord:
+    """Fresh identity/stat fields with saved analysis filled in when missing."""
+    if previous is None:
+        return current
+    merged = copy.deepcopy(current)
+    for field in dataclasses.fields(FileRecord):
+        if getattr(merged, field.name) is None:
+            setattr(merged, field.name, getattr(previous, field.name))
+    return merged
+
+
+def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[str, FileRecord],
+                              arrivals: set[str]):
+    """Union same-kind old/new keep-one groups connected through shared members."""
+    parent = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    owner: dict[str, int] = {}
+    for index, (group, is_new) in enumerate(entries):
+        for member in group.members:
+            # A replaced path is not evidence that its old byte-identical group
+            # and its new group are the same duplicate set.
+            if not is_new and member.path in arrivals:
+                continue
+            if member.path in owner:
+                union(index, owner[member.path])
+            else:
+                owner[member.path] = index
+
+    components: dict[int, list[tuple[object, bool]]] = {}
+    for index, entry in enumerate(entries):
+        components.setdefault(find(index), []).append(entry)
+
+    old_members = {
+        member.path: member
+        for group, is_new in entries
+        if not is_new
+        for member in group.members
+    }
+    merged_groups = []
+    for component in components.values():
+        # New groups come first in ``entries`` and therefore own the id/template.
+        new_paths = {
+            member.path
+            for group, is_new in component
+            if is_new
+            for member in group.members
+        }
+        ordered_members = []
+        seen = set()
+        for group, is_new in component:
+            for member in group.members:
+                if member.path in seen or member.path not in records:
+                    continue
+                # A changed file's old membership is evidence only when the fresh
+                # scan still connects it to this component.
+                if member.path in arrivals and member.path not in new_paths:
+                    continue
+                seen.add(member.path)
+                if member.path in arrivals:
+                    # A replacement at the same path must not inherit hashes,
+                    # crop measurements, or detector verdicts from different bytes.
+                    ordered_members.append(records[member.path])
+                elif is_new:
+                    ordered_members.append(
+                        _fuse_saved_analysis(records[member.path], old_members.get(member.path))
+                    )
+                else:
+                    # Unchanged files keep their saved analysis (crop metadata,
+                    # detector verdicts, hashes) instead of inventory-only records.
+                    ordered_members.append(member)
+        if len(ordered_members) < 2:
+            continue
+        member_paths = {member.path for member in ordered_members}
+        merged = copy.deepcopy(component[0][0])
+        merged.members = ordered_members
+        saved_deselections = set()
+        for group, is_new in component:
+            if is_new:
+                continue
+            saved_deselections.update(
+                set(group.reviewed_paths) - set(group.selected_for_removal)
+            )
+            if set(group.selected_for_removal) != _default_keep_one_selection(group):
+                # A manual keep-one edit is not otherwise marked server-side.
+                # Once the saved state differs from the automatic suggestion,
+                # every unchanged unselected member is a keep decision that a
+                # fresh automatic pick must not undo.
+                saved_deselections.update(
+                    member.path
+                    for member in group.members
+                    if member.path not in arrivals
+                    and member.path not in group.selected_for_removal
+                )
+        saved_selections = set()
+        saved_reviewed = set()
+        for group, is_new in component:
+            for path in group.selected_for_removal:
+                if is_new or path not in arrivals:
+                    saved_selections.add(path)
+            for path in group.reviewed_paths:
+                if is_new or path not in arrivals:
+                    saved_reviewed.add(path)
+        merged.selected_for_removal = sorted(
+            (saved_selections - saved_deselections) & member_paths
+        )
+        merged.reviewed_paths = sorted(saved_reviewed & member_paths)
+        merged.distinct_participants = sorted({
+            path
+            for group, _is_new in component
+            for path in group.distinct_participants
+        })
+        merged.reviewed = all(group.reviewed for group, _is_new in component)
+        merged.suggested_keep = next(
+            (
+                group.suggested_keep
+                for group, _is_new in component
+                if group.suggested_keep in member_paths
+            ),
+            None,
+        )
+        merged.match_scores = {}
+        merged.match_details = {}
+        merged.match_explanations = {}
+        for group, _is_new in reversed(component):
+            merged.match_scores.update(group.match_scores)
+            merged.match_details.update(group.match_details)
+            merged.match_explanations.update(group.match_explanations)
+        merged_groups.append(merged)
+    return merged_groups
+
+
+def _merge_match_metadata(target, source, arrivals: set[str]) -> None:
+    """Carry saved per-member analysis metadata that the fresh group lacks."""
+    for key, value in source.match_details.items():
+        if key == "adjusted_crops" and isinstance(value, dict):
+            value = {path: box for path, box in value.items() if path not in arrivals}
+        existing = target.match_details.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged = copy.deepcopy(value)
+            merged.update(existing)
+            target.match_details[key] = merged
+        elif key not in target.match_details:
+            target.match_details[key] = copy.deepcopy(value)
+    for mapping_name in ("match_scores", "match_explanations"):
+        target_mapping = getattr(target, mapping_name)
+        for key, value in getattr(source, mapping_name).items():
+            target_mapping.setdefault(key, value)
+
+
+def _restored_original_paths(group, records: dict) -> set[str]:
+    """Paths whose current file is exactly the object an undo restored."""
+    restored = group.match_details.get("restored_originals") or {}
+    if not isinstance(restored, dict):
+        return set()
+    return {
+        path
+        for path, identity in restored.items()
+        if path in records and file_identity(records[path]) == identity
+    }
+
+
+def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, baseline: dict) -> None:
+    """Carry unchanged pending review groups into an incremental arrival result.
+
+    Incremental scans intentionally do not re-verify old-vs-old pairs. The prior
+    review is therefore the positive evidence for pairs among unchanged files:
+    unchanged non-overlapping groups are carried forward, and same-kind groups
+    connected through an arrival are unioned instead of dropping older copies.
+    """
+    if previous is None or not previous.groups:
+        return
+    arrivals = new_arrival_paths(result, baseline)
+    records = {record.path: record for record in result.files}
+    groups = list(result.groups)
+
+    for kind in (GroupKind.EXACT, GroupKind.SIMILAR):
+        entries = [(group, True) for group in groups if group.kind == kind]
+        entries.extend(
+            (group, False) for group in previous.groups if group.kind == kind
+        )
+        if not entries:
+            continue
+        merged = _merge_cluster_components(entries, records, arrivals)
+        groups = [group for group in groups if group.kind != kind] + merged
+
+    # Independent review tabs are often one group per kind. Preserve unchanged
+    # candidates in the matching fresh group when one exists, otherwise carry
+    # the old group forward with only the members that still have current records.
+    for old in previous.groups:
+        if old.kind in (GroupKind.ALL_FILES, GroupKind.EXACT, GroupKind.SIMILAR):
+            continue
+        target = next((group for group in groups if group.kind == old.kind), None)
+        target_paths = {
+            member.path for group in groups if group.kind == old.kind
+            for member in group.members
+        }
+        restored_unchanged = _restored_original_paths(old, records)
+        effective_arrivals = arrivals - restored_unchanged
+        preserved = []
+        unchanged_preserved = []
+        carried = []
+        seen = set()
+        target_member_paths = (
+            {member.path for member in target.members} if target is not None else set()
+        )
+        for member in old.members:
+            if member.path in seen or member.path not in records:
+                continue
+            if member.path in effective_arrivals and member.path not in target_paths:
+                continue
+            seen.add(member.path)
+            kept_member = records[member.path] if member.path in effective_arrivals else member
+            preserved.append(kept_member)
+            if member.path not in effective_arrivals:
+                unchanged_preserved.append(kept_member)
+            if member.path not in target_member_paths:
+                carried.append(kept_member)
+        minimum = 2 if old.kind == GroupKind.SETS else 1
+        if target is None and len(carried) < minimum:
+            continue
+        unchanged_preserved_paths = {member.path for member in unchanged_preserved}
+        carried_paths = {member.path for member in carried}
+        if target is not None:
+            target.members.extend(carried)
+            saved_deselections = set(old.reviewed_paths) - set(old.selected_for_removal)
+            # ``-`` binds tighter than ``|``: the union needs its own parentheses
+            # or a saved Keep decision is re-selected by the fresh group.
+            target.selected_for_removal = sorted((
+                (
+                    set(target.selected_for_removal)
+                    | (set(old.selected_for_removal) & unchanged_preserved_paths)
+                )
+                - (saved_deselections & unchanged_preserved_paths)
+            ) & {member.path for member in target.members})
+            target.reviewed_paths = sorted(
+                set(target.reviewed_paths) | (set(old.reviewed_paths) & unchanged_preserved_paths)
+            )
+            _merge_match_metadata(target, old, effective_arrivals)
+        else:
+            kept = copy.deepcopy(old)
+            kept.members = carried
+            kept.selected_for_removal = [
+                path for path in old.selected_for_removal if path in carried_paths
+            ]
+            kept.reviewed_paths = [
+                path for path in old.reviewed_paths if path in carried_paths
+            ]
+            groups.append(kept)
+
+    result.groups = groups
+    result.recompute_stats()
