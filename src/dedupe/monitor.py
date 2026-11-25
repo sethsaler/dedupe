@@ -211,10 +211,12 @@ class FolderMonitor:
             self._shutdown_observer(observer)
 
     def stop(self, job_id: str) -> None:
-        self._stop_runtime(job_id)
-        with self._lock:
-            self._specs.pop(job_id, None)
-            self._root_losses.pop(job_id, None)
+        runtime_lock = self._runtime_lock(job_id)
+        with runtime_lock:
+            self._stop_runtime(job_id)
+            with self._lock:
+                self._specs.pop(job_id, None)
+                self._root_losses.pop(job_id, None)
 
     def stop_all(self) -> None:
         self._stopped.set()

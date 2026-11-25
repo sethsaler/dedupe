@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -155,4 +156,59 @@ def test_unreadable_root_is_missing_without_killing_health_thread(tmp_path) -> N
         assert monitor._health_thread.is_alive()
     finally:
         restricted.chmod(0o700)
+        monitor.stop_all()
+
+
+def test_stop_waits_for_startup_and_cleans_observer(tmp_path, monkeypatch) -> None:
+    import dedupe.monitor as monitor_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    instances = []
+
+    class BlockingObserver:
+        def __init__(self):
+            self.running = False
+            instances.append(self)
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            entered.set()
+            assert release.wait(timeout=2)
+            self.running = True
+
+        def stop(self):
+            self.running = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self.running
+
+    monkeypatch.setattr(monitor_module, "Observer", BlockingObserver)
+    monitor = FolderMonitor(lambda _job: None, health_seconds=60.0)
+    try:
+        starter = threading.Thread(
+            target=monitor.start,
+            args=("job", [tmp_path], {}),
+        )
+        starter.start()
+        assert entered.wait(timeout=1)
+        stopper = threading.Thread(target=monitor.stop, args=("job",))
+        stopper.start()
+        time.sleep(0.02)
+        assert stopper.is_alive()
+        release.set()
+        starter.join(timeout=2)
+        stopper.join(timeout=2)
+        assert not starter.is_alive()
+        assert not stopper.is_alive()
+        assert not monitor.running("job")
+        assert "job" not in monitor._specs
+        assert instances and not instances[0].is_alive()
+    finally:
+        release.set()
         monitor.stop_all()
