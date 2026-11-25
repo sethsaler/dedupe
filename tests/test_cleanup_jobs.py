@@ -604,9 +604,27 @@ def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, mon
     client = app.test_client()
     job_id = _save_job(client, app, "Imports", _settings(inbox))
     _run_job(client, app, job_id)
+    checks = []
+    real_inventory = web.inventory
+
+    def counting_inventory(*args, **kwargs):
+        records = real_inventory(*args, **kwargs)
+        checks.append(len(records))
+        return records
+
+    monkeypatch.setattr(web, "inventory", counting_inventory)
     response = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": True},
                            headers=_headers(app))
     assert response.status_code == 200, response.get_json()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+    assert checks == [1]
+    checks.clear()
 
     arrival = inbox / "arrival.png"
     arrival.write_bytes(original.read_bytes())
@@ -621,6 +639,31 @@ def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, mon
     assert seen_done, client.get("/api/status").get_json()
     (group,) = _groups(client)
     assert {m["path"] for m in group["members"]} == {str(original), str(arrival)}
+    # A file-only arrival is verified from the event path and file identity;
+    # the precheck does not inventory every file in the watched folder again.
+    assert checks == []
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "folder-arrival.png").write_bytes(original.read_bytes())
+    # Moving a populated directory into the watch reports a directory event
+    # whose contents cannot be checked one file at a time.
+    outside.rename(inbox / "directory-arrival")
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        status = client.get("/api/status").get_json()
+        if (
+            not status["scanning"]
+            and "1 new or changed files" in status["progress"]["message"]
+            and checks
+        ):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"directory arrival did not finish: {client.get('/api/status').get_json()}")
+    # Directory creation/moves can hide many nested arrivals, so those events
+    # deliberately keep the broader inventory fallback.
+    assert checks
 
     client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
 
@@ -800,6 +843,16 @@ def test_monitor_leaves_review_and_undo_alone_after_in_app_delete(
             time.sleep(0.02)
         pytest.fail(f"monitor never checked the folder: {checks}")
 
+    def wait_for_monitor_event(previous: str | None = None) -> str:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            payload = client.get("/api/jobs").get_json()["jobs"][0]
+            current = payload.get("monitor_last_event_at")
+            if current and current != previous:
+                return current
+            time.sleep(0.02)
+        pytest.fail("monitor never saw the folder event")
+
     wait_for_check(3)  # the catch-up pass after enabling
     assert _scan_id(client) == scan_id
 
@@ -808,19 +861,24 @@ def test_monitor_leaves_review_and_undo_alone_after_in_app_delete(
         "scan_id": scan_id, "group_id": group["id"], "path": victim, "dry_run": False,
     })
     assert deleted.status_code == 200, deleted.get_json()
-    wait_for_check(2)
+    delete_event_at = wait_for_monitor_event()
+    time.sleep(0.3)
+    # The deletion event was file-only, so the monitor checked that file's
+    # identity directly instead of inventorying the whole watched folder.
+    assert checks == [3]
     status = client.get("/api/status").get_json()
     assert status["scan_id"] == scan_id
     assert status["trash_undo_cleared"] == 0
     assert victim in state["deleted_files"]
 
-    checks.clear()
     restored = client.post("/api/review-candidate/undo", headers=_headers(app), json={
         "scan_id": scan_id, "group_id": group["id"], "path": victim,
     })
     assert restored.status_code == 200, restored.get_json()
     assert Path(victim).exists()
-    wait_for_check(3)
+    wait_for_monitor_event(delete_event_at)
+    time.sleep(0.3)
+    assert checks == [3]
     assert _scan_id(client) == scan_id
     (group,) = _groups(client, "similar")
     assert len(group["members"]) == 3
