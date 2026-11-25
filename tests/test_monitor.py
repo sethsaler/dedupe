@@ -139,3 +139,20 @@ def test_missing_drive_is_retried_and_attached_when_it_returns(tmp_path) -> None
         assert monitor.running("job")
     finally:
         monitor.stop_all()
+
+
+def test_unreadable_root_is_missing_without_killing_health_thread(tmp_path) -> None:
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+    missing_inside = restricted / "inbox"
+    restricted.chmod(0)
+    monitor = FolderMonitor(lambda _job: None, health_seconds=0.01)
+    try:
+        assert monitor._watch_roots([missing_inside]) == []
+        monitor._specs["job"] = ((str(missing_inside),), {})
+        monitor.refresh("job")
+        time.sleep(0.05)
+        assert monitor._health_thread.is_alive()
+    finally:
+        restricted.chmod(0o700)
+        monitor.stop_all()

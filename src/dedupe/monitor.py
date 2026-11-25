@@ -106,10 +106,17 @@ class FolderMonitor:
         watched: list[str] = []
         seen: set[str] = set()
         for raw_root in roots:
-            root = Path(raw_root).expanduser().resolve(strict=False)
-            watch_root = root if root.is_dir() else root.parent
+            try:
+                root = Path(raw_root).expanduser().resolve(strict=False)
+                watch_root = root if root.is_dir() else root.parent
+                if not watch_root.is_dir():
+                    continue
+            except OSError:
+                # An unreadable mount point is missing for watch purposes; the
+                # health retry must not kill recovery for every other job.
+                continue
             key = str(watch_root)
-            if key in seen or not watch_root.is_dir() or is_in_photos_library(watch_root):
+            if key in seen or is_in_photos_library(watch_root):
                 continue
             seen.add(key)
             watched.append(key)
@@ -309,7 +316,10 @@ class FolderMonitor:
             with self._lock:
                 job_ids = list(self._specs)
             for job_id in job_ids:
-                self.refresh(job_id)
+                try:
+                    self.refresh(job_id)
+                except (OSError, ValueError):
+                    continue
 
     def _fire(self, job_id: str) -> None:
         with self._lock:
