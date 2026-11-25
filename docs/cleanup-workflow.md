@@ -73,8 +73,10 @@ arrivals again.
 for that saved job. While Dedupe is open, filesystem events in the job's scan
 and protected folders are debounced and start an incremental scan automatically;
 an active scan or file action is never interrupted. Monitoring catches up once
-when it starts, then reacts to later changes. It does not run after the Mac app
-is closed. Choose **Stop monitoring** to disable it.
+when it starts, then reacts to later changes. Automatic monitor scans preserve
+unfinished review groups and merge later arrivals into them instead of erasing
+the saved review. It does not run after the Mac app is closed. Choose
+**Stop monitoring** to disable it.
 
 **Delete job** removes the saved settings and review, stops its folder monitor,
 and leaves media untouched.
