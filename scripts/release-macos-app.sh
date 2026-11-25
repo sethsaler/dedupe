@@ -38,6 +38,7 @@ missing=()
 ((${#missing[@]} == 0)) || die "required release credentials are absent: ${missing[*]} (see --help)"
 command -v codesign >/dev/null 2>&1 || die 'codesign is unavailable (install Xcode command-line tools)'
 command -v xcrun >/dev/null 2>&1 || die 'xcrun is unavailable (install Xcode command-line tools)'
+command -v file >/dev/null 2>&1 || die 'file is unavailable'
 
 printf 'Plan:\n'
 printf '  codesign Developer ID bundle: %q\n' "$APP"
@@ -46,7 +47,15 @@ printf '  submit with notarytool profile: %q (team %q)\n' "$NOTARYTOOL_PROFILE" 
 printf '  staple and verify the accepted ticket\n'
 ((EXECUTE)) || { printf 'Dry run only; pass --execute to perform these operations.\n'; exit 0; }
 
-codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
+# PyInstaller keeps its Python framework and extension modules under
+# Resources/backend, outside the nested-code locations `codesign --deep` is
+# documented to visit. Sign every Mach-O there inside out before sealing the app.
+while IFS= read -r -d '' candidate; do
+  if file -b "$candidate" | grep -q 'Mach-O'; then
+    codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$candidate"
+  fi
+done < <(find "$APP/Contents/Resources/backend" -type f -print0)
+codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
 ARCHIVE="${APP%.app}-notarization.zip"
 trap 'rm -f "$ARCHIVE"' EXIT
 /usr/bin/ditto -c -k --keepParent "$APP" "$ARCHIVE"
