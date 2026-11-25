@@ -702,3 +702,40 @@ def test_monitor_waits_instead_of_scanning_when_a_folder_is_missing(
     assert str(side) in payload["monitor_error"]
     assert not client.get("/api/status").get_json()["scanning"]
     client.post("/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(app))
+
+
+def test_monitor_recovery_after_missing_drive_marks_runtime_active(
+    tmp_path: Path, make_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(web, "MONITOR_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(web, "MONITOR_BUSY_RETRY_SECONDS", 0.05)
+    drive = tmp_path / "drive"
+    inbox = drive / "inbox"
+    _image(inbox / "one.png")
+    store = JobStore(tmp_path / "review.json")
+    job = store.save("Drive", _settings(inbox))
+    result = _scan(inbox)
+    result.job_id = job["id"]
+    store.finish_scan(result)
+    store.set_monitor(job["id"], True)
+
+    moved = tmp_path / "drive-away"
+    drive.rename(moved)
+    app = make_app()
+    client = app.test_client()
+    payload = client.get("/api/jobs").get_json()["jobs"][0]
+    assert payload["monitor"] is True
+    assert payload["monitor_active"] is False
+    assert "No existing folders" in payload["monitor_error"]
+
+    moved.rename(drive)
+    app.extensions["dedupe_monitor"].refresh(job["id"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        payload = client.get("/api/jobs").get_json()["jobs"][0]
+        if payload.get("monitor_last_scan_at"):
+            break
+        time.sleep(0.02)
+    assert payload.get("monitor_last_scan_at")
+    assert payload["monitor_active"] is True
+    assert payload["monitor_error"] is None

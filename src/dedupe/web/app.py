@@ -956,6 +956,7 @@ def create_app(
             # files removed. The parent watch fires again when the folder returns.
             _set_monitor_runtime(
                 job_id,
+                active=monitor_service.running(job_id),
                 pending=False,
                 error="Waiting for missing folder: " + ", ".join(missing),
             )
@@ -979,6 +980,7 @@ def create_app(
         if status == 200:
             _set_monitor_runtime(
                 job_id,
+                active=monitor_service.running(job_id),
                 pending=False,
                 error=None,
                 last_scan_at=datetime.now(UTC).isoformat(),
@@ -990,6 +992,7 @@ def create_app(
             message = body.get("error") if isinstance(body, dict) else None
             _set_monitor_runtime(
                 job_id,
+                active=monitor_service.running(job_id),
                 pending=False,
                 error=message or f"monitor scan failed with HTTP {status}",
             )
