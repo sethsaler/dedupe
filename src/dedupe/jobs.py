@@ -307,7 +307,11 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
                 if member.path in arrivals and member.path not in new_paths:
                     continue
                 seen.add(member.path)
-                if is_new or member.path in arrivals:
+                if member.path in arrivals:
+                    # A replacement at the same path must not inherit hashes,
+                    # crop measurements, or detector verdicts from different bytes.
+                    ordered_members.append(records[member.path])
+                elif is_new:
                     ordered_members.append(
                         _fuse_saved_analysis(records[member.path], old_members.get(member.path))
                     )
@@ -338,16 +342,19 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
                     if member.path not in arrivals
                     and member.path not in group.selected_for_removal
                 )
-        merged.selected_for_removal = sorted(({
-            path
-            for group, _is_new in component
-            for path in group.selected_for_removal
-        } - saved_deselections) & member_paths)
-        merged.reviewed_paths = sorted({
-            path
-            for group, _is_new in component
-            for path in group.reviewed_paths
-        } & member_paths)
+        saved_selections = set()
+        saved_reviewed = set()
+        for group, is_new in component:
+            for path in group.selected_for_removal:
+                if is_new or path not in arrivals:
+                    saved_selections.add(path)
+            for path in group.reviewed_paths:
+                if is_new or path not in arrivals:
+                    saved_reviewed.add(path)
+        merged.selected_for_removal = sorted(
+            (saved_selections - saved_deselections) & member_paths
+        )
+        merged.reviewed_paths = sorted(saved_reviewed & member_paths)
         merged.distinct_participants = sorted({
             path
             for group, _is_new in component
@@ -373,9 +380,11 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
     return merged_groups
 
 
-def _merge_match_metadata(target, source) -> None:
+def _merge_match_metadata(target, source, arrivals: set[str]) -> None:
     """Carry saved per-member analysis metadata that the fresh group lacks."""
     for key, value in source.match_details.items():
+        if key == "adjusted_crops" and isinstance(value, dict):
+            value = {path: box for path, box in value.items() if path not in arrivals}
         existing = target.match_details.get(key)
         if isinstance(existing, dict) and isinstance(value, dict):
             merged = copy.deepcopy(value)
@@ -425,6 +434,7 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
             for member in group.members
         }
         preserved = []
+        unchanged_preserved = []
         carried = []
         seen = set()
         target_member_paths = (
@@ -438,25 +448,27 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
             seen.add(member.path)
             kept_member = records[member.path] if member.path in arrivals else member
             preserved.append(kept_member)
+            if member.path not in arrivals:
+                unchanged_preserved.append(kept_member)
             if member.path not in target_member_paths:
                 carried.append(kept_member)
         minimum = 2 if old.kind == GroupKind.SETS else 1
         if target is None and len(carried) < minimum:
             continue
-        preserved_paths = {member.path for member in preserved}
+        unchanged_preserved_paths = {member.path for member in unchanged_preserved}
         carried_paths = {member.path for member in carried}
         if target is not None:
             target.members.extend(carried)
             saved_deselections = set(old.reviewed_paths) - set(old.selected_for_removal)
             target.selected_for_removal = sorted((
                 set(target.selected_for_removal)
-                | (set(old.selected_for_removal) & preserved_paths)
+                | (set(old.selected_for_removal) & unchanged_preserved_paths)
                 - saved_deselections
             ) & {member.path for member in target.members})
             target.reviewed_paths = sorted(
-                set(target.reviewed_paths) | (set(old.reviewed_paths) & preserved_paths)
+                set(target.reviewed_paths) | (set(old.reviewed_paths) & unchanged_preserved_paths)
             )
-            _merge_match_metadata(target, old)
+            _merge_match_metadata(target, old, arrivals)
         else:
             kept = copy.deepcopy(old)
             kept.members = carried

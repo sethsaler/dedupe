@@ -132,3 +132,32 @@ def test_merge_preserves_unmarked_manual_deselection() -> None:
 
     (merged,) = [group for group in result.groups if group.kind == GroupKind.EXACT]
     assert merged.selected_for_removal == [arrival.path]
+
+
+def test_replacement_does_not_inherit_crop_decision_or_adjustment() -> None:
+    old = _record("/photo.jpg", 1, mtime=1000, width=1200)
+    replacement = _record("/photo.jpg", 9, mtime=2000)
+    previous = ScanResult(
+        roots=["/"], files=[old], groups=[
+            _group(
+                GroupKind.CROP,
+                [old],
+                selected_for_removal=[old.path],
+                reviewed_paths=[old.path],
+                match_details={"adjusted_crops": {old.path: "10,10,100,100,1200,800"}},
+            )
+        ],
+    )
+    result = ScanResult(
+        roots=["/"], files=[replacement], groups=[
+            _group(GroupKind.CROP, [replacement], match_details={"adjusted_crops": {}})
+        ],
+    )
+
+    merge_new_arrival_review(result, previous, _baseline(old))
+
+    (crop,) = [group for group in result.groups if group.kind == GroupKind.CROP]
+    assert crop.selected_for_removal == []
+    assert crop.reviewed_paths == []
+    assert crop.match_details["adjusted_crops"] == {}
+    assert crop.members[0].width is None
