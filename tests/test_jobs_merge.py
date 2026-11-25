@@ -6,7 +6,14 @@ from dedupe.jobs import file_identity, merge_new_arrival_review
 from dedupe.models import FileRecord, GroupKind, MediaType, ReviewGroup, ScanResult
 
 
-def _record(path: str, inode: int, *, mtime: float = 1000.0, width=None) -> FileRecord:
+def _record(
+    path: str,
+    inode: int,
+    *,
+    mtime: float = 1000.0,
+    width=None,
+    ctime_ns: int | None = None,
+) -> FileRecord:
     return FileRecord(
         path=path,
         size=100,
@@ -16,7 +23,7 @@ def _record(path: str, inode: int, *, mtime: float = 1000.0, width=None) -> File
         device=1,
         inode=inode,
         mtime_ns=int(mtime * 1_000_000_000),
-        ctime_ns=int(mtime * 1_000_000_000),
+        ctime_ns=ctime_ns if ctime_ns is not None else int(mtime * 1_000_000_000),
         width=width,
     )
 
@@ -161,3 +168,40 @@ def test_replacement_does_not_inherit_crop_decision_or_adjustment() -> None:
     assert crop.reviewed_paths == []
     assert crop.match_details["adjusted_crops"] == {}
     assert crop.members[0].width is None
+
+
+def test_undo_restored_crop_keeps_custom_adjustment() -> None:
+    original = _record("/photo.jpg", 1, mtime=1000, width=1200)
+    restored = _record("/photo.jpg", 22, mtime=2000, ctime_ns=2001, width=1200)
+    identity = [
+        restored.size,
+        restored.mtime_sort_stamp,
+        restored.ctime_ns,
+        restored.device,
+        restored.inode,
+    ]
+    previous = ScanResult(
+        roots=["/"], files=[restored], groups=[
+            _group(
+                GroupKind.CROP,
+                [restored],
+                match_details={
+                    "adjusted_crops": {restored.path: "10,10,100,100,1200,800"},
+                    "restored_originals": {restored.path: identity},
+                },
+            )
+        ],
+    )
+    fresh = _record("/photo.jpg", 22, mtime=2000, ctime_ns=2001)
+    result = ScanResult(
+        roots=["/"], files=[fresh], groups=[
+            _group(GroupKind.CROP, [fresh], match_details={"adjusted_crops": {}})
+        ],
+    )
+
+    merge_new_arrival_review(result, previous, _baseline(original))
+
+    (crop,) = [group for group in result.groups if group.kind == GroupKind.CROP]
+    assert crop.match_details["adjusted_crops"] == {
+        restored.path: "10,10,100,100,1200,800"
+    }

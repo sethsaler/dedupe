@@ -398,6 +398,18 @@ def _merge_match_metadata(target, source, arrivals: set[str]) -> None:
             target_mapping.setdefault(key, value)
 
 
+def _restored_original_paths(group, records: dict) -> set[str]:
+    """Paths whose current file is exactly the object an undo restored."""
+    restored = group.match_details.get("restored_originals") or {}
+    if not isinstance(restored, dict):
+        return set()
+    return {
+        path
+        for path, identity in restored.items()
+        if path in records and file_identity(records[path]) == identity
+    }
+
+
 def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, baseline: dict) -> None:
     """Carry unchanged pending review groups into an incremental arrival result.
 
@@ -433,6 +445,8 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
             member.path for group in groups if group.kind == old.kind
             for member in group.members
         }
+        restored_unchanged = _restored_original_paths(old, records)
+        effective_arrivals = arrivals - restored_unchanged
         preserved = []
         unchanged_preserved = []
         carried = []
@@ -443,12 +457,12 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
         for member in old.members:
             if member.path in seen or member.path not in records:
                 continue
-            if member.path in arrivals and member.path not in target_paths:
+            if member.path in effective_arrivals and member.path not in target_paths:
                 continue
             seen.add(member.path)
-            kept_member = records[member.path] if member.path in arrivals else member
+            kept_member = records[member.path] if member.path in effective_arrivals else member
             preserved.append(kept_member)
-            if member.path not in arrivals:
+            if member.path not in effective_arrivals:
                 unchanged_preserved.append(kept_member)
             if member.path not in target_member_paths:
                 carried.append(kept_member)
@@ -468,7 +482,7 @@ def merge_new_arrival_review(result: ScanResult, previous: ScanResult | None, ba
             target.reviewed_paths = sorted(
                 set(target.reviewed_paths) | (set(old.reviewed_paths) & unchanged_preserved_paths)
             )
-            _merge_match_metadata(target, old, arrivals)
+            _merge_match_metadata(target, old, effective_arrivals)
         else:
             kept = copy.deepcopy(old)
             kept.members = carried

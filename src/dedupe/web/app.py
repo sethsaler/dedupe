@@ -3240,6 +3240,19 @@ def create_app(
             ),
         })
         update_records_locked(path, before)
+        mtime_stamp = int(
+            before["mtime_ns"]
+            if before.get("mtime_ns") is not None
+            else before["mtime"] * 1_000_000_000
+        )
+        restored_originals = group.match_details.setdefault("restored_originals", {})
+        restored_originals[path] = [
+            before["size"],
+            mtime_stamp,
+            before.get("ctime_ns"),
+            before.get("device"),
+            before.get("inode"),
+        ]
         return before
 
     def finish_crop_locked(group) -> dict:
