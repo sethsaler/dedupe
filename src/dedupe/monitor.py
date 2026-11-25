@@ -149,7 +149,28 @@ class FolderMonitor:
         self._health_thread.start()
 
     @staticmethod
-    def _watch_roots(roots: Iterable[str]) -> list[str]:
+    def _watch_roots(roots: Iterable[str], settings: dict | None = None) -> list[str]:
+        settings = settings or {}
+        exclusions = settings.get("exclusions") or []
+        if isinstance(exclusions, str):
+            exclusions = exclusions.split(",")
+        patterns = {e.strip().lower() for e in exclusions if str(e).strip()}
+        patterns |= BUILTIN_EXCLUSIONS
+        excluded = _exclusion_matcher(patterns)
+        include_hidden = bool(settings.get("include_hidden", False))
+
+        def same_filter_semantics(relative: Path) -> bool:
+            current = Path()
+            for part in relative.parts:
+                if part in (".", ""):
+                    continue
+                if not include_hidden and part.startswith("."):
+                    return False
+                current /= part
+                if excluded(part, current):
+                    return False
+            return True
+
         watched: list[str] = []
         seen: set[str] = set()
         for raw_root in roots:
@@ -175,10 +196,16 @@ class FolderMonitor:
         collapsed: list[str] = []
         candidates = sorted((Path(key) for key in watched), key=lambda path: len(path.parts))
         for candidate in candidates:
-            if any(
-                candidate == existing or candidate.is_relative_to(existing)
-                for existing in (Path(key) for key in collapsed)
-            ):
+            nested_with_same_semantics = False
+            for existing in (Path(key) for key in collapsed):
+                try:
+                    relative = candidate.relative_to(existing)
+                except ValueError:
+                    continue
+                if candidate == existing or same_filter_semantics(relative):
+                    nested_with_same_semantics = True
+                    break
+            if nested_with_same_semantics:
                 continue
             collapsed.append(str(candidate))
         return collapsed
@@ -236,7 +263,7 @@ class FolderMonitor:
                 # health loop uses it to attach a watcher when the drive returns.
                 self._specs[job_id] = spec
                 self._root_losses.pop(job_id, None)
-            watched = self._watch_roots(roots)
+            watched = self._watch_roots(roots, settings)
             if not watched:
                 raise ValueError("No existing folders to monitor")
             observer = self._make_observer(job_id, watched, settings)
@@ -346,7 +373,7 @@ class FolderMonitor:
             if spec is None:
                 return
             roots, settings = spec
-            desired = self._watch_roots(roots)
+            desired = self._watch_roots(roots, settings)
             changed = False
             missing = set()
             for raw_path, identity in identities.items():

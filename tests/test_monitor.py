@@ -227,6 +227,27 @@ def test_nested_watch_roots_are_collapsed_to_one_recursive_watch(tmp_path) -> No
         monitor.stop_all()
 
 
+
+def test_hidden_or_excluded_explicit_roots_keep_their_own_watch(tmp_path) -> None:
+    parent = tmp_path / "parent"
+    hidden = parent / ".hidden"
+    excluded = parent / "excluded"
+    hidden.mkdir(parents=True)
+    excluded.mkdir()
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=60.0)
+    try:
+        assert set(monitor._watch_roots([hidden, parent])) == {
+            str(parent.resolve()),
+            str(hidden.resolve()),
+        }
+        assert set(monitor._watch_roots([excluded, parent], {"exclusions": ["excluded"]})) == {
+            str(parent.resolve()),
+            str(excluded.resolve()),
+        }
+    finally:
+        monitor.stop_all()
+
+
 def test_continuous_events_fire_within_a_bounded_batch_window() -> None:
     fired_at = []
     monitor = FolderMonitor(
