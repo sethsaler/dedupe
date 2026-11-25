@@ -4,6 +4,11 @@
    (.decision-card) and the Similar views keep their own steps. */
 
 @layer theme {
+:root {
+  /* Dual-contrast 28x28 bullseye + X target cursor centered at (14, 14) */
+  --cursor-trash-delete: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28'%3E%3Ccircle cx='14' cy='14' r='11' fill='rgba(17,17,17,0.72)' stroke='%23ffffff' stroke-width='2'/%3E%3Ccircle cx='14' cy='14' r='9.5' fill='none' stroke='%23ff3b30' stroke-width='1.5'/%3E%3Cpath d='M9.8 9.8 L18.2 18.2 M18.2 9.8 L9.8 18.2' stroke='%23ffffff' stroke-width='3.6' stroke-linecap='round'/%3E%3Cpath d='M9.8 9.8 L18.2 18.2 M18.2 9.8 L9.8 18.2' stroke='%23ff3b30' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E") 14 14, pointer;
+}
+
 /* ---------- Contact sheet grid ----------
    --tile-size comes from the Preview size slider (240-520px). Triage cells use half
    of it so the default 360px lands at five to six columns on a 1440px window. */
@@ -22,6 +27,7 @@
   box-shadow: none;
   overflow: visible;
   transform: none;
+  cursor: default;
 }
 
 #members.triage-grid .triage-card:hover {
@@ -87,6 +93,47 @@
 #members.triage-grid .triage-card .thumb-wrap {
   background: var(--lt-loupe);
   border-radius: 4px;
+}
+
+#members.triage-grid .triage-card.focus-card div.thumb-wrap {
+  cursor: default;
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash]:not(:disabled) {
+  cursor: var(--cursor-trash-delete);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  transition: transform 0.12s var(--ease-out);
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash]:disabled {
+  cursor: not-allowed;
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash] > :is(img, video, .thumb-badge, .video-preview-badge) {
+  pointer-events: none;
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash]:not(:disabled)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 1;
+  box-shadow: inset 0 0 0 2px transparent;
+  background-color: transparent;
+  transition: box-shadow 0.14s var(--ease-out), background-color 0.14s var(--ease-out);
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash]:not(:disabled):hover::after {
+  box-shadow: inset 0 0 0 2px var(--lt-pencil);
+  background-color: rgba(201, 42, 20, 0.08);
+}
+
+#members.triage-grid .triage-card .thumb-wrap[data-click-trash]:not(:disabled):active {
+  transform: scale(0.985);
 }
 
 #members.triage-grid .triage-card .thumb-wrap:focus-visible {
@@ -203,7 +250,12 @@
   position: relative;
   z-index: 2;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.15s var(--ease-out);
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > * {
+  pointer-events: none;
 }
 
 #members.triage-grid .triage-card:not(.focus-card):hover .card-actions,
@@ -212,9 +264,17 @@
   opacity: 1;
 }
 
+#members.triage-grid .triage-card:not(.focus-card):is(:hover, .focused, :focus-within, .deleted) .card-actions > * {
+  pointer-events: auto;
+}
+
 @media (hover: none) {
   #members.triage-grid .triage-card:not(.focus-card) .card-actions {
     opacity: 1;
+  }
+
+  #members.triage-grid .triage-card:not(.focus-card) .card-actions > * {
+    pointer-events: auto;
   }
 }
 
@@ -237,6 +297,23 @@
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+#members.triage-grid .triage-card .card-actions > .delete-candidate:not(:disabled) {
+  cursor: var(--cursor-trash-delete);
+}
+
+#members.triage-grid .triage-card .card-actions > .delete-candidate:disabled {
+  cursor: not-allowed;
+}
+
+#members.triage-grid .triage-card:not(.focus-card) .card-actions > .enlarge-candidate,
+#members.triage-grid .triage-card .card-actions > .inspect-media {
+  cursor: zoom-in;
+}
+
+#members.triage-grid .triage-card .card-actions > .reveal {
   cursor: pointer;
 }
 
@@ -265,8 +342,33 @@
 /* ---------- Trashed placeholder ----------
    Pencil-soft fill, 1.5px dashed pencil border, centered "Moved to Trash" text and
    an ink underlined Undo link. The name stays, struck through in graphite. */
+@keyframes triage-trash-in {
+  from {
+    opacity: 0.35;
+    transform: scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 #members.triage-grid .triage-card.deleted {
   opacity: 1;
+}
+
+/* Keep deleted gallery card geometry identical to live cards so trashing an
+   entire row never shifts lower rows under the cursor. */
+#members.triage-grid .triage-card.deleted:not(.focus-card) .card-meta {
+  display: flex;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+#members.triage-grid .triage-card.deleted:not(.focus-card) .card-body .evidence {
+  display: block;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 #members.triage-grid .triage-card .deleted-preview {
@@ -276,6 +378,7 @@
   border: 1.5px dashed var(--lt-pencil);
   border-radius: 4px;
   cursor: default;
+  animation: triage-trash-in 0.16s var(--ease-out) both;
 }
 
 #members.triage-grid .triage-card .deleted-preview .thumb-fallback {
@@ -312,12 +415,36 @@
   font-weight: 500;
   text-decoration: underline;
   text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+#members.triage-grid .triage-card.deleted .card-actions > .undo-delete:disabled {
+  cursor: not-allowed;
+}
+
+#members.triage-grid .triage-card .name {
+  transition: color 0.14s var(--ease-out);
 }
 
 #members.triage-grid .triage-card.deleted .name {
   color: var(--lt-graphite);
   text-decoration: line-through;
   text-decoration-thickness: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #members.triage-grid .triage-card .thumb-wrap[data-click-trash],
+  #members.triage-grid .triage-card .thumb-wrap[data-click-trash]::after,
+  #members.triage-grid .triage-card:not(.focus-card) .card-actions,
+  #members.triage-grid .triage-card .deleted-preview,
+  #members.triage-grid .triage-card .name {
+    transition: none;
+    animation: none;
+  }
+
+  #members.triage-grid .triage-card .thumb-wrap[data-click-trash]:not(:disabled):active {
+    transform: none;
+  }
 }
 
 /* ---------- Toolbar: layout segmented control, quiet selects ---------- */

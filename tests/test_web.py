@@ -903,7 +903,11 @@ def test_review_ui_exposes_clear_selection_controls(tmp_path: Path) -> None:
     assert "collapseScanPanel" in script
 
     stylesheet = app.test_client().get("/static/app.css").get_data(as_text=True)
-    assert ".thumb-wrap[data-click-trash] { cursor: pointer; }" in stylesheet
+    assert ".thumb-wrap[data-click-trash]:not(:disabled)" in stylesheet
+    assert "cursor: var(--cursor-trash-delete, pointer);" in stylesheet
+    triage_stylesheet = app.test_client().get("/static/theme-triage.css").get_data(as_text=True)
+    assert "--cursor-trash-delete: url(" in triage_stylesheet
+    assert "cursor: var(--cursor-trash-delete);" in triage_stylesheet
     assert "aspect-ratio: var(--preview-aspect-ratio);" in stylesheet
     assert "aspect-ratio: 16 / 10;" not in stylesheet
     assert ".triage-card .thumb-wrap" in stylesheet
@@ -4496,3 +4500,314 @@ def test_action_undo_blocked_details_allow_partial_sets_groups_and_semantic_defa
     while client.get("/api/status").get_json()["scanning"] and time.monotonic() < deadline:
         time.sleep(0.02)
     assert seen_kwargs["semantic_duplicate_threshold"] == 0.92
+
+
+def _make_media_record(path: Path, payload: bytes, media_type: MediaType, **extra) -> FileRecord:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    st = path.stat()
+    return FileRecord(
+        path=str(path),
+        size=st.st_size,
+        mtime=st.st_mtime,
+        media_type=media_type,
+        extension=path.suffix.lower(),
+        device=st.st_dev,
+        inode=st.st_ino,
+        mtime_ns=st.st_mtime_ns,
+        **extra,
+    )
+
+
+def test_one_click_review_candidate_delete_runs_single_pass_and_keeps_safety(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash"))
+    root = tmp_path / "media"
+    photo = _make_media_record(root / "photo.jpg", b"photo-bytes", MediaType.IMAGE, width=100, height=100)
+    video = _make_media_record(root / "clip.mp4", b"video-bytes", MediaType.VIDEO)
+    changed = _make_media_record(root / "changed.jpg", b"original", MediaType.IMAGE)
+    symlink_target = tmp_path / "outside-target.jpg"
+    symlink_target.write_bytes(b"sym-target")
+    sym_path = root / "link.jpg"
+    sym_path.symlink_to(symlink_target)
+    sym_stat = sym_path.lstat()
+    sym_rec = FileRecord(
+        path=str(sym_path),
+        size=sym_stat.st_size,
+        mtime=sym_stat.st_mtime,
+        media_type=MediaType.IMAGE,
+        extension=".jpg",
+        device=sym_stat.st_dev,
+        inode=sym_stat.st_ino,
+        mtime_ns=sym_stat.st_mtime_ns,
+    )
+    outside = _make_media_record(
+        tmp_path / "outside.jpg",
+        b"outside",
+        MediaType.IMAGE,
+        human_detection_status="no_person_detected",
+        human_detection_signature=human_detection_signature(),
+    )
+
+    changed_file = Path(changed.path)
+    changed_file.write_bytes(b"mutated-after-scan")
+
+    low_res = build_low_resolution_groups([photo])
+    outside_group = DuplicateGroup(
+        id="outside-nh",
+        kind=GroupKind.NO_HUMANS,
+        media_type=MediaType.IMAGE,
+        members=[outside],
+    )
+    result = ScanResult(
+        roots=[str(root)],
+        files=[photo, video, changed, sym_rec, outside],
+        groups=[*low_res, outside_group],
+    )
+    app = create_app(result, review_session_path=tmp_path / "review.json")
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    all_files = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()["groups"][0]
+    low_res_group = client.get("/api/groups", query_string={"kind": "low_resolution"}).get_json()["groups"][0]
+
+    # Mark photo as Kept in Low-res so Files one-click delete must veto it.
+    kept = client.post(
+        "/api/selection",
+        json={
+            "group_id": low_res_group["id"],
+            "decision_path": photo.path,
+            "decision_remove": False,
+            "scan_id": scan_id,
+        },
+        headers=headers,
+    )
+    assert kept.status_code == 200
+
+    calls: list[dict] = []
+    real_apply = web_app.apply_actions
+
+    def spy_apply(groups, **kwargs):
+        res = real_apply(groups, **kwargs)
+        calls.append({"dry_run": kwargs.get("dry_run"), "log_path": res.log_path})
+        return res
+
+    monkeypatch.setattr(web_app, "apply_actions", spy_apply)
+
+    vetoed = client.post(
+        "/api/review-candidate/delete",
+        json={"group_id": all_files["id"], "path": photo.path, "scan_id": scan_id, "dry_run": False},
+        headers=headers,
+    )
+    assert vetoed.status_code == 400
+    assert "Kept in the Low-res review" in vetoed.get_json()["error"]
+    assert len(calls) == 0  # veto short-circuits before calling apply_actions
+
+    # One-click delete of video calls apply_actions exactly once with dry_run=False.
+    deleted = client.post(
+        "/api/review-candidate/delete",
+        json={"group_id": all_files["id"], "path": video.path, "scan_id": scan_id, "dry_run": False},
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted_paths"] == [video.path]
+    assert [c["dry_run"] for c in calls] == [False]
+    assert calls[0]["log_path"] and Path(calls[0]["log_path"]).exists()
+    state = app.extensions["dedupe_state"]
+    assert video.path in state["deleted_files"]
+
+    # Changed file, symlink, and out-of-root file all refuse safely with 400.
+    for group_id, bad_path, expected in (
+        (all_files["id"], changed.path, "changed since scan"),
+        (all_files["id"], sym_rec.path, "symbolic link"),
+        (outside_group.id, outside.path, "outside"),
+    ):
+        resp = client.post(
+            "/api/review-candidate/delete",
+            json={"group_id": group_id, "path": bad_path, "scan_id": scan_id, "dry_run": False},
+            headers=headers,
+        )
+        assert resp.status_code == 400
+        assert expected in resp.get_json()["error"]
+
+
+def test_rapid_review_candidate_delete_and_undo_never_409_and_flush_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(actions_module, "_send_to_trash", _fake_web_trash(tmp_path / "trash"))
+    root = tmp_path / "media"
+    records = [
+        _make_media_record(root / "p1.jpg", b"p1", MediaType.IMAGE),
+        _make_media_record(root / "v1.mp4", b"v1", MediaType.VIDEO),
+        _make_media_record(root / "p2.jpg", b"p2", MediaType.IMAGE),
+        _make_media_record(root / "v2.mp4", b"v2", MediaType.VIDEO),
+    ]
+    review_path = tmp_path / "review.json"
+    app = create_app(ScanResult(roots=[str(root)], files=records, groups=[]), review_session_path=review_path)
+    client = app.test_client()
+    headers = {"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]}
+    state = app.extensions["dedupe_state"]
+    scan_id = client.get("/api/status").get_json()["scan_id"]
+    all_files = client.get("/api/groups", query_string={"kind": "all_files"}).get_json()["groups"][0]
+
+    # Part A: While synchronous persistence is slow/blocked, acting is already False
+    # so back-to-back delete + undo requests succeed immediately without 409.
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    real_save = web_app.save_review_session
+    block_first = True
+
+    def blocking_save(*args, **kwargs):
+        nonlocal block_first
+        if block_first:
+            block_first = False
+            persist_entered.set()
+            assert persist_release.wait(5)
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(web_app, "save_review_session", blocking_save)
+    first_result: dict = {}
+
+    def run_first_delete() -> None:
+        resp = app.test_client().post(
+            "/api/review-candidate/delete",
+            json={"group_id": all_files["id"], "path": records[0].path, "scan_id": scan_id, "dry_run": False},
+            headers=headers,
+        )
+        first_result["status"] = resp.status_code
+
+    t1 = threading.Thread(target=run_first_delete)
+    t1.start()
+    assert persist_entered.wait(5)
+    assert state["acting"] is False  # released before persistence
+
+    second_result: dict = {}
+
+    def run_second_delete() -> None:
+        resp = app.test_client().post(
+            "/api/review-candidate/delete",
+            json={"group_id": all_files["id"], "path": records[1].path, "scan_id": scan_id, "dry_run": False},
+            headers=headers,
+        )
+        second_result["status"] = resp.status_code
+
+    t2 = threading.Thread(target=run_second_delete)
+    t2.start()
+    deadline = time.monotonic() + 5
+    while records[1].path not in state["deleted_files"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert records[1].path in state["deleted_files"]
+
+    persist_release.set()
+    t1.join(5)
+    t2.join(5)
+    assert first_result["status"] == 200
+    assert second_result["status"] == 200
+
+    second_undo = client.post(
+        "/api/review-candidate/undo",
+        json={"group_id": all_files["id"], "path": records[1].path, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert second_undo.status_code == 200
+    assert Path(records[1].path).exists()
+
+    # Part B: Debounced mode — rapid deletes + undo don't 409, SSE never flickers acting=true,
+    # and /api/review-session/resume flushes pending debounced state.
+    monkeypatch.setattr(web_app, "save_review_session", real_save)
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_MIN_GROUPS", 0)
+    monkeypatch.setattr(web_app, "PERSIST_DEBOUNCE_SECONDS", 30.0)
+
+    sse_acting_values: list[bool] = []
+    sse_ready = threading.Event()
+    sse_stop = threading.Event()
+
+    def read_sse() -> None:
+        resp = app.test_client().get("/api/events")
+        sse_ready.set()
+        event_name = None
+        for raw in resp.response:
+            if sse_stop.is_set():
+                break
+            chunk = raw.decode("utf-8", errors="ignore")
+            for line in chunk.splitlines():
+                if line.startswith("event: "):
+                    event_name = line[7:].strip()
+                elif line.startswith("data: ") and event_name == "status":
+                    payload = json.loads(line[6:])
+                    sse_acting_values.append(bool(payload.get("acting")))
+
+    sse_thread = threading.Thread(target=read_sse, daemon=True)
+    sse_thread.start()
+    assert sse_ready.wait(5)
+
+    # Single-card delete must not flicker acting=true in SSE status broadcasts.
+    single = client.post(
+        "/api/review-candidate/delete",
+        json={"group_id": all_files["id"], "path": records[1].path, "scan_id": scan_id, "dry_run": False},
+        headers=headers,
+    )
+    assert single.status_code == 200
+    deadline = time.monotonic() + 2
+    while len(sse_acting_values) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    sse_stop.set()
+    assert len(sse_acting_values) >= 2
+    assert all(val is False for val in sse_acting_values)
+
+    # Rapid back-to-back deletes + undo succeed cleanly without 409.
+    for rec in records[2:]:
+        r = client.post(
+            "/api/review-candidate/delete",
+            json={"group_id": all_files["id"], "path": rec.path, "scan_id": scan_id, "dry_run": False},
+            headers=headers,
+        )
+        assert r.status_code == 200
+    u = client.post(
+        "/api/review-candidate/undo",
+        json={"group_id": all_files["id"], "path": records[2].path, "scan_id": scan_id},
+        headers=headers,
+    )
+    assert u.status_code == 200
+    assert state["acting"] is False
+    assert state["persist_dirty"] is True
+
+    resumed = client.post("/api/review-session/resume", json={}, headers=headers)
+    assert resumed.status_code == 200
+    assert state["persist_dirty"] is False
+    scan_id2 = resumed.get_json()["scan_id"]
+    resumed_group = client.get(f"/api/groups/{all_files['id']}").get_json()
+    assert set(resumed_group["deleted_paths"]) == {records[0].path, records[1].path, records[3].path}
+
+    # Part C: /api/shutdown flushes any pending debounced undo/delete before stopping.
+    monkeypatch.setattr(web_app, "SHUTDOWN_GRACE_SECONDS", 0.05)
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    fake = FakeServer()
+    app.extensions["dedupe_server"] = fake
+    u2 = client.post(
+        "/api/review-candidate/undo",
+        json={"group_id": all_files["id"], "path": records[3].path, "scan_id": scan_id2},
+        headers=headers,
+    )
+    assert u2.status_code == 200
+    assert state["persist_dirty"] is True
+
+    assert client.post("/api/shutdown", json={}, headers=headers).status_code == 200
+    deadline = time.monotonic() + 5
+    while not fake.shutdown_calls and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert fake.shutdown_calls == 1
+    assert state["persist_dirty"] is False
+
+    from dedupe.review_session import load_review_session
+
+    saved = load_review_session(review_path)
+    assert set(saved.deleted_files) == {records[0].path, records[1].path}

@@ -1601,9 +1601,18 @@ kbd {
   cursor: zoom-in;
 }
 
-/* Triage pictures move to Trash on click instead of enlarging, so they take
-   the plain click pointer rather than the magnifying glass. */
-.thumb-wrap[data-click-trash] { cursor: pointer; }
+/* Triage pictures and videos move to Trash on click instead of enlarging, so
+   they take the delete target cursor defined in theme-triage.css. */
+.thumb-wrap[data-click-trash]:not(:disabled) {
+  cursor: var(--cursor-trash-delete, pointer);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+
+.thumb-wrap[data-click-trash] > :is(img, video, .thumb-badge, .video-preview-badge) {
+  pointer-events: none;
+}
 
 /* Tall originals should fit on screen without scrolling through the preview. */
 .card:not(.triage-card) .thumb-wrap { max-height: 58vh; }
