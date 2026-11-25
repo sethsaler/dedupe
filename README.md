@@ -131,7 +131,8 @@ own saved progress. **Check new arrivals** compares against all current files bu
 shows duplicate groups involving new or changed files and new independent review
 candidates. It requires an initial completed scan. **Monitor folders** uses the
 same incremental scan automatically while Dedupe is open: events in scan and
-protected folders are debounced, unchanged media reuses cached hashes and
+protected folders are debounced with a bounded batch delay, overlapping folders
+share recursive watchers, unchanged media reuses cached hashes and
 analysis, and active scans or file actions are never interrupted. Changed job
 settings require another full scan before checking arrivals or monitoring.
 **Delete job** removes only that job and its saved review, not media.

@@ -22,7 +22,7 @@ def _handler(root: Path, **overrides) -> _JobEventHandler:
         "exclusions": [],
     }
     options.update(overrides)
-    return _JobEventHandler(root, lambda: None, **options)
+    return _JobEventHandler(root, lambda *_args: None, **options)
 
 
 def _event(path: Path, *, directory: bool = False, dest_path: str = "", event_type: str = "modified"):
@@ -39,11 +39,13 @@ def test_media_events_are_relevant_but_noise_is_filtered(tmp_path: Path) -> None
     handler = _handler(root, exclusions=["ignored*"])
 
     assert handler.relevant(_event(root / "inbox" / "photo.jpg"))
-    assert handler.relevant(_event(root / "inbox", directory=True))
+    assert handler.relevant(_event(root / "inbox", directory=True, event_type="created"))
+    assert not handler.relevant(_event(root / "inbox", directory=True))
     assert handler.relevant(_event(root / "old.txt", dest_path=str(root / "renamed.mov")))
     assert not handler.relevant(_event(root / "notes.txt"))
     assert not handler.relevant(_event(root / ".hidden" / "photo.jpg"))
     assert not handler.relevant(_event(root / "ignored-photo.jpg"))
+    assert not handler.relevant(_event(root / "ignored" / "photo.jpg"))
     assert not handler.relevant(_event(root / "photo.jpg", event_type="opened"))
     assert not handler.relevant(_event(root / "photo.jpg", event_type="closed_no_write"))
 
@@ -62,7 +64,7 @@ def test_recreated_watch_root_is_reattached(tmp_path) -> None:
     root = tmp_path / "watch"
     root.mkdir()
     monitor = FolderMonitor(
-        lambda job_id: events.append(job_id), debounce_seconds=0.02, health_seconds=0.02
+        lambda job_id, _change: events.append(job_id), debounce_seconds=0.02, health_seconds=0.02
     )
     try:
         monitor.start("job", [root], {})
@@ -115,7 +117,7 @@ def test_start_failure_shuts_down_partial_observer(tmp_path, monkeypatch) -> Non
             return self.running
 
     monkeypatch.setattr(monitor_module, "Observer", FailingObserver)
-    monitor = FolderMonitor(lambda _job: None)
+    monitor = FolderMonitor(lambda *_args: None)
     try:
         with pytest.raises(OSError, match="emitter failed"):
             monitor.start("job", [tmp_path], {})
@@ -127,7 +129,7 @@ def test_start_failure_shuts_down_partial_observer(tmp_path, monkeypatch) -> Non
 
 def test_missing_drive_is_retried_and_attached_when_it_returns(tmp_path) -> None:
     missing_root = tmp_path / "drive" / "inbox"
-    monitor = FolderMonitor(lambda _job: None, health_seconds=60.0)
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=60.0)
     try:
         with pytest.raises(ValueError, match="No existing folders"):
             monitor.start("job", [missing_root], {})
@@ -147,7 +149,7 @@ def test_unreadable_root_is_missing_without_killing_health_thread(tmp_path) -> N
     restricted.mkdir()
     missing_inside = restricted / "inbox"
     restricted.chmod(0)
-    monitor = FolderMonitor(lambda _job: None, health_seconds=0.01)
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=0.01)
     try:
         assert monitor._watch_roots([missing_inside]) == []
         monitor._specs["job"] = ((str(missing_inside),), {})
@@ -189,7 +191,7 @@ def test_stop_waits_for_startup_and_cleans_observer(tmp_path, monkeypatch) -> No
             return self.running
 
     monkeypatch.setattr(monitor_module, "Observer", BlockingObserver)
-    monitor = FolderMonitor(lambda _job: None, health_seconds=60.0)
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=60.0)
     try:
         starter = threading.Thread(
             target=monitor.start,
@@ -211,4 +213,63 @@ def test_stop_waits_for_startup_and_cleans_observer(tmp_path, monkeypatch) -> No
         assert instances and not instances[0].is_alive()
     finally:
         release.set()
+        monitor.stop_all()
+
+
+def test_nested_watch_roots_are_collapsed_to_one_recursive_watch(tmp_path) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=60.0)
+    try:
+        assert monitor._watch_roots([child, parent]) == [str(parent.resolve())]
+    finally:
+        monitor.stop_all()
+
+
+
+def test_hidden_or_excluded_explicit_roots_keep_their_own_watch(tmp_path) -> None:
+    parent = tmp_path / "parent"
+    hidden = parent / ".hidden"
+    excluded = parent / "excluded"
+    hidden.mkdir(parents=True)
+    excluded.mkdir()
+    monitor = FolderMonitor(lambda *_args: None, health_seconds=60.0)
+    try:
+        assert set(monitor._watch_roots([hidden, parent])) == {
+            str(parent.resolve()),
+            str(hidden.resolve()),
+        }
+        assert set(monitor._watch_roots([excluded, parent], {"exclusions": ["excluded"]})) == {
+            str(parent.resolve()),
+            str(excluded.resolve()),
+        }
+    finally:
+        monitor.stop_all()
+
+
+def test_continuous_events_fire_within_a_bounded_batch_window() -> None:
+    fired_at = []
+    monitor = FolderMonitor(
+        lambda *_args: fired_at.append(time.monotonic()),
+        debounce_seconds=0.05,
+        health_seconds=60.0,
+    )
+    try:
+        class IdleObserver:
+            def stop(self):
+                return None
+
+            def join(self, timeout=None):
+                return None
+
+        monitor._observers["job"] = IdleObserver()
+        start = time.monotonic()
+        monitor._record_change("job", ["/tmp/one.jpg"], False)
+        while time.monotonic() - start < 0.4 and not fired_at:
+            monitor._record_change("job", ["/tmp/two.jpg"], False)
+            time.sleep(0.02)
+        assert fired_at, "continuous events starved the monitor scan"
+        assert fired_at[0] - start < 0.4
+    finally:
         monitor.stop_all()

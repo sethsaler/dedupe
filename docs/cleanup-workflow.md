@@ -72,13 +72,17 @@ arrivals again.
 **Monitor folders** turns the same new-arrivals review into an opt-in watcher
 for that saved job. While Dedupe is open, filesystem events in the job's scan
 and protected folders are debounced and start an incremental scan automatically;
-an active scan or file action is never interrupted. Monitoring catches up once
-when it starts, then reacts to later changes. Automatic monitor scans preserve
+continuous bursts still scan within a bounded delay, and an active scan or file
+action is never interrupted. Overlapping scan/protected folders share one
+recursive watcher instead of triggering duplicate scans. Monitoring catches up
+once when it starts, then reacts to later changes. Automatic monitor scans preserve
 unfinished review groups and merge later arrivals into them instead of erasing
 the saved review. A change that adds nothing new — including Dedupe's own
 Trash, quarantine, crop, and undo actions — does not start a scan, so the
-open review and in-app Trash undo stay as they are. If a folder or removable
-drive is temporarily missing,
+open review and in-app Trash undo stay as they are. File-only events are
+checked directly by path and file identity, so a no-op does not inventory the
+whole library; directory moves keep a broader inventory fallback because they
+can contain many arrivals. If a folder or removable drive is temporarily missing,
 monitoring waits rather than saving an incomplete review and reattaches when it
 returns. It does not run after the Mac app is closed. Choose **Stop monitoring**
 to disable it.

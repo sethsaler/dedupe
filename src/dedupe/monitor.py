@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -14,13 +16,36 @@ from watchdog.observers import Observer
 from .scanner import BUILTIN_EXCLUSIONS, _exclusion_matcher, is_in_photos_library, media_extensions
 
 
+@dataclass
+class MonitorChange:
+    """The file events collected during one debounce window."""
+
+    paths: set[str] = field(default_factory=set)
+    directory: bool = False
+    overflow: bool = False
+
+    def add(self, paths: Iterable[str], directory: bool) -> None:
+        if directory:
+            self.directory = True
+            self.paths.clear()
+            return
+        if self.directory or self.overflow:
+            return
+        self.paths.update(paths)
+        if len(self.paths) > 512:
+            # A huge batch is cheaper to verify with one inventory than with
+            # unbounded per-path bookkeeping.
+            self.overflow = True
+            self.paths.clear()
+
+
 class _JobEventHandler(FileSystemEventHandler):
     """Trigger once for events that can affect a job's media inventory."""
 
     def __init__(
         self,
         root: Path,
-        callback: Callable[[], None],
+        callback: Callable[[list[str], bool], None],
         *,
         include_images: bool,
         include_gifs: bool,
@@ -39,8 +64,9 @@ class _JobEventHandler(FileSystemEventHandler):
         self.excluded = _exclusion_matcher(patterns)
 
     def on_any_event(self, event: FileSystemEvent) -> None:
-        if self.relevant(event):
-            self.callback()
+        paths = self.relevant_paths(event)
+        if paths:
+            self.callback(paths, bool(event.is_directory))
         if (
             self.root_event_callback is not None
             and event.is_directory
@@ -50,15 +76,24 @@ class _JobEventHandler(FileSystemEventHandler):
             self.root_event_callback()
 
     def relevant(self, event: FileSystemEvent) -> bool:
+        return bool(self.relevant_paths(event))
+
+    def relevant_paths(self, event: FileSystemEvent) -> list[str]:
         # Watchdog also reports read-only open/close events on some platforms.
         # Those cannot change the media inventory and scanning them would make
         # the monitor re-scan its own analysis reads.
         if event.event_type not in {"created", "modified", "deleted", "moved"}:
             return False
+        if event.is_directory and event.event_type == "modified":
+            # Directory mtime updates accompany child create/delete events and
+            # do not themselves describe media inventory. Treating them as a
+            # directory change would force a full-library precheck every time.
+            return []
         paths = [event.src_path]
         dest_path = getattr(event, "dest_path", "")
         if dest_path:
             paths.append(dest_path)
+        matching = []
         for raw_path in paths:
             path = Path(raw_path)
             try:
@@ -69,13 +104,22 @@ class _JobEventHandler(FileSystemEventHandler):
                 part.startswith(".") for part in relative.parts if part not in (".", "")
             ):
                 continue
-            if self.excluded(path.name, relative):
+            excluded = False
+            current = Path()
+            for part in relative.parts:
+                if part in (".", ""):
+                    continue
+                current /= part
+                if self.excluded(part, current):
+                    excluded = True
+                    break
+            if excluded:
                 continue
             # A directory event can represent many media files moving at once;
             # file events are cheap to filter by the scan's enabled extensions.
             if event.is_directory or path.suffix.lower() in self.extensions:
-                return True
-        return False
+                matching.append(str(path))
+        return matching
 
 
 class FolderMonitor:
@@ -83,7 +127,7 @@ class FolderMonitor:
 
     def __init__(
         self,
-        on_change: Callable[[str], None],
+        on_change: Callable[[str, MonitorChange | None], None],
         *,
         debounce_seconds: float = 2.0,
         health_seconds: float = 10.0,
@@ -98,12 +142,35 @@ class FolderMonitor:
         self._runtime_locks: dict[str, threading.Lock] = {}
         self._watch_identities: dict[str, dict[str, tuple[int, int]]] = {}
         self._root_losses: dict[str, set[str]] = {}
+        self._changes: dict[str, MonitorChange] = {}
+        self._pending_since: dict[str, float] = {}
         self._stopped = threading.Event()
         self._health_thread = threading.Thread(target=self._health_loop, daemon=True)
         self._health_thread.start()
 
     @staticmethod
-    def _watch_roots(roots: Iterable[str]) -> list[str]:
+    def _watch_roots(roots: Iterable[str], settings: dict | None = None) -> list[str]:
+        settings = settings or {}
+        exclusions = settings.get("exclusions") or []
+        if isinstance(exclusions, str):
+            exclusions = exclusions.split(",")
+        patterns = {e.strip().lower() for e in exclusions if str(e).strip()}
+        patterns |= BUILTIN_EXCLUSIONS
+        excluded = _exclusion_matcher(patterns)
+        include_hidden = bool(settings.get("include_hidden", False))
+
+        def same_filter_semantics(relative: Path) -> bool:
+            current = Path()
+            for part in relative.parts:
+                if part in (".", ""):
+                    continue
+                if not include_hidden and part.startswith("."):
+                    return False
+                current /= part
+                if excluded(part, current):
+                    return False
+            return True
+
         watched: list[str] = []
         seen: set[str] = set()
         for raw_root in roots:
@@ -126,7 +193,22 @@ class FolderMonitor:
                 continue
             seen.add(key)
             watched.append(key)
-        return watched
+        collapsed: list[str] = []
+        candidates = sorted((Path(key) for key in watched), key=lambda path: len(path.parts))
+        for candidate in candidates:
+            nested_with_same_semantics = False
+            for existing in (Path(key) for key in collapsed):
+                try:
+                    relative = candidate.relative_to(existing)
+                except ValueError:
+                    continue
+                if candidate == existing or same_filter_semantics(relative):
+                    nested_with_same_semantics = True
+                    break
+            if nested_with_same_semantics:
+                continue
+            collapsed.append(str(candidate))
+        return collapsed
 
     def _make_observer(
         self,
@@ -145,7 +227,9 @@ class FolderMonitor:
         for key in watched:
             handler = _JobEventHandler(
                 Path(key),
-                lambda job_id=job_id: self._debounce(job_id),
+                lambda paths, directory, job_id=job_id: self._record_change(
+                    job_id, paths, directory
+                ),
                 root_event_callback=lambda job_id=job_id, key=key: self._mark_root_lost(
                     job_id, key
                 ),
@@ -179,7 +263,7 @@ class FolderMonitor:
                 # health loop uses it to attach a watcher when the drive returns.
                 self._specs[job_id] = spec
                 self._root_losses.pop(job_id, None)
-            watched = self._watch_roots(roots)
+            watched = self._watch_roots(roots, settings)
             if not watched:
                 raise ValueError("No existing folders to monitor")
             observer = self._make_observer(job_id, watched, settings)
@@ -211,6 +295,8 @@ class FolderMonitor:
             observer = self._observers.pop(job_id, None)
             timer = self._timers.pop(job_id, None)
             self._watch_identities.pop(job_id, None)
+            self._changes.pop(job_id, None)
+            self._pending_since.pop(job_id, None)
         if timer is not None:
             timer.cancel()
         if observer is not None:
@@ -242,10 +328,26 @@ class FolderMonitor:
         with self._lock:
             return set(self._observers)
 
+    def _record_change(self, job_id: str, paths: list[str], directory: bool) -> None:
+        with self._lock:
+            self._pending_since.setdefault(job_id, time.monotonic())
+            change = self._changes.setdefault(job_id, MonitorChange())
+            change.add(paths, directory)
+        self._debounce(job_id)
+
     def _debounce(self, job_id: str) -> None:
         with self._lock:
+            now = time.monotonic()
             timer = self._timers.get(job_id)
             if timer is not None:
+                first_pending = self._pending_since.get(job_id)
+                if first_pending is not None:
+                    # Resetting every event can postpone a scan forever while a
+                    # folder is actively written. Keep the existing timer once
+                    # it is the last quiet period inside a bounded batch window.
+                    max_delay = self.debounce_seconds * 5
+                    if first_pending + max_delay - now <= self.debounce_seconds:
+                        return
                 timer.cancel()
             timer = threading.Timer(
                 self.debounce_seconds,
@@ -271,7 +373,7 @@ class FolderMonitor:
             if spec is None:
                 return
             roots, settings = spec
-            desired = self._watch_roots(roots)
+            desired = self._watch_roots(roots, settings)
             changed = False
             missing = set()
             for raw_path, identity in identities.items():
@@ -333,5 +435,7 @@ class FolderMonitor:
         with self._lock:
             self._timers.pop(job_id, None)
             active = job_id in self._observers
+            change = self._changes.pop(job_id, None)
+            self._pending_since.pop(job_id, None)
         if active:
-            self.on_change(job_id)
+            self.on_change(job_id, change)

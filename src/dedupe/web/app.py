@@ -15,6 +15,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat as stat_module
 import sys
 import threading
 import time
@@ -979,7 +980,35 @@ def create_app(
         timer.start()
         _set_monitor_runtime(job_id, pending=True)
 
-    def _monitor_has_arrivals(job: dict) -> bool:
+    def _monitor_known_identities(job: dict) -> dict[str, list]:
+        """Identity of files already represented by the open review."""
+        with lock:
+            result: ScanResult | None = state["result"]
+            known: dict[str, list] = {}
+            if result is not None and result.job_id == job["id"]:
+                for record in (
+                    *result.files,
+                    *(member for group in result.groups for member in group.members),
+                ):
+                    known[record.path] = file_identity(record)
+            return known
+
+    def _path_identity(raw_path: str) -> list | None:
+        try:
+            st = Path(raw_path).stat()
+        except OSError:
+            return None
+        if not stat_module.S_ISREG(st.st_mode):
+            return None
+        return [
+            int(st.st_size),
+            int(st.st_mtime_ns),
+            int(st.st_ctime_ns),
+            int(st.st_dev),
+            int(st.st_ino),
+        ]
+
+    def _monitor_has_arrivals(job: dict, change=None) -> bool:
         """Whether the job's folders hold a file the app has not already seen.
 
         A real arrival scan replaces the open review and ends in-app Trash
@@ -992,6 +1021,19 @@ def create_app(
         baseline = job.get("baseline")
         if not isinstance(baseline, dict):
             return True
+        known = _monitor_known_identities(job)
+        if change is not None and not change.directory and not change.overflow:
+            # File-only events can be checked directly. Missing files are never
+            # arrivals; existing files are arrivals only when neither the scan
+            # baseline nor the live review already knows this exact object.
+            for raw_path in change.paths:
+                identity = _path_identity(raw_path)
+                if identity is None:
+                    continue
+                if baseline.get(raw_path) != identity and known.get(raw_path) != identity:
+                    return True
+            return False
+
         settings = job.get("settings") or {}
         exclusions = settings.get("exclusions") or []
         if isinstance(exclusions, str):
@@ -1015,22 +1057,13 @@ def create_app(
             )
         except (OSError, ValueError, TypeError):
             return True
-        with lock:
-            result: ScanResult | None = state["result"]
-            known: dict[str, list] = {}
-            if result is not None and result.job_id == job["id"]:
-                for record in (
-                    *result.files,
-                    *(member for group in result.groups for member in group.members),
-                ):
-                    known[record.path] = file_identity(record)
         for record in records:
             identity = file_identity(record)
             if baseline.get(record.path) != identity and known.get(record.path) != identity:
                 return True
         return False
 
-    def _run_monitor_scan(job_id: str) -> None:
+    def _run_monitor_scan(job_id: str, change=None) -> None:
         _cancel_monitor_retry(job_id)
         # Check busy state BEFORE reading/parsing potentially large job baselines.
         with lock:
@@ -1071,7 +1104,7 @@ def create_app(
         if busy:
             _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
             return
-        if not _monitor_has_arrivals(job):
+        if not _monitor_has_arrivals(job, change):
             # Nothing new: leave the open review, its scan session, and Trash
             # undo untouched instead of replacing them with an identical result.
             _set_monitor_runtime(
@@ -1118,9 +1151,9 @@ def create_app(
                 error=message or f"monitor scan failed with HTTP {status}",
             )
 
-    def _monitor_files_changed(job_id: str) -> None:
+    def _monitor_files_changed(job_id: str, change=None) -> None:
         _set_monitor_runtime(job_id, last_event_at=datetime.now(UTC).isoformat())
-        _run_monitor_scan(job_id)
+        _run_monitor_scan(job_id, change)
 
     monitor_service = FolderMonitor(
         _monitor_files_changed,
