@@ -32,7 +32,6 @@ def _finder_safe_path() -> str:
 def run() -> int:
     os.environ["PATH"] = _finder_safe_path()
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    os.environ.setdefault("DEDUPE_NATIVE_SHELL", "1")
     from dedupe.cli import main
 
     return main()
