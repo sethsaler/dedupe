@@ -107,3 +107,28 @@ def test_independent_merge_preserves_crop_adjustments_and_analysis() -> None:
     carried = next(member for member in crop.members if member.path == old.path)
     assert carried.width == 1200
     assert carried.human_detection_status == "no_person"
+
+
+def test_merge_preserves_unmarked_manual_deselection() -> None:
+    keeper = _record("/z.jpg", 1)
+    copy_old = _record("/a.jpg", 2)
+    copy_current = _record("/a.jpg", 2)
+    arrival = _record("/0.jpg", 3)
+    previous = ScanResult(
+        roots=["/"], files=[keeper, copy_old], groups=[
+            # Automatic would select copy_old because keeper ranks first; the empty
+            # saved selection is therefore itself the user's keep decision.
+            _group(GroupKind.EXACT, [keeper, copy_old], selected_for_removal=[])
+        ],
+    )
+    result = ScanResult(
+        roots=["/"], files=[keeper, copy_current, arrival], groups=[
+            _group(GroupKind.EXACT, [keeper, copy_current, arrival],
+                   selected_for_removal=[copy_current.path, arrival.path])
+        ],
+    )
+
+    merge_new_arrival_review(result, previous, _baseline(keeper, copy_old))
+
+    (merged,) = [group for group in result.groups if group.kind == GroupKind.EXACT]
+    assert merged.selected_for_removal == [arrival.path]

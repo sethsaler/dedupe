@@ -224,6 +224,20 @@ def focus_new_arrivals(result: ScanResult, baseline: dict) -> int:
     return len(arrivals)
 
 
+def _default_keep_one_selection(group) -> set[str]:
+    """The automatic selection a freshly built exact/similar group would have."""
+    if group.match_basis in ("semantic", "video_version"):
+        return set()
+    keep = group.suggested_keep or group.anchor_path
+    if keep is None and group.members:
+        keep = max((member.path for member in group.members), default=None)
+    return {
+        member.path
+        for member in group.members
+        if member.path != keep and not member.protected
+    }
+
+
 def _fuse_saved_analysis(current: FileRecord, previous: FileRecord | None) -> FileRecord:
     """Fresh identity/stat fields with saved analysis filled in when missing."""
     if previous is None:
@@ -306,12 +320,24 @@ def _merge_cluster_components(entries: list[tuple[object, bool]], records: dict[
         member_paths = {member.path for member in ordered_members}
         merged = copy.deepcopy(component[0][0])
         merged.members = ordered_members
-        saved_deselections = {
-            path
-            for group, is_new in component
-            if not is_new
-            for path in set(group.reviewed_paths) - set(group.selected_for_removal)
-        }
+        saved_deselections = set()
+        for group, is_new in component:
+            if is_new:
+                continue
+            saved_deselections.update(
+                set(group.reviewed_paths) - set(group.selected_for_removal)
+            )
+            if set(group.selected_for_removal) != _default_keep_one_selection(group):
+                # A manual keep-one edit is not otherwise marked server-side.
+                # Once the saved state differs from the automatic suggestion,
+                # every unchanged unselected member is a keep decision that a
+                # fresh automatic pick must not undo.
+                saved_deselections.update(
+                    member.path
+                    for member in group.members
+                    if member.path not in arrivals
+                    and member.path not in group.selected_for_removal
+                )
         merged.selected_for_removal = sorted(({
             path
             for group, _is_new in component
