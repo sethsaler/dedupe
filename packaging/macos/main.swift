@@ -26,10 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var serverURL: URL?
     private let nativeToken = UUID().uuidString
     private var isTerminating = false
+    private var forceQuitConfirmed = false
     private var hasLoadedInterface = false
-    private var isBackendBusy = false
-    private var hasLiveBusyState = false
-    private var allowConfirmedWindowClose = false
+    private var monitoringWithWindowClosed = false
     private var isCheckingWindowClose = false
     private var isPickerOpen = false
     private var serverActivity: NSObjectProtocol?
@@ -77,49 +76,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        !monitoringWithWindowClosed
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !window.isVisible || window.isMiniaturized {
+            showMainWindow()
+        }
+        return true
+    }
+
+    @objc private func showMainWindow() {
+        monitoringWithWindowClosed = false
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if forceQuitConfirmed { return .terminateNow }
         guard !isTerminating else { return .terminateLater }
         guard let process = backendProcess, process.isRunning else {
             endAllActivities()
             return .terminateNow
         }
         isTerminating = true
-        let cachedBusy = isBackendBusy
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let status = self.queryBackendBusy(cachedBusy: cachedBusy)
+        Task { @MainActor in
+            let status = await self.queryBackendStatus()
             if status.busy {
-                DispatchQueue.main.async {
-                    self.cancelBusyTermination(sender, unresponsive: status.unresponsive)
-                }
+                self.cancelBusyTermination(sender, unresponsive: status.unresponsive)
                 return
             }
-            self.requestBackendShutdown()
+            await self.requestBackendShutdown()
             // The endpoint deliberately waits through the browser shutdown grace
             // period. Give that clean path a moment, then stop the embedded server.
             let deadline = Date().addingTimeInterval(2.2)
             while process.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.1)
+                try? await Task.sleep(nanoseconds: 100_000_000)
             }
             if process.isRunning {
                 // A scan or file action can have started after the shutdown POST.
                 // Never kill it halfway through a batch of file mutations.
-                let recheck = self.queryBackendBusy(cachedBusy: self.currentBusyFlag())
+                let recheck = await self.queryBackendStatus()
                 if recheck.busy {
-                    DispatchQueue.main.async {
-                        self.cancelBusyTermination(sender, unresponsive: recheck.unresponsive)
-                    }
+                    self.cancelBusyTermination(sender, unresponsive: recheck.unresponsive)
                     return
                 }
-                self.terminateBackendTree(process, graceSeconds: 0.4)
+                await Task.detached {
+                    self.terminateBackendTree(process, graceSeconds: 0.4)
+                }.value
             }
-            DispatchQueue.main.async {
-                self.endAllActivities()
-                sender.reply(toApplicationShouldTerminate: true)
-            }
+            self.endAllActivities()
+            sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
     }
@@ -138,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         } else {
             serverURL = nil
             hasLoadedInterface = false
-            updateBusyState(false, live: false)
+            updateBusyState(false)
             showLoading()
             startBackend()
         }
@@ -167,11 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
-    private func updateBusyState(_ busy: Bool, live: Bool) {
-        isBackendBusy = busy
-        if live {
-            hasLiveBusyState = true
-        }
+    private func updateBusyState(_ busy: Bool) {
         if busy {
             if busyActivity == nil {
                 busyActivity = ProcessInfo.processInfo.beginActivity(
@@ -186,15 +189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func endAllActivities() {
-        updateBusyState(false, live: false)
+        updateBusyState(false)
         endServerActivity()
-    }
-
-    private func currentBusyFlag() -> Bool {
-        if Thread.isMainThread {
-            return isBackendBusy
-        }
-        return DispatchQueue.main.sync { self.isBackendBusy }
     }
 
     // MARK: - WKScriptMessageHandler
@@ -206,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         switch message.name {
         case "busyState":
             if let body = message.body as? [String: Any], let busy = body["busy"] as? Bool {
-                updateBusyState(busy, live: true)
+                updateBusyState(busy)
             }
         case "pickPaths":
             handlePickPathsMessage(message.body)
@@ -484,7 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.load(URLRequest(url: url))
     }
 
-    private func terminateBackendTree(_ process: Process, graceSeconds: TimeInterval) {
+    nonisolated private func terminateBackendTree(_ process: Process, graceSeconds: TimeInterval) {
         guard process.isRunning else { return }
         let pid = process.processIdentifier
         if pid > 0 {
@@ -529,7 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
-    private func requestBackendShutdown() {
+    private func requestBackendShutdown() async {
         guard let serverURL else { return }
         let endpoint = serverURL.appendingPathComponent("api/shutdown")
         var request = URLRequest(url: endpoint)
@@ -538,73 +534,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(nativeToken, forHTTPHeaderField: "X-Dedupe-Native-Token")
         request.httpBody = Data("{}".utf8)
-        let semaphore = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { _, _, _ in
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + 0.8)
+        _ = try? await URLSession.shared.data(for: request)
     }
 
-    private func queryBackendBusy(cachedBusy: Bool) -> (busy: Bool, unresponsive: Bool) {
-        if cachedBusy {
-            return (true, false)
-        }
+    @MainActor
+    private func queryBackendStatus() async -> (busy: Bool, monitoring: Bool, unresponsive: Bool) {
         guard let serverURL, backendProcess?.isRunning == true else {
-            return (false, false)
+            return (false, false, false)
         }
         let endpoint = serverURL.appendingPathComponent("api/status")
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 0.8
-        let semaphore = DispatchSemaphore(value: 0)
-        var gotPayload = false
-        var busy = false
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            if let data,
-               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                gotPayload = true
-                busy = (payload["scanning"] as? Bool == true) || (payload["acting"] as? Bool == true)
-            }
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + 1.0)
-        if !gotPayload {
-            // Fail closed while the backend is still running so an overloaded
-            // scan/action is never SIGTERMed on a status timeout.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let scanning = payload["scanning"] as? Bool,
+              let acting = payload["acting"] as? Bool,
+              let monitors = payload["monitors"] as? [String: Any] else {
             let stillRunning = backendProcess?.isRunning == true
-            return (stillRunning, stillRunning)
+            return (stillRunning, false, stillRunning)
         }
-        return (busy, false)
+        // A monitor waiting for an unplugged drive still needs the server.
+        return (scanning || acting, !monitors.isEmpty, false)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if allowConfirmedWindowClose {
-            allowConfirmedWindowClose = false
+        guard backendProcess?.isRunning == true else {
+            monitoringWithWindowClosed = false
             return true
         }
-        if isBackendBusy {
-            showBusyAlert(unresponsive: false, onForceQuit: nil)
-            return false
-        }
-        if hasLiveBusyState || backendProcess?.isRunning != true {
-            return true
-        }
-        // Fallback before JS has reported live state: check off the main thread.
-        guard !isCheckingWindowClose else { return false }
+        guard !isCheckingWindowClose, !isTerminating else { return false }
         isCheckingWindowClose = true
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let status = self.queryBackendBusy(cachedBusy: false)
-            DispatchQueue.main.async {
-                self.isCheckingWindowClose = false
-                if status.busy {
-                    self.showBusyAlert(unresponsive: status.unresponsive) {
-                        self.allowConfirmedWindowClose = true
-                        self.window.close()
-                    }
-                } else {
-                    self.allowConfirmedWindowClose = true
-                    self.window.close()
-                }
+        Task { @MainActor in
+            let status = await self.queryBackendStatus()
+            self.isCheckingWindowClose = false
+            guard !self.isTerminating else { return }
+            self.monitoringWithWindowClosed = status.monitoring
+            if status.busy && !status.monitoring {
+                self.showBusyAlert(unresponsive: status.unresponsive)
+            } else {
+                self.window.close()
             }
         }
         return false
@@ -616,29 +586,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // Let AppKit finish any vetoed close/termination pass before restoring
         // the reusable window and presenting modal UI.
         DispatchQueue.main.async {
-            self.window.makeKeyAndOrderFront(nil)
+            self.showMainWindow()
             NSApp.activate(ignoringOtherApps: true)
-            self.showBusyAlert(unresponsive: unresponsive) {
-                self.isTerminating = true
-                if let process = self.backendProcess, process.isRunning {
-                    self.terminateBackendTree(process, graceSeconds: 0.3)
-                }
-                self.endAllActivities()
-                NSApp.terminate(nil)
-            }
+            self.showBusyAlert(unresponsive: unresponsive)
         }
     }
 
-    private func showBusyAlert(unresponsive: Bool, onForceQuit: (() -> Void)?) {
+    private func showBusyAlert(unresponsive: Bool) {
         let alert = NSAlert()
         alert.alertStyle = .warning
         if unresponsive {
             alert.messageText = "Dedupe is busy or not responding"
             alert.informativeText = "The local media server did not respond in time. Wait for active work to finish, or force quit now."
             alert.addButton(withTitle: "Wait")
-            if onForceQuit != nil {
-                alert.addButton(withTitle: "Force Quit")
-            }
+            alert.addButton(withTitle: "Force Quit")
         } else {
             alert.messageText = "Dedupe is busy"
             alert.informativeText = "Wait for the current scan or file action to finish, then quit again."
@@ -646,7 +607,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         let response = alert.runModal()
         if unresponsive && response == .alertSecondButtonReturn {
-            onForceQuit?()
+            forceQuitConfirmed = true
+            NSApp.terminate(nil)
         }
     }
 
@@ -772,6 +734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
         let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(item("Show Dedupe Window", action: #selector(showMainWindow), key: "", target: self))
         windowMenu.addItem(item("Minimize", action: #selector(NSWindow.performMiniaturize(_:)), key: "m"))
         windowMenu.addItem(item("Zoom", action: #selector(NSWindow.performZoom(_:)), key: ""))
         windowMenuItem.submenu = windowMenu

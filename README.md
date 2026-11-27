@@ -132,9 +132,12 @@ shows duplicate groups involving new or changed files and new independent review
 candidates. It requires an initial completed scan. **Monitor folders** uses the
 same incremental scan automatically while Dedupe is open: events in scan and
 protected folders are debounced with a bounded batch delay, overlapping folders
-share recursive watchers, unchanged media reuses cached hashes and
-analysis, and active scans or file actions are never interrupted. Changed job
-settings require another full scan before checking arrivals or monitoring.
+share recursive watchers, and changes that arrive during a scan or file action
+wait for it to finish. Open **Monitoring** in the top bar to see each job’s
+status and last check. In the Mac app, you can close the window while a monitor
+is enabled and reopen it from the Dock. Quitting stops monitoring until you
+launch Dedupe again. Changed job settings require another full scan before
+checking arrivals or monitoring.
 **Delete job** removes only that job and its saved review, not media.
 
 Open **History** to browse completed or interrupted cleanups, even before loading

@@ -21,9 +21,9 @@ import threading
 import time
 import urllib.request
 import webbrowser
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from itertools import combinations
+from itertools import chain, combinations
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -97,7 +97,7 @@ from ..models import (
     SmartRule,
     effective_selected_paths,
 )
-from ..monitor import FolderMonitor
+from ..monitor import FolderMonitor, MonitorChange
 from ..people_score import (
     PEOPLE_MEDIA_TYPES,
     has_current_non_person_coverage,
@@ -160,6 +160,25 @@ PERSIST_DEBOUNCE_MIN_FILES = 1000
 PERSIST_DEBOUNCE_SECONDS = 0.3
 MONITOR_DEBOUNCE_SECONDS = 2.0
 MONITOR_BUSY_RETRY_SECONDS = 5.0
+
+
+@dataclass
+class _MonitorChecks:
+    """Pending work for one activation of a job's monitor."""
+
+    pending: MonitorChange | None = None
+    timer: threading.Timer | None = None
+    checking: bool = False
+
+    def include(self, change: MonitorChange | None) -> None:
+        if self.pending is None:
+            self.pending = MonitorChange()
+        # Startup, reattachment, directories and overflow all need an inventory.
+        # A later file-only batch must not narrow that outstanding check.
+        if change is None or change.overflow:
+            self.pending.add((), directory=True)
+        else:
+            self.pending.add(change.paths, change.directory)
 
 # Why an execute was refused, phrased so the UI can tell the user what happens next.
 PREVIEW_STALE_MESSAGES = {
@@ -761,6 +780,7 @@ def create_app(
         "people_scoring_job": None,
         # Runtime state for saved jobs watching their folders, keyed by job id.
         "monitors": {},
+        "monitors_version": 0,
         # Wakes SSE generators when groups/progress/scan state change.
         "events": threading.Condition(lock),
     }
@@ -925,7 +945,7 @@ def create_app(
         persist_result()
 
     monitor_control_lock = threading.RLock()
-    monitor_retry_timers: dict[str, threading.Timer] = {}
+    monitor_checks: dict[str, _MonitorChecks] = {}
 
     def _monitor_runtime(job_id: str) -> dict:
         return state["monitors"].setdefault(job_id, {
@@ -939,15 +959,12 @@ def create_app(
 
     def _set_monitor_runtime(job_id: str, **changes) -> None:
         with lock:
+            existed = job_id in state["monitors"]
             runtime = _monitor_runtime(job_id)
-            runtime.update(changes)
-            state["events"].notify_all()
-
-    def _cancel_monitor_retry(job_id: str) -> None:
-        with monitor_control_lock:
-            timer = monitor_retry_timers.pop(job_id, None)
-        if timer is not None:
-            timer.cancel()
+            if not existed or any(runtime.get(key) != val for key, val in changes.items()):
+                runtime.update(changes)
+                state["monitors_version"] += 1
+                state["events"].notify_all()
 
     def _monitor_roots(job: dict) -> list[str]:
         settings = job.get("settings") or {}
@@ -955,47 +972,88 @@ def create_app(
         roots.extend(settings.get("protected_folders") or [])
         return [str(path) for path in roots if str(path).strip()]
 
-    def _stop_job_monitor(job_id: str) -> None:
-        _cancel_monitor_retry(job_id)
-        monitor_service.stop(job_id)
-        with lock:
-            state["monitors"].pop(job_id, None)
-            state["events"].notify_all()
+    def _monitor_root_identities(roots) -> dict[str, tuple[int, int]]:
+        identities = {}
+        missing = []
+        for raw in dict.fromkeys(roots):
+            root = Path(raw).expanduser()
+            try:
+                st = root.stat()
+                if stat_module.S_ISDIR(st.st_mode):
+                    if not os.access(root, os.X_OK):
+                        raise PermissionError("folder cannot be traversed")
+                    # stat can succeed even when macOS refuses to list a folder.
+                    with os.scandir(root) as entries:
+                        next(entries, None)
+                elif stat_module.S_ISREG(st.st_mode):
+                    with root.open("rb"):
+                        pass
+                else:
+                    raise OSError("expected a folder or regular file")
+            except (FileNotFoundError, NotADirectoryError):
+                missing.append(str(root))
+                continue
+            except OSError as exc:
+                raise ValueError(f"Cannot read monitored path {root}: {exc}") from exc
+            identities[raw] = (st.st_dev, st.st_ino)
+        if missing:
+            raise ValueError("Waiting for missing folder: " + ", ".join(missing))
+        return identities
 
-    def _start_job_monitor(job: dict, *, catchup: bool = True) -> None:
+    def _stop_job_monitor(job_id: str) -> None:
+        with monitor_control_lock:
+            checks = monitor_checks.pop(job_id, None)
+            if checks and checks.timer:
+                checks.timer.cancel()
+            monitor_service.stop(job_id)
+            with lock:
+                if state["monitors"].pop(job_id, None) is not None:
+                    state["monitors_version"] += 1
+                    state["events"].notify_all()
+
+    def _start_job_monitor(job: dict) -> None:
         job_id = job["id"]
-        watched = monitor_service.start(job_id, _monitor_roots(job), job.get("settings") or {})
-        _set_monitor_runtime(job_id, active=True, pending=False, error=None, watched=watched)
-        if catchup:
+        with monitor_control_lock:
+            previous = monitor_checks.get(job_id)
+            if previous and previous.timer:
+                previous.timer.cancel()
+            checks = monitor_checks[job_id] = _MonitorChecks()
+            watched = monitor_service.start(job_id, _monitor_roots(job), job.get("settings") or {})
+            _set_monitor_runtime(job_id, active=True, pending=True, error=None, watched=watched)
             # Watchers only see future events. One incremental pass catches files
             # changed while the app was closed or before monitoring was enabled.
-            _retry_monitor_scan(job_id, delay=0.2)
+            checks.include(None)
+            _schedule_monitor_check(job_id, checks, delay=0.2)
 
-    def _retry_monitor_scan(job_id: str, *, delay: float) -> None:
-        _cancel_monitor_retry(job_id)
-        timer = threading.Timer(delay, _run_monitor_scan, args=(job_id,))
+    def _schedule_monitor_check(job_id: str, checks: _MonitorChecks, *, delay: float) -> None:
+        # Caller holds monitor_control_lock. Scheduled work keeps its deadline
+        # even as new events arrive; they join the batch consumed by that timer.
+        timer = threading.Timer(delay, _drain_monitor_checks, args=(job_id, checks))
         timer.daemon = True
-        with monitor_control_lock:
-            monitor_retry_timers[job_id] = timer
+        checks.timer = timer
         timer.start()
-        _set_monitor_runtime(job_id, pending=True)
 
-    def _monitor_known_identities(job: dict) -> dict[str, list]:
-        """Identity of files already represented by the open review."""
+    def _has_unreviewed_files(job_id: str, candidates: dict[str, list]) -> bool:
+        # Most events match the baseline or name a deleted file. Only examine
+        # the open review when it might explain a changed identity (e.g. undo).
+        if not candidates:
+            return False
         with lock:
             result: ScanResult | None = state["result"]
+            if result is None or result.job_id != job_id:
+                return True
             known: dict[str, list] = {}
-            if result is not None and result.job_id == job["id"]:
-                for record in (
-                    *result.files,
-                    *(member for group in result.groups for member in group.members),
-                ):
+            members = (member for group in result.groups for member in group.members)
+            for record in chain(result.files, members):
+                if record.path in candidates:
                     known[record.path] = file_identity(record)
-            return known
+        return known != candidates
 
     def _path_identity(raw_path: str) -> list | None:
         try:
-            st = Path(raw_path).stat()
+            # Inventory skips symlink entries inside scanned directories.
+            # Explicit root links are already resolved when watches are installed.
+            st = Path(raw_path).lstat()
         except OSError:
             return None
         if not stat_module.S_ISREG(st.st_mode):
@@ -1021,7 +1079,7 @@ def create_app(
         baseline = job.get("baseline")
         if not isinstance(baseline, dict):
             return True
-        known = _monitor_known_identities(job)
+        candidates = {}
         if change is not None and not change.directory and not change.overflow:
             # File-only events can be checked directly. Missing files are never
             # arrivals; existing files are arrivals only when neither the scan
@@ -1030,9 +1088,9 @@ def create_app(
                 identity = _path_identity(raw_path)
                 if identity is None:
                     continue
-                if baseline.get(raw_path) != identity and known.get(raw_path) != identity:
-                    return True
-            return False
+                if baseline.get(raw_path) != identity:
+                    candidates[raw_path] = identity
+            return _has_unreviewed_files(job["id"], candidates)
 
         settings = job.get("settings") or {}
         exclusions = settings.get("exclusions") or []
@@ -1059,64 +1117,54 @@ def create_app(
             return True
         for record in records:
             identity = file_identity(record)
-            if baseline.get(record.path) != identity and known.get(record.path) != identity:
-                return True
-        return False
+            if baseline.get(record.path) != identity:
+                candidates[record.path] = identity
+        return _has_unreviewed_files(job["id"], candidates)
 
-    def _run_monitor_scan(job_id: str, change=None) -> None:
-        _cancel_monitor_retry(job_id)
+    def _run_monitor_scan(job_id: str, checks: _MonitorChecks, change: MonitorChange) -> dict | None:
+        """Return the runtime update, or None to retry this batch when idle."""
+        watch_error = monitor_service.watch_error(job_id)
+        if watch_error:
+            return {"error": watch_error}
         # Check busy state BEFORE reading/parsing potentially large job baselines.
         with lock:
             busy = state["scanning"] or state["acting"] or state["transitioning"]
         if busy:
-            _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
-            return
+            return None
         try:
             with jobs_io_lock:
                 job = jobs.get(job_id)
-        except (OSError, ValueError):
-            _stop_job_monitor(job_id)
-            return
+        except FileNotFoundError:
+            job = {}
         if not job.get("monitor"):
-            _stop_job_monitor(job_id)
-            return
-        settings = job.get("settings") or {}
-        configured_roots = [
-            *(settings.get("paths") or []),
-            *(settings.get("protected_folders") or []),
-        ]
-        missing = [
-            str(raw) for raw in configured_roots
-            if not Path(str(raw)).expanduser().exists()
-        ]
-        if missing:
+            with monitor_control_lock:
+                if monitor_checks.get(job_id) is checks:
+                    _stop_job_monitor(job_id)
+            return {}
+        try:
+            roots = _monitor_root_identities(_monitor_roots(job))
+        except ValueError as exc:
             # Scanning now would save a review/baseline with the missing folder's
             # files removed. The parent watch fires again when the folder returns.
-            _set_monitor_runtime(
-                job_id,
-                active=monitor_service.running(job_id),
-                pending=False,
-                error="Waiting for missing folder: " + ", ".join(missing),
-            )
-            return
+            return {"error": str(exc)}
         with lock:
             busy = state["scanning"] or state["acting"] or state["transitioning"]
         if busy:
-            _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
-            return
+            return None
         if not _monitor_has_arrivals(job, change):
             # Nothing new: leave the open review, its scan session, and Trash
             # undo untouched instead of replacing them with an identical result.
-            _set_monitor_runtime(
-                job_id,
-                active=monitor_service.running(job_id),
-                pending=False,
-                error=None,
-                last_scan_at=datetime.now(UTC).isoformat(),
-            )
-            return
+            return {
+                "error": None,
+                "last_scan_at": datetime.now(UTC).isoformat(),
+            }
         payload = {"job_id": job_id, "new_only": True, "_preserve_review": True}
-        try:
+        with monitor_control_lock:
+            # Stop can occur mid-inventory. A late callback from that activation
+            # must not replace the user's review or submit work after re-enable.
+            if monitor_checks.get(job_id) is not checks:
+                return {}
+            _set_monitor_runtime(job_id, error=None)
             # Invoke the same view as the browser so locking, persistence,
             # validation, streaming, and scan completion stay in one code path.
             with app.test_request_context(
@@ -1125,35 +1173,61 @@ def create_app(
                 json=payload,
                 headers={"X-Dedupe-Token": csrf_token},
             ):
-                outcome = api_scan()
-        except Exception as exc:
-            _set_monitor_runtime(job_id, pending=False, error=str(exc))
-            return
+                outcome = api_scan(monitor_roots=roots, monitor_activation=checks)
         response = outcome[0] if isinstance(outcome, tuple) else outcome
         status = outcome[1] if isinstance(outcome, tuple) else response.status_code
         if status == 200:
+            # The asynchronous worker reports the outcome after checking that
+            # every configured root was still accessible at commit time.
+            return {}
+        if status == 409:
+            return None
+        body = response.get_json(silent=True) if hasattr(response, "get_json") else None
+        message = body.get("error") if isinstance(body, dict) else None
+        return {"error": message or f"monitor scan failed with HTTP {status}"}
+
+    def _drain_monitor_checks(job_id: str, checks: _MonitorChecks) -> None:
+        with monitor_control_lock:
+            if monitor_checks.get(job_id) is not checks:
+                return
+            change = checks.pending
+            checks.pending = None
+            checks.timer = None
+            checks.checking = True
+        try:
+            update = _run_monitor_scan(job_id, checks, change)
+        except Exception as exc:
+            update = {"error": str(exc)}
+        with monitor_control_lock:
+            if monitor_checks.get(job_id) is not checks:
+                return
+            checks.checking = False
+            if update is None:
+                # Busy (including an API dispatch race). Retry everything this
+                # check took, together with events that arrived while it ran.
+                checks.include(change)
+            if checks.pending is not None:
+                delay = MONITOR_BUSY_RETRY_SECONDS if update is None else 0
+                _schedule_monitor_check(job_id, checks, delay=delay)
             _set_monitor_runtime(
                 job_id,
                 active=monitor_service.running(job_id),
-                pending=False,
-                error=None,
-                last_scan_at=datetime.now(UTC).isoformat(),
-            )
-        elif status == 409:
-            _retry_monitor_scan(job_id, delay=MONITOR_BUSY_RETRY_SECONDS)
-        else:
-            body = response.get_json(silent=True) if hasattr(response, "get_json") else None
-            message = body.get("error") if isinstance(body, dict) else None
-            _set_monitor_runtime(
-                job_id,
-                active=monitor_service.running(job_id),
-                pending=False,
-                error=message or f"monitor scan failed with HTTP {status}",
+                watched=monitor_service.watched_roots(job_id),
+                pending=checks.pending is not None,
+                **(update or {}),
             )
 
     def _monitor_files_changed(job_id: str, change=None) -> None:
-        _set_monitor_runtime(job_id, last_event_at=datetime.now(UTC).isoformat())
-        _run_monitor_scan(job_id, change)
+        with monitor_control_lock:
+            checks = monitor_checks.get(job_id)
+            if checks is None:
+                return
+            checks.include(change)
+            _set_monitor_runtime(job_id, pending=True, last_event_at=datetime.now(UTC).isoformat())
+            if checks.timer is not None or checks.checking:
+                return
+            checks.checking = True
+        _drain_monitor_checks(job_id, checks)
 
     monitor_service = FolderMonitor(
         _monitor_files_changed,
@@ -1575,23 +1649,24 @@ def create_app(
         data = request.get_json(silent=True) or {}
         job_id = data.get("id")
         enabled = bool(data.get("enabled"))
-        try:
-            with jobs_io_lock:
-                job = jobs.set_monitor(job_id, enabled)
-            if enabled:
-                try:
-                    _start_job_monitor(job)
-                except (OSError, ValueError) as exc:
-                    with jobs_io_lock:
-                        jobs.set_monitor(job_id, False)
+        with monitor_control_lock:
+            try:
+                with jobs_io_lock:
+                    job = jobs.set_monitor(job_id, enabled)
+                if enabled:
+                    try:
+                        _start_job_monitor(job)
+                    except (OSError, ValueError) as exc:
+                        with jobs_io_lock:
+                            jobs.set_monitor(job_id, False)
+                        _stop_job_monitor(job_id)
+                        return jsonify({"error": str(exc)}), 400
+                else:
                     _stop_job_monitor(job_id)
-                    return jsonify({"error": str(exc)}), 400
-            else:
-                _stop_job_monitor(job_id)
-        except (OSError, ValueError, TypeError) as exc:
-            return jsonify({"error": str(exc)}), 400
-        with lock:
-            runtime = copy.deepcopy(state["monitors"].get(job["id"], {}))
+            except (OSError, ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+            with lock:
+                runtime = copy.deepcopy(state["monitors"].get(job["id"], {}))
         job["monitor_active"] = bool(runtime.get("active", False))
         job["monitor_pending"] = bool(runtime.get("pending", False))
         job["monitor_error"] = runtime.get("error")
@@ -1829,6 +1904,7 @@ def create_app(
                             seen_groups_version = state["groups_version"]
 
                         prog = state["progress"]
+                        monitors_version = state["monitors_version"]
                         scoring = state["people_scoring"]
                         people_running = bool(scoring["running"])
                         # Omit high-frequency files_processed/done counts from immediate
@@ -1841,6 +1917,7 @@ def create_app(
                             prog.groups_found,
                             state["last_error"],
                             state["groups_version"],
+                            monitors_version,
                             state["selected_count"],
                             len(state["deleted_files"]),
                             people_running,
@@ -1890,6 +1967,8 @@ def create_app(
                     with lock:
                         if app.extensions.get("dedupe_shutting_down"):
                             return
+                        if state["monitors_version"] != monitors_version:
+                            continue  # A monitor changed while this status was being sent.
                         # Coalesce per-file progress notifications into one wakeup
                         # cadence while active; sleep until notified when idle.
                         state["events"].wait(timeout=0.25 if active_poll else 30.0)
@@ -2275,7 +2354,7 @@ def create_app(
         return jsonify(payload), 202
 
     @app.post("/api/scan")
-    def api_scan():
+    def api_scan(*, monitor_roots=None, monitor_activation=None):
         data = request.get_json(silent=True) or {}
         preserve_review = bool(data.pop("_preserve_review", False))
         job = None
@@ -2328,6 +2407,7 @@ def create_app(
 
         resolved_roots = [str(Path(p).expanduser().resolve()) for p in paths]
 
+        invalidated_monitor = False
         while True:
             with lock:
                 if state["scanning"]:
@@ -2340,10 +2420,13 @@ def create_app(
                     if job and not data.get("new_only"):
                         try:
                             with jobs_io_lock:
-                                jobs.save(job["name"], data, job["id"])
+                                updated_job = jobs.save(job["name"], data, job["id"])
+                                invalidated_monitor = updated_job["settings"] != job["settings"]
                                 job = jobs.get(job["id"])
                         except (OSError, ValueError) as exc:
                             return jsonify({"error": f"Could not save cleanup job: {exc}"}), 400
+                    previous_settings = state.get("last_scan_settings")
+                    previous_job_name = state["last_job_name"]
                     state["last_scan_settings"] = dict(data)
                     state["last_job_name"] = job["name"] if job else None
                     scan_id = secrets.token_hex(12)
@@ -2395,6 +2478,15 @@ def create_app(
                     break
             if not persist_result():
                 return jsonify({"error": "Could not save the current review before scanning"}), 400
+
+        if invalidated_monitor:
+            _stop_job_monitor(job["id"])
+
+        def report_monitor_outcome(**changes) -> None:
+            if monitor_activation is not None:
+                with monitor_control_lock:
+                    if monitor_checks.get(job["id"]) is monitor_activation:
+                        _set_monitor_runtime(job["id"], **changes)
 
         def worker() -> None:
             last_progress_notify = [0.0]
@@ -2606,7 +2698,12 @@ def create_app(
                     )
                     if prior_result is None:
                         try:
-                            prior_load = load_review_session(jobs.session_path(job["id"]))
+                            # Monitor merges are provisional until the final
+                            # root check. Loading the prior review must not save
+                            # file pruning caused by a disconnected drive.
+                            prior_load = load_review_session(
+                                jobs.session_path(job["id"]), persist_pruning=monitor_roots is None
+                            )
                             if prior_load.result is not None and prior_load.result.job_id == job["id"]:
                                 prior_result = prior_load.result
                         except (OSError, ValueError, TypeError):
@@ -2620,6 +2717,13 @@ def create_app(
                     # The scan is not complete from the client's perspective until
                     # its new baseline is durable; otherwise a follow-up arrival
                     # check or folder monitor can race ahead with a stale baseline.
+                    if monitor_roots is not None:
+                        now = _monitor_root_identities(monitor_roots)
+                        for root, identity in monitor_roots.items():
+                            if now[root] != identity:
+                                raise ValueError(
+                                    f"Monitored path was replaced during the scan: {root}"
+                                )
                     try:
                         with jobs_io_lock:
                             jobs.finish_scan(result)
@@ -2660,6 +2764,7 @@ def create_app(
                         state["persist_seq"] += 1
                         state["persist_dirty"] = True
                     state["events"].notify_all()
+                report_monitor_outcome(error=None, last_scan_at=datetime.now(UTC).isoformat())
                 # Keep an already-completed scan in memory even if persisting to disk fails.
                 if async_persist:
                     threading.Thread(
@@ -2676,6 +2781,9 @@ def create_app(
                     was_cancelled = isinstance(exc, InterruptedError)
                     state["result"] = previous_result
                     state["deleted_files"] = previous_deleted
+                    if monitor_activation is not None:
+                        state["last_scan_settings"] = previous_settings
+                        state["last_job_name"] = previous_job_name
                     state["trash_undo_cleared"] = 0  # the undo map survived after all
                     state["scan_id"] = secrets.token_hex(12)
                     state["groups_version"] += 1
@@ -2694,6 +2802,7 @@ def create_app(
                         message="Scan cancelled" if was_cancelled else str(exc),
                     )
                     state["events"].notify_all()
+                report_monitor_outcome(error=None if was_cancelled else str(exc))
 
         with lock:
             state["events"].notify_all()  # wake SSE clients: scanning=True

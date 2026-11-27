@@ -482,7 +482,9 @@ def save_review_session(
     return {"path": str(target), "saved_at": saved_at}
 
 
-def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
+def load_review_session(
+    path: str | Path | None = None, *, persist_pruning: bool = True
+) -> ReviewSessionLoad:
     """Load and revalidate a review, pruning files that changed since its scan."""
     target = Path(path).expanduser() if path is not None else default_review_session_path()
     report = ReviewSessionLoad(path=target)
@@ -558,7 +560,7 @@ def load_review_session(path: str | Path | None = None) -> ReviewSessionLoad:
         {"path": path, "reason": prune_reason(error), "detail": error}
         for path, error in sorted(invalid.items())[:MAX_PRUNE_SAMPLES]
     ]
-    if report.pruned_files or deleted_changed:
+    if persist_pruning and (report.pruned_files or deleted_changed):
         try:
             saved = save_review_session(
                 result,

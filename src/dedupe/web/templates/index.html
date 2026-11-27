@@ -39,6 +39,7 @@
         <span class="stat-chip muted-chip">No scan yet</span>
       </div>
       <div class="topbar-actions">
+        <button type="button" class="btn ghost" id="btnMonitorStatus" aria-controls="monitoredJobs" title="Show folder monitoring" hidden></button>
         <button type="button" class="btn ghost theme-toggle" id="btnTheme" title="Switch color theme (System)" aria-label="Color theme: System">
           <span class="theme-icon" aria-hidden="true">◐</span>
           <span class="theme-label" id="themeLabel">Auto</span>
@@ -129,6 +130,13 @@
             <button class="btn ghost" type="button" id="btnDeleteJob" disabled>Delete job</button>
           </div>
           <p class="thresh-hint" id="jobHint">Save folders and settings together. Each job keeps its own review progress.</p>
+          <section id="monitoredJobs" aria-labelledby="monitorHeading" hidden>
+            <h3 class="setup-heading" id="monitorHeading" tabindex="-1">Folder monitoring</h3>
+            <ul class="monitor-jobs-list" id="monitorJobsList"></ul>
+            {% if native_shell %}
+            <p class="thresh-hint">Monitoring continues when you close the Dedupe window. Click Dedupe in the Dock to return. Quit Dedupe to stop until the next launch.</p>
+            {% endif %}
+          </section>
         </section>
         <div class="options-heading">
           <h2>Scan settings</h2>

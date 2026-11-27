@@ -84,8 +84,24 @@ checked directly by path and file identity, so a no-op does not inventory the
 whole library; directory moves keep a broader inventory fallback because they
 can contain many arrivals. If a folder or removable drive is temporarily missing,
 monitoring waits rather than saving an incomplete review and reattaches when it
-returns. It does not run after the Mac app is closed. Choose **Stop monitoring**
-to disable it.
+returns. If a selected folder disappears, becomes unreadable, or is replaced
+during an automatic scan, Dedupe keeps the previous saved review and baseline.
+Files that arrived while the drive was disconnected are checked when
+it returns, even if more changes arrive during that check. Jobs that select
+individual files respond to those files without scanning for changes to their
+siblings.
+
+The **Monitoring** button in the top bar shows how many jobs are enabled and
+flags issues, including a missing folder. Open it to see each job’s status,
+last check, and **Stop** button. You can stop a job there while editing another
+job’s setup. When an automatic scan finds arrivals, its results open in the
+shared review window. Select a different saved job and choose **Resume review**
+to go back to that job’s review.
+
+With a monitor enabled, closing the Mac app’s window leaves monitoring running.
+Click Dedupe in the Dock or choose **Window → Show Dedupe Window** to return.
+**Quit Dedupe** stops the watchers until the next launch, when enabled jobs
+check for arrivals again. **Stop monitoring** disables a job across launches.
 
 **Delete job** removes the saved settings and review, stops its folder monitor,
 and leaves media untouched.

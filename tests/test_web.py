@@ -5118,6 +5118,12 @@ def test_monitor_scan_checks_busy_before_jobs_get(tmp_path: Path, monkeypatch) -
         def watched_jobs(self):
             return set()
 
+        def watch_error(self, job_id):
+            return None
+
+        def watched_roots(self, job_id):
+            return [str(tmp_path)]
+
     jobs_get_calls: list[str] = []
 
     class SpyJobStore(web_app.JobStore):
@@ -5129,18 +5135,31 @@ def test_monitor_scan_checks_busy_before_jobs_get(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(web_app, "JobStore", SpyJobStore)
     monkeypatch.setattr(web_app, "MONITOR_BUSY_RETRY_SECONDS", 60.0)
 
-    app = create_app(_result(tmp_path))
+    review_path = tmp_path / "review.json"
+    store = web_app.JobStore(review_path)
+    job = store.save("Busy test", {"paths": [str(tmp_path)]})
+    result = _result(tmp_path)
+    result.job_id = job["id"]
+    store.finish_scan(result)
+    store.set_monitor(job["id"], True)
+    timers = []
+    monkeypatch.setattr(threading.Timer, "start", lambda timer: timers.append(timer))
+    app = create_app(result, review_session_path=review_path)
     state = app.extensions["dedupe_state"]
     state["scanning"] = True
     jobs_get_calls.clear()
 
     # Triggering a monitor event while busy must defer BEFORE calling jobs.get().
-    captured_cb["on_change"]("job-busy-test")
+    captured_cb["on_change"](job["id"])
+    catchup = timers.pop(0)
+    catchup.function(*catchup.args)
     assert jobs_get_calls == []
-    assert state["monitors"]["job-busy-test"]["pending"] is True
+    assert state["monitors"][job["id"]]["pending"] is True
+    assert len(timers) == 1 and timers[0].interval == 60.0
 
     # Cancel the retry timer so it doesn't linger.
-    app.extensions["dedupe_monitor"].stop_all()
+    app.test_client().post("/api/jobs/monitor", json={"id": job["id"], "enabled": False},
+                           headers={"X-Dedupe-Token": app.config["DEDUPE_CSRF_TOKEN"]})
     state["scanning"] = False
 
 

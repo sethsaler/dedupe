@@ -143,7 +143,8 @@ BACKEND="$BACKEND_DIR/dedupe-server"
 
 if ((SMOKE)); then
   printf 'Smoke-testing the embedded backend…\n'
-  BACKEND_PATH="$BACKEND" "$PY" - <<'PY'
+  mkdir -p "$WORK/smoke-home"
+  BACKEND_PATH="$BACKEND" SMOKE_HOME="$WORK/smoke-home" "$PY" - <<'PY'
 import os
 import select
 import subprocess
@@ -154,6 +155,11 @@ import urllib.request
 backend = os.environ["BACKEND_PATH"]
 token = "build-smoke"
 env = dict(os.environ)
+# Launch with an empty library. Startup restores saved folder monitors and
+# could otherwise scan the builder's real folders during bundle verification.
+env["HOME"] = os.environ["SMOKE_HOME"]
+env["XDG_STATE_HOME"] = os.path.join(env["HOME"], "state")
+env["XDG_CACHE_HOME"] = os.path.join(env["HOME"], ".cache")
 env["DEDUPE_NATIVE_SHELL"] = "1"
 env["DEDUPE_NATIVE_TOKEN"] = token
 process = subprocess.Popen(
