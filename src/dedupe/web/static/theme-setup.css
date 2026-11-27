@@ -765,6 +765,17 @@
 .job-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding-top: 12px; }
 .job-controls label { display: grid; gap: 5px; flex: 1 1 200px; }
 .job-controls input, .job-controls select { min-width: 0; width: 100%; }
+#monitoredJobs { margin-top: 16px; }
+.monitor-jobs-list { list-style: none; padding: 0; margin: 4px 0; }
+.monitor-jobs-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--lt-sleeve);
+  overflow-wrap: anywhere;
+}
 .protected-setup .field-row { padding-top: 12px; }
 .history-panel { padding: 20px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

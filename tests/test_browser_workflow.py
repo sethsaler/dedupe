@@ -173,8 +173,31 @@ def test_saved_job_monitor_control_enables_and_disables(
     expect(page.locator("#btnMonitorJob")).to_have_text("Stop monitoring")
     expect(page.locator("#jobHint")).to_contain_text("Monitoring")
 
-    page.locator("#btnMonitorJob").click()
-    expect(page.locator("#btnMonitorJob")).to_have_text("Monitor folders")
+    shortcut = page.get_by_role("button", name="Monitoring 1 job")
+    expect(shortcut).to_be_visible()
+    expect(page.locator("#monitorJobsList")).to_contain_text("Last checked", timeout=15_000)
+    page.locator("#cleanupJob").select_option("")
+    page.locator("#paths").fill("/unsaved/cleanup")
+    page.locator("#scanCollapse").click()
+    expect(page.locator("#scanMain")).to_be_hidden()
+    moved = duplicate_images.with_name("disconnected")
+    duplicate_images.rename(moved)
+    try:
+        expect(shortcut).to_have_text("Monitoring 1 job · 1 issue", timeout=20_000)
+        shortcut.click()
+        expect(page.locator("#monitorHeading")).to_be_focused()
+        expect(page.locator("#monitorJobsList")).to_contain_text("Waiting for missing folder")
+        expect(page.locator("#monitorJobsList")).to_contain_text(str(duplicate_images))
+    finally:
+        moved.rename(duplicate_images)
+    expect(shortcut).to_have_text("Monitoring 1 job", timeout=20_000)
+    expect(page.locator("#cleanupJob")).to_have_value("")
+    expect(page.locator("#paths")).to_have_value("/unsaved/cleanup")
+
+    page.get_by_role("button", name="Stop monitoring Inbox watch").click()
+    expect(page.locator("#btnMonitorStatus")).to_be_hidden()
+    expect(page.locator("#monitoredJobs")).to_be_hidden()
+    expect(page.locator("#paths")).to_have_value("/unsaved/cleanup")
     assert page_errors == []
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from PIL import Image
 from dedupe.engine import run_scan
 from dedupe.jobs import JobStore, file_identity, focus_new_arrivals
 from dedupe.models import GroupKind, ScanResult, effective_selected_paths
+from dedupe.monitor import MonitorChange
 from dedupe.review_session import load_review_session, save_review_session
 from dedupe.web import app as web
 
@@ -593,6 +595,216 @@ def test_monitor_setting_is_restored_when_the_app_restarts(tmp_path: Path, make_
     restarted.test_client().post(
         "/api/jobs/monitor", json={"id": job_id, "enabled": False}, headers=_headers(restarted)
     )
+
+
+@pytest.fixture
+def controlled_monitor(tmp_path, make_app, monkeypatch):
+    """Deliver watcher batches and timer callbacks in a known order."""
+    inbox = tmp_path / "inbox"
+    original = _image(inbox / "original.png")
+    app = make_app()
+    client = app.test_client()
+    job_id = _save_job(client, app, "Imports", _settings(inbox))
+    _run_job(client, app, job_id)
+    service = app.extensions["dedupe_monitor"]
+    monkeypatch.setattr(service, "start", lambda job_id, roots, settings: roots)
+    timers = []
+    start = threading.Timer.start
+
+    def capture(timer):
+        if timer.function.__name__ == "_drain_monitor_checks":
+            timers.append(timer)
+        else:
+            start(timer)
+
+    monkeypatch.setattr(threading.Timer, "start", capture)
+
+    def enable(value):
+        res = client.post("/api/jobs/monitor", json={"id": job_id, "enabled": value},
+                          headers=_headers(app))
+        assert res.status_code == 200, res.get_json()
+
+    def changed(path):
+        service.on_change(job_id, MonitorChange(paths={str(path)}))
+
+    def fire_next():
+        timer = timers.pop(0)
+        timer.function(*timer.args)
+
+    return app, client, original, enable, changed, fire_next
+
+
+def _wait_for_arrival_group(client, arrival):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not client.get("/api/status").get_json()["scanning"]:
+            for group in _groups(client):
+                if str(arrival) in {m["path"] for m in group["members"]}:
+                    return
+        time.sleep(0.01)
+    pytest.fail(f"The monitor missed the arrival {arrival}")
+
+
+def test_file_event_keeps_startup_catchup(controlled_monitor):
+    _app, client, original, enable, changed, fire_next = controlled_monitor
+    arrival = _image(original.with_name("arrived-while-closed.png"))
+    enable(True)
+    changed(original)
+    fire_next()
+    _wait_for_arrival_group(client, arrival)
+
+
+def test_busy_retry_keeps_earlier_files_without_inventory(controlled_monitor, monkeypatch):
+    app, client, original, enable, changed, fire_next = controlled_monitor
+    enable(True)
+    fire_next()  # finish startup catch-up
+    arrival = _image(original.with_name("arrived-while-busy.png"))
+    monkeypatch.setattr(web, "inventory", lambda *a, **kw: pytest.fail("unexpected inventory"))
+    state = app.extensions["dedupe_state"]
+    state["acting"] = True
+    changed(arrival)
+    state["acting"] = False
+    changed(original)  # an unchanged path arrives before the queued retry
+    fire_next()
+    _wait_for_arrival_group(client, arrival)
+
+
+def test_monitor_ignores_media_symlinks_inside_watched_folders(controlled_monitor, tmp_path):
+    _app, client, original, enable, changed, fire_next = controlled_monitor
+    enable(True)
+    fire_next()
+    previous_scan = _scan_id(client)
+    link = original.with_name("linked.png")
+    link.symlink_to(_image(tmp_path / "outside.png"))
+    changed(link)
+    assert _scan_id(client) == previous_scan
+
+
+def test_cancelled_catchup_cannot_run_after_reenable(controlled_monitor):
+    _app, client, original, enable, _changed, fire_next = controlled_monitor
+    arrival = _image(original.with_name("arrival.png"))
+    scan_id = _scan_id(client)
+    enable(True)
+    enable(False)
+    enable(True)
+    fire_next()  # simulate an old callback already dispatched when stop cancelled it
+    assert _scan_id(client) == scan_id
+    assert client.get("/api/jobs").get_json()["jobs"][0]["monitor_pending"]
+    fire_next()
+    _wait_for_arrival_group(client, arrival)
+
+
+def test_stopping_during_inventory_does_not_start_an_arrival_scan(controlled_monitor, monkeypatch):
+    _app, client, original, enable, _changed, fire_next = controlled_monitor
+    _image(original.with_name("arrival.png"))
+    scan_id = _scan_id(client)
+    inventory_started = threading.Event()
+    release_inventory = threading.Event()
+    inventory = web.inventory
+
+    def blocking_inventory(*args, **kwargs):
+        inventory_started.set()
+        assert release_inventory.wait(timeout=5)
+        return inventory(*args, **kwargs)
+
+    monkeypatch.setattr(web, "inventory", blocking_inventory)
+    enable(True)
+    check = threading.Thread(target=fire_next)
+    check.start()
+    try:
+        assert inventory_started.wait(timeout=5)
+        enable(False)
+    finally:
+        release_inventory.set()
+        check.join(timeout=5)
+    assert not check.is_alive()
+    assert _scan_id(client) == scan_id
+    assert client.get("/api/status").get_json()["monitors"] == {}
+
+
+@pytest.mark.parametrize("failure", ["missing", "replaced", "cannot_list", "missing_offscreen"])
+def test_monitor_keeps_prior_review_if_a_root_fails_during_scan(
+    controlled_monitor, tmp_path, monkeypatch, failure,
+):
+    app, client, original, enable, _changed, fire_next = controlled_monitor
+    library = _image(tmp_path / "archive" / "keeper.png").parent
+    job_id = client.get("/api/jobs").get_json()["jobs"][0]["id"]
+    _run_job(client, app, job_id, protected_folders=[str(library)])
+    state = app.extensions["dedupe_state"]
+    prior_result = state["result"]
+    with state["events"]:
+        assert state["events"].wait_for(lambda: state["review_session"].result is prior_result, 5)
+    store = JobStore(tmp_path / "review.json")
+    baseline_before = store.baseline_path(job_id).read_bytes()
+    review_before = store.session_path(job_id).read_bytes()
+    if failure == "missing_offscreen":
+        # The monitor must load this job's prior review from disk to merge
+        # arrivals. Tentative pruning on a missing drive must not be persisted.
+        other = _image(tmp_path / "other" / "other.png")
+        other_job = _save_job(client, app, "Other", _settings(other.parent))
+        _run_job(client, app, other_job)
+        prior_result = state["result"]
+    undo_before = {"original trash path": "previous item"}
+    state["deleted_files"] = undo_before.copy()
+
+    # The scanner can produce a successful but partial inventory if a drive
+    # disappears, gets replaced, or stops allowing directory listings.
+    affected = original.parent if failure.startswith("missing") else library
+
+    def partial_scan(paths, **kwargs):
+        if failure == "cannot_list":
+            scandir = web.os.scandir
+
+            def deny_listing(path):
+                if path == affected:
+                    raise PermissionError("listing denied")
+                return scandir(path)
+
+            monkeypatch.setattr(web.os, "scandir", deny_listing)
+        else:
+            affected.rename(tmp_path / "offline")
+            if failure == "replaced":
+                affected.mkdir()
+        return ScanResult(roots=[str(original.parent)], files=[], groups=[])
+
+    monkeypatch.setattr(web, "run_scan", partial_scan)
+    _image(original.with_name("new.png"))
+    enable(True)
+    fire_next()
+    with state["events"]:
+        assert state["events"].wait_for(lambda: state["monitors"][job_id]["error"], 5)
+    assert str(affected) in state["monitors"][job_id]["error"]
+    assert state["result"] is prior_result
+    assert state["deleted_files"] == undo_before
+    assert store.baseline_path(job_id).read_bytes() == baseline_before
+    assert store.session_path(job_id).read_bytes() == review_before
+
+
+def test_manual_scan_with_changed_settings_clears_runtime_monitor(controlled_monitor):
+    app, client, _original, enable, _changed, fire_next = controlled_monitor
+    enable(True)
+    job_id = client.get("/api/jobs").get_json()["jobs"][0]["id"]
+    _run_job(client, app, job_id, include_hidden=True)
+    fire_next()  # the previous monitor's timer may have already dispatched
+    assert client.get("/api/status").get_json()["monitors"] == {}
+    assert not client.get("/api/jobs").get_json()["jobs"][0]["monitor"]
+
+
+def test_idle_event_stream_reports_monitor_enable_and_stop(controlled_monitor):
+    _app, client, _original, enable, _changed, _fire_next = controlled_monitor
+    with client.get("/api/events", buffered=False) as response:
+        stream = iter(response.response)
+
+        def next_monitors():
+            packet = next(stream).decode()
+            status = next(event for event in packet.split("\n\n") if event.startswith("event: status"))
+            return json.loads(status.split("\ndata: ", 1)[1])["monitors"]
+
+        assert next_monitors() == {}
+        enable(True)
+        assert next(iter(next_monitors().values()))["pending"]
+        enable(False)
+        assert next_monitors() == {}
 
 
 def test_monitor_scans_media_changes_automatically(tmp_path: Path, make_app, monkeypatch) -> None:

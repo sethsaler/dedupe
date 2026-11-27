@@ -5,6 +5,7 @@ import { collectScanSettings, startScan, switchTab } from "./scan.js";
 import {
   applySettingsToForm,
   collapseScanPanel,
+  expandScanPanel,
   scanGoalShortLabel,
 } from "./settings.js";
 import { state } from "./state.js";
@@ -13,6 +14,8 @@ import { $, escapeHtml, toast } from "./util.js";
 
 let jobs = [];
 let lastCompletedScan = null;
+let catalogRefresh = null;
+const changingMonitors = new Set();
 
 function normalizedSettingValue(value) {
   if (Array.isArray(value)) return value.map((item) => String(item).trim());
@@ -45,10 +48,56 @@ function syncJobButtons(busy = state.scanning || state.acting) {
   $("btnSaveJob").disabled = busy;
   $("btnResumeJob").disabled = busy || !job?.last_scan_at;
   $("btnNewArrivals").disabled = busy || !job?.last_scan_at;
-  $("btnMonitorJob").disabled = !job || (!job.monitor && (busy || !job.last_scan_at));
+  $("btnMonitorJob").disabled = !job || changingMonitors.has(job.id)
+    || (!job.monitor && (busy || !job.last_scan_at));
   $("btnMonitorJob").textContent = job?.monitor ? "Stop monitoring" : "Monitor folders";
   $("btnDeleteJob").disabled = busy || !job;
 }
+
+function renderMonitors() {
+  const watched = jobs.filter((job) => job.monitor);
+  const issues = watched.filter((job) => job.monitor_error).length;
+  const shortcut = $("btnMonitorStatus");
+  shortcut.hidden = !watched.length;
+  shortcut.textContent = `Monitoring ${watched.length} job${watched.length === 1 ? "" : "s"}`
+    + (issues ? ` · ${issues} issue${issues === 1 ? "" : "s"}` : "");
+  $("monitoredJobs").hidden = !watched.length;
+
+  const list = $("monitorJobsList");
+  const watchedIds = new Set(watched.map((job) => job.id));
+  for (const row of Array.from(list.children)) {
+    if (!watchedIds.has(row.dataset.jobId)) row.remove();
+  }
+  for (const job of watched) {
+    let row = $(`monitor-row-${job.id}`);
+    if (!row) {
+      row = document.createElement("li");
+      row.id = `monitor-row-${job.id}`;
+      row.dataset.jobId = job.id;
+      row.innerHTML = '<div><strong></strong><p class="thresh-hint"></p></div>'
+        + '<button type="button" class="btn ghost">Stop</button>';
+      list.append(row);
+    }
+    row.querySelector("strong").textContent = job.name;
+    let status = job.monitor_error;
+    if (!status) {
+      if (job.monitor_pending) status = "Check queued";
+      else status = job.monitor_active ? "Watching folders" : "Waiting for folders";
+    }
+    if (job.monitor_last_scan_at) {
+      status += ` · Last checked ${new Date(job.monitor_last_scan_at).toLocaleString()}`;
+    }
+    row.querySelector("p").textContent = status;
+    const stop = row.querySelector("button");
+    stop.setAttribute("aria-label", `Stop monitoring ${job.name}`);
+    stop.disabled = changingMonitors.has(job.id);
+  }
+}
+
+$("btnMonitorStatus").addEventListener("click", () => {
+  expandScanPanel({ focusId: "monitorHeading" });
+  $("monitorHeading").scrollIntoView({ block: "center" });
+});
 
 function updateJobHint() {
   const hint = $("jobHint");
@@ -83,8 +132,9 @@ function restoreSettings(settings) {
   updateJobHint();
 }
 
-async function refreshJobs(selected = $("cleanupJob").value) {
+async function refreshJobs(selected) {
   const data = await api("/api/jobs");
+  selected ??= $("cleanupJob").value;
   jobs = data.jobs;
   $("cleanupJob").innerHTML = '<option value="">New cleanup</option>' + jobs.map((job) =>
     `<option value="${job.id}">${escapeHtml(job.name)}</option>`).join("");
@@ -93,6 +143,7 @@ async function refreshJobs(selected = $("cleanupJob").value) {
   state.selectedJobId = job?.id || null;
   syncJobButtons();
   updateJobHint();
+  renderMonitors();
 }
 
 $("cleanupJob").addEventListener("change", () => {
@@ -180,20 +231,36 @@ $("btnNewArrivals").addEventListener("click", async () => {
   startScan({ ...job.settings, job_id: job.id, new_only: true });
 });
 
-$("btnMonitorJob").addEventListener("click", async () => {
-  const job = chosenJob();
-  if (!job) return;
-  const enabled = !job.monitor;
+async function setMonitor(job, enabled) {
+  if (!job || changingMonitors.has(job.id)) return;
+  changingMonitors.add(job.id);
+  syncJobButtons();
+  renderMonitors();
   try {
     const updated = await api("/api/jobs/monitor", {
       method: "POST",
       body: JSON.stringify({ id: job.id, enabled }),
     });
-    await refreshJobs(updated.id);
+    await refreshJobs();
     toast(enabled
       ? `Monitoring ${updated.name} while Dedupe is open`
       : `Stopped monitoring ${updated.name}`, "ok");
   } catch (error) { toast(error.message, "error"); }
+  finally {
+    changingMonitors.delete(job.id);
+    syncJobButtons();
+    renderMonitors();
+  }
+}
+
+$("btnMonitorJob").addEventListener("click", () => {
+  const job = chosenJob();
+  if (job) setMonitor(job, !job.monitor);
+});
+
+$("monitorJobsList").addEventListener("click", (event) => {
+  const row = event.target.closest("button")?.closest("li");
+  if (row) setMonitor(jobs.find((job) => job.id === row.dataset.jobId), false);
 });
 
 $("btnDeleteJob").addEventListener("click", async () => {
@@ -210,24 +277,43 @@ $("btnDeleteJob").addEventListener("click", async () => {
   } catch (error) { toast(error.message, "error"); }
 });
 
-refreshJobs().catch((error) => toast(error.message, "error"));
+function refreshJobCatalog() {
+  if (!catalogRefresh) {
+    catalogRefresh = refreshJobs()
+      .catch((error) => toast(error.message, "error"))
+      .finally(() => { catalogRefresh = null; });
+  }
+}
+
+refreshJobCatalog();
 
 window.addEventListener("dedupe:work-state", (event) => {
   const { busy, scanId, done, monitors } = event.detail;
-  syncJobButtons(busy);
-  if (monitors) {
-    for (const job of jobs) {
-      const runtime = monitors[job.id] || {};
-      job.monitor_active = Boolean(runtime.active);
-      job.monitor_pending = Boolean(runtime.pending);
-      job.monitor_error = runtime.error || null;
-      job.monitor_last_event_at = runtime.last_event_at || null;
-      job.monitor_last_scan_at = runtime.last_scan_at || null;
+  let changed = false;
+  let knownMonitorCount = 0;
+  for (const job of jobs) {
+    const runtime = monitors?.[job.id];
+    if (runtime) knownMonitorCount++;
+    const fields = {
+      monitor: Boolean(runtime),
+      monitor_active: Boolean(runtime?.active),
+      monitor_pending: Boolean(runtime?.pending),
+      monitor_error: runtime?.error || null,
+      monitor_last_scan_at: runtime?.last_scan_at || null,
+    };
+    for (const [key, value] of Object.entries(fields)) {
+      if (job[key] === value) continue;
+      job[key] = value;
+      changed = true;
     }
+  }
+  if (changed) {
     updateJobHint();
+    renderMonitors();
   }
-  if (!busy && done && scanId !== lastCompletedScan) {
-    lastCompletedScan = scanId;
-    refreshJobs().catch((error) => toast(error.message, "error"));
-  }
+  syncJobButtons(busy);
+  const completed = !busy && done && scanId !== lastCompletedScan;
+  if (completed) lastCompletedScan = scanId;
+  // Another window can enable a job created since this page loaded.
+  if (completed || Object.keys(monitors || {}).length > knownMonitorCount) refreshJobCatalog();
 });
